@@ -30,7 +30,7 @@ SOURCE_DOMAINS = {
 MOTION_DOMAINS = ("General", "Tip", "Gripper")
 ALL_DOMAINS = (*MOTION_DOMAINS, "TC")
 LIFECYCLE_HOOKS = frozenset({
-    "prepare", "run_job", "script_prologue", "ordinary_pause_prepare",
+    "prepare", "preparation_abort", "run_job", "script_prologue", "ordinary_pause_prepare",
     "ordinary_pause_restore", "deferred_pause_request", "deferred_pause_enter",
     "wake", "safe_stop_request", "safe_stop_exit", "abort_true_prefix", "abort_true_finish",
     "abort_false", "source_error_request", "source_error", "cleanup", "epilogue_sweep",
@@ -274,9 +274,11 @@ class ProtocolExecutor:
             return ()
         # Control/termination exits belong to the selected job even before a
         # control is requested. Physical leaves are supplied by the canonical factory.
-        required = LIFECYCLE_HOOKS - {"prepare", "ordinary_pause_restore"}
+        required = LIFECYCLE_HOOKS - {"prepare", "preparation_abort", "ordinary_pause_restore"}
         if document.metadata.get("oem_prepare") is True:
             required = required | {"prepare"}
+            if document.metadata.get("source_settings", {}).get("DeckInspection") is True:
+                required = required | {"preparation_abort"}
         return tuple(sorted(required))
 
     def preflight(self, document: ProtocolDocument) -> dict[str, Any]:
@@ -386,9 +388,11 @@ class ProtocolExecutor:
                 "control_command_id": control_id, "phase": workflow.phase,
                 "gate": workflow.gate, "gate_id": workflow.gate_id}
 
-    def acknowledge_review(self, *, control_id: str, gate_id: str) -> dict[str, Any]:
+    def acknowledge_review(self, *, control_id: str, gate_id: str,
+                           decision: str | None = None) -> dict[str, Any]:
         with self._condition:
-            request = {"action": "review", "gate_id": gate_id}
+            request = {"action": "review", "gate_id": gate_id,
+                       **({"decision": decision} if decision is not None else {})}
             if control_id in self._controls:
                 if self._controls[control_id] != request:
                     raise ValueError("Control identity conflicts with earlier request")
@@ -398,10 +402,18 @@ class ProtocolExecutor:
             workflow = self._state.workflow
             if workflow.gate != "review" or workflow.gate_id != gate_id:
                 raise ValueError("Review cannot release another gate")
+            preparation = gate_id == "lifecycle:prepare" and not self._source_entered
+            if preparation and decision not in {"ignore", "abort"}:
+                raise ValueError("Preparation review requires explicit Ignore or Abort")
+            if not preparation and decision is not None:
+                raise ValueError("Inspection decision requires the preparation review gate")
             self._controls[control_id] = request
-            self._review_released = True
+            self._review_released = decision != "abort"
+            if decision == "abort":
+                self._termination = "abort"
             self._release_gate = control_id
             workflow.last_control_id = control_id
+            workflow.requested_control = dict(request)
             self._condition.notify_all()
             return self._control_result(control_id)
 
@@ -681,6 +693,10 @@ class ProtocolExecutor:
     def _service_requests(self) -> None:
         if self._servicing or self._interrupted or self._recording_failed or self._unknown:
             return
+        # Prepare is outside executeScript: its Abort is the inspection UI
+        # unlock, never the running-script pressure/Abort/cleanup chain.
+        if not self._source_entered:
+            return
         self._servicing = True
         try:
             if (self._source_entered and self._failed
@@ -720,6 +736,10 @@ class ProtocolExecutor:
                 raise _Diversion()
             if self._termination:
                 # A diversion never acknowledges review or runs restoration.
+                if gate_id == "lifecycle:prepare" and not self._source_entered:
+                    self._hook("preparation_abort", once=True)
+                    workflow.gate = workflow.gate_id = None
+                    raise _Diversion()
                 if gate == "review" and self._termination in {"abort", "safe_stop"} and not self._safe_boundary():
                     self._unknown = True
                     self._publish("reconciling", held_reason="review_blocks_termination")
@@ -747,7 +767,7 @@ class ProtocolExecutor:
                 workflow.requested_control = None
                 workflow.gate = workflow.gate_id = None
                 self._pause = None
-                self._publish("executing")
+                self._publish("preparing" if gate_id == "lifecycle:prepare" else "executing")
                 return
             with self._condition:
                 self._condition.wait(0.05)
@@ -922,7 +942,35 @@ class ProtocolExecutor:
             self._publish("preparing" if document.metadata.get("oem_prepare") else "starting")
             if self._oem:
                 if document.metadata.get("oem_prepare"):
-                    self._hook("prepare", once=True)
+                    preparation = self._hook("prepare", once=True) or {}
+                    if self._termination:
+                        raise _Diversion()
+                    # Preparation owns the captured source model. A successful
+                    # callback without its required output cannot enter RunJob.
+                    from .validators import validate_prepared_tip_inventory
+                    try:
+                        validate_prepared_tip_inventory(document, state.source_model)
+                        self._validate_preparation_manifest(document, preparation)
+                    except ValueError as exc:
+                        self._failed = True
+                        state.record_event("preparation_inputs_missing", detail={"error": str(exc)})
+                        raise _Diversion() from exc
+                    if preparation.get("inspection_decision_required") is True:
+                        if "preparation_abort" not in self._lifecycle_handlers:
+                            self._failed = True
+                            state.record_event("preparation_inputs_missing", detail={"error": "preparation_abort_unbound"})
+                            raise _Diversion()
+                        state.workflow.held_reason = "source_preparation_operator_decision_required"
+                        self._gate("review", "lifecycle:prepare")
+                        state.workflow.held_reason = None
+                        # Retained evidence may have changed while the operator
+                        # reviewed it. Ignore is not permission to lose bytes.
+                        try:
+                            self._validate_preparation_manifest(document, preparation)
+                        except ValueError as exc:
+                            self._failed = True
+                            state.record_event("preparation_inputs_missing", detail={"error": str(exc)})
+                            raise _Diversion() from exc
                 self._publish("starting")
                 run_job_result = self._hook("run_job", once=True)
                 if run_job_result and run_job_result.get("source_pause_scripts"):
@@ -1013,7 +1061,7 @@ class ProtocolExecutor:
         state.completed = self.outcome == "completed"
         if self._termination in {"abort", "safe_stop"} and self.outcome == "interrupted" and not self._interrupted and not self._failed:
             for control_id, request in self._controls.items():
-                if request["action"] in {"abort", "safe_stop"}:
+                if request["action"] in {"abort", "safe_stop"} or request.get("decision") == "abort":
                     self._reached_controls.add(control_id)
                     state.workflow.reached_control_id = control_id
         for stage_state in state.stage_states.values():
@@ -1063,6 +1111,34 @@ class ProtocolExecutor:
         self._source_return_notified = True  # failed notification is not retried
         self._source_lifetime_call(self._source_script_returned, returned=True)
         self._source_returned = True
+
+    @staticmethod
+    def _validate_preparation_manifest(document: ProtocolDocument, result: Mapping[str, Any]) -> None:
+        """Consume the selected producer, not caller-declared physical stock."""
+        if document.metadata.get("source_settings", {}).get("DeckInspection") is not True:
+            return
+        manifest = result.get("deck_manifest")
+        if not isinstance(manifest, Mapping) or manifest.get("physical_observations") is not False:
+            raise ValueError("source_preparation_manifest_missing_or_physical_claim")
+        observations = manifest.get("inspections")
+        if (not isinstance(observations, list) or not observations
+                or observations != result.get("inspections")
+                or manifest.get("inspection_issues") != result.get("inspection_issues")
+                or result.get("source_return") != "OK"):
+            raise ValueError("source_preparation_manifest_observations_missing")
+        artifacts = manifest.get("artifacts")
+        if not isinstance(artifacts, list) or not artifacts:
+            raise ValueError("source_preparation_manifest_images_missing")
+        for artifact in artifacts:
+            # Consume the actual acquisition identity emitted by the trusted
+            # producer. Saving diagnostic images is nonblocking OEM logging;
+            # filesystem availability must not become another motion gate.
+            digest = artifact.get("sha256") if isinstance(artifact, Mapping) else None
+            if (not isinstance(digest, str) or len(digest) != 64
+                    or any(char not in "0123456789abcdef" for char in digest)
+                    or type(artifact.get("size_bytes")) is not int
+                    or artifact["size_bytes"] <= 0):
+                raise ValueError("source_preparation_manifest_image_identity_invalid")
 
     def _hook_succeeded(self, name: str) -> bool:
         return any(row.get("hook") == name and row.get("ok") is True

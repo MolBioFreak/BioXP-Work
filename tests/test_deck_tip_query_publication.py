@@ -63,13 +63,14 @@ def query_rig(installed_retained, monkeypatch):
     from bioxp.oem_compat.position_table import load_bound_oem_position_table
     app = FastAPI()
     app.add_api_route('/liquid/tip-status', api.liquid_tip_status, methods=['POST'])
+    monkeypatch.setattr(api, 'app', app)
+    app.state.oem_preparation_camera = api._protocol_preparation_camera()
     operator_controls.install_operator_control_plane(app,
         maintenance_state_provider=lambda: {'motion_blocked': False, 'recovery_required': False, 'block_reason': None},
         reference_state_provider=lambda: references.snapshot(('x','y','z','g')),
         lifecycle_state_provider=lambda: {'operation_state': 'stopped'},
         serial206_initialization_state_provider=api.serial206_oem_initialization_provider_status,
         oem_deck_provider=lambda: provider, oem_deck_position_table_provider=load_bound_oem_position_table)
-    monkeypatch.setattr(api, 'app', app)
     app.middleware('http')(api.bind_direct_pipette_idempotency)
     yield app, provider, primitive, references, root, receipt_store, calls, wire, transport
     app.state.operator_command_plane.stop()

@@ -74,13 +74,16 @@ def installed_retained(retained_rig, monkeypatch):
     from bioxp.oem_compat.position_table import load_bound_oem_position_table
     app = FastAPI()
     app.add_api_route('/hardware/snapshot/collect', api.hardware_snapshot_collect, methods=['POST'])
+    monkeypatch.setattr(api, 'app', app)
+    # Mirror the real lifespan producer order; do not install a missing camera
+    # dependency and then replace the provider after the plane captures it.
+    app.state.oem_preparation_camera = api._protocol_preparation_camera()
     controls.install_operator_control_plane(app,
         maintenance_state_provider=lambda: {'motion_blocked': False, 'recovery_required': False, 'block_reason': None},
         reference_state_provider=lambda: references.snapshot(('x','y','z','g')),
         lifecycle_state_provider=lambda: {'operation_state': 'stopped'},
         serial206_initialization_state_provider=projection,
         oem_deck_provider=lambda: provider, oem_deck_position_table_provider=load_bound_oem_position_table)
-    monkeypatch.setattr(api, 'app', app)
     monkeypatch.setattr(api, '_get_tester', lambda: object())
     monkeypatch.setattr(api, '_hardware_collectors', lambda tester: {})
     monkeypatch.setattr(api.hardware_state, 'collect', lambda *a, **k: {'ok': True, 'snapshot': {}})

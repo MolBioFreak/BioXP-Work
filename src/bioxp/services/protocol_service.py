@@ -209,7 +209,11 @@ def _build_live_execution_contract(
         missing_contract_fields.append("operator_id")
     if not physical_console_verified:
         missing_contract_fields.append("physical_console_verified")
-    if not deck_manifest:
+    # This selected native producer runs only after admission. Its real output
+    # is required by the executor before RunJob; do not fabricate stock here.
+    preparation_manifest = (compiled.document.metadata.get("oem_prepare") is True
+                            and compiled.document.metadata.get("source_settings", {}).get("DeckInspection") is True)
+    if not deck_manifest and not preparation_manifest:
         missing_contract_fields.append("deck_manifest")
     if not artifact_refs:
         missing_contract_fields.append("preflight.artifact_refs")
@@ -242,6 +246,7 @@ def _build_live_execution_contract(
         "hardware_action_kinds": hardware_action_kinds,
         "reference_required_action_kinds": reference_required_action_kinds,
         "deck_manifest": deck_manifest,
+        **({"deck_manifest_producer": "lifecycle:prepare"} if preparation_manifest else {}),
         "preflight": {
             "reference_snapshot": reference_snapshot,
             "reference_axes_verified": reference_axes_verified,
@@ -281,6 +286,12 @@ def _job_status_from_state(state: ProtocolRuntimeState) -> str:
 def _pending_review_payload(state: ProtocolRuntimeState) -> dict[str, Any] | None:
     if not state.awaiting_review:
         return None
+    if state.workflow is not None and state.workflow.gate_id == "lifecycle:prepare":
+        preparation = next((row for row in state.action_results if row.get("hook") == "prepare"), {})
+        return {"stage_id": "lifecycle:prepare", "action_id": "lifecycle:prepare",
+                "reason": state.pause_reason, "decisions": ["abort", "ignore"],
+                "inspection_issues": preparation.get("inspection_issues"),
+                "deck_manifest": preparation.get("deck_manifest")}
     action_id = None
     if state.current_stage_id and state.current_stage_id in state.stage_states:
         stage = state.stage_states[state.current_stage_id]
@@ -535,8 +546,13 @@ def _idempotency_recovery_error(job_id: str, message: str) -> ProtocolLiveContra
 def _workflow_resources(document: ProtocolDocument) -> list[str]:
     # OEM lifecycle includes future Park/door/pipette work, not only current leaf.
     if document.metadata.get("input_mode") == "oem_prepared":
-        return ["axis:x", "axis:y", "axis:z", "axis:g", "axis:door",
-                "motor:4:0", "motor:4:1", "motor:5:0", "pipette", "thermal"]
+        source_resources = ["axis:x", "axis:y", "axis:z", "axis:g", "axis:door",
+                            "motor:4:0", "motor:4:1", "motor:5:0", "pipette", "thermal"]
+        settings = document.metadata.get("source_settings", {})
+        if (document.metadata.get("oem_prepare") is True
+                or (isinstance(settings, Mapping) and settings.get("JobName") is not None)):
+            source_resources.append("camera")
+        return source_resources
     resources: set[str] = set()
     for action in _iter_document_actions(document):
         if action.kind in REFERENCE_REQUIRED_ACTION_KINDS or action.kind is ProtocolActionKind.THERMAL_DOOR:
@@ -624,10 +640,13 @@ def bind_protocol_dispatcher(command_store, *, binding_factory, artifact_store=N
                 pending = _pending_review_payload(state)
                 if not pending or pending["stage_id"] != request.get("stage_id") or pending["action_id"] != request.get("action_id"):
                     raise ProtocolLiveContractError("Review occurrence is not current.")
-                executor.acknowledge_review(control_id=control_id, gate_id=state.workflow.gate_id)
+                executor.acknowledge_review(control_id=control_id, gate_id=state.workflow.gate_id,
+                                            decision=request.get("decision"))
                 reviews.append({"reviewed_at": _utc_now_iso(), "reviewer": request["reviewer"],
                                 "note": request.get("note"), "stage_id": request["stage_id"],
-                                "action_id": request.get("action_id"), "control_command_id": control_id})
+                                "action_id": request.get("action_id"),
+                                **({"decision": request["decision"]} if "decision" in request else {}),
+                                "control_command_id": control_id})
             else:
                 executor.request_control(request["action"], control_id=control_id,
                                          **{key: request[key] for key in ("mode", "gate", "gate_id") if key in request})
@@ -656,7 +675,7 @@ def bind_protocol_dispatcher(command_store, *, binding_factory, artifact_store=N
 
 def control_protocol_job(job_id: str, request: Mapping[str, Any], *, command_store) -> dict[str, Any]:
     variants = {"pause": {"mode"}, "wake": {"gate_id"}, "continue": {"gate", "gate_id"},
-                "safe_stop": set(), "abort": set(), "review": {"reviewer", "note", "stage_id", "action_id"}}
+                "safe_stop": set(), "abort": set(), "review": {"reviewer", "note", "stage_id", "action_id", "decision"}}
     action = request.get("action")
     common = {"action", "idempotency_key", "command_id", "expected_ownership_generation"}
     if action not in variants or set(request) - (common | variants[action]):
@@ -748,18 +767,18 @@ def create_protocol_job(
     validate_protocol_support(compiled.document, handlers=handlers or {}, oem_handlers=oem_handlers or {},
                               lifecycle_handlers=lifecycle_handlers or {},
                               required_lifecycle=executor.required_lifecycle(compiled.document))
-    if "epilogue_sweep" in executor.required_lifecycle(compiled.document):
-        # Source sweep indexes four captured 96-well tip trays. Reject incomplete
-        # preparation before native entry; never manufacture empty inventory.
+    if ("epilogue_sweep" in executor.required_lifecycle(compiled.document)
+            and compiled.document.metadata.get("oem_prepare") is not True):
+        # Already-prepared submissions must carry captured wells at admission.
+        # The selected native prepare hook produces them under workflow custody;
+        # that path applies this same check immediately after preparation.
         from ..protocols.runtime_state import ProtocolSourceModel
+        from ..protocols.validators import validate_prepared_tip_inventory
         model = ProtocolSourceModel.from_payload(compiled.document.to_payload()["metadata"].get("source_model", {}))
-        trays_needed = 5 if any(
-            action.oem_opcode == "ldtip" and len(action.params["arguments"]) > 3
-            and action.params["arguments"][3] == "H"
-            for action in _iter_document_actions(compiled.document)
-        ) else 4
-        if len(model.tip_trays) < trays_needed or any(len(tray.wells) < 96 for tray in model.tip_trays[:trays_needed]):
-            raise ProtocolLiveContractError("Prepared source model lacks required captured tip-tray wells.")
+        try:
+            validate_prepared_tip_inventory(compiled.document, model)
+        except ValueError as exc:
+            raise ProtocolLiveContractError(str(exc)) from exc
     # Historical file custody is not permission to reissue under the new owner.
     active_store = store or ProtocolOperatorBundleStore()
     if active_store.load_live_reservation(job_id) is not None or active_store._bundle_path(job_id).exists():

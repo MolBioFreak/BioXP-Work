@@ -211,6 +211,19 @@ def validate_oem_selected_dependencies(document: ProtocolDocument, *, capabiliti
         require("prepare_inspections")
 
 
+def validate_prepared_tip_inventory(document: ProtocolDocument, model) -> None:
+    """The same source sweep/load requirement, after its selected producer."""
+    trays_needed = 5 if any(
+        action.oem_opcode == "ldtip" and len(action.params["arguments"]) > 3
+        and action.params["arguments"][3] == "H"
+        for stage in document.stages for action in stage.actions
+    ) else 4
+    if len(model.tip_trays) < trays_needed or any(
+        len(tray.wells) < 96 for tray in model.tip_trays[:trays_needed]
+    ):
+        raise ValueError("Prepared source model lacks required captured tip-tray wells.")
+
+
 def validate_protocol_support(
     document: ProtocolDocument, *, oem_handlers: Mapping[str, Any],
     handlers: Mapping[ProtocolActionKind, Any],
