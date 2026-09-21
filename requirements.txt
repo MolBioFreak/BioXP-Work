@@ -5,3 +5,6 @@ pydantic
 pyusb
 pillow
 rfc8785
+# CPU inspection port qualified against captured OEM pixels (OEM OpenCV 3.2).
+numpy==1.26.4
+opencv-python-headless==3.4.18.65

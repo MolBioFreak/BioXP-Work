@@ -1010,6 +1010,7 @@ async def lifespan(app: FastAPI):
         global _operator_control_plane_installed
         command_plane_to_start = None
         if not _operator_control_plane_installed and app.state.release_start_error is None:
+            app.state.oem_preparation_camera = _protocol_preparation_camera()
             install_operator_control_plane(
                 app,
                 maintenance_state_provider=_maintenance_state_payload,
@@ -1102,6 +1103,12 @@ async def lifespan(app: FastAPI):
                     )
                     raise RuntimeError(_startup_error) from command_plane_failure
                 cleanup_errors = list(shutdown_errors)
+                close_camera = getattr(_camera_provider, "close", None)
+                if callable(close_camera):
+                    try:
+                        close_camera()
+                    except Exception as exc:
+                        cleanup_errors.append(f"camera control owner close: {exc}")
                 failed_owner = None
                 close_fn = getattr(_pipette_transport, "close", None)
                 if callable(close_fn):
@@ -2886,6 +2893,7 @@ class ProtocolReviewRequest(ProtocolControlTarget):
     note: Optional[str] = Field(None, max_length=4000)
     stage_id: StrictStr = Field(..., min_length=1)
     action_id: StrictStr | None = None
+    decision: Literal["ignore", "abort"] | None = None
 
 
 class LedRgbRequest(BaseModel):
@@ -10799,6 +10807,30 @@ def _protocol_workflow_initial_check(state: Any, *, validate_current) -> dict[st
 app.state.oem_workflow_initial_check = _protocol_workflow_initial_check
 
 
+def _protocol_preparation_camera():
+    from .oem_preparation_runtime import PreparationCameraRuntime
+    from .services.protocol_service import get_protocol_jobs_root
+    current = getattr(app.state, "oem_preparation_camera", None)
+    if current is None or current.camera is not _camera_provider:
+        current = PreparationCameraRuntime(_camera_provider,
+            artifact_root=get_protocol_jobs_root())
+        app.state.oem_preparation_camera = current
+    return current
+
+
+def _protocol_snapshot_image(*, condition, artifact_id):
+    from .oem_preparation_runtime import PreparationCameraRuntime
+    from .runtime_audit_store import workflow_claim_context
+    from .services.protocol_service import get_protocol_jobs_root
+    binding = workflow_claim_context()
+    if binding is None:
+        raise RuntimeError("source_snapshot_requires_workflow_owner")
+    _protocol_command_store().assert_workflow_current(binding["parent_command_id"])
+    runtime = PreparationCameraRuntime(_camera_provider,
+        artifact_root=get_protocol_jobs_root() / binding["parent_command_id"] / "source-images")
+    return runtime.snapshot_image(condition=condition, artifact_id=artifact_id)
+
+
 def _protocol_bindings(bundle, *, source_executor=None):
     from contextvars import ContextVar
     from threading import Lock
@@ -10822,9 +10854,6 @@ def _protocol_bindings(bundle, *, source_executor=None):
         capabilities.add("dispense_pressure_stream")
     if callable(getattr(FourPipetteTransport, "query_tip_status_for_oem_script", None)):
         capabilities.add("query_tip_status_single")
-    validate_oem_selected_dependencies(
-        ProtocolDocument.from_payload(bundle["protocol"]["document"]), capabilities=capabilities,
-    )
     provider = _serial206_oem_initialization_provider
     canonical_plan = getattr(app.state, "oem_workflow_plan_executor", None)
     canonical_control = getattr(app.state, "oem_workflow_lifecycle_control_executor", None)
@@ -10854,6 +10883,12 @@ def _protocol_bindings(bundle, *, source_executor=None):
                                   "source_stop_scripts", "source_board_error_event"):
                         if field in row:
                             result[field] = row[field]
+                from .oem_preparation_runtime import snapshot_evidence_missing
+                if snapshot_evidence_missing(result):
+                    # OEM collection suppresses logging/capture failures. Keep
+                    # the missing evidence explicit, without changing its return
+                    # or blocking the physical workflow for artifact logging.
+                    result = {**result, "source_snapshot_capture_incomplete": True}
             return result
     def execute_thermal(operation, arguments, action, state):
         """Finite native thermal/control child on the existing claim owner."""
@@ -11037,6 +11072,28 @@ def _protocol_bindings(bundle, *, source_executor=None):
         raise ProtocolLiveContractError("Conflicting finite source operation bindings.")
     from .services.protocol_service import ProtocolBindings
     lifetime = {}
+    if metadata.get("oem_prepare") is True:
+        from .oem_preparation_runtime import bind_selected_preparation
+        from .oem_machine_bundle import get_active_oem_machine_snapshot
+        from .oem_deck_movement import compile_finite_plate_operation
+        if provider is None or not callable(canonical_plan) or not callable(canonical_control):
+            raise ProtocolLiveContractError("OEM preparation canonical children unavailable.")
+        camera_runtime = _protocol_preparation_camera()
+        def preparation_native(operation, arguments, state):
+            plan = compile_finite_plate_operation(operation, source_leaf_available=True, **dict(arguments))
+            return execute_plan(plan, "lifecycle:prepare", state)
+        try:
+            lifecycle["preparation_abort"] = lambda state: lifecycle_plan("unlatch", state)
+            lifecycle["prepare"] = bind_selected_preparation(
+                metadata=metadata, snapshot=get_active_oem_machine_snapshot(),
+                camera_runtime=camera_runtime, execute_native=preparation_native,
+                execute_control=lambda operation, arguments, state: execute_thermal(
+                    operation, arguments, "lifecycle:prepare", state), sleep=provider.sleep,
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise ProtocolLiveContractError(str(exc)) from exc
+    if provider is not None and (metadata.get("oem_prepare") is True or settings.get("JobName") is not None):
+        provider.bind_oem_snapshot_image(_protocol_snapshot_image)
     if provider is not None:
         begin = getattr(provider, "wp8_source_script_begin", None)
         returned = getattr(provider, "wp8_source_script_returned", None)
@@ -11045,6 +11102,11 @@ def _protocol_bindings(bundle, *, source_executor=None):
                 "source_script_begin": lambda state: begin(command_id=state.workflow.command_id),
                 "source_script_returned": lambda state: returned(command_id=state.workflow.command_id),
             }
+    if "prepare" in lifecycle:
+        capabilities.add("prepare_inspections")
+    validate_oem_selected_dependencies(
+        ProtocolDocument.from_payload(bundle["protocol"]["document"]), capabilities=capabilities,
+    )
     return ProtocolBindings(_protocol_live_handlers(), {**native, **pipette}, lifecycle, **lifetime)
 
 

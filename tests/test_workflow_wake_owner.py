@@ -53,6 +53,7 @@ def owner():
     state = CanonicalLifecycleOwner()
     state.transport_changed(True, reason="fixture transport")
     state.run_stage("constructor_pipette_stage", lambda: {"ok": True})
+    state.run_stage("initialization_without_motion", lambda: {"ok": True})
     state.transition("paused", reason="fixture deferred gate")
     return state
 
@@ -203,17 +204,18 @@ def test_board_test_source_branch_remains_activation_only():
     assert hardware.epoch == 0
 
 
-def test_public_startup_still_publishes_stage_and_invalidates_successor():
+def test_public_startup_still_publishes_stage_and_preserves_constructor_configuration():
     state, hardware = owner(), Hardware()
     state.transition("stopped", reason="test")
+    configured = state.projection()["startup"]["stages"]["initialization_without_motion"]
     def initial():
         return state.run_initial_check(hardware, can_ready=lambda: True,
                                       sleep=lambda _: None, clock=lambda: 0.0)
     assert initial()["startup"]["stages"]["initial_check"]["state"] == "passed"
-    state.run_stage("initialization_without_motion", lambda: {"ok": True})
     result = initial()
     assert result["operation_state"] == "stopped"
-    successor = result["startup"]["stages"]["initialization_without_motion"]
-    assert successor["state"] == "not_run"
-    assert successor["error"] == "invalidated_by_repeat_initial_check"
-    assert len(successor["history"]) == 1
+    assert result["startup"]["stages"]["initialization_without_motion"] == configured
+    repeated = result["startup"]["stages"]["initial_check"]
+    assert repeated["state"] == "passed"
+    assert len(repeated["history"]) == 1
+    assert repeated["history"][0]["attempt_id"] != repeated["attempt_id"]

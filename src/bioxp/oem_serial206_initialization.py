@@ -4331,6 +4331,7 @@ class Serial206OemInitializationProvider:
     """One durable expected-next stage per generation-bound approval."""
 
     _WP8_CHILD_BINDINGS: Mapping[str, str] = {
+        "sourceForceToHighHome": "wp8_preparation_force_high_home",
         "sourceMoveTo": "wp8_source_move_to",
         "sourceImageGantryLoad": "wp8_source_image_gantry_load",
         "sourceMoveX": "wp8_source_move_x",
@@ -5013,8 +5014,9 @@ class Serial206OemInitializationProvider:
             raise RuntimeError("deck_gripper_observation_not_authoritative")
         return position["position"] < 50
 
-    def _offset_deck_semantic_state(self, *, gripper_confirmed: bool, allow_recovery: bool = False) -> dict[str, Any]:
-        """Read only facts consumed by the offset overload; no bootstrap writes.
+    def _offset_deck_semantic_state(self, *, gripper_confirmed: bool, allow_recovery: bool = False,
+                                    pseudo_home_only: bool = False) -> dict[str, Any]:
+        """Read offset facts, or only pseudo-home for primitive Z; no writes.
 
         The retained machine object remains its source owner for facts that have
         not yet been published to the canonical row. This projection neither
@@ -5044,18 +5046,21 @@ class Serial206OemInitializationProvider:
         with self._lock:
             machine = dict(self._load_state().get("machine_status") or {})
         sources = {}
-        for field, legacy_key in (("tip_loaded", "tip_loaded"), ("pseudo_z_home", "psudo_z_home_steps")):
+        fields = (("pseudo_z_home", "psudo_z_home_steps"),) if pseudo_home_only else (
+            ("tip_loaded", "tip_loaded"), ("pseudo_z_home", "psudo_z_home_steps"))
+        for field, legacy_key in fields:
             sources[field] = "canonical"
             if semantic.get(field) is None:
                 semantic[field] = machine.get(legacy_key)
                 sources[field] = "retained_machine_status"
-        if type(semantic.get("tip_loaded")) is not bool:
+        if not pseudo_home_only and type(semantic.get("tip_loaded")) is not bool:
             raise RuntimeError("deck_semantic_state_not_authoritative:tip_loaded")
         if type(semantic.get("pseudo_z_home")) is not int or semantic["pseudo_z_home"] not in {500, 65000}:
             raise RuntimeError("deck_semantic_state_not_authoritative:pseudo_z_home")
-        required = ["tip_loaded", "pseudo_z_home"]
+        required = [field for field, _ in fields]
+        # Primitive Z reads neither tip nor gripper/plate state.
         # Confirmed/no-tip moveXY never reads PlateOnGantry. Other routes do.
-        if not (gripper_confirmed and semantic["tip_loaded"] is False):
+        if not pseudo_home_only and not (gripper_confirmed and semantic["tip_loaded"] is False):
             required.append("plate_on_gantry")
             if semantic.get("plate_on_gantry") is None:
                 if "plate_on_gantry" not in machine:
@@ -7210,6 +7215,106 @@ class Serial206OemInitializationProvider:
                 "state": lifecycle.get("state"),
             }
 
+    def _native_y_reference_current(self, board, axis):
+        """Consume committed native Home provenance, never constructor readiness."""
+        if self.state_store is None or self.reference_store is None:
+            return False
+        generation = int(self.generation_provider())
+        if (board.get("state") != "active" or type(board.get("active_board_epoch")) is not int
+            or axis.get("lifecycle_state") != "referenced_ready"
+            or axis.get("ownership_generation") != generation
+            or axis.get("pending_ticket") is not None
+            or type(axis.get("interrupt_epoch")) is not int
+            or type(axis.get("software_interrupt_epoch")) is not int
+            or axis.get("software_interrupt_active") is not False):
+            return False
+        references = self.reference_store.snapshot(("y",))
+        row = references["rows"]["y"]
+        if (references.get("durable_clean") is not True or row.get("state") != "referenced"
+            or type(row.get("state_version")) is not int):
+            return False
+        command_id = axis.get("last_receipt_id")
+        # The normal paired Home publisher atomically commits both children.
+        receipt = self._durable_serial206_receipt("y", str(command_id)) or {}
+        evidence = receipt.get("recovery_home") or {}
+        if receipt.get("intent") == "home_xy":
+            paired = self._durable_serial206_receipt("x", str(command_id)) or {}
+            return bool(receipt.get("status") == paired.get("status") == "completed"
+                and paired.get("intent") == "home_xy"
+                and paired.get("recovery_home", {}).get("owner_id") == self._home_recovery_owner_id
+                and paired.get("composite_authority", {}).get("admitted", {}).get("y", {}).get("interrupt_epoch") == axis.get("interrupt_epoch")
+                and paired.get("child_receipts", {}).get("y", {}).get("recovery_home") == evidence
+                and evidence and evidence.get("owner_id") == getattr(self.y_provider, "_home_recovery_owner_id", None)
+                and evidence.get("ownership_generation") == generation
+                and evidence.get("board_epoch_4") == board["active_board_epoch"]
+                and evidence.get("board_epoch_5") == self.preparation_provider.current_board_lifecycle_generation()
+                and evidence.get("interrupt_epoch") == axis.get("software_interrupt_epoch")
+                and evidence.get("reference_version") == row["state_version"])
+        native = self._native_initialized_home_receipts(self._load_state())
+        return bool(native and native["y"].get("command_id") == command_id
+            and native["y"]["recovery_home"]["board_epoch_4"] == board["active_board_epoch"]
+            and native["y"]["reference_publication"]["fence"]["interrupt_epoch"] == axis["interrupt_epoch"]
+            and native["y"]["recovery_home"]["interrupt_epoch"] == axis["software_interrupt_epoch"])
+
+    def _native_initialized_home_receipts(self, state):
+        """Read one complete native initialization's current Home publications."""
+        if self.state_store is None or self.reference_store is None:
+            return {}
+        ledger = state.get("movement_ledger", {})
+        stages = ledger.get("stages", {})
+        if (ledger.get("terminal_state") != "initializeMotors_complete"
+            or ledger.get("stage_order") != list(OEM_INITIALIZE_MOTORS_STAGE_KEYS)):
+            return {}
+        references = self.reference_store.snapshot(("x", "y", "z", "g"))
+        if references.get("durable_clean") is not True:
+            return {}
+        receipts = {}
+        run_id = None
+        for key in OEM_INITIALIZE_MOTORS_STAGE_KEYS:
+            stage = stages.get(key, {})
+            command = stage.get("command_id")
+            if stage.get("state") != "completed" or not isinstance(command, str) or not command.endswith(":" + key):
+                return {}
+            identity = command[:-(len(key) + 1)]
+            if run_id is not None and run_id != identity:
+                return {}
+            run_id = identity
+        for axis, key in (("x", "x-set-home"), ("y", "y-set-home"), ("z", "z-home"), ("g", "gripper-home")):
+            receipt = stages[key].get("result") or {}
+            publication = receipt.get("reference_publication") or {}
+            evidence = receipt.get("recovery_home") or {}
+            proof = publication.get("controller_home_evidence") or {}
+            row = references["rows"][axis]
+            try:
+                fence = self._aggregate_reference_fence(state, axis)
+            except RuntimeError:
+                return {}
+            if not (receipt.get("status") == "completed" and receipt.get("component") == axis
+                and receipt.get("stage") == key and receipt.get("source_call_completed") is True
+                and receipt.get("command_id") == stages[key]["command_id"]
+                and publication.get("published") is True and publication.get("fence") == fence
+                and row.get("state") == "referenced" and type(row.get("state_version")) is int
+                and publication.get("reference_version") == evidence.get("reference_version") == row["state_version"]
+                and evidence.get("source") == "serial206.initializeMotors"
+                and evidence.get("owner_id") == (fence["y_owner"] if axis == "y" else fence["provider_owner"])
+                and evidence.get("owner_id") and evidence.get("command_id") == receipt["command_id"]
+                and evidence.get("ownership_generation") == fence["generation"]
+                and evidence.get("board_epoch_4") == fence["board_epoch_4"]
+                and evidence.get("board_epoch_5") == fence["board_generation"]
+                and evidence.get("interrupt_epoch") == (fence["software_interrupt_epoch"] if axis in {"y", "g"} else fence["x_interrupt" if axis == "x" else "z_interrupt"])
+                and type(evidence.get("started_at")) in (int, float)
+                and type(evidence.get("finished_at")) in (int, float)
+                and 0 < evidence["started_at"] <= evidence["finished_at"] <= time.time()
+                and row.get("origin_position_steps") == 0
+                and proof.get("axis") == axis
+                and all(proof.get(k) is True for k in ("controller_command_acknowledged",
+                    "controller_terminal_state_verified", "controller_home_proof_verified"))
+                and publication.get("zero_write_ack", {}).get("status") == 100
+                and publication.get("controller_position_observation", {}).get("result", {}).get("position") == 0):
+                return {}
+            receipts[axis] = receipt
+        return receipts
+
     def _xy_authority_snapshot(
         self,
         lifecycle: Mapping[str, Any],
@@ -7273,7 +7378,8 @@ class Serial206OemInitializationProvider:
             and snapshot["y"]["lifecycle_state"] in allowed_y_states
             and snapshot["y"]["ownership_generation"] == generation
             and snapshot["y"]["board_state"] == "active"
-            and snapshot["y"]["prepared_board_epoch"] == snapshot["y"]["active_board_epoch"]
+            and (snapshot["y"]["prepared_board_epoch"] == snapshot["y"]["active_board_epoch"]
+                 or self._native_y_reference_current(y_board, y_axis))
             and snapshot["y"]["pending_ticket"] is None
             and type(snapshot["y"]["interrupt_epoch"]) is int
         )
@@ -8784,11 +8890,15 @@ class Serial206OemInitializationProvider:
         y_axis = board4.get("axes", {}).get("y", {})
         if (board4.get("board", {}).get("state") != "active"
             or y_axis.get("lifecycle_state") != "referenced_ready"
-            or y_axis.get("prepared_board_epoch") != stamps["board_epoch_4"]):
+            or (y_axis.get("prepared_board_epoch") != stamps["board_epoch_4"]
+                and not self._native_y_reference_current(board4["board"], y_axis))):
             raise RuntimeError("deck_home_y_authority_unavailable")
+        native_homes = self._native_initialized_home_receipts(state)
         homes = {}
         x_home = next((r for r in reversed(state["x_lifecycle"].get("receipts", []))
                        if isinstance(r, Mapping) and isinstance(r.get("recovery_home"), Mapping)), {})
+        if native_homes:
+            x_home = native_homes["x"]
         paired_y = None
         if x_home.get("intent") == "home_xy":
             # Both committed children must exist. Source success or an in-memory
@@ -8813,7 +8923,7 @@ class Serial206OemInitializationProvider:
             else:
                 lifecycle = state[axis + "_lifecycle"]
                 paired_home = axis == "x" and paired_y is not None
-                allowed_states = {"referenced_ready", "prepared_unreferenced"} if paired_home else {"referenced_ready"}
+                allowed_states = {"referenced_ready", "prepared_unreferenced"} if paired_home or native_homes else {"referenced_ready"}
                 if (lifecycle.get("state") not in allowed_states
                     or lifecycle.get("generation") != expected_generation
                     or lifecycle.get("board_lifecycle_generation") != stamps["board_epoch_5"]):
@@ -8823,6 +8933,8 @@ class Serial206OemInitializationProvider:
                 owner = self._home_recovery_owner_id
                 epoch = getattr(self, "_" + axis + "_interrupt_epoch")
                 active = getattr(self, "_" + axis + "_interrupt_active")
+            if native_homes:
+                receipt = native_homes[axis]
             evidence = receipt.get("recovery_home")
             if (not isinstance(evidence, Mapping) or receipt.get("status") != "completed"
                 or not owner or evidence.get("owner_id") != owner or active
@@ -8855,6 +8967,7 @@ class Serial206OemInitializationProvider:
             or self.state_store.axis_interrupt_snapshot("y") != interrupt
             or any(self._load_state()[a + "_lifecycle"] != state[a + "_lifecycle"] for a in ("x", "z"))
             or self.state_store.board4_authority_projection() != board4
+            or (native_homes and self._native_initialized_home_receipts(self._load_state()) != native_homes)
             or self.deck_owner_authority_stamps() != stamps
             or self.reference_store.snapshot(("x", "y", "z", "g"))["rows"] != references
             or dict(self._deck_semantic_state_reader()) != semantic):
@@ -10193,8 +10306,16 @@ class Serial206OemInitializationProvider:
                         ),
                     )
                 except Exception as exc:
-                    result["reference_persistence_ok"] = False
-                    result["reference_persistence_error"] = f"{type(exc).__name__}:{exc}"
+                    # Native success is not usable reference authority until its
+                    # durable publication succeeds. Preserve controller evidence,
+                    # but do not report completed/referenced_ready or re-home.
+                    ok = False
+                    result.update(
+                        ok=False,
+                        failure="z_reference_persistence_failed",
+                        reference_persistence_ok=False,
+                        reference_persistence_error=f"{type(exc).__name__}:{exc}",
+                    )
                 else:
                     reference_published = True
                     result["reference_persistence_ok"] = True
@@ -10314,6 +10435,23 @@ class Serial206OemInitializationProvider:
                 z.update({"state": previous_state, "last_failure": None})
             elif intent == "stop":
                 z.update({"state": previous_state, "reference_state": str(z.get("reference_state") or "unknown"), "last_failure": None if ok else _json_safe(result)})
+            elif result.get("reference_persistence_ok") is False:
+                # Reference storage may also reject compensation. Still attempt
+                # to retain a failed lifecycle/receipt in the existing state
+                # owner; never let this second error restore a ready projection.
+                z.update(state="failed_latched", reference_state="desynced",
+                         awaiting_observation_receipt_id=None)
+                try:
+                    self._z_mark_desynced(
+                        "Z reference publication failed; reconciliation is required.",
+                        f"serial206.z.{intent}.reference_publication_failed",
+                    )
+                    result["reference_invalidation_ok"] = True
+                except Exception as exc:
+                    result["reference_invalidation_ok"] = False
+                    result["reference_invalidation_error"] = f"{type(exc).__name__}:{exc}"
+                receipt["result"] = _json_safe(result)
+                z["last_failure"] = _json_safe(receipt)
             else:
                 z.update({
                     "state": "failed_latched",
@@ -11174,10 +11312,19 @@ class Serial206OemInitializationProvider:
         if operation not in WP8_OPERATION_INTENT_KEYS:
             raise RuntimeError(f"source_authority_missing:{operation}")
         from .oem_deck_movement import OEM_PIPETTE_LEAVES
-        if operation in OEM_PIPETTE_LEAVES or operation in {"pipette_shift_camera", "pipette_script_waste", "pipette_unlock"}:
+        if operation in OEM_PIPETTE_LEAVES or operation in {"pipette_shift_camera", "pipette_script_waste", "pipette_unlock", "park_gantry", "critical_item_images"}:
             # These literal leaves resolve only their selected source facts at
             # native entry. Do not introduce a gripper GAP into every leaf.
             return {}
+        if operation == "thermal_door":
+            # Door planning consumes the source door flag and board-test mode.
+            # Its Park child performs its own scoped custody/collection reads.
+            with self._lock:
+                machine = dict(self._load_state().get("machine_status") or {})
+            return {
+                "door_is_open": machine.get("thermal_door_open"),
+                "board_test_mode": bool(machine.get("BoardTestMode", machine.get("board_test_mode", False))),
+            }
         state = dict(self.mov_execution_machine_state())
         manifest = build_machine_calibration_manifest(serial_number=206)
         if manifest.get("ok") is not True:
@@ -11323,15 +11470,41 @@ class Serial206OemInitializationProvider:
 
     def _mov_axis_leaf(self, operation: str, value: int) -> dict[str, Any]:
         key = "y" if operation == "moveY" else "z"
-        state = self.mov_execution_machine_state()
+        # Primitive moveZ consumes pseudo-home, not ClassMoveTo path state.
+        state = (self._offset_deck_semantic_state(gripper_confirmed=False, pseudo_home_only=True)
+                 if operation == "moveZ" else self.mov_execution_machine_state())
         execution = _execute_oem_steps_live(
             [{"op": operation, key: int(value)}], self.primitives, wait_timeout_s=60.0,
             speed=None, acc=None, pseudo_z_home_steps=int(state["pseudo_z_home"]),
         )
         evidence = _aggregate_executed_controller_evidence(execution)
+        z_noop_verified = False
+        if operation == "moveZ" and execution.get("ok") is True:
+            # moveZ's OEM pseudo-home clamp precedes the board's exact-noop
+            # test. The wrapper request is not the board's effective target.
+            result = execution["execution_results"][0]["results"][0]["result"]
+            native = result.get("move") if isinstance(result, Mapping) else None
+            before = native.get("before") if isinstance(native, Mapping) else None
+            z_noop_verified = bool(
+                isinstance(result, Mapping)
+                and result.get("controller_terminal_state_verified") is True
+                and result.get("controller_command_required") is False
+                and isinstance(native, Mapping) and native.get("ok") is True
+                and native.get("source_noop") is True
+                and native.get("short_circuit") == "current_position_equals_target"
+                and native.get("command_sent") is False and native.get("ack") is None
+                and isinstance(before, Mapping) and before.get("ok") is True
+                and before.get("position_reply_valid") is True
+                and type(result.get("effective")) is int
+                and type(native.get("requested_position")) is int
+                and type(before.get("position")) is int
+                and before["position"] == native["requested_position"] == result["effective"]
+            )
+            if z_noop_verified:
+                evidence["hardware_postcondition_verified"] = True
         return {
             "ok": execution.get("ok") is True
-            and evidence["controller_command_acknowledged"]
+            and (evidence["controller_command_acknowledged"] or z_noop_verified)
             and evidence["controller_completion_verified"],
             **evidence, "delivery_attempted": True, "execution": _json_safe(execution),
         }
@@ -11449,8 +11622,23 @@ class Serial206OemInitializationProvider:
             command_id = context["command_id"]
             def before_entry(boundary: str) -> None:
                 checker(command_id, boundary=boundary)
-            return self.parkGantry(rehome=True, before_native_entry=before_entry)
-        return self.parkGantry(rehome=False)
+            result = self.parkGantry(rehome=True, before_native_entry=before_entry)
+        else:
+            result = self.parkGantry(rehome=False)
+        update = result.get("source_location_update")
+        if (result.get("ok") is True
+                and not result.get("source_pause_scripts")
+                and result.get("semantic_location_commit_allowed") is not False
+                and not result.get("source_noop")
+                and isinstance(update, Mapping)):
+            # Consume only the native successful return, with this same WP8
+            # child's identity. No-op and paused returns establish no location.
+            self.wp8_update_location(
+                "updateLocation",
+                {"destination": update["current_location"], "well": update["current_well"]},
+                **context,
+            )
+        return result
 
     def wp8_scriptmove_to(self, operation: str, arguments: Mapping[str, Any], **_: Any) -> Any:
         del operation
@@ -12020,13 +12208,12 @@ class Serial206OemInitializationProvider:
             if not callable(writer):
                 raise RuntimeError("source_authority_missing:RGB")
             rgb = tuple(max(0, min(255, arguments[key])) for key in ("r", "g", "b"))
-            if self._oem_source_rgb == rgb:
-                return {"ok": True, "source_noop": True, "delivery_attempted": False}
+            # OEM setColor writes all three channels on every occurrence.
             result = writer(*rgb)
             self._oem_source_rgb = rgb
             if not isinstance(result, Mapping):
                 raise RuntimeError("source_authority_invalid:RGB")
-            return dict(result)
+            return {**result, "delivery_attempted": True}
         raise RuntimeError(f"source_authority_missing:{operation}")
 
     def build_oem_native_handlers(
@@ -12448,6 +12635,27 @@ class Serial206OemInitializationProvider:
             handlers["script_prologue"] = script_prologue
         return handlers
 
+    def wp8_preparation_force_high_home(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        """DefaultParameters.ForceToHighHome: software pseudo-home only.
+
+        Called as a finite canonical child, never by a private preparation path.
+        """
+        if operation != "sourceForceToHighHome" or arguments:
+            raise ValueError("invalid preparation ForceToHighHome child")
+        return self._wp8_publish_semantic(
+            operation=operation, command_id=command_id, child_order=child_order,
+            plan_digest=plan_digest, updates={"pseudo_z_home": 500},
+        )
+
+    def bind_oem_snapshot_image(self, callback: Callable[..., Any]) -> None:
+        """Bind the existing shared-camera snapshot owner during composition."""
+        if not callable(callback):
+            raise TypeError("OEM snapshot callback must be callable")
+        self._oem_snapshot_image_owner = callback
+
     def wp8_source_image_gantry_load(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
         child_order: int, plan_digest: str, **_: Any,
@@ -12467,11 +12675,14 @@ class Serial206OemInitializationProvider:
             offset_x=arguments["offset_x"], offset_y=arguments["offset_y"],
             x_high_limit=90263, y_high_limit=102956,
         )
-        state = self.mov_execution_machine_state()
+        # This is the offset moveTo overload, not ClassMoveTo/path planning.
+        # Read only its existing scoped facts; clean_path is not consumed here.
+        gripper_confirmed = self._deck_gripper_confirmed()
+        state = self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed)
         return self._deck_primitive_receipt(self.primitives.oem_move_to(
             coordinates["x"], coordinates["y"], state["pseudo_z_home"],
             pseudo_home_steps=state["pseudo_z_home"], run_in_parallel=arguments.get("run_in_parallel", True),
-            gripper_confirmed=self._deck_gripper_confirmed(), tip_loaded=state["tip_loaded"],
+            gripper_confirmed=gripper_confirmed, tip_loaded=state["tip_loaded"],
             plate_on_gantry=state.get("plate_on_gantry"),
             location19_y=int(table.resolve(location_id="LOC_RC_COVER").base_coordinates["y"]),
         ), source_anchor="ClassControlInterface.moveTo:3691-3715")
@@ -12832,7 +13043,9 @@ class Serial206OemInitializationProvider:
     ) -> dict[str, Any]:
         del operation
         condition = str(arguments.get("name") or "")
-        owner = getattr(self.primitives, "wp8_snapshot_image", None)
+        owner = getattr(self, "_oem_snapshot_image_owner", None)
+        if not callable(owner):
+            owner = getattr(self.primitives, "wp8_snapshot_image", None)
         if not callable(owner):
             return {
                 "ok": True, "delivery_attempted": False,
@@ -13187,7 +13400,19 @@ class Serial206OemInitializationProvider:
                 "result": _json_safe(result),
             })
             if row.get("ok") is not True:
-                raise RuntimeError(f"park_source_child_failed:{operation}")
+                from .oem_deck_movement import DeckExecutionFailure
+
+                # Retain the actual consumed source predicate and returned
+                # children. This is failure evidence, never a location commit.
+                raise DeckExecutionFailure(
+                    f"park_source_child_failed:{operation}",
+                    delivery_attempted=True,
+                    provider_results=[{
+                        "operation": "park_gantry",
+                        "collection_tip_state": dict(collection),
+                        "source_children": list(source_children),
+                    }],
+                )
             return row
 
         collection = self._park_collection_state()
@@ -13454,8 +13679,12 @@ class Serial206OemInitializationProvider:
             fence = {"generation": generation, "board_generation": board_generation,
                      "x_interrupt": self._x_interrupt_epoch, "z_interrupt": self._z_interrupt_epoch,
                      "native_owner": id(tester),
+                     "provider_owner": self._home_recovery_owner_id,
+                     "y_owner": getattr(self.y_provider, "_home_recovery_owner_id", None),
                      "transport_generation": getattr(tester, "_oem_transport_generation", None),
                      "abort_generation": getattr(tester, "_oem_abort_generation", None)}
+        fence["board_epoch_4"] = (self.state_store.board4_authority_projection()["board"].get("active_board_epoch")
+            if self.state_store is not None else None)
         if axis in {"x", "z"}:
             lifecycle = state[f"{axis}_lifecycle"]
             if (lifecycle.get("active_receipt") is not None
@@ -13550,7 +13779,8 @@ class Serial206OemInitializationProvider:
                     generation=fence["generation"], board_lifecycle_generation=fence["board_generation"],
                 )
             publication["fence"] = dict(fence)
-            state["movement_ledger"]["stages"][receipt["stage"]]["result"] = _json_safe(receipt)
+            state["movement_ledger"]["stages"][receipt["stage"]]["result"] = {
+                **_json_safe(receipt), "reference_publication": copy.deepcopy(publication)}
             self._save_state(state)
             if dict(fence) != self._aggregate_reference_fence(state, axis):
                 raise RuntimeError("aggregate_reference_fence_changed")
@@ -13564,6 +13794,17 @@ class Serial206OemInitializationProvider:
                 raise RuntimeError("aggregate_reference_persistence_failed")
             if dict(fence) != self._aggregate_reference_fence(state, axis):
                 raise RuntimeError("aggregate_reference_fence_changed")
+            publication["reference_version"] = reference["state_version"]
+            receipt["recovery_home"] = {
+                "source": "serial206.initializeMotors", "command_id": receipt["command_id"],
+                "owner_id": fence["y_owner"] if axis == "y" else fence["provider_owner"],
+                "ownership_generation": fence["generation"],
+                "board_epoch_4": fence["board_epoch_4"],
+                "board_epoch_5": fence["board_generation"],
+                "interrupt_epoch": fence["software_interrupt_epoch"] if axis in {"y", "g"} else fence["x_interrupt" if axis == "x" else "z_interrupt"],
+                "reference_version": reference["state_version"],
+                "started_at": receipt["started_at"], "finished_at": time.time(),
+            }
             publication["published"] = True
         except Exception as exc:
             publication["blocker"] = str(exc)
@@ -13628,6 +13869,7 @@ class Serial206OemInitializationProvider:
             stage_receipts: list[dict[str, Any]] = []
             motion_commanded = False
             run_id = f"initialize-motors-{time.time_ns()}"
+            run_started_at = time.time()
             home_results: dict[str, Any] = {}
             reference_fences: dict[str, Any] = {}
             reference_publications: dict[str, Any] = {}
@@ -13690,6 +13932,7 @@ class Serial206OemInitializationProvider:
 
                 receipt = {
                     "stage": spec.key,
+                    "started_at": run_started_at,
                     "component": spec.component,
                     "status": "completed" if stage_ok else "failed",
                     "ok": stage_ok,
@@ -13710,6 +13953,11 @@ class Serial206OemInitializationProvider:
                         state, receipt, home_results.get(spec.component), reference_fences.get(spec.component),
                     )
                 row["result"] = _json_safe(receipt)
+                # Current authority is not diagnostic trace. Keep the captured
+                # native Home proof intact outside raw-result item budgets.
+                for field in ("reference_publication", "recovery_home"):
+                    if field in receipt:
+                        row["result"][field] = copy.deepcopy(receipt[field])
                 row["state"] = "completed" if stage_ok else "failed"
                 stage_receipts.append(receipt)
                 self._apply_initialize_motors_host_state(state, spec, receipt)

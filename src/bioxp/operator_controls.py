@@ -121,6 +121,9 @@ _WORKFLOW_LIFECYCLE_CONTROLS = {
     "software_abort": ("safety_interrupt", (), ()),
     "wake_prepare": ("physical_command", _WORKFLOW_INITIALIZATION_RESOURCES, ()),
     "restore_door_model": ("physical_command", ("axis:door",), ("value",)),
+    "preparation_camera_initialize": ("physical_command", ("camera",), ()),
+    "preparation_camera_exposure": ("physical_command", ("camera",), ("value",)),
+    "preparation_led": ("physical_command", ("camera",), ("channel", "on")),
 }
 
 
@@ -247,6 +250,7 @@ def _validate_workflow_wake_result(command_store, provider, fence, result):
 def make_workflow_lifecycle_control_executor(
     command_store: Any, provider_getter: Callable[[], Any], *,
     initial_check: Callable[..., Mapping[str, Any]] | None = None,
+    preparation_camera: Any = None,
 ) -> Callable[..., dict[str, Any]]:
     """Direct, independently claimed source controls on the existing owner.
 
@@ -299,7 +303,16 @@ def make_workflow_lifecycle_control_executor(
             raise ValueError("workflow_lifecycle_arguments_invalid")
         if "wait" in args and type(args["wait"]) is not bool:
             raise ValueError("workflow_lifecycle_arguments_invalid")
-        if "value" in args and type(args["value"]) is not bool:
+        if operation == "restore_door_model" and type(args["value"]) is not bool:
+            raise ValueError("workflow_lifecycle_arguments_invalid")
+        if operation == "preparation_camera_exposure":
+            value = args["value"]
+            if value is not None and (type(value) not in (int, float) or not math.isfinite(value)):
+                raise ValueError("workflow_lifecycle_arguments_invalid")
+        if operation == "preparation_led" and (
+            type(args["channel"]) is not int or args["channel"] not in (1, 2, 3)
+            or type(args["on"]) is not bool
+        ):
             raise ValueError("workflow_lifecycle_arguments_invalid")
         if "bank" in args and (type(args["bank"]) is not int or args["bank"] not in (0, 1)):
             raise ValueError("workflow_lifecycle_arguments_invalid")
@@ -397,6 +410,14 @@ def make_workflow_lifecycle_control_executor(
                         provider = provider_getter()
                         if int(provider.generation_provider()) != generation:
                             return {"ok": False, "failure": "workflow_hardware_owner_changed"}
+                        if operation in {"preparation_camera_initialize", "preparation_camera_exposure", "preparation_led"}:
+                            if preparation_camera is None:
+                                return {"ok": False, "failure": "workflow_preparation_camera_unavailable"}
+                            if operation == "preparation_camera_initialize":
+                                return preparation_camera.initialize_illumination()
+                            if operation == "preparation_camera_exposure":
+                                return preparation_camera.exposure(value=args["value"])
+                            return preparation_camera.led(channel=args["channel"], on=args["on"])
                         if operation == "wake_prepare":
                             return _deliver_workflow_wake_prepare(command_store, provider, state,
                                 child_id=command_id, fence=wake_fence, initial_check=initial_check)
@@ -579,6 +600,19 @@ class InvokeRequest(BaseModel):
     expected_generation: StrictInt = Field(ge=0)
     idempotency_key: str = Field(min_length=8, max_length=128)
     inputs: dict[str, Any] = Field(default_factory=dict)
+    # None/empty retains legacy unspecified-epoch behavior. Nonempty V2
+    # expectations are command identity and must survive the internal handoff.
+    expected_board_epoch_by_board: dict[str, StrictInt] | None = None
+
+    @field_validator("expected_board_epoch_by_board")
+    @classmethod
+    def validate_board_epochs(cls, value):
+        if value is not None and any(
+            not key.isdecimal() or str(int(key)) != key or epoch < 0
+            for key, epoch in value.items()
+        ):
+            raise ValueError("board epochs require canonical board IDs and nonnegative integers")
+        return value
 
 
 class OperatorActionRequestV2(BaseModel):
@@ -2857,7 +2891,7 @@ def install_operator_control_plane(
         domain_names = ("transport", "boards", "axes", "range", "power", "interlock", "latch", "gripper", "thermal", "chiller", "pipette")
         domains: dict[str, Any] = {}
         # One coherent observation, not eleven copies of the same snapshot.
-        projection = hardware_state.project(*domain_names, independent_domains=True)
+        projection = hardware_state.project(*domain_names, independent_domains=True, include_lifecycle=False)
         snapshot_id = projection.get("snapshot_id") or None
         projected_freshness = projection.get("freshness")
         freshness: dict[str, Any] = (
@@ -3086,6 +3120,7 @@ def install_operator_control_plane(
 
         app.state.oem_workflow_lifecycle_control_executor = make_workflow_lifecycle_control_executor(
             command_plane.store, oem_deck_provider, initial_check=workflow_initial_check,
+            preparation_camera=getattr(app.state, "oem_preparation_camera", None),
         )
         app.state.oem_workflow_plan_executor = execute_workflow_plan
         app.state.oem_mov_execution_admitter = admit_mov_execution
@@ -3377,6 +3412,24 @@ def install_operator_control_plane(
             "evidence_lock_identity_verified": True,
         }
 
+    def verify_replay_board_epochs(receipt: Mapping[str, Any], payload: InvokeRequest) -> None:
+        expected = dict(payload.expected_board_epoch_by_board or {})
+        retained = dict(receipt.get("expected_board_epoch_by_board") or {})
+        if retained != expected:
+            raise HTTPException(409, detail="idempotency receipt board epoch binding mismatch")
+
+    def check_direct_board_epochs(state: Mapping[str, Any], expected: Mapping[str, int] | None) -> None:
+        if not expected:
+            return  # Compatibility: no new mandatory epoch fields in this fix.
+        from .operator_command_plane import _active_board_epochs
+        # Read the existing composite projection: board 5's current X lifecycle
+        # and board 4's own authority, never an axis cache or caller replacement.
+        observed = _active_board_epochs(state, "oem.deck._finite_operation")
+        if any(type(observed.get(board)) is not int or observed[board] != epoch
+               for board, epoch in expected.items()):
+            raise HTTPException(409, detail={"error": "board_epoch_mismatch",
+                "requested": dict(expected), "observed": observed})
+
     def verify_replay_source_identity(receipt: Mapping[str, Any]) -> None:
         stored = receipt.get("source_identity")
         if not isinstance(stored, Mapping):
@@ -3410,7 +3463,7 @@ def install_operator_control_plane(
             "unavailable_reason": assessment["disabled_reason"],
         }
 
-    def motion_dispatch_precheck(action, inputs, expected_generation) -> None:
+    def motion_dispatch_precheck(action, inputs, expected_generation, expected_board_epochs=None, *, check_snapshot=True) -> None:
         # Executed by the existing tester worker after it acquires its lease.
         # SQLite/another query may have consumed time after outer admission.
         # No refresh here: never substitute a new command or retry source work.
@@ -3418,6 +3471,9 @@ def install_operator_control_plane(
         if (state["ownership_generation"] != expected_generation
                 or int(hardware_state.ownership_epoch) != expected_generation):
             raise HTTPException(409, detail="ownership generation mismatch at motion dispatch")
+        check_direct_board_epochs(state, expected_board_epochs)
+        if not check_snapshot:
+            return
         assessment = _assess_action(action, state, inputs)
         if not assessment["enabled"]:
             raise HTTPException(409, detail={"error": "action_unavailable",
@@ -3695,6 +3751,7 @@ def install_operator_control_plane(
                     or existing.get("requested_inputs", existing.get("inputs")) != payload.inputs
                     or int(existing.get("ownership_generation", -1)) != payload.expected_generation):
                 raise HTTPException(409, detail="idempotency_key already bound to different action request")
+            verify_replay_board_epochs(existing, payload)
             verify_replay_source_identity(existing)
             return existing
         retained = direct_requests.get(key)
@@ -3784,6 +3841,7 @@ def install_operator_control_plane(
                 expected_generation=int(payload.expected_ownership_generation),
                 idempotency_key=payload.idempotency_key,
                 inputs=dict(payload.inputs),
+                expected_board_epoch_by_board=dict(payload.expected_board_epoch_by_board),
             )
             direct_receipt = await retain_direct_action(action_id, direct_payload)
             if str(direct_receipt.get("status") or "") in {"failed", "blocked", "rejected", "outcome_unknown", "ambiguous"}:
@@ -3829,6 +3887,14 @@ def install_operator_control_plane(
         compact = _v2_compact_receipt(row)
         if not detail:
             return compact
+        # Reconciliation is committed after the immutable terminal receipt.
+        # Keep that receipt authoritative, but disclose the existing deck
+        # owner's current resolution rather than its terminal-time snapshot.
+        if isinstance(row.get("deck_movement"), Mapping):
+            deck_receipt = await asyncio.to_thread(command_plane.store.get_command, command_id)
+            if deck_receipt is not None and isinstance(deck_receipt.get("deck_movement"), Mapping):
+                row = {**row, "deck_movement": {**row["deck_movement"],
+                    "recovery_resolution": deck_receipt["deck_movement"].get("recovery_resolution")}}
         compact["transport_exchanges"] = list(row.get("transport_exchanges") or [])
         compact["source_receipt"] = source_receipt
         raw_return_layers = dict(row.get("raw_return_layers") or {})
@@ -4077,6 +4143,7 @@ def install_operator_control_plane(
                     expected_generation=int(payload.expected_ownership_generation),
                     idempotency_key=payload.idempotency_key,
                     inputs=dict(payload.inputs),
+                    expected_board_epoch_by_board=dict(payload.expected_board_epoch_by_board),
                 )
             else:
                 raise HTTPException(status_code=404, detail="unknown normal v2 operator action_id")
@@ -4127,6 +4194,7 @@ def install_operator_control_plane(
                     status_code=409,
                     detail="idempotency receipt ownership generation mismatch",
                 )
+            verify_replay_board_epochs(existing, payload)
             verify_replay_source_identity(existing)
             return existing
         expected = int(hardware_state.ownership_epoch)
@@ -4223,6 +4291,8 @@ def install_operator_control_plane(
             if not is_safety_interrupt and payload.expected_generation != locked_expected:
                 raise HTTPException(status_code=409, detail="ownership generation mismatch")
             effective_inputs = {**dict(target.get("fixed_inputs") or {}), **dict(payload.inputs)}
+            if not is_safety_interrupt:
+                check_direct_board_epochs(locked_state or {}, payload.expected_board_epoch_by_board)
             current_authority_fingerprint = replay_authority_fingerprint(locked_state or {})
             existing = None
             if not is_safety_interrupt:
@@ -4248,6 +4318,7 @@ def install_operator_control_plane(
                     )
                 if existing.get("authority_fingerprint") != current_authority_fingerprint:
                     raise HTTPException(status_code=409, detail="idempotency replay current authority mismatch")
+                verify_replay_board_epochs(existing, payload)
                 verify_replay_source_identity(existing)
                 return existing
             command_id = f"operator_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}"
@@ -4262,6 +4333,7 @@ def install_operator_control_plane(
                 "idempotency_key": payload.idempotency_key,
                 "idempotency_replay_enabled": not is_safety_interrupt,
                 "ownership_generation": locked_expected,
+                "expected_board_epoch_by_board": dict(payload.expected_board_epoch_by_board or {}),
                 "authority_fingerprint": current_authority_fingerprint,
                 "source_identity": replay_source_identity(),
                 "started_at": str(started),
@@ -4305,6 +4377,7 @@ def install_operator_control_plane(
                             status_code=409,
                             detail="idempotency replay current authority mismatch",
                         )
+                    verify_replay_board_epochs(claimed, payload)
                     verify_replay_source_identity(claimed)
                     return claimed
                 claim_expected_status = str(claimed["status"])
@@ -4341,6 +4414,15 @@ def install_operator_control_plane(
                         "motion_observation_collection", "Current motion observation collection", False, reason))
                     assessment.update(enabled=False, disabled_reason=reason)
                 receipt["authority_fingerprint"] = replay_authority_fingerprint(locked_state)
+            if not is_safety_interrupt:
+                try:
+                    check_direct_board_epochs(locked_state or {}, payload.expected_board_epoch_by_board)
+                except HTTPException as exc:
+                    # A claim already exists. Retain a rejected outcome rather
+                    # than abandoning a reservation after refreshed-state drift.
+                    assessment["dependencies"].append(_dependency(
+                        "expected_board_epochs", "Requested board epochs", False, str(exc.detail)))
+                    assessment.update(enabled=False, disabled_reason="board_epoch_mismatch")
             if not assessment["enabled"]:
                 detail = {
                     "error": "action_unavailable",
@@ -4391,9 +4473,16 @@ def install_operator_control_plane(
                 "expected_ownership_generation": payload.expected_generation,
                 "action_id": action_id,
                 "caller_class": "manual_operator",
+                "expected_board_epoch_by_board": dict(payload.expected_board_epoch_by_board or {}),
                 "motion_snapshot_precheck": (
-                    lambda: motion_dispatch_precheck(action, effective_inputs, locked_expected)
-                ) if "snapshot_fresh" in dependency_state else None,
+                    lambda: motion_dispatch_precheck(
+                        action, effective_inputs, locked_expected,
+                        payload.expected_board_epoch_by_board,
+                        check_snapshot="snapshot_fresh" in dependency_state,
+                    )
+                ) if not is_safety_interrupt and (
+                    "snapshot_fresh" in dependency_state or payload.expected_board_epoch_by_board
+                ) else None,
             })
             linked_pipette_finalization = None
             deck_interrupt_action = None

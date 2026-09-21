@@ -219,7 +219,7 @@ class HardwareStateOwner:
         age = max(ages) if ages else max(0.0, now - float(snapshot.get("completed_unix", now)))
         return ("fresh" if age <= self._fresh_for_s else "stale"), age
 
-    def project(self, *domains: str, independent_domains: bool = False) -> dict[str, Any]:
+    def project(self, *domains: str, independent_domains: bool = False, include_lifecycle: bool = True) -> dict[str, Any]:
         requested = tuple(dict.fromkeys(str(item) for item in domains))
         with self._lock:
             # The lock protects the published snapshot. Copy only the requested
@@ -238,8 +238,11 @@ class HardwareStateOwner:
                 "requested_domains": list(requested),
                 "ownership": copy.deepcopy(self._ownership),
                 "provenance": "POST /hardware/snapshot/collect",
-                "lifecycle": lifecycle_state.projection(),
             }
+            # Admission acquires lifecycle separately from its bound provider.
+            # Do not copy its populated stage evidence into an unused attachment.
+            if include_lifecycle:
+                base["lifecycle"] = lifecycle_state.projection()
             if snapshot is None or snapshot.get("ownership_epoch") != self._epoch or (cache_state == "missing" and not independent_domains):
                 return {
                     **base,

@@ -3,10 +3,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import os
+import stat
+from uuid import UUID
 import re
 import secrets
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -98,6 +102,54 @@ class CameraFrame:
 
 
 @dataclass(frozen=True)
+class OemInspectionCameraSettings:
+    """Values from CameraControlParameter, NOT arbitrary V4L2 controls.
+
+    ControlLib.AdjustCamera (1883-1920) skips Exposure=1000, selects auto
+    for Exposure=0, and never applies Gain. The serial-206 Settings3200
+    bundle uses 1000 for both fields. Manual exposure units are NOT proven
+    by the supplied CGrabThread (it passes property 15 to OpenCV without
+    identifying the backend); do not invent a log2-to-V4L2 conversion.
+    """
+
+    gain: float = 1000
+    exposure: float = 1000
+
+    def validate(self) -> None:
+        if type(self.gain) not in (int, float) or self.gain != 1000:
+            raise CameraUnavailable(
+                "OEM inspection Gain must be the 1000 unchanged sentinel; "
+                "CGrabThread.setGain writes OpenCV property 10, not V4L2 gain")
+        if type(self.exposure) not in (int, float) or self.exposure not in (0, 1000):
+            raise CameraUnavailable(
+                "OEM manual exposure conversion is unqualified: only 1000 "
+                "(unchanged) and 0 (auto exposure) are supported")
+
+
+@dataclass(frozen=True)
+class CameraInspectionControls:
+    brightness: int
+    gain: int
+    auto_exposure: int
+    exposure_time_absolute: int  # V4L2 100-microsecond units, not OEM units.
+
+
+@dataclass(frozen=True)
+class CameraInspectionFrame:
+    frame: CameraFrame
+    settings: OemInspectionCameraSettings
+    controls_before: CameraInspectionControls
+    controls_configured: CameraInspectionControls
+    controls_after: CameraInspectionControls
+    acquisition_started_at: datetime
+    source_frames_discarded: int
+    source_policy: str = "CGrabThread.GetSingleFrame: discard one, read one"
+    width: int = 640
+    height: int = 480
+    flip: str = "none"
+
+
+@dataclass(frozen=True)
 class CameraStatus:
     available: bool
     frame_sequence: int | None
@@ -162,6 +214,116 @@ class CameraProvider:
         self._stream_owner: str | None = None
         self._stream_identity: CameraIdentity | None = None
         self._stream_accepting = False
+        self._led_fd: int | None = None
+        self._led_leaf: Any = None
+        self._led_binding: Any = None
+
+    def _close_illumination(self) -> None:
+        # Caller holds provider RLock, including stream generation transitions.
+        fd, self._led_fd = self._led_fd, None
+        self._led_leaf = self._led_binding = None
+        if fd is not None:
+            os.close(fd)
+
+    def close(self) -> None:
+        """Release the control-only fd; capture owner lifecycle is unchanged."""
+        with self._lock:
+            self._close_illumination()
+
+    def _illumination_selection(self):
+        from .vision.oem_camera_led import SMI_XU_GUID
+        identity = self.discover()
+        if self._stream_owner is not None and (
+                not self._stream_accepting or identity != self._stream_identity):
+            raise CameraUnavailable("camera illumination stream identity changed")
+        node = self._sysfs_root / Path(identity.device).name
+        current = node.resolve(strict=True)
+        usb = None
+        for parent in (current, *current.parents):
+            if (parent / "idVendor").exists():
+                usb = parent
+                break
+        if usb is None or (self._normalize_hex(self._read_text(usb / "idVendor")),
+                           self._normalize_hex(self._read_text(usb / "idProduct"))) != (
+                               EXPECTED_USB_VID, EXPECTED_USB_PID):
+            raise CameraUnavailable("selected camera USB descriptor identity unavailable")
+        raw = (usb / "descriptors").read_bytes()
+        if (len(raw) < 18 or raw[:2] != b"\x12\x01"
+                or raw[8:12] != bytes.fromhex("84207df3")):
+            raise CameraUnavailable("selected camera USB device descriptor mismatch")
+        descriptors, offset, video_control = [], 0, False
+        while offset < len(raw):
+            size = raw[offset]
+            if size < 2 or offset + size > len(raw):
+                raise CameraUnavailable("malformed selected USB descriptors")
+            d = raw[offset:offset + size]
+            if d[1] == 4:
+                video_control = len(d) >= 9 and d[5:7] == b"\x0e\x01"
+            if (video_control and len(d) >= 20 and d[1:3] == b"\x24\x06"
+                    and d[4:20] == UUID(SMI_XU_GUID).bytes_le):
+                descriptors.append(d)
+            offset += size
+        if len(descriptors) != 1:
+            raise CameraUnavailable("selected camera source XU missing or ambiguous")
+        device_stat = os.stat(identity.device)
+        expected_dev = self._read_text(node / "dev")
+        if (not stat.S_ISCHR(device_stat.st_mode) or expected_dev !=
+                f"{os.major(device_stat.st_rdev)}:{os.minor(device_stat.st_rdev)}"):
+            raise CameraUnavailable("selected camera device node identity mismatch")
+        binding = (identity, self._generation, str(current), str(usb),
+                   device_stat.st_dev, device_stat.st_ino, device_stat.st_rdev,
+                   hashlib.sha256(raw).hexdigest())
+        return binding, descriptors[0]
+
+    def _illumination(self, operation: str, *, channel=None, on=None) -> dict[str, Any]:
+        from .vision.oem_camera_led import SmiUvcLed
+        # This is explicitly an RLock. The leaf re-enters it for the ENTIRE
+        # transaction; no separate capture owner or nonreentrant io_lock nesting.
+        with self._lock:
+            try:
+                binding, descriptor = self._illumination_selection()
+                if self._led_binding != binding:
+                    self._close_illumination()
+                if self._led_leaf is None:
+                    if operation == "set":
+                        raise CameraUnavailable("camera illumination initialization required")
+                    fd = os.open(binding[0].device, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
+                    self._led_fd = fd
+                    opened = os.fstat(fd)
+                    if (opened.st_dev, opened.st_ino, opened.st_rdev) != binding[4:7]:
+                        raise CameraUnavailable("camera control fd selection changed during open")
+                    self._led_leaf = SmiUvcLed(fd, self._lock, descriptor)
+                    self._led_binding = binding
+                leaf = self._led_leaf
+                if operation == "probe":
+                    length, info = leaf.probe()
+                    result = {"control_length": length, "control_info": info}
+                elif operation == "initialize":
+                    leaf.probe()
+                    result = {"dsp_type": leaf.discover_dsp_type()}
+                else:
+                    leaf.set_led(channel, on)
+                    result = {"channel": channel, "on": on}
+                return {"ok": True, **result, "provider_generation": self._generation,
+                        "delivery_attempted": operation != "probe",
+                        "physical_effect_verified": False}
+            except Exception:
+                self._close_illumination()
+                raise
+
+    def probe_illumination(self) -> dict[str, Any]:
+        """Read-only GET_LEN/INFO preflight; never register/bank writes."""
+        return self._illumination("probe")
+
+    def initialize_illumination(self) -> dict[str, Any]:
+        """Physical source discovery: invoke only inside canonical camera child."""
+        return self._illumination("initialize")
+
+    def set_illumination(self, *, channel: int, on: bool) -> dict[str, Any]:
+        """Canonical camera child leaf; no implicit discovery or retry."""
+        if type(channel) is not int or channel not in (1, 2, 3) or type(on) is not bool:
+            raise ValueError("source_preparation_led_arguments_invalid")
+        return self._illumination("set", channel=channel, on=on)
 
     def begin_stream(self, owner: str) -> CameraIdentity:
         """Reserve the device under the same lock as still capture/discovery."""
@@ -169,6 +331,7 @@ class CameraProvider:
             if self._stream_owner is not None:
                 raise CameraUnavailable("camera stream already owns the device")
             identity = self.discover()
+            self._close_illumination()
             self._stream_owner = owner
             self._stream_identity = identity
             self._stream_accepting = True
@@ -179,6 +342,7 @@ class CameraProvider:
     def invalidate_stream(self, owner: str) -> None:
         with self._lock:
             if self._stream_owner == owner:
+                self._close_illumination()
                 self._stream_accepting = False
                 self._latest = None
 
@@ -186,6 +350,7 @@ class CameraProvider:
         """Release only after the corresponding process is reaped."""
         with self._lock:
             if self._stream_owner == owner:
+                self._close_illumination()
                 self._stream_owner = None
                 self._stream_identity = None
                 self._stream_accepting = False
@@ -310,6 +475,126 @@ class CameraProvider:
             content = bytes(completed.stdout or b"")
             self._validate_jpeg(content)
             return self._publish(content, identity)
+
+    def capture_inspection(self, settings: OemInspectionCameraSettings) -> CameraInspectionFrame:
+        """Fresh source-typed acquisition; NEVER returns the preview cache.
+
+        The native caller owns movement/LED sequencing and must call this only
+        after its source settle point. A preview owner must be explicitly stopped
+        and reaped by its existing service before entry. We neither stop nor
+        restart that service, including after failure. All work uses our normal
+        lock, discovery, generation, decode and publication authority.
+        """
+        if type(settings) is not OemInspectionCameraSettings:
+            raise CameraUnavailable("inspection requires OemInspectionCameraSettings")
+        settings.validate()  # Reject unqualified mappings before any device access.
+        with self._lock:
+            if self._stream_owner is not None:
+                raise CameraUnavailable("inspection requires preview owner to be stopped and reaped")
+            # An unsuccessful inspection must not leave an older frame looking
+            # like the result of the current post-move request.
+            self._latest = None
+            identity = self.discover()
+            before = self._inspection_controls(identity)
+            configured = before
+            frames = 2
+            if settings.exposure == 0:
+                self._inspection_run([
+                    "v4l2-ctl", "--device", identity.device, "--set-ctrl", "auto_exposure=3",
+                ])
+                configured = self._inspection_controls(identity)
+                if configured.auto_exposure != 3:
+                    raise CameraUnavailable("OEM auto exposure readback disagrees with requested mode")
+                self._check_inspection_controls(before, configured, allow_mode_change=True)
+                # CGrabThread.setAutoExposure: waitKey(50), then two
+                # GetSingleFrame calls. Each request reads twice (90-140).
+                time.sleep(0.050)
+                frames += 4
+            started = self._aware_now()
+            completed = self._inspection_run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "video4linux2", "-input_format", "mjpeg",
+                "-video_size", "640x480", "-i", identity.device,
+                "-frames:v", str(frames), "-c:v", "copy",
+                "-fs", str(frames * MAX_JPEG_BYTES + 1),
+                "-f", "image2pipe", "pipe:1",
+            ], capture=True)
+            content = bytes(completed.stdout or b"")
+            if len(content) > frames * MAX_JPEG_BYTES:
+                raise CameraFrameUnavailable("inspection capture exceeds bounded frame size")
+            buffer = CameraJpegBuffer()
+            captured = list(buffer.feed(content))
+            if len(captured) != frames or buffer.dropped or buffer.buffer:
+                raise CameraFrameUnavailable("inspection capture did not return the required fresh frames")
+            remaining = content
+            for image in captured:
+                if not remaining.startswith(image):
+                    raise CameraFrameUnavailable("inspection capture did not return the required fresh frames")
+                self._validate_jpeg(image)
+                # Native UVC copy packets can have zero padding after EOI.
+                # Strip only after each complete verified frame, never within
+                # a JPEG or before the first frame; reject all other bytes.
+                remaining = remaining[len(image):].lstrip(b"\x00")
+            if remaining:
+                raise CameraFrameUnavailable("inspection capture did not return the required fresh frames")
+            after = self._inspection_controls(identity)
+            self._check_inspection_controls(configured, after)
+            return CameraInspectionFrame(
+                frame=self._publish(captured[-1], identity), settings=settings,
+                controls_before=before, controls_configured=configured,
+                controls_after=after, acquisition_started_at=started,
+                source_frames_discarded=frames - 1,
+            )
+
+    def _inspection_run(self, argv: list[str], *, capture: bool = False) -> Any:
+        try:
+            completed = self._runner(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=CAPTURE_TIMEOUT_SECONDS if capture else DISCOVERY_TIMEOUT_SECONDS,
+                check=False, shell=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise CameraUnavailable(f"bounded inspection camera operation failed: {exc}") from exc
+        if int(completed.returncode) != 0:
+            raise CameraUnavailable(self._as_text(completed.stderr).strip() or "inspection camera operation failed")
+        return completed
+
+    def _inspection_controls(self, identity: CameraIdentity) -> CameraInspectionControls:
+        output = self._as_text(self._inspection_run([
+            "v4l2-ctl", "--device", identity.device, "--list-ctrls-menus",
+        ]).stdout)
+        values: dict[str, int] = {}
+        # Narrow to the actual IZONE control domains, not generic control input.
+        for name, low, high in (("brightness", 0, 15), ("gain", 0, 9),
+                                ("exposure_time_absolute", 39, 5000)):
+            rows = re.findall(rf"^\s*{name}\s+0x[0-9a-f]+\s+\(int\)\s*:\s*(.*)$", output, re.M)
+            if len(rows) != 1:
+                raise CameraUnavailable(f"inspection control evidence missing or ambiguous: {name}")
+            fields = dict(re.findall(r"(min|max|step|value)=(-?\d+)", rows[0]))
+            if (fields.get("min"), fields.get("max"), fields.get("step")) != (str(low), str(high), "1"):
+                raise CameraUnavailable(f"inspection control domain changed: {name}")
+            if "value" not in fields or not low <= int(fields["value"]) <= high:
+                raise CameraUnavailable(f"inspection control readback invalid: {name}")
+            values[name] = int(fields["value"])
+        modes = re.findall(r"^\s*auto_exposure\s+0x[0-9a-f]+\s+\(menu\)\s*:\s*([^\n]+)\n((?:[ \t]+[13]:[^\n]+\n?)+)", output, re.M)
+        if len(modes) != 1:
+            raise CameraUnavailable("inspection auto exposure menu is missing or ambiguous")
+        mode = re.search(r"\bvalue=(\d+)\b", modes[0][0])
+        entries = dict(re.findall(r"([13]):\s*([^\n]+)", modes[0][1]))
+        if entries != {"1": "Manual Mode", "3": "Aperture Priority Mode"} or mode is None or mode[1] not in entries:
+            raise CameraUnavailable("inspection auto exposure mode is unsupported")
+        return CameraInspectionControls(auto_exposure=int(mode[1]), **values)
+
+    @staticmethod
+    def _check_inspection_controls(
+        before: CameraInspectionControls, after: CameraInspectionControls,
+        *, allow_mode_change: bool = False,
+    ) -> None:
+        if (before.brightness != after.brightness or before.gain != after.gain
+                or (not allow_mode_change and before.auto_exposure != after.auto_exposure)
+                or (after.auto_exposure == 1
+                    and before.exposure_time_absolute != after.exposure_time_absolute)):
+            raise CameraUnavailable("inspection controls changed unexpectedly during acquisition")
 
     def capture_snapshot(self) -> dict[str, Any]:
         """Capture one frame and expose only immutable, provider-owned pixels.

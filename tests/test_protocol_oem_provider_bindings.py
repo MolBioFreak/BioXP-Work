@@ -42,6 +42,9 @@ def rig(monkeypatch):
     machine = dict(current_location=3, current_well=14, tip_location=-1, tip_loaded=False,
         tip_dirty=False, pseudo_z_home=65000, plate_on_gantry=None, well_pierced={})
     p.mov_execution_machine_state = lambda: dict(machine)
+    # Scoped source moves read the canonical owner, not the full-state getter.
+    p.bind_deck_semantic_state_reader(lambda: dict(machine,
+        semantic_state_revision=0, ambiguity_state="none", transition_provenance={}))
     p._canonical_deck_semantic_state = lambda: {"current_tray": 2}
     p._deck_gripper_confirmed = lambda: False
     p._park_collection_state = lambda: {"tip_exists": True}
