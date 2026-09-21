@@ -1058,6 +1058,7 @@ class OperatorCommandStore:
         self._priority_fence = threading.Event()
         self._axis_priority_fences = {axis: threading.Event() for axis in ("x", "y", "z")}
         self._interrupt_lock = threading.Lock()
+        self._interrupt_decision_lock = threading.Lock()
         self._pending_interrupt_lock = threading.RLock()
         self._pending_interrupt_reconciliations: list[dict[str, Any]] = []
         self._active_interrupt_deliveries: dict[str, str] = {}
@@ -1465,6 +1466,161 @@ class OperatorCommandStore:
         finally:
             self._interrupt_spool_write_depth -= 1
             connection.close()
+
+    def append_interrupt_decision(self, event: Mapping[str, Any]) -> dict[str, Any]:
+        """Append one fsync'd interrupt decision fact (refusal, materialization).
+
+        The reconcile spool admits only pending/delivered/reconciled phases, so
+        refusals and crash-materializations -- facts about a Stop that was never
+        delivered -- are kept in this plane-owned append-only log instead. It is
+        a projection of the write-ahead journal, never a replacement for it.
+        """
+
+        record = {
+            "schema": "bioxp.operator_interrupt_decision.v1",
+            "recorded_at": _now(),
+            "pid": os.getpid(),
+            **{str(key): value for key, value in dict(event).items()},
+        }
+        payload = (_canonical(record) + "\n").encode("utf-8")
+        path = self.root / "operator_interrupt_decisions.v1.jsonl"
+        with self._interrupt_decision_lock:
+            self.root.mkdir(parents=True, exist_ok=True)
+            handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.write(handle, payload)
+                os.fsync(handle)
+            finally:
+                os.close(handle)
+        return {"ok": True, "path": str(path), "record": record}
+
+    def record_interrupt_rejection(
+        self, *, interrupt_attempt_id: str, action_id: str, reason: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Durably record a refused stop press without delivering anything.
+
+        A refusal is evidence, not silence: the write-ahead journal carries the
+        authority record and this inert spool event (phase ``rejected`` is never
+        drained by ``_pending_interrupt_spool_rows``) keeps the refusal in the
+        same store as the reconcile spool. No safety epoch is bumped and no
+        interrupt fence is armed: nothing was attempted.
+        """
+
+        attempt_id = str(interrupt_attempt_id or "").strip()
+        if not attempt_id:
+            raise ValueError("interrupt attempt identity is required")
+        if action_id not in INTERRUPT_ACTIONS:
+            raise ValueError("interrupt rejection action is invalid")
+        event = {
+            "kind": "rejected",
+            "interrupt_attempt_id": attempt_id,
+            "action_id": str(action_id),
+            "reason": str(reason),
+            "admitted": False,
+            "attempted": False,
+            "acknowledged": False,
+            "response": None,
+            "error": str(reason),
+            "physical_motion_commanded": False,
+        }
+        if payload:
+            event.update({str(key): value for key, value in payload.items() if key not in event})
+        # The reconcile spool only admits pending/delivered/reconciled, and a
+        # refusal must never enter the reconciliation drain. The plane keeps its
+        # own append-only, fsync'd decision log for non-delivery interrupt facts.
+        self.append_interrupt_decision(event)
+        return {"ok": True, "phase": "rejected", "interrupt_attempt_id": attempt_id,
+                "action_id": str(action_id), "reason": str(reason), "recorded": True}
+
+    def materialize_interrupt_journal(self, journal: Any) -> dict[str, Any]:
+        """Project orphaned write-ahead interrupt attempts into durable rows (RCA F1).
+
+        Startup recovery reconciled only the nonterminal *normal* command; the
+        stops that were pressed left nothing behind. Every attempt the journal
+        still shows as unresolved is now materialized:
+
+        * ``admitted`` ledger row + safety epochs + interrupt fence (the press is
+          a fact and outstanding work is suspect until reconciled);
+        * ``attempted`` ledger row plus a pending reconciliation spool row when
+          the journal proves delivery was attempted (outcome unknown, fence stays
+          armed -> fail-closed);
+        * an inert spool ``materialized`` event when delivery was never
+          attempted, so the ledger never claims a stop that was never sent.
+        """
+
+        if journal is None or not hasattr(journal, "materialize_startup"):
+            return {"ok": True, "materialized": [], "failed": {}, "unresolved": []}
+
+        def projector(state: Mapping[str, Any]) -> dict[str, Any]:
+            attempt_id = str(state["interrupt_attempt_id"])
+            action_id = str(state.get("action_id") or "")
+            if action_id not in INTERRUPT_ACTIONS:
+                raise ValueError(f"journal interrupt action is invalid: {action_id!r}")
+            records = [row for row in state.get("records") or [] if isinstance(row, Mapping)]
+            admitted = next(
+                (row for row in records if str(row.get("phase")) == "admitted"),
+                records[0] if records else {},
+            )
+            idempotency_key = str(admitted.get("idempotency_key") or attempt_id)
+            observed_generation = int(admitted.get("observed_ownership_generation") or 0)
+            request = {
+                "idempotency_key": idempotency_key,
+                "caller_idempotency_key": admitted.get("caller_idempotency_key"),
+                "interrupt_attempt_id": attempt_id,
+                "observed_ownership_generation": observed_generation,
+                "observed_board_epoch_by_board": dict(
+                    admitted.get("observed_board_epoch_by_board") or {}
+                ),
+                "startup_materialization": True,
+            }
+            attempt_state = {
+                "ownership_generation": observed_generation,
+                "board_epoch_by_board": dict(admitted.get("observed_board_epoch_by_board") or {}),
+                "startup_materialization": True,
+                "journal_phases": list(state.get("phases") or []),
+            }
+            receipt = self.begin_interrupt(
+                action_id,
+                state=attempt_state,
+                request=request,
+                interrupt_attempt_id=attempt_id,
+            )
+            attempted = any(
+                str(row.get("phase")) == "delivery_attempted" for row in records
+            )
+            if attempted:
+                self.mark_interrupt_attempted(idempotency_key=idempotency_key)
+                self.queue_pending_interrupt_reconciliation({
+                    "action_id": action_id,
+                    "state": attempt_state,
+                    "request": request,
+                    "interrupt_attempt_id": attempt_id,
+                    "attempted": True,
+                    "acknowledged": False,
+                    "response": None,
+                    "error": "process_restart_during_interrupt_delivery",
+                })
+            else:
+                # Delivery was never attempted: the ledger must not claim a Stop
+                # that was never sent, so the fact is recorded as a decision.
+                self.append_interrupt_decision({
+                    "kind": "materialized",
+                    "interrupt_attempt_id": attempt_id,
+                    "action_id": action_id,
+                    "reason": "process_restart_before_interrupt_delivery",
+                    "attempted": False,
+                    "journal_phases": list(state.get("phases") or []),
+                })
+            return {
+                "action_id": action_id,
+                "idempotency_key": idempotency_key,
+                "delivery_attempted": attempted,
+                "persistence_state": receipt.get("persistence_state"),
+                "reconciliation_required": True,
+            }
+
+        return journal.materialize_startup(projector)
 
     def _pending_interrupt_spool_rows(self) -> list[dict[str, Any]]:
         connection = self._interrupt_spool_connection()
@@ -7919,18 +8075,41 @@ class OperatorCommandStore:
 
 
 class OperatorCommandPlane:
-    def __init__(self, app: FastAPI, *, machine_state_provider: Callable[[], Mapping[str, Any]], actions: list[dict[str, Any]], dispatch: Mapping[str, Mapping[str, Any]]) -> None:
+    def __init__(self, app: FastAPI, *, machine_state_provider: Callable[[], Mapping[str, Any]], actions: list[dict[str, Any]], dispatch: Mapping[str, Mapping[str, Any]], interrupt_journal: Any = None) -> None:
         self.app = app
         self.machine_state_provider = machine_state_provider
         self.actions = actions
         self.dispatch = dispatch
         self.by_id = {str(row["action_id"]): row for row in actions}
         self.store = OperatorCommandStore()
+        if interrupt_journal is None:
+            from .interrupt_journal import InterruptJournal
+
+            interrupt_journal = InterruptJournal(self.store.root)
+        self.interrupt_journal = interrupt_journal
         self.router = APIRouter(prefix="/operator", tags=["operator-command-plane"])
         self._install_routes()
 
     def start(self) -> None:
         self.store.start(self._dispatch_one)
+        # RCA F1: a stop press must survive the process that recorded it. Any
+        # attempt the write-ahead journal still shows as unresolved is
+        # materialized into durable projection rows before new work is admitted.
+        if str(os.environ.get("BIOXP_INTERRUPT_JOURNAL_MATERIALIZE", "1")).strip().lower() not in {"0", "false", "no"}:
+            try:
+                self.interrupt_journal_materialization = self.store.materialize_interrupt_journal(
+                    self.interrupt_journal
+                )
+            except Exception as exc:  # never block startup on projection repair
+                self.interrupt_journal_materialization = {
+                    "ok": False, "materialized": [],
+                    "failed": {"*": f"{type(exc).__name__}: {exc}"[:500]},
+                }
+                # The journal itself is authoritative and untouched; keep it reachable.
+                try:
+                    print(f"[WARN] interrupt journal materialization failed: {type(exc).__name__}")
+                except Exception:
+                    pass
 
     def is_canonical(self, action_id: str) -> bool:
         return action_id in CANONICAL_ACTIONS
@@ -8876,12 +9055,14 @@ class OperatorCommandPlane:
                 "recovery_hold": True,
             }
 
-    async def compat_invoke(self, action_id: str, payload: Mapping[str, Any], *, controller_delivery: tuple[int, Any] | None = None) -> dict[str, Any]:
+    async def compat_invoke(self, action_id: str, payload: Mapping[str, Any], *, controller_delivery: tuple[int, Any] | None = None, interrupt_attempt_id: str | None = None) -> dict[str, Any]:
         if action_id in INTERRUPT_ACTIONS:
-            interrupt_attempt_id: str | None = None
             allow_fence_release = False
             try:
-                interrupt_attempt_id = str(uuid.uuid4())
+                # The caller (operator controls) mints the attempt id at
+                # admission so the write-ahead journal record and this durable
+                # projection row share one identity across a crash.
+                interrupt_attempt_id = str(interrupt_attempt_id or uuid.uuid4())
                 self.store.mark_interrupt_delivery_active(interrupt_attempt_id, action_id)
                 # Every explicit interrupt gets a storage-unique attempt. The
                 # caller key/observations are evidence, never delivery admission.

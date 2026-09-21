@@ -12,6 +12,7 @@ import hashlib
 import inspect
 import json
 import math
+import os
 import uuid
 import threading
 import time
@@ -286,6 +287,54 @@ class _MutationPriorityRLock:
             yield self
         finally:
             self.release()
+
+
+#: How long an interrupt's post-delivery reconciliation may wait for the
+#: provider lifecycle lock before it must report ``reconciliation_pending``
+#: instead of queueing behind the command it is stopping (RCA F3).
+_INTERRUPT_RECONCILIATION_LOCK_DEADLINE_S = float(
+    os.environ.get("BIOXP_INTERRUPT_RECONCILIATION_LOCK_DEADLINE_S") or 1.0
+)
+
+
+class _InterruptReconciliationLockUnavailable(RuntimeError):
+    """The provider lifecycle lock is held by the interrupted command itself."""
+
+
+class _InterruptReconciliationLock:
+    """Bounded, non-preempting acquisition of the provider lifecycle lock.
+
+    A stop must never wait for a lock that the command it is stopping may hold
+    for the whole of a blocking controller exchange. Acquisition is bounded;
+    when it fails the caller records ``reconciliation_pending`` and keeps its
+    fail-closed authority invalidation instead of blocking.
+    """
+
+    def __init__(self, lock: Any, *, deadline_s: float | None = None) -> None:
+        self._lock = lock
+        self._deadline_s = float(
+            _INTERRUPT_RECONCILIATION_LOCK_DEADLINE_S if deadline_s is None else deadline_s
+        )
+        self._acquired = False
+
+    @property
+    def acquired(self) -> bool:
+        return self._acquired
+
+    def __enter__(self) -> bool:
+        try:
+            self._acquired = bool(
+                self._lock.acquire(timeout=self._deadline_s, mutation=True)
+            )
+        except TypeError:  # a plain lock without the mutation-priority extension
+            self._acquired = bool(self._lock.acquire(timeout=self._deadline_s))
+        return self._acquired
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        if self._acquired:
+            self._lock.release()
+            self._acquired = False
+        return False
 
 
 _EVIDENCE_MAX_DEPTH = 8
@@ -6120,6 +6169,22 @@ class Serial206OemInitializationProvider:
             except Exception as exc:
                 return {"ok": False, "axis": "x", "state": "failed_latched", "failure": f"projection_failed:{type(exc).__name__}"}
 
+    def _interrupt_reconciliation_lock(self, *, reason: str) -> "_InterruptReconciliationLock":
+        """Bounded lifecycle-lock acquisition for an interrupt's reconciliation."""
+
+        return _InterruptReconciliationLock(self._lock)
+
+    def _interrupt_reconciliation_lock_unavailable(self, *, reason: str) -> dict[str, Any]:
+        """Fail-closed record for a stop whose reconciliation cannot take the lock."""
+
+        return {
+            "reconciliation_pending": True,
+            "recovery_hold": True,
+            "lifecycle_reconciliation": "deferred_lock_unavailable",
+            "lifecycle_lock_deadline_s": _INTERRUPT_RECONCILIATION_LOCK_DEADLINE_S,
+            "reason": str(reason),
+        }
+
     def _begin_aggregate_software_abort(self, *, include_z: bool = True) -> dict[str, int]:
         # Only volatile owner fences here. Never acquire _lock, the DB writer
         # lock, or the other axis's dispatch lease before releasing waiters.
@@ -6162,41 +6227,57 @@ class Serial206OemInitializationProvider:
                         raise RuntimeError("axis reconciliation not verified")
                 except Exception as exc:
                     errors[axis] = f"{type(exc).__name__}: {exc}"
-        try:
-            with self._lock:
-                state = self._load_state()
+        # RCA F3: the durable reference invalidation is the fail-closed
+        # consequence of the abort and needs no provider lifecycle lock. It must
+        # happen even when that lock is held by the command this abort stops.
+        if self.reference_store is not None:
+            try:
+                self._z_mark_desynced("Aggregate software Abort invalidated Z authority.",
+                                      "serial206.aggregate.software_abort")
                 if invalidate_x:
-                    state["x_lifecycle"].update(
-                        state="failed_latched", active_receipt=None, pending_ticket=None,
-                        reference_state="desynced",
+                    invalidated_x = self.reference_store.mark_desynced(MarkAxisDesyncedCommand(
+                        axis="x", reason="Aggregate software Abort invalidated X authority.",
+                        source="serial206.aggregate.software_abort",
+                    ))
+                    if not self._z_reference_commit_verified(invalidated_x, expected_state="desynced"):
+                        raise RuntimeError("durable X reference invalidation unverified")
+                for axis in ("y", "g"):
+                    invalidated = self.reference_store.mark_desynced(MarkAxisDesyncedCommand(
+                        axis=axis, reason=f"Aggregate software Abort invalidated {axis.upper()} authority.",
+                        source="serial206.aggregate.software_abort",
+                    ))
+                    if not self._z_reference_commit_verified(invalidated, expected_state="desynced"):
+                        raise RuntimeError(f"durable {axis.upper()} reference invalidation unverified")
+            except Exception as exc:
+                errors["reference_invalidation"] = f"{type(exc).__name__}: {exc}"
+        lifecycle_lease = self._interrupt_reconciliation_lock(reason="aggregate_software_abort")
+        lifecycle_locked = False
+        try:
+            with lifecycle_lease:
+                lifecycle_locked = bool(lifecycle_lease.acquired)
+                if not lifecycle_locked:
+                    # Delivered, but the lifecycle lock belongs to the command
+                    # this abort is stopping. Record it and return; never queue.
+                    errors["z_lifecycle"] = "reconciliation_lock_unavailable_bounded"
+                else:
+                    state = self._load_state()
+                    if invalidate_x:
+                        state["x_lifecycle"].update(
+                            state="failed_latched", active_receipt=None, pending_ticket=None,
+                            reference_state="desynced",
+                            last_failure={"reason": "aggregate_software_abort", "command_id": command_id},
+                        )
+                    state["z_lifecycle"].update(
+                        state="failed_latched", active_receipt=None,
+                        prepared_receipt=None, board_lifecycle_generation=None,
+                        awaiting_observation_receipt_id=None, reference_state="desynced",
                         last_failure={"reason": "aggregate_software_abort", "command_id": command_id},
                     )
-                state["z_lifecycle"].update(
-                    state="failed_latched", active_receipt=None,
-                    prepared_receipt=None, board_lifecycle_generation=None,
-                    awaiting_observation_receipt_id=None, reference_state="desynced",
-                    last_failure={"reason": "aggregate_software_abort", "command_id": command_id},
-                )
-                self._save_state(state)
-                if self.reference_store is not None:
-                    self._z_mark_desynced("Aggregate software Abort invalidated Z authority.",
-                                          "serial206.aggregate.software_abort")
-                    if invalidate_x:
-                        invalidated_x = self.reference_store.mark_desynced(MarkAxisDesyncedCommand(
-                            axis="x", reason="Aggregate software Abort invalidated X authority.",
-                            source="serial206.aggregate.software_abort",
-                        ))
-                        if not self._z_reference_commit_verified(invalidated_x, expected_state="desynced"):
-                            raise RuntimeError("durable X reference invalidation unverified")
-                    for axis in ("y", "g"):
-                        invalidated = self.reference_store.mark_desynced(MarkAxisDesyncedCommand(
-                            axis=axis, reason=f"Aggregate software Abort invalidated {axis.upper()} authority.",
-                            source="serial206.aggregate.software_abort",
-                        ))
-                        if not self._z_reference_commit_verified(invalidated, expected_state="desynced"):
-                            raise RuntimeError(f"durable {axis.upper()} reference invalidation unverified")
+                    self._save_state(state)
         except Exception as exc:
             errors["z_lifecycle"] = f"{type(exc).__name__}: {exc}"
+        if not lifecycle_locked:
+            errors["reconciliation_pending"] = "aggregate_abort_lifecycle_deferred"
         # Keep retry admission fenced until the complete persistence attempt
         # (including lifecycle/reference invalidation) has a result. Every
         # member uses the generation captured before this attempt did any work.
@@ -6224,14 +6305,49 @@ class Serial206OemInitializationProvider:
                     and self._z_interrupt_recovery_owner is recovery_owner):
                 self._z_interrupt_recovery_required = bool(errors)
             self._z_interrupt_active = bool(self._z_interrupt_count or self._z_interrupt_recovery_required)
-        return {"ok": not errors, "errors": errors, "controller_dispatches": 0}
+        result = {"ok": not errors, "errors": errors, "controller_dispatches": 0}
+        if not lifecycle_locked:
+            # Extend (never replace) the reconciliation receipt: the software
+            # Abort was delivered and its lifecycle persistence is explicitly
+            # pending rather than silently assumed.
+            result["reconciliation_pending"] = True
+            result["delivery_completed"] = True
+        return result
 
     def execute_x_stop_interrupt(
         self,
         values: Mapping[str, Any] | None = None,
         *,
         abort: bool = False,
-    ) -> dict[str, Any]:
+        defer_reconciliation: bool = False,
+    ):
+        # RCA F3: delivery and reconciliation are separable. The physical OEM
+        # double Stop is delivered first; the lifecycle/reference persistence
+        # that needs the provider lifecycle lock is a bounded follow-up step.
+        steps = self._x_stop_interrupt_steps(values, abort=abort)
+        try:
+            delivery_result = next(steps)
+        except StopIteration as completed:
+            return completed.value
+
+        def reconcile():
+            try:
+                next(steps)
+            except StopIteration as completed:
+                return completed.value
+            raise RuntimeError("unexpected X Stop reconciliation boundary")
+
+        if defer_reconciliation and not abort:
+            reconcile.delivery_result = dict(delivery_result)
+            return reconcile
+        return reconcile()
+
+    def _x_stop_interrupt_steps(
+        self,
+        values: Mapping[str, Any] | None = None,
+        *,
+        abort: bool = False,
+    ):
         values = dict(values or {})
         selected = "abort" if abort else "stop"
         supplied_command_id = values.get("command_id")
@@ -6246,7 +6362,11 @@ class Serial206OemInitializationProvider:
         # Software Abort has no controller sequence to serialize. In particular,
         # another invocation must not wait behind persistence or a reentrant
         # provider owner. Addressed Stop retains its existing dispatch lease.
-        with nullcontext() if abort else self._x_interrupt_dispatch_lock:
+        # Serialize only the addressed OEM sequence. Lifecycle/SQLite
+        # reconciliation must not fence the next explicit Stop delivery (RCA F3).
+        with ExitStack() as delivery_lease:
+            if not abort:
+                delivery_lease.enter_context(self._x_interrupt_dispatch_lock)
             with self._x_interrupt_state_lock:
                 self._x_interrupt_epoch += 1
                 interrupt_epoch = self._x_interrupt_epoch
@@ -6286,8 +6406,36 @@ class Serial206OemInitializationProvider:
                     result["aggregate_authority_invalidation"] = reconciliation
                     if not aggregate_reconciled:
                         result.update(ok=False, recovery_hold=True, persistence_state="recovery_required")
+                delivery_result = {
+                    "ok": result.get("ok") is True,
+                    "axis": "x",
+                    "intent": selected,
+                    "interrupt_epoch": interrupt_epoch,
+                    "delivery_completed": True,
+                    "reconciliation_pending": True,
+                    "physical_effect_verified": False,
+                    **{
+                        key: result.get(key)
+                        for key in (
+                            "source_call_completed",
+                            "source_return_ok",
+                            "controller_command_acknowledged",
+                            "controller_terminal_state_verified",
+                        )
+                    },
+                }
+                # Physical delivery is over. Release the addressed delivery lease
+                # and yield before the lifecycle/lock step so the caller can
+                # release its connection lease and lane; the stop's own
+                # epoch/count custody stays with this generator.
+                delivery_lease.close()
+                yield delivery_result
                 try:
-                    with self._lock:
+                    with self._interrupt_reconciliation_lock(
+                        reason="x_stop_interrupt"
+                    ) as lifecycle_locked:
+                        if not lifecycle_locked:
+                            raise _InterruptReconciliationLockUnavailable("x_stop_lifecycle")
                         state = self._load_state()
                         lifecycle = state["x_lifecycle"]
                         current_active = lifecycle.get("active_receipt")
@@ -6403,6 +6551,54 @@ class Serial206OemInitializationProvider:
                             "result": _json_safe(result),
                             "authority_receipt": _json_safe(receipt),
                         }
+                except _InterruptReconciliationLockUnavailable:
+                    # RCA F3: the addressed Stop was delivered, but the
+                    # lifecycle lock is held by the command this stop
+                    # interrupted. Never wait on it: record delivery, keep the
+                    # authority fail-closed and report reconciliation pending.
+                    with self._x_interrupt_state_lock:
+                        self._x_interrupt_recovery_required = True
+                    if self.reference_store is not None:
+                        try:
+                            invalidated_x = self.reference_store.mark_desynced(
+                                MarkAxisDesyncedCommand(
+                                    axis="x",
+                                    reason="X Stop reconciliation pending: lifecycle lock unavailable.",
+                                    source="serial206.x.interrupt_reconciliation_pending",
+                                )
+                            )
+                            if not self._z_reference_commit_verified(
+                                invalidated_x, expected_state="desynced"
+                            ):
+                                raise RuntimeError(
+                                    "durable X reference invalidation unverified"
+                                )
+                        except Exception as exc:
+                            result["reference_invalidation_error"] = (
+                                f"{type(exc).__name__}: {exc}"
+                            )[:300]
+                    pending = self._interrupt_reconciliation_lock_unavailable(
+                        reason="x_stop_lifecycle"
+                    )
+                    result.update(
+                        ok=result.get("ok") is True, recovery_hold=True,
+                        reconciliation_pending=True,
+                    )
+                    return {
+                        "ok": result.get("ok") is True,
+                        "axis": "x",
+                        "intent": selected,
+                        "state": None,
+                        "interrupt_epoch": interrupt_epoch,
+                        "source_call_completed": result.get("source_call_completed") is True,
+                        "source_return_ok": result.get("source_return_ok") is True,
+                        "controller_command_acknowledged": result.get("controller_command_acknowledged") is True,
+                        "controller_terminal_state_verified": False,
+                        "physical_effect_verified": False,
+                        "authority_receipt": None,
+                        "result": _json_safe(result),
+                        **pending,
+                    }
                 except Exception as persistence_exc:
                     return {
                         "ok": False,
@@ -6647,7 +6843,11 @@ class Serial206OemInitializationProvider:
                 expected_generation=int(values.get("expected_generation", self.generation_provider())),
             )
         if selected in {"stop", "abort"}:
-            return self.execute_x_stop_interrupt(values, abort=selected == "abort")
+            return self.execute_x_stop_interrupt(
+                values,
+                abort=selected == "abort",
+                defer_reconciliation=bool(values.get("defer_reconciliation")),
+            )
         with self._x_interrupt_state_lock:
             admitted_interrupt_epoch = self._x_interrupt_epoch
             if self._x_interrupt_active:
@@ -9406,7 +9606,10 @@ class Serial206OemInitializationProvider:
             expected_generation=expected_generation, idempotency_key=idempotency_key, abort=abort)
         # The sole yield is after all OEM physical calls and release of the
         # addressed delivery lease. Keep epoch/count custody until reconciliation.
-        next(steps)
+        try:
+            delivery_result = next(steps)
+        except StopIteration as completed:
+            return completed.value
 
         def reconcile():
             try:
@@ -9415,7 +9618,14 @@ class Serial206OemInitializationProvider:
                 return completed.value
             raise RuntimeError("unexpected Z Stop reconciliation boundary")
 
-        return reconcile if defer_reconciliation and not abort else reconcile()
+        if defer_reconciliation and not abort:
+            # Delivery facts travel with the continuation so a bounded or
+            # pending reconciliation still reports the Stop that was sent.
+            reconcile.delivery_result = (
+                dict(delivery_result) if isinstance(delivery_result, Mapping) else {}
+            )
+            return reconcile
+        return reconcile()
 
     def _z_stop_interrupt_steps(
         self,
@@ -9486,12 +9696,33 @@ class Serial206OemInitializationProvider:
                     "failure": f"z_{interrupt_intent}_result_not_mapping",
                 }
                 delivery_finished_at = time.time()
+                delivery_result = {
+                    "ok": result.get("ok") is True,
+                    "axis": "z",
+                    "intent": interrupt_intent,
+                    "interrupt_epoch": interrupt_epoch,
+                    "delivery_completed": True,
+                    "physical_effect_verified": False,
+                    **{
+                        key: result.get(key)
+                        for key in (
+                            "source_call_completed",
+                            "source_return_ok",
+                            "controller_command_acknowledged",
+                            "controller_terminal_state_verified",
+                            "first_stop_acknowledged",
+                            "second_stop_acknowledged",
+                            "double_stop_acknowledged",
+                            "failure",
+                        )
+                    },
+                }
                 # Serialize only the addressed OEM sequence. SQLite/lifecycle
                 # reconciliation must not fence the next explicit Stop delivery.
                 delivery_lease.close()
                 # Resume only persistence/reference reconciliation, never
                 # controller calls, outside the API's physical-delivery worker.
-                yield
+                yield delivery_result
                 if abort:
                     reconciliation = self._reconcile_aggregate_software_abort(
                         str(command_id), invalidate_x=True,

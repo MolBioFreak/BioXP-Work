@@ -213,9 +213,31 @@ _tester_lock = asyncio.Lock()
 # lane. Normal tester work deliberately does not, so a stop can still preempt
 # an in-flight diagnostic without racing release/rebind.
 _tester_transition_lock = asyncio.Lock()
+# RCA F2: every addressed stop surface gets its own delivery lane and its own
+# single-worker executor. Four separate stop actions exist precisely so that x,
+# y, z and the aggregate abort can be delivered independently; sharing one
+# lane/worker is what let a single stuck stop swallow every other press.
+_safety_interrupt_executors: dict[str, ThreadPoolExecutor] = {}
+_safety_interrupt_lanes: dict[str, asyncio.Lock] = {}
 _safety_interrupt_executor = ThreadPoolExecutor(
     max_workers=1,
     thread_name_prefix="bioxp-safety",
+)
+# How long a stop waits for the shared connection-ownership lease before it
+# refuses, with a durable record, instead of parking silently (RCA F2).
+_INTERRUPT_CONNECTION_LEASE_S = float(
+    os.environ.get("BIOXP_INTERRUPT_CONNECTION_LEASE_S") or 2.0
+)
+# Bounded same-surface admission window: another press for the same axis may
+# wait only this long for the in-flight delivery of that axis, then is refused
+# with a durable record (never queued behind reconciliation or another surface).
+_INTERRUPT_LANE_WAIT_S = float(
+    os.environ.get("BIOXP_INTERRUPT_LANE_WAIT_S") or 0.5
+)
+# Bounded reconciliation: a delivered stop must never wait unbounded for the
+# provider lifecycle lock it may be interrupting (RCA F3).
+_INTERRUPT_RECONCILIATION_DEADLINE_S = float(
+    os.environ.get("BIOXP_INTERRUPT_RECONCILIATION_DEADLINE_S") or 5.0
 )
 _camera_stream_lock = asyncio.Lock()
 _oem_startup_program: Optional[OEMStartupProgram] = None
@@ -1319,8 +1341,10 @@ def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = N
         return result
 
 
-def _execute_provider_x_intent(intent: str, inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def _execute_provider_x_intent(intent: str, inputs: Mapping[str, Any] | None = None, *,
+                               defer_reconciliation: bool = False):
     """Dispatch one typed X intent through the retained OEM provider."""
+
     context = current_operator_dispatch_context()
     if context is None:
         raise HTTPException(
@@ -1345,13 +1369,19 @@ def _execute_provider_x_intent(intent: str, inputs: Mapping[str, Any] | None = N
             "expected_generation": int(context["expected_ownership_generation"]),
         }
     )
+    if defer_reconciliation:
+        # RCA F3: the Stop's physical delivery and its lifecycle reconciliation
+        # are separable. The provider returns a continuation the caller runs
+        # under a bounded deadline, outside the delivery lease.
+        payload["defer_reconciliation"] = True
     result = execute(intent, payload)
+    if callable(result) and not isinstance(result, Mapping):
+        return result
     if not isinstance(result, dict):
         raise HTTPException(status_code=409, detail={"error": "serial206_x_provider_returned_non_object"})
     if result.get("ok") is not True:
         raise HTTPException(status_code=409, detail=result)
     return result
-
 
 def _execute_runtime_provider_z_intent(
     intent: str,
@@ -5798,53 +5828,334 @@ async def _run_blocking(label: str, func, timeout_s: float | None = 30.0, *, on_
         ) from exc
 
 
-async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30.0, *, delivery_only_lease: bool = False):
-    """Retain connection ownership through the complete physical sequence.
+def _interrupt_surface_slug(label: str) -> str:
+    """Stable per-surface lane key for one stop route."""
 
-    Only Z Stop can explicitly signal the delivery boundary; its remaining
-    provider work is lifecycle/SQLite reconciliation, with generation checks.
-    Other callers retain the full lease. Timeout/cancellation never cancel the
-    underlying worker or release ownership before delivery actually finishes.
+    slug = "".join(
+        character if character.isalnum() else "-" for character in str(label or "").lower()
+    )
+    slug = "-".join(part for part in slug.split("-") if part)
+    return slug or "interrupt"
+
+
+def _safety_interrupt_lane(surface: str) -> asyncio.Lock:
+    lane = _safety_interrupt_lanes.get(str(surface))
+    if lane is None:
+        lane = asyncio.Lock()
+        _safety_interrupt_lanes[str(surface)] = lane
+    return lane
+
+
+def _safety_interrupt_worker(surface: str) -> ThreadPoolExecutor:
+    executor = _safety_interrupt_executors.get(str(surface))
+    if executor is None:
+        executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"bioxp-safety-{str(surface)[:24]}",
+        )
+        _safety_interrupt_executors[str(surface)] = executor
+    return executor
+
+
+def _interrupt_journal():
+    plane = getattr(app.state, "operator_command_plane", None)
+    return getattr(plane, "interrupt_journal", None)
+
+
+def _interrupt_attempt_identity() -> tuple[str | None, str | None]:
+    """Attempt id/action for the stop currently dispatched through this route."""
+
+    try:
+        from bioxp.operator_controls import current_operator_dispatch_context
+
+        context = current_operator_dispatch_context() or {}
+    except Exception:
+        return None, None
+    return (
+        context.get("interrupt_attempt_id"),
+        context.get("action_id") or context.get("operator_interrupt_action_id"),
+    )
+
+
+def _journal_interrupt_phase(phase: str, *, surface: str, **fields) -> dict | None:
+    """Best-effort write-ahead record. Never raises into a stop delivery path."""
+
+    attempt_id, action_id = _interrupt_attempt_identity()
+    journal = _interrupt_journal()
+    if journal is None or not attempt_id:
+        return None
+    try:
+        return journal.record(
+            interrupt_attempt_id=str(attempt_id),
+            action_id=str(action_id or surface),
+            phase=str(phase),
+            surface=str(surface),
+            **fields,
+        )
+    except Exception:
+        return None
+
+
+def _interrupt_refusal(surface: str, *, error: str, message: str, status_code: int,
+                       record: bool = True, **fields):
+    """Build a recorded refusal: no silent parking, ever."""
+
+    attempt_id, action_id = _interrupt_attempt_identity()
+    journal = _interrupt_journal()
+    journal_path = None
+    if journal is not None:
+        journal_path = str(journal.path)
+        if record and attempt_id:
+            try:
+                journal.record_rejection(
+                    interrupt_attempt_id=str(attempt_id),
+                    action_id=str(action_id or surface),
+                    reason=str(error),
+                    surface=str(surface),
+                    **fields,
+                )
+            except Exception:
+                pass
+        try:
+            plane = getattr(app.state, "operator_command_plane", None)
+            store = getattr(plane, "store", None)
+            if record and attempt_id and store is not None and str(action_id or "") in {
+                "oem.x.stop", "oem.y.stop", "oem.z.stop", "oem.g.stop",
+                "oem.abort_all", "oem.z.abort",
+            }:
+                store.record_interrupt_rejection(
+                    interrupt_attempt_id=str(attempt_id),
+                    action_id=str(action_id),
+                    reason=str(error),
+                    payload={"surface": str(surface), **fields},
+                )
+        except Exception:
+            pass
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "error": str(error),
+            "message": str(message),
+            "surface": str(surface),
+            "interrupt_attempt_id": attempt_id,
+            "admitted": False,
+            "delivered": False,
+            "delivery_attempted": False,
+            "physical_motion_commanded": False,
+            "recorded": True,
+            "journal_path": journal_path,
+            "automatic_retry": False,
+            **fields,
+        },
+    )
+
+
+async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30.0, *,
+                                         delivery_only_lease: bool = False,
+                                         surface: str | None = None):
+    """Deliver one stop on its own lane; never queue behind what it is stopping.
+
+    Bounded admission (RCA F2): a press is either admitted on this surface's lane
+    within a small bounded window or refused now with a durable record. The
+    connection lease is held only for the physical delivery and is released the
+    moment the Stop is sent -- and released when the HTTP waiter ends, so the
+    next press can never queue behind this one. Lifecycle/SQLite reconciliation
+    runs afterwards as a bounded, separable step (RCA F3); if it cannot finish
+    it reports ``reconciliation_pending`` instead of blocking, and it still runs
+    when the caller has already gone away (a delivered Stop must be recorded).
     """
 
-    ownership_lease_released = False
+    surface_key = str(surface or _interrupt_surface_slug(label))
+    lane = _safety_interrupt_lane(surface_key)
+    loop = asyncio.get_running_loop()
+    interrupt_context = copy_context()
+    state = {
+        "lease_acquired": False, "lease_released": False,
+        "delivery_attempted": False, "delivery_finished": False,
+    }
+    admitted: asyncio.Future = loop.create_future()
 
-    async def leased_interrupt():
-        nonlocal ownership_lease_released
-        async with _tester_transition_lock:
+    def _admit(outcome: HTTPException | None) -> None:
+        if not admitted.done():
+            admitted.set_result(outcome)
+
+    async def leased_delivery_then_reconciliation():
+        if lane.locked():
+            # Bounded admission: wait only for the same surface's in-flight
+            # delivery (never reconciliation, another surface or the interrupted
+            # command), then refuse with a record instead of parking.
+            try:
+                await asyncio.wait_for(lane.acquire(), timeout=_INTERRUPT_LANE_WAIT_S)
+            except asyncio.TimeoutError:
+                _admit(_interrupt_refusal(
+                    surface_key,
+                    error="interrupt_lane_busy_same_surface",
+                    message=(
+                        f"{label} already has a delivery in flight; this press was refused "
+                        "after a bounded wait, never parked behind it."
+                    ),
+                    status_code=409,
+                    lane_wait_s=_INTERRUPT_LANE_WAIT_S,
+                ))
+                return None
+        else:
+            await lane.acquire()
+        lease_held = False
+        value: Any = None
+        try:
+            try:
+                await asyncio.wait_for(
+                    _tester_transition_lock.acquire(), timeout=_INTERRUPT_CONNECTION_LEASE_S
+                )
+                lease_held = True
+            except asyncio.TimeoutError:
+                _admit(_interrupt_refusal(
+                    surface_key,
+                    error="interrupt_connection_lease_unavailable",
+                    message=(
+                        f"{label} could not take the connection lease within "
+                        f"{_INTERRUPT_CONNECTION_LEASE_S:.1f}s; refused with record rather "
+                        "than waiting behind it."
+                    ),
+                    status_code=503,
+                    connection_lease_wait_s=_INTERRUPT_CONNECTION_LEASE_S,
+                ))
+                return None
+            state["lease_acquired"] = True
             tester = _get_tester()
-            loop = asyncio.get_running_loop()
-            interrupt_context = copy_context()
 
             def invoke_interrupt():
                 return interrupt_context.run(func, tester)
 
-            result = await loop.run_in_executor(_safety_interrupt_executor, invoke_interrupt)
-            if not delivery_only_lease:
-                return result
-        ownership_lease_released = True
-        # Only the Z Stop route opts in and returns its no-controller
-        # continuation. Free BOTH the ownership lease and single safety worker
-        # before waiting for ordinary lifecycle/SQLite recording.
-        reconciliation_context = interrupt_context.copy()
-        return await loop.run_in_executor(None, reconciliation_context.run, result)
+            _admit(None)
+            state["delivery_attempted"] = True
+            _journal_interrupt_phase(
+                "delivery_attempted", surface=surface_key, connection_lease_acquired=True
+            )
+            try:
+                value = await loop.run_in_executor(
+                    _safety_interrupt_worker(surface_key), invoke_interrupt
+                )
+            except asyncio.CancelledError:
+                _journal_interrupt_phase(
+                    "failed", surface=surface_key, reason="delivery_cancelled",
+                    delivery_outcome_unknown=True,
+                )
+                raise
+            except Exception as exc:
+                _journal_interrupt_phase(
+                    "failed", surface=surface_key, reason=f"{type(exc).__name__}: {exc}"[:300]
+                )
+                raise
+            _journal_interrupt_phase("delivered", surface=surface_key)
+        finally:
+            # Delivery boundary: free the connection lease and this surface's
+            # lane immediately so no other Stop is queued behind this one.
+            state["delivery_finished"] = True
+            if lease_held:
+                state["lease_released"] = True
+                _tester_transition_lock.release()
+            lane.release()
+        if not callable(value):
+            return value
+        pending = asyncio.wrap_future(
+            loop.run_in_executor(None, interrupt_context.copy().run, value)
+        )
+        _journal_interrupt_phase("reconciliation_pending", surface=surface_key)
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(pending), timeout=_INTERRUPT_RECONCILIATION_DEADLINE_S
+            )
+        except asyncio.TimeoutError:
+            pending.add_done_callback(
+                lambda done: None if done.cancelled() else done.exception()
+            )
+            _journal_interrupt_phase(
+                "reconciliation_pending", surface=surface_key,
+                reason="interrupt_reconciliation_deadline_exceeded",
+                reconciliation_deadline_s=_INTERRUPT_RECONCILIATION_DEADLINE_S,
+            )
+            delivery_result = getattr(value, "delivery_result", None)
+            return {
+                **(
+                    dict(delivery_result)
+                    if isinstance(delivery_result, Mapping)
+                    else {"ok": True, "axis_delivery_lease_released": True}
+                ),
+                "delivered": True,
+                "delivery_completed": True,
+                "reconciliation_pending": True,
+                "reconciliation_required": True,
+                "reconciliation_deadline_s": _INTERRUPT_RECONCILIATION_DEADLINE_S,
+                "completion_ambiguous": False,
+                "physical_effect_verified": False,
+                "error": "interrupt_reconciliation_pending",
+                "recorded": True,
+            }
 
-    worker = asyncio.create_task(leased_interrupt(), name=f"bioxp-interrupt:{label}")
+    worker = asyncio.create_task(
+        leased_delivery_then_reconciliation(), name=f"bioxp-interrupt:{surface_key}"
+    )
+
+    def _resolve_admission(task: asyncio.Task) -> None:
+        # Admission is always resolved by the worker; this is a safety net so a
+        # crash before admission can never leave a Stop press hanging.
+        if admitted.done():
+            return
+        if task.cancelled():
+            admitted.set_result(None)
+            return
+        error = task.exception()
+        if error is None:
+            admitted.set_result(None)
+        else:
+            admitted.set_exception(error)
+
+    worker.add_done_callback(_resolve_admission)
+    try:
+        admission = await admitted
+    except asyncio.CancelledError:
+        # The delivery worker is shielded on purpose: a cancelled HTTP waiter
+        # must not cancel a Stop that is already being delivered.
+        worker.add_done_callback(
+            lambda task: task.exception() if not task.cancelled() else None
+        )
+        raise
+    if isinstance(admission, HTTPException):
+        raise admission
     try:
         return await asyncio.wait_for(asyncio.shield(worker), timeout=timeout_s)
     except asyncio.CancelledError:
-        worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+        worker.add_done_callback(
+            lambda task: task.exception() if not task.cancelled() else None
+        )
         raise
     except asyncio.TimeoutError as exc:
-        # Retrieve a later exception without cancelling delivery or recording.
-        worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+        # The delivery worker keeps running: it still completes the physical
+        # Stop and its durable reconciliation. Only the waiter gave up.
+        worker.add_done_callback(
+            lambda task: task.exception() if not task.cancelled() else None
+        )
+        _journal_interrupt_phase(
+            "failed", surface=surface_key,
+            reason="interrupt_delivery_deadline_exceeded",
+            delivery_deadline_s=float(timeout_s),
+            delivery_outcome_unknown=not state["delivery_finished"],
+        )
         raise HTTPException(
             status_code=504,
             detail={
                 "error": "safety_interrupt_completion_ambiguous",
-                "message": f"{label} exceeded its {timeout_s:.0f}s response bound",
+                "message": f"{label} exceeded its {timeout_s:.0f}s delivery bound",
+                "surface": surface_key,
                 "completion_ambiguous": True,
-                "connection_transition_blocked_until_worker_exit": not ownership_lease_released,
+                "outcome_unknown": True,
+                "reconciliation_required": True,
+                "retry_forbidden": True,
+                "delivery_worker_still_running": not worker.done(),
+                "physical_delivery_started": bool(state["delivery_attempted"]),
+                "connection_transition_blocked_until_worker_exit": False,
+                "recorded": True,
             },
         ) from exc
 
@@ -7798,12 +8109,19 @@ async def motion_diagnostics_execute(req: AxisDiagnosticExecuteRequest):
 @app.post("/motion/diagnostics/stop")
 async def motion_diagnostics_stop(req: AxisDiagnosticStopRequest):
     if req.axis == "y":
+        # RCA F6: a stop-class refusal must be recorded, not answered with
+        # silence. The write-ahead journal keeps the press falsifiable.
+        _journal_interrupt_phase(
+            "rejected", surface="diagnostics-y", reason="direct_y_diagnostic_stop_retired",
+            physical_motion_commanded=False,
+        )
         raise HTTPException(
             status_code=410,
             detail={
                 "error": "direct_y_diagnostic_stop_retired",
                 "replacement_action_id": None,
                 "physical_motion_commanded": False,
+                "recorded": True,
             },
         )
     try:
@@ -7862,6 +8180,7 @@ async def motion_diagnostics_stop(req: AxisDiagnosticStopRequest):
         f"OEM {req.axis} diagnostic stop",
         stop_and_verify,
         timeout_s=25.0,
+        surface=f"diagnostics-{req.axis}",
     )
 
 
@@ -8249,6 +8568,7 @@ async def motion_oem_y_stop():
         "serial-206 Y stop",
         lambda tester: _execute_serial206_y_call("stop"),
         timeout_s=10.0,
+        surface="y",
     )
 
 
@@ -8413,8 +8733,11 @@ async def motion_oem_x_internal_enable_xyz(req: OemXCurrentModeRequest):
 async def motion_oem_x_stop():
     return await _run_safety_interrupt_blocking(
         "serial-206 X double-stop",
-        lambda _tester: _execute_provider_x_intent("stop", {"timeout_s": 3.0}),
+        lambda _tester: _execute_provider_x_intent(
+            "stop", {"timeout_s": 3.0}, defer_reconciliation=True
+        ),
         timeout_s=10.0,
+        surface="x",
     )
 
 
@@ -8427,6 +8750,7 @@ async def motion_oem_x_abort():
             "abort", {"timeout_s": 3.0, "physical_scope": "none_software_flags_and_waiters"}
         ),
         timeout_s=10.0,
+        surface="abort",
     )
     return {
         **result,
@@ -8514,6 +8838,7 @@ async def motion_oem_z_stop():
         lambda _tester: _execute_provider_z_intent("stop", {"timeout_s": 3.0}, defer_reconciliation=True),
         timeout_s=10.0,
         delivery_only_lease=True,
+        surface="z",
     )
 
 
