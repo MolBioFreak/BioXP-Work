@@ -6718,6 +6718,14 @@ class OperatorCommandStore:
             return row is not None
 
     def claim_next(self) -> dict[str, Any] | None:
+        # This indexed read is only a hint. An actual claim still revalidates
+        # ownership, recovery and queue state in the existing write transaction.
+        # Empty queues must not repeatedly scan immutable command history.
+        with self._lock:
+            if self.connection.execute(
+                "SELECT 1 FROM operator_plane_commands WHERE status='queued' LIMIT 1"
+            ).fetchone() is None:
+                return None
         with self._transaction() as conn:
             safety = conn.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone()
             lane = conn.execute("SELECT * FROM operator_plane_lane WHERE singleton=1").fetchone()
@@ -7765,14 +7773,13 @@ class OperatorCommandStore:
 
     def _dispatch_loop(self, dispatch_one: Callable[[dict[str, Any]], None]) -> None:
         next_renewal = 0.0
-        next_reconciliation = 0.0
         while not self._stop.is_set():
-            # Deliveries wake this loop immediately. Retained/external work is
-            # still checked each second, without twenty idle SQLite reopens.
-            if self._wake.is_set() or time.monotonic() >= next_reconciliation:
-                self.reconcile_pending_interrupts()
-                next_reconciliation = time.monotonic() + 1.0
-            if _now() >= next_renewal:
+            # Consume BEFORE examining durable/memory predicates. A notification
+            # during this pass stays set for wait(); one before clear is covered
+            # by this pass. Never clear after wait (that can lose a new wake).
+            self._wake.clear()
+            self.reconcile_pending_interrupts()
+            if time.monotonic() >= next_renewal:
                 try:
                     if not self._renew_owner():
                         self._priority_fence.set()
@@ -7782,7 +7789,7 @@ class OperatorCommandStore:
                     self._priority_fence.set()
                     self._stop.set()
                     break
-                next_renewal = _now() + 1.0
+                next_renewal = time.monotonic() + 1.0
 
             self._settle_workflow_child_waiters()
             self._notify_workflow_interrupt()
@@ -7820,11 +7827,10 @@ class OperatorCommandStore:
                     except Exception:
                         pass
             if not spawned:
-                if self._wake.wait(timeout=0.05):
-                    # Preserve the wake through clear(): delivered interrupts
-                    # must not wait for the idle reconciliation interval.
-                    next_reconciliation = 0.0
-                self._wake.clear()
+                # Explicit admission/finish/control/interrupt notifications wake
+                # immediately. The one-second fallback discovers external writes
+                # and renews the five-second owner lease; it is not motion pacing.
+                self._wake.wait(timeout=max(0.0, min(1.0, next_renewal - time.monotonic())))
 
     def _dispatch_worker(self, dispatch_one: Callable[[dict[str, Any]], None], claimed: dict[str, Any]) -> None:
         try:
@@ -7870,6 +7876,8 @@ class OperatorCommandStore:
                 worker = threading.current_thread()
                 self._workers.discard(worker)
                 self._worker_commands.pop(worker, None)
+            # Revisit queued work and workflow waiters when capacity is released.
+            self._wake.set()
 
 
 class OperatorCommandPlane:
