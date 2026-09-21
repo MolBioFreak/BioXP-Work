@@ -11140,6 +11140,7 @@ def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
         ProtocolActionKind.MOVE_COVER: _protocol_live_plate_move_handler,
         ProtocolActionKind.PLATE_PREPARE: _protocol_live_plate_prepare_handler,
         ProtocolActionKind.THERMAL_DOOR: _protocol_live_thermal_door_handler,
+        ProtocolActionKind.INSPECT: _protocol_live_inspect_cover_handler,
         ProtocolActionKind.PIPETTE_INIT: _protocol_live_pipette_handler,
         ProtocolActionKind.PIPETTE_TIP: _protocol_live_pipette_handler,
         ProtocolActionKind.TIP_EJECT: _protocol_live_pipette_handler,
@@ -11258,6 +11259,124 @@ def _protocol_snapshot_image(*, condition, artifact_id):
     runtime = PreparationCameraRuntime(_camera_provider,
         artifact_root=get_protocol_jobs_root() / binding["parent_command_id"] / "source-images")
     return runtime.snapshot_image(condition=condition, artifact_id=artifact_id)
+
+
+def _deck_inspection_settings() -> dict:
+    """Machine-bundle deck-inspection policy, camera profiles, template bytes.
+
+    Reads the validated snapshot exactly the way the preparation lane does;
+    template bytes come from the captured vision inputs, never a filesystem
+    guess. Defensive copies keep callers from mutating the snapshot records.
+    """
+    from .oem_job_preparation import capture_preparation_settings
+    from .oem_machine_bundle import get_active_oem_machine_snapshot
+    snapshot = get_active_oem_machine_snapshot()
+    settings = dict(capture_preparation_settings(snapshot)["settings"])
+    templates: dict = {}
+    for name in ("cover.jpg", "output.jpg", "outputw_foil.jpg", "output_empty.jpg",
+                 "reagentTray.jpg", "reagentEmpty.jpg", "EmptyStorage.jpg"):
+        record = snapshot.records.get(f"appdata/{name}")
+        raw = getattr(record, "raw_bytes", None) if record is not None else None
+        if isinstance(raw, (bytes, bytearray)):
+            templates[name] = bytes(raw)
+    settings["VisionTemplates"] = templates
+    return settings
+
+
+def _deck_cover_inspection_capture(*, condition: str, artifact_id: str) -> dict:
+    """One fresh source-typed inspection frame (CGrabThread single-frame port)."""
+    from .camera_provider import OemInspectionCameraSettings
+    result = _camera_provider.capture_inspection(OemInspectionCameraSettings(gain=1000, exposure=1000))
+    frame = result.frame
+    return {
+        "frame": bytes(frame.content),
+        "capture_evidence": {
+            "frame_sha256": frame.content_sha256,
+            "provider_generation": frame.provider_generation,
+            "sequence": frame.sequence,
+            "captured_at": frame.captured_at.isoformat(),
+            "source_frames_discarded": result.source_frames_discarded,
+            "condition": condition,
+            "artifact_id": str(artifact_id),
+        },
+    }
+
+
+def _deck_cover_inspection_save(*, frame, condition: str, artifact_id: str) -> dict:
+    """Save the exact decision frame under the source condition label."""
+    import hashlib as _hashlib
+    from .services.protocol_service import get_protocol_jobs_root
+    content = bytes(frame)
+    digest = _hashlib.sha256(content).hexdigest()
+    root = get_protocol_jobs_root() / "deck-cover-inspection"
+    path = root / (_hashlib.sha256(str(artifact_id).encode()).hexdigest() + ".jpg")
+    artifact = {"ok": True, "capture_ok": True, "condition": condition,
+                "artifact_id": str(artifact_id), "path": str(path),
+                "sha256": digest, "size_bytes": len(content)}
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        with path.open("xb") as output:
+            output.write(content)
+        with path.with_suffix(".json").open("x") as output:
+            json.dump(artifact, output, sort_keys=True, allow_nan=False)
+        artifact["artifact_saved"] = True
+    except (OSError, TypeError, ValueError) as exc:
+        artifact.update(ok=False, artifact_saved=False,
+                        error="source_image_logging_failed:" + str(exc))
+    return artifact
+
+
+def _bind_deck_cover_inspection(provider) -> None:
+    """Compose the cover-inspection callbacks onto the serial-206 provider."""
+    provider.bind_oem_cover_inspection_callbacks(
+        settings=_deck_inspection_settings,
+        capture=_deck_cover_inspection_capture,
+        save=_deck_cover_inspection_save,
+        led=lambda *, channel, on: _camera_provider.set_illumination(channel=channel, on=on),
+        rgb=lambda r, g, b: _get_tester().strip_set_rgb(r, g, b, reconnect_first=False, activate_first=False),
+    )
+
+
+def _protocol_live_inspect_cover_handler(action, state):
+    """OEM inspectCover as the canonical finite deck operation.
+
+    Admits `cover_inspection` (source port of ControlLib.inspectCover:3663-3768)
+    into the same canonical deck queue as move_plate, waits for its terminal,
+    then evaluates the assembled receipt against the build-time acceptance
+    contract. Movement and state writes happen only inside that admitted run.
+    """
+    from .oem_vision_acceptance import assemble_inspect_cover_receipt, evaluate_inspect_cover_receipt
+    provider = _serial206_oem_initialization_provider
+    if provider is None:
+        raise HTTPException(status_code=503, detail={"error": "serial206_provider_unavailable"})
+    _bind_deck_cover_inspection(provider)
+    settings = _deck_inspection_settings()
+    inputs = {
+        "deck_inspection": bool(settings["DeckInspection"]),
+        "screen_resolution_high": bool(settings["ScreenResolutionHigh"]),
+        "inspection_log_only": bool(settings["InspectionLogOnly"]),
+    }
+    admitter = getattr(app.state, "oem_wp8_operation_admitter", None)
+    if not callable(admitter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    job_id = str(getattr(state, "job_id", None) or getattr(state, "protocol_id", None) or "")
+    admitted = admitter(
+        "cover_inspection", inputs=inputs,
+        idempotency_key=f"protocol:{job_id}:{action.action_id}",
+    )
+    command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
+    if not isinstance(command_id, str) or not command_id:
+        raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
+    row = _wait_protocol_deck_command(command_id, timeout_s=900.0)
+    evidence = _protocol_command_store().wp8_operation_evidence(command_id)
+    receipt = assemble_inspect_cover_receipt(evidence, settings=inputs)
+    evaluation = evaluate_inspect_cover_receipt(receipt)
+    return {
+        "ok": bool(evaluation.get("receipt_validation_pass")),
+        "command_id": command_id,
+        "receipt": receipt,
+        "evaluation": evaluation,
+    }
 
 
 def _protocol_bindings(bundle, *, source_executor=None):

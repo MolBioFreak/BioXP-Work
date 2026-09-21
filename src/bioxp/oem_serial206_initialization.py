@@ -4462,6 +4462,8 @@ class Serial206OemInitializationProvider:
         "startMoveZPseudoHome": "wp8_start_move_z_pseudo_home",
         "updateLocation": "wp8_update_location",
         "updatePlateLocation": "wp8_update_plate_location",
+        "inspectCoverAt": "wp8_inspect_cover_at",
+        "coverInspectionRelocate": "wp8_cover_inspection_relocate",
         "updateThermalDoorOpen": "wp8_update_thermal_door_open",
         "waitMoveZOnly": "wp8_wait_move_z_only",
         "waitStop": "wp8_wait_stop",
@@ -13210,6 +13212,369 @@ class Serial206OemInitializationProvider:
             plan_digest=plan_digest,
             updates={"thermal_door_open": value},
         )
+
+    # ------------------------------------------------------------------
+    # OEM cover inspection (ControlLib.inspectCover:3663-3768)
+    # ------------------------------------------------------------------
+
+    def bind_oem_cover_inspection_callbacks(
+        self, *, settings: Callable[[], Mapping[str, Any]],
+        capture: Callable[..., Mapping[str, Any]],
+        save: Callable[..., Mapping[str, Any]],
+        led: Callable[..., Any], rgb: Callable[..., Any],
+    ) -> None:
+        """Bind the validated machine-bundle settings and shared camera owners.
+
+        The composition layer supplies these; this module never discovers a
+        camera, never re-reads settings XML and never fabricates a frame.
+        """
+        callbacks: dict[str, Any] = {
+            "settings": settings, "capture": capture, "save": save, "led": led, "rgb": rgb,
+        }
+        for name, callback in callbacks.items():
+            if not callable(callback):
+                raise TypeError(f"OEM cover inspection {name} callback must be callable")
+        self._oem_cover_inspection_callbacks = callbacks
+
+    def _cover_inspection_callbacks(self) -> Mapping[str, Any]:
+        callbacks = getattr(self, "_oem_cover_inspection_callbacks", None)
+        if not isinstance(callbacks, Mapping):
+            raise RuntimeError("source_authority_missing:cover_inspection_camera")
+        return callbacks
+
+    def _cover_inspection_settings(self) -> Mapping[str, Any]:
+        settings = self._cover_inspection_callbacks()["settings"]()
+        if not isinstance(settings, Mapping):
+            raise RuntimeError("source_authority_invalid:cover_inspection_settings")
+        return settings
+
+    def _cover_inspection_profile(self, item_name: str) -> Mapping[str, Any]:
+        """ControlLib.AdjustCamera:1883-1920 for one InspectionItems profile.
+
+        Exposure=1000 is the unchanged sentinel and the only qualified value for
+        this port; any other value refuses instead of inventing a conversion.
+        Every camera LED channel is written on/off exactly as the source does,
+        before the capture.
+        """
+        settings = self._cover_inspection_settings()
+        profiles = dict(settings.get("InspectionSettings") or {})
+        profile = profiles.get(item_name)
+        if not isinstance(profile, Mapping):
+            raise RuntimeError(f"source_authority_missing:cover_inspection_profile:{item_name}")
+        exposure = profile.get("Exposure")
+        if exposure != 1000:
+            raise RuntimeError(
+                f"source_authority_missing:cover_inspection_exposure:{item_name}:{exposure}"
+            )
+        callbacks = self._cover_inspection_callbacks()
+        for channel in (1, 2, 3):
+            callbacks["led"](channel=channel, on=bool(profile.get(f"LED{channel}")))
+        return profile
+
+    def _cover_inspection_all_leds_off(self) -> None:
+        """ControlLib.AllLEDOff:1922-1927 (all three camera LED channels)."""
+        callbacks = self._cover_inspection_callbacks()
+        for channel in (1, 2, 3):
+            callbacks["led"](channel=channel, on=False)
+
+    def _cover_inspection_template(self, name: str) -> bytes:
+        settings = self._cover_inspection_settings()
+        templates = settings.get("VisionTemplates")
+        if isinstance(templates, Mapping):
+            value = templates.get(name)
+            if isinstance(value, (bytes, bytearray)):
+                return bytes(value)
+        raise RuntimeError(f"source_authority_missing:cover_inspection_template:{name}")
+
+    def _cover_inspection_move(self, location: int, offset_x: int, offset_y: int) -> dict[str, Any]:
+        """ClassControlInterface.moveTo(loc, offX, offY):3791-3713 row + offsets.
+
+        Uses the ported position-table helper (offset math, high-limit clamp,
+        dynamic pseudo-home target) and the same source XY primitive as every
+        other deck operation.
+        """
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        table = load_bound_oem_position_table()
+        row = table.resolve(location_id=LOCATION_ID_TO_NAME[location])
+        axis_x = self.primitives._axis_profile("x")
+        axis_y = self.primitives._axis_profile("y")
+        x_limit = axis_x.get("axis_max_steps")
+        y_limit = axis_y.get("axis_max_steps")
+        target = row.oem_offset_move_coordinates(
+            offset_x=int(offset_x), offset_y=int(offset_y),
+            x_high_limit=int(x_limit) if type(x_limit) is int else None,
+            y_high_limit=int(y_limit) if type(y_limit) is int else None,
+        )
+        state = self.mov_execution_machine_state()
+        pseudo = int(state["pseudo_z_home"])
+        z_result = self.primitives.oem_move_z(
+            int(pseudo), pseudo_home_steps=pseudo, motor_current=31, wait_for_stop=True,
+        )
+        move = self.primitives.oem_move_xy(
+            int(target["x"]), int(target["y"]),
+            wait_timeout_s=60.0, source_context="ControlLib.inspectCover",
+        )
+        if not isinstance(move, Mapping) or move.get("ok") is not True:
+            raise RuntimeError("cover_inspection_move_failed")
+        return {"target": dict(target), "z": _json_safe(z_result), "move": _json_safe(move)}
+
+    def _cover_inspection_move_z(self, target: int) -> dict[str, Any]:
+        state = self.mov_execution_machine_state()
+        pseudo = int(state["pseudo_z_home"])
+        result = self.primitives.oem_move_z(
+            int(target), pseudo_home_steps=pseudo, motor_current=31, wait_for_stop=True,
+        )
+        if not isinstance(result, Mapping) or result.get("ok") is not True:
+            raise RuntimeError("cover_inspection_z_move_failed")
+        return _json_safe(result)
+
+    def _cover_inspection_capture(self, *, condition: str, artifact_id: str) -> dict[str, Any]:
+        result = self._cover_inspection_callbacks()["capture"](
+            condition=condition, artifact_id=artifact_id,
+        )
+        if not isinstance(result, Mapping) or not isinstance(result.get("frame"), (bytes, bytearray)):
+            raise RuntimeError("source_authority_invalid:cover_inspection_capture")
+        return dict(result)
+
+    def _cover_inspection_location_publish(
+        self, location: int, *, command_id: str, child_order: int, plan_digest: str,
+    ) -> None:
+        # m_machineStatus.updateLocation(location, 0) inside every source check
+        # (3789/3834/3878/3921). Kept as the same canonical publication.
+        self.wp8_update_location(
+            "updateLocation", {"destination": location, "well": 0},
+            command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+        )
+
+    def wp8_inspect_cover_at(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        """One source cover check, one method per source branch.
+
+        Low resolution: ControlLib.checkChillerCover:3891-3942 for all four
+        spots. High resolution: InspectOutputLocation:3778-3823 (17),
+        checkRCCover:3825-3848 (19), checkCoverStorage:3850-3888 (18/20).
+        """
+        del operation
+        from .vision.oem_inspection import (
+            locate_cover, match_pattern, output_location_from_scores, reagent_cover_from_scores,
+        )
+
+        location = arguments.get("destination")
+        if type(location) is not int or location not in {17, 18, 19, 20}:
+            raise ValueError("cover_inspection_location_invalid")
+        screen_high = arguments.get("screen_resolution_high")
+        if type(screen_high) is not bool:
+            raise ValueError("cover_inspection_screen_resolution_invalid")
+        settings = self._cover_inspection_settings()
+        camera_x = int(settings["CameraXOffset"])
+        camera_y = int(settings["CameraYOffset"])
+        camera_z = int(settings["CameraZOffset"])
+        identity = self._wp8_identity(command_id, child_order, plan_digest)
+        details: dict[str, Any] = {}
+        snapshot_condition: str | None = None
+        frame: bytes
+
+        if not screen_high:
+            # checkChillerCover: setLEDColor(255,255,255) then item 6 profile.
+            self._cover_inspection_callbacks()["rgb"](255, 255, 255)
+            self._cover_inspection_profile("CoverInspection")
+            offset_x, offset_y = {17: (20021, 0), 19: (5923, 0), 20: (5923, 0), 18: (20021, 0)}[location]
+            details["move"] = self._cover_inspection_move(location, offset_x, offset_y)
+            self._cover_inspection_location_publish(
+                location, command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+            )
+            time.sleep(0.4)
+            time.sleep(0.5)
+            capture = self._cover_inspection_capture(
+                condition=f"check_chiller_cover_{location}", artifact_id=f"{identity}:check:{location}",
+            )
+            frame = bytes(capture["frame"])
+            details["capture_evidence"] = _json_safe(capture.get("capture_evidence"))
+            detected = bool(locate_cover(frame))
+            method = "checkChillerCover"
+            details["locate_cover"] = detected
+            if location == 19 and detected:
+                # 3926-3938 re-reads the reagent barcode and flips a positive
+                # finding when a real label answers. The shared deck context has
+                # no bound reagent barcode reader; the skip is recorded, never
+                # fabricated.
+                details["barcode_flip_applied"] = False
+                details["barcode_read_skipped"] = "no_bound_reagent_barcode_reader"
+            from .oem_compat.pathing import LOCATION_ID_TO_NAME
+            snapshot_condition = (
+                "check_chiller_cover_" + LOCATION_ID_TO_NAME[location] + ("found" if detected else "missing")
+            )
+        elif location == 17:
+            self._cover_inspection_profile("CoverInspection")
+            details["move"] = self._cover_inspection_move(1, 3435 + camera_x, -2772 + camera_y)
+            self._cover_inspection_location_publish(
+                17, command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+            )
+            time.sleep(0.7)
+            first = self._cover_inspection_capture(
+                condition="inspect_output_location_cover", artifact_id=f"{identity}:cover:{location}",
+            )
+            cover_score = match_pattern(bytes(first["frame"]), self._cover_inspection_template("cover.jpg"), 5).maximum
+            self._cover_inspection_profile("OutputPlateInspection")
+            details["z_move"] = self._cover_inspection_move_z(15000 + camera_z)
+            second = self._cover_inspection_capture(
+                condition="inspect_output_location_output", artifact_id=f"{identity}:output:{location}",
+            )
+            frame = bytes(second["frame"])
+            output = match_pattern(frame, self._cover_inspection_template("output.jpg"), 5).maximum
+            foil = match_pattern(frame, self._cover_inspection_template("outputw_foil.jpg"), 5).maximum
+            empty = match_pattern(frame, self._cover_inspection_template("output_empty.jpg"), 5).maximum
+            selected = output_location_from_scores(cover_score, output, foil, empty)
+            detected = selected == 1
+            method = "InspectOutputLocation(1)"
+            details.update(selected=selected, scores={
+                "cover": cover_score, "output": output, "foil": foil, "empty": empty,
+            })
+            if selected != 1:
+                # 3811-3813 (expectedResult=1): missing-cover snapshot.
+                from .oem_compat.pathing import LOCATION_ID_TO_NAME
+                snapshot_condition = "check_chiller_cover_" + LOCATION_ID_TO_NAME[17] + " missing"
+        elif location == 19:
+            self._cover_inspection_profile("CoverInspection")
+            details["z_move"] = self._cover_inspection_move_z(40000 + camera_z)
+            details["move"] = self._cover_inspection_move(3, 3980 + camera_x, -2606 + camera_y)
+            self._cover_inspection_location_publish(
+                19, command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+            )
+            time.sleep(0.7)
+            capture = self._cover_inspection_capture(
+                condition="check_rc_cover", artifact_id=f"{identity}:check:{location}",
+            )
+            frame = bytes(capture["frame"])
+            cover = match_pattern(frame, self._cover_inspection_template("cover.jpg"), 5).maximum
+            reagent = match_pattern(frame, self._cover_inspection_template("reagentTray.jpg"), 5).maximum
+            empty = match_pattern(frame, self._cover_inspection_template("reagentEmpty.jpg"), 5).maximum
+            detected = reagent_cover_from_scores(cover, reagent, empty)
+            method = "checkRCCover"
+            details.update(scores={"cover": cover, "reagent": reagent, "empty": empty})
+            if not detected:
+                # 3843-3844: reagent cover missing snapshot.
+                from .oem_compat.pathing import LOCATION_ID_TO_NAME
+                snapshot_condition = "Reagent_Chiller_Cover" + LOCATION_ID_TO_NAME[1] + " missing"
+        else:
+            self._cover_inspection_profile("CoverStorageInspection")
+            details["move"] = self._cover_inspection_move(location, 1990, 3198)
+            details["z_move"] = self._cover_inspection_move_z(40000 + camera_z)
+            self._cover_inspection_location_publish(
+                location, command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+            )
+            time.sleep(0.7)
+            capture = self._cover_inspection_capture(
+                condition=f"check_cover_storage_{location}", artifact_id=f"{identity}:check:{location}",
+            )
+            frame = bytes(capture["frame"])
+            empty_template = match_pattern(frame, self._cover_inspection_template("EmptyStorage.jpg"), 5).maximum
+            detected = not (empty_template > 0.7)
+            method = "checkCoverStorage"
+            details["empty_storage_score"] = empty_template
+            # 3881: the source repeats the offset move before its evidence step.
+            details["recheck_move"] = self._cover_inspection_move(location, 1990, 3198)
+            if not detected:
+                # 3884-3885: source false-positive-path snapshot.
+                from .oem_compat.pathing import LOCATION_ID_TO_NAME
+                snapshot_condition = "check_chiller_cover_" + LOCATION_ID_TO_NAME[location] + "missing"
+
+        if snapshot_condition:
+            # SnapshotImage evidence is saved from the exact frame the source
+            # decision consumed (capture-once; the OEM's internal re-grab at the
+            # same pose is not repeated).
+            self._cover_inspection_callbacks()["save"](
+                frame=frame, condition=snapshot_condition, artifact_id=f"{identity}:snapshot:{location}",
+            )
+        self._cover_inspection_all_leds_off()
+        findings = getattr(self, "_oem_cover_inspection_findings", None)
+        if not isinstance(findings, dict):
+            findings = {}
+            self._oem_cover_inspection_findings = findings
+        findings.setdefault(str(command_id), {})[location] = detected
+        return {
+            "ok": True, "delivery_attempted": True,
+            "cover_detected": detected, "location": location, "method": method,
+            "details": _json_safe(details),
+            "frame_sha256": hashlib.sha256(frame).hexdigest(),
+            "snapshot_condition": snapshot_condition,
+            "source_anchor": "ControlLib.checkChillerCover:3891-3942",
+        }
+
+    def wp8_cover_inspection_relocate(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        """ControlLib.inspectCover:3727-3766 num==2 branch as one decision child.
+
+        Reads this command's four check findings, plans the exact index-paired
+        relocations (plan_cover_relocations mirrors the acceptance evaluator),
+        executes every catch/release through the canonical nested compiles, then
+        the terminal storage writes and the doorOpen(true) terminal. Failed or
+        unpaired topologies move nothing and claim nothing.
+        """
+        del operation
+        from .oem_deck_movement import compile_cover_inspection_finalize
+        from .oem_vision_acceptance import plan_cover_relocations
+
+        log_only = arguments.get("inspection_log_only")
+        if type(log_only) is not bool:
+            raise ValueError("cover_inspection_relocate_log_only_invalid")
+        findings = getattr(self, "_oem_cover_inspection_findings", None)
+        detected = dict((findings or {}).get(str(command_id)) or {})
+        if set(detected) != {17, 19, 20, 18}:
+            raise RuntimeError("source_authority_missing:cover_inspection_findings")
+        plan = plan_cover_relocations(detected)
+        receipts: list[dict[str, Any]] = []
+        final_cover_locations: dict[str, int] | None = None
+        door_open_verified = False
+        if plan["cover_count"] == 2 and plan["error_status"] is None:
+            for relocation in plan["relocations"]:
+                plate = 4 if relocation["from"] == 17 else 5
+                catch = self._wp8_compile_and_execute(
+                    operation="catch_plate",
+                    inputs={"plate": plate, "run_in_parallel": True},
+                    command_id=command_id, owner_identity=owner_identity,
+                )
+                release = self._wp8_compile_and_execute(
+                    operation="release_plate",
+                    inputs={"destination": relocation["to"], "press_plate": False, "run_in_parallel": True},
+                    command_id=command_id, owner_identity=owner_identity,
+                )
+                receipts.append({
+                    "relocation": dict(relocation),
+                    "catch": _json_safe(catch), "release": _json_safe(release),
+                })
+            finalize = self._wp8_execute_nested_plan(
+                plan=compile_cover_inspection_finalize(),
+                command_id=command_id, owner_identity=owner_identity,
+            )
+            receipts.append({"finalize": _json_safe(finalize)})
+            door = self._wp8_compile_and_execute(
+                operation="thermal_door", inputs={"open": True},
+                command_id=command_id, owner_identity=owner_identity,
+            )
+            receipts.append({"door_open": _json_safe(door)})
+            sensors = self.wp8_read_door_sensors("readDoorSensors", {})
+            door_open_verified = isinstance(sensors, Mapping) and sensors.get("door_open") is True
+            if not door_open_verified:
+                raise RuntimeError("cover_inspection_door_open_unverified")
+            final_cover_locations = {"output": 18, "reagent": 20}
+        if isinstance(findings, dict):
+            findings.pop(str(command_id), None)
+        return {
+            "ok": True, "delivery_attempted": True,
+            "cover_count": plan["cover_count"], "error_status": plan["error_status"],
+            "detected": plan["detected"], "relocations": plan["relocations"],
+            "relocation_receipts": receipts,
+            "final_cover_locations": final_cover_locations,
+            "door_open_verified": door_open_verified,
+            "inspection_log_only": log_only,
+            "source_anchor": "ControlLib.inspectCover:3727-3766",
+        }
 
     def wp8_clear_tip_loaded(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,

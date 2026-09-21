@@ -1124,6 +1124,7 @@ FINITE_PLATE_OPERATIONS = frozenset({
     "catch_plate", "release_plate", "park_gantry", "waste_sequence",
     "press_plate", "press_plates", "send_z_and_gripper_home", "thermal_door", "cleanup",
     "move_plate", "script_snapshot", "cut_seal", "shakeoff", "ordinary_pause_prepare", "critical_item_images",
+    "cover_inspection",
 })
 
 WP8_OPERATION_INTENT_KEYS: Mapping[str, frozenset[str]] = {
@@ -1159,6 +1160,7 @@ WP8_COMPILED_CHILD_OPERATIONS = frozenset({
     "startGripperHomeAndUnlock", "startMoveZPseudoHome", "updateLocation", "updatePlateLocation", "updateThermalDoorOpen",
     "waitMoveZOnly", "waitStop", "waitZ",
     "sourceMoveTo", "sourceImageGantryLoad", "sourceMoveX", "sourceMoveZ", "sourceSetZAcc", "sourceRestoreZAcc", "sourceLowerPipette",
+    "inspectCoverAt", "coverInspectionRelocate",
 })
 
 
@@ -1166,6 +1168,11 @@ FINITE_PLATE_OPERATIONS |= frozenset(OEM_PIPETTE_LEAVES) | {"pipette_shift_camer
 WP8_OPERATION_INTENT_KEYS.update({name: frozenset(keys) for name, (_, keys) in OEM_PIPETTE_LEAVES.items()})
 WP8_OPERATION_INTENT_KEYS.update({name: frozenset() for name in ("pipette_shift_camera", "pipette_script_waste", "pipette_unlock")})
 WP8_COMPILED_CHILD_OPERATIONS |= frozenset(leaf for leaf, _ in OEM_PIPETTE_LEAVES.values()) | {"sourceRelativeX", "sourceRelativeY"}
+# ControlLib.inspectCover:3663-3768 branch inputs: the captured deck-inspection
+# policy plus no caller coordinates; every location/method is compile-owned.
+WP8_OPERATION_INTENT_KEYS["cover_inspection"] = frozenset(
+    {"deck_inspection", "screen_resolution_high", "inspection_log_only"}
+)
 
 
 def _compile_finite_plate_operation_unchecked(
@@ -1198,6 +1205,48 @@ def _compile_finite_plate_operation_unchecked(
         _wp8_child(children, "doorOpen", arguments={"open": True})
         _wp8_child(children, "sourceUnlatch")
         return _wp8_plan(operation, children, source_stop_scripts=True)
+
+    if operation == "cover_inspection":
+        # ControlLib.inspectCover:3663-3768 ported as the same child call graph:
+        # ForceToHighHome, doorOpen(false), the four source checks in the source
+        # order (17, 19, 20, 18), then the num==2 relocation block as one
+        # decision child. The destination pairing and refusals live in
+        # oem_vision_acceptance.plan_cover_relocations (evaluator-mirrored).
+        deck_inspection = inputs.get("deck_inspection")
+        if type(deck_inspection) is not bool:
+            raise RuntimeError("source_authority_missing:cover_inspection:deck_inspection")
+        if not deck_inspection:
+            # inspectCover:3667-3670 early return after ForceToHighHome.
+            _wp8_child(children, "sourceForceToHighHome", state_mutation={"pseudo_z_home": 500})
+            return _wp8_plan(operation, children, source_caller="ControlLib.inspectCover:3663-3670")
+        screen_high = inputs.get("screen_resolution_high")
+        if type(screen_high) is not bool:
+            raise RuntimeError("source_authority_missing:cover_inspection:screen_resolution_high")
+        log_only = inputs.get("inspection_log_only")
+        if type(log_only) is not bool:
+            raise RuntimeError("source_authority_missing:cover_inspection:inspection_log_only")
+        _wp8_child(children, "sourceForceToHighHome", state_mutation={"pseudo_z_home": 500})
+        _wp8_child(children, "doorOpen", arguments={"open": False}, ignored_return=True)
+        for location, plate in ((17, 4), (19, 5)):
+            check_order = len(children)
+            _wp8_child(
+                children, "inspectCoverAt",
+                arguments={"destination": location, "screen_resolution_high": screen_high},
+            )
+            # m_machineStatus.setPlateLocation(plate, location) only inside the
+            # source's found branch (3669-3695).
+            _wp8_child(
+                children, "updatePlateLocation",
+                arguments={"plate": plate, "location": location},
+                source_condition={"child_order": check_order, "result_field": "cover_detected", "equals": True},
+            )
+        for location in (20, 18):
+            _wp8_child(
+                children, "inspectCoverAt",
+                arguments={"destination": location, "screen_resolution_high": screen_high},
+            )
+        _wp8_child(children, "coverInspectionRelocate", arguments={"inspection_log_only": log_only})
+        return _wp8_plan(operation, children, source_caller="ControlLib.inspectCover:3663-3768", exception_policy="propagate")
 
     if operation == "move_plate":
         plate = canonical_plate_name(inputs.get("plate"))
@@ -1545,6 +1594,25 @@ def compile_cleanup_waste_prelude() -> dict[str, Any]:
         if not child["source_condition"]:
             child["source_condition"] = {"child_order": 1, "result_field": "door_ok", "equals": True}
     return _wp8_plan("cleanup", children, exception_policy="propagate", finally_children=[])
+
+
+def compile_cover_inspection_finalize() -> dict[str, Any]:
+    """ControlLib.inspectCover:3745-3752 terminal custody writes.
+
+    The source re-records both covers at their storage corners after the
+    relocations; this nested plan carries exactly those two state children so
+    they stay first-class ledger receipts of the same parent command.
+    """
+    children: list[dict[str, Any]] = []
+    _wp8_child(
+        children, "updatePlateLocation",
+        arguments={"plate": 4, "location": 18},
+    )
+    _wp8_child(
+        children, "updatePlateLocation",
+        arguments={"plate": 5, "location": 20},
+    )
+    return _wp8_plan("cover_inspection_finalize", children, source_caller="ControlLib.inspectCover:3745-3752")
 
 
 def compile_finite_plate_operation(
