@@ -4935,6 +4935,34 @@ def _drain_receiver_audits(buffers):
             "buffers": results, "durable_ownership_claimed": False}
 
 
+def _pipette_channel_status() -> list[dict[str, Any]]:
+    """Per-channel pipette state for /status: software belief + taint record.
+
+    Display-only and lock-free (momentary locks inside); never breaks the
+    envelope on an unavailable runtime.
+    """
+    rows: list[dict[str, Any]] = []
+    transport = _pipette_transport
+    channels = getattr(transport, "_transports", None)
+    if not isinstance(channels, (list, tuple)):
+        return rows
+    for index, channel_transport in enumerate(channels):
+        row: dict[str, Any] = {
+            "channel": index,
+            "software_initialized": bool(getattr(channel_transport, "_initialized", False)),
+            "completion_taint": None,
+        }
+        try:
+            driver = channel_transport._get_driver()
+            router = getattr(getattr(driver, "bus", None), "router", None)
+            if router is not None:
+                row["completion_taint"] = router.pipette_completion_taint(index)
+        except Exception:
+            pass
+        rows.append(row)
+    return rows
+
+
 def _status_payload() -> dict:
     """Compatibility envelope projected from canonical state only."""
     projection = hardware_state.project("transport", "boards", "latch", "chiller")
@@ -5004,6 +5032,12 @@ def _status_payload() -> dict:
         "oem_initialize_motors": serial206_initialization.get("initialize_motors"),
         "oem_initialize_motion": serial206_initialization.get("initialize_motion_ledger"),
         "serial206_initialization": serial206_initialization,
+        "pipette_channels": _pipette_channel_status(),
+        "pipette_readiness_recovery": {
+            "silent_streak": _PIPETTE_READINESS_RECOVERY["silent_streak"],
+            "last_attempt_at": _PIPETTE_READINESS_RECOVERY["last_attempt_at"],
+            "last_outcome": _PIPETTE_READINESS_RECOVERY["last_outcome"],
+        },
     }
 
 
@@ -10677,6 +10711,83 @@ def _query_and_publish_pipette_tip_status(*, runtime_binding=None, readiness_bou
     return _run_pipette_tip_query_with_deck_owner(audited_query, transport)
 
 
+# Pipette readiness self-heal (operator directive 2026-09-21): the bounded
+# readiness tip probe is wake-less by OEM parity (QueryTipStatus).  Consecutive
+# all-silent sweeps escalate to ONE wake-carrying reinitialize so a slept
+# channel recovers without a human; bounded by a streak threshold plus a
+# cooldown, receipted, never motion, never a permanent lock.
+_PIPETTE_READINESS_RECOVERY: dict[str, Any] = {
+    "silent_streak": 0,
+    "last_attempt_at": None,
+    "last_outcome": None,
+}
+_PIPETTE_READINESS_RECOVERY_STREAK_THRESHOLD = 3
+_PIPETTE_READINESS_RECOVERY_COOLDOWN_S = 600.0
+
+
+def _pipette_readiness_sweep_replied(result: Any) -> bool | None:
+    """True when any observed channel answered; None when nothing was observed."""
+    channels = result.get("channels") if isinstance(result, Mapping) else None
+    if not isinstance(channels, list) or not channels:
+        return None
+    for row in channels:
+        inner = row.get("result") if isinstance(row, Mapping) else None
+        if not isinstance(inner, Mapping):
+            continue
+        ack_value = inner.get("ack")
+        ack = ack_value if isinstance(ack_value, Mapping) else {}
+        if inner.get("ok") is True or ack.get("received") is True:
+            return True
+    return False
+
+
+def _pipette_readiness_silent_sweep(result: Any) -> None:
+    replied = _pipette_readiness_sweep_replied(result)
+    if replied is None:
+        return
+    if replied:
+        _PIPETTE_READINESS_RECOVERY["silent_streak"] = 0
+        return
+    streak = int(_PIPETTE_READINESS_RECOVERY.get("silent_streak") or 0) + 1
+    _PIPETTE_READINESS_RECOVERY["silent_streak"] = streak
+    if streak < _PIPETTE_READINESS_RECOVERY_STREAK_THRESHOLD:
+        return
+    now = time.time()
+    last = _PIPETTE_READINESS_RECOVERY.get("last_attempt_at")
+    if isinstance(last, (int, float)) and (now - float(last)) < _PIPETTE_READINESS_RECOVERY_COOLDOWN_S:
+        return
+    _PIPETTE_READINESS_RECOVERY["last_attempt_at"] = now
+    _PIPETTE_READINESS_RECOVERY["silent_streak"] = 0
+
+    async def inline_run(_label, callback, *, timeout_s):
+        return callback()
+
+    try:
+        transport = _get_pipette_transport()
+        outcome = asyncio.run(run_pipette_operation(
+            "reinitialize",
+            lambda owned: owned.reinitialize_pipette(force_wake=True),
+            get_transport=lambda: transport,
+            run_blocking=inline_run,
+            timeout_s=180.0,
+            receipt_store=_pipette_receipts,
+            requested_inputs={"trigger": "readiness_silent_sweep"},
+            runtime_binding={
+                "caller_class": "lifecycle",
+                "entrypoint_id": "hardware.snapshot.pipette_readiness_recovery",
+                "idempotency_key": "readiness-pipette-recovery:" + uuid.uuid4().hex,
+            },
+        ))
+    except Exception as exc:
+        _PIPETTE_READINESS_RECOVERY["last_outcome"] = f"failed: {exc}"
+        return
+    _PIPETTE_READINESS_RECOVERY["last_outcome"] = (
+        "reinitialized"
+        if isinstance(outcome, Mapping) and outcome.get("ok") is True
+        else str(outcome.get("outcome") if isinstance(outcome, Mapping) else "not_ok")
+    )
+
+
 def _observe_park_tip_prerequisite(provider):
     """Fill missing source observations, never infer MachineStatus from TipExist.
 
@@ -10701,12 +10812,15 @@ def _observe_park_tip_prerequisite(provider):
     try:
         # Reuse lifecycle child binding: a Refresh/admission parent must not be
         # overwritten by the pipette receipt, or replayed as a fresh observation.
-        return _query_and_publish_pipette_tip_status(runtime_binding={
+        result = _query_and_publish_pipette_tip_status(runtime_binding={
             "caller_class": "lifecycle", "entrypoint_id": "hardware.snapshot.park_tip_observation",
             "idempotency_key": "readiness-tip-query:" + uuid.uuid4().hex,
         }, readiness_bounded=True)
+        _pipette_readiness_silent_sweep(result)
+        return result
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, Mapping) else {}
+        _pipette_readiness_silent_sweep(detail)
         return {"available": False, "queried": True, "reason": "park_tip_query_unavailable",
                 "status_code": exc.status_code, "receipt_id": detail.get("receipt_id"),
                 "command_id": detail.get("command_id")}

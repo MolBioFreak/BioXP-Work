@@ -370,6 +370,14 @@ class CanPipetteTransport:
             result["reader_generation"] = reader_generation
             self._reader_generation = reader_generation
             self._last_tip_status = result
+            ack_value = result.get("ack")
+            ack = ack_value if isinstance(ack_value, Mapping) else {}
+            if result.get("ok") is not True and not ack.get("received"):
+                # The channel did not answer at all: the software-initialized
+                # belief is stale — the next init/reinitialize attempt must
+                # carry the OEM wake frame, never a WR-only retry against a
+                # slept channel.
+                self._initialized = False
             if type(result.get("source_tip_loaded")) is bool:
                 self._tip_loaded = result["source_tip_loaded"]
             elif result.get("ok") and "tip_loaded" in result:
@@ -1498,13 +1506,26 @@ class FourPipetteTransport:
         eligible, _ledger = self._tip_eligibility(channels)
         return eligible
 
-    def reinitialize_pipette(self) -> dict[str, Any]:
-        """Separate OEM reinitializePipette path: all WR sends, then one 10 s wait."""
+    def reinitialize_pipette(self, *, force_wake: bool = False) -> dict[str, Any]:
+        """Separate OEM reinitializePipette path: all WR sends, then one 10 s wait.
+
+        Channels the software does not believe initialized get the OEM wake
+        frame before WR — the same conditional the constructor ``initiate()``
+        applies — so this recovery path can wake a slept channel instead of
+        timing out.  ``force_wake`` (readiness self-heal) sends the wake for
+        every channel.
+        """
         with self._transaction_lock:
             sends: list[dict[str, Any]] = []
             for channel, transport in enumerate(self._transports):
                 driver = transport._get_driver()
-                result = transport._assert_driver_result("reinitialize_pipette", driver.pipette_initiate_group())
+                if force_wake or not transport._initialized:
+                    result = transport._assert_driver_result(
+                        "reinitialize_pipette",
+                        driver.pipette_initialize(),
+                    )
+                else:
+                    result = transport._assert_driver_result("reinitialize_pipette", driver.pipette_initiate_group())
                 sends.append({"channel": channel, "result": result})
 
             deadline = time.monotonic() + 10.0
