@@ -503,9 +503,30 @@ def serial206_oem_initialization_provider_status() -> dict[str, Any]:
 
 
 def _serial206_oem_initialization_provider_status_busy() -> dict[str, Any]:
-    """Display-safe busy envelope; never an admission input."""
+    """Display-safe busy envelope; never an admission input.
+
+    Passive polls never queue behind authority work (2026-09-20 warm-lock
+    incident). The per-axis durable projections are still read here through
+    their own state locks, so a served view keeps the last observed authority
+    instead of blanking to unbound while a collection or movement lease holds
+    the authority manager. These reads never acquire the authority manager;
+    admission and dispatch keep validating against the live controllers
+    (epoch-blank feedback, 2026-09-21).
+    """
     provider = _serial206_oem_initialization_provider
     busy = ["provider_authority_busy"]
+
+    def durable(reader: Any) -> dict[str, Any]:
+        try:
+            value = reader() if callable(reader) else None
+        except Exception:
+            value = None
+        return dict(value) if isinstance(value, Mapping) else {
+            "available": False,
+            "state": "unbound",
+            "blockers": busy,
+        }
+
     return {
         "schema_version": "bioxp.serial206_oem_initialization_provider_status.v1",
         "bound": provider is not None,
@@ -518,9 +539,9 @@ def _serial206_oem_initialization_provider_status_busy() -> dict[str, Any]:
         "machine_status": None,
         "initialize_motors": None,
         "initialize_motors_admission": {"available": False, "blockers": busy, "expected_stage": None},
-        "z_authority": {"available": False, "state": "unbound", "blockers": busy},
-        "x_authority": {"available": False, "state": "unbound", "blockers": busy},
-        "y_authority": {"available": False, "state": "unbound", "blockers": busy},
+        "z_authority": durable(getattr(provider, "z_projection", None)),
+        "x_authority": durable(getattr(provider, "x_projection", None)),
+        "y_authority": durable(getattr(_serial206_y_provider, "projection", None)),
         "physical_acceptance_required": True,
         "provider": None if provider is None else type(provider).__name__,
         "binding_error": _serial206_oem_initialization_provider_binding_error,
