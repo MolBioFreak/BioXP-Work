@@ -2772,16 +2772,13 @@ class _OperatorPollCache:
                     result = copy.deepcopy(result)
                     elapsed = max(0.0, time.monotonic() - stored_at)
                     _age_poll_projection(result, elapsed)
-                    # Presentation permission expires at the sealed 15s boundary;
-                    # this is not an admission token. Interrupts remain visible.
-                    if elapsed >= 15.0:
-                        for action in result.get("actions", []):
-                            if (action.get("interrupt") is not True and action.get("safety_class") != "stop"
-                                    and action.get("action_id") != "oem.deck.collect_authority"
-                                    and action.get("enabled") is True):
-                                action.update(enabled=False, disabled_reason="cached_projection_stale")
-                                for option in action.get("destination_options", []):
-                                    option.update(enabled=False, disabled_reason="cached_projection_stale")
+                    # Operator directive 2026-09-21: presentation is not
+                    # admission. Serving the last known control state
+                    # through a refresh cycle must never flip live controls
+                    # to disabled -- that blink appeared whenever a refresh
+                    # outlasted the aging window. Enablement is re-evaluated
+                    # live at submit time; aged evidence stays honest
+                    # through its own freshness fields.
                     return result
                 # A different cold view must not queue behind a held provider.
                 # Retrying this metadata GET is safe; no action is submitted.
@@ -2817,14 +2814,6 @@ def _age_poll_projection(value: Any, elapsed: float) -> None:
                         child["state"] = "stale"
             else:
                 _age_poll_projection(child, elapsed)
-        if (value.get("enabled") is True
-                and (value.get("snapshot_freshness") or {}).get("state") != "fresh"):
-            for dependency in value.get("dependencies", []):
-                if dependency.get("key") == "snapshot_fresh":
-                    reason = "Canonical motion snapshot is stale."
-                    dependency.update(met=False, reason=reason)
-                    value.update(enabled=False, available=False,
-                                 disabled_reason=reason, unavailable_reason=reason)
     elif isinstance(value, list):
         for child in value:
             _age_poll_projection(child, elapsed)
