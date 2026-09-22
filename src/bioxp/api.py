@@ -31,6 +31,7 @@ from anyio import from_thread as anyio_from_thread
 from .camera_provider import CameraError, CameraFrame, CameraProvider
 from .oem_config import harmonized_motion_config
 from .hardware_status import CANONICAL_DOMAINS, CollectionContext, hardware_state
+from .reference_recovery import ReferenceRecoveryMonitor
 from .lifecycle_state import LifecycleStateError, lifecycle_state
 from .oem_machine_bundle import configure_oem_machine_snapshot_from_env
 from .runtime_state import configure_oem_runtime_state_from_env
@@ -277,6 +278,79 @@ _serial206_oem_initialization_provider: Serial206OemInitializationProvider | Non
 _serial206_y_provider: Serial206YProvider | None = None
 _serial206_oem_initialization_provider_binding_error: str | None = None
 _operator_control_plane_installed = False
+
+
+_reference_recovery_monitor: ReferenceRecoveryMonitor | None = None
+
+
+def _reference_recovery_rail_reader() -> Mapping[str, Any] | None:
+    tester = _tester
+    if tester is None:
+        return None
+    try:
+        rail = tester.motor_query_24v_sensor()
+    except Exception:
+        return None
+    return rail if isinstance(rail, Mapping) else None
+
+
+def _reference_recovery_references_ready() -> bool | None:
+    try:
+        snapshot = _reference_state_store.snapshot([AxisName.X, AxisName.Y, AxisName.Z, AxisName.GRIPPER])
+    except Exception:
+        return None
+    rows = snapshot.get("rows")
+    if not isinstance(rows, Mapping) or not rows:
+        return None
+    states = [row.get("state") for row in rows.values() if isinstance(row, Mapping)]
+    if not states:
+        return None
+    return all(state == "referenced" for state in states)
+
+
+def _reference_recovery_idle() -> tuple[bool, str | None]:
+    try:
+        projection = lifecycle_state.projection()
+    except Exception:
+        return (False, "lifecycle_unavailable")
+    state = projection.get("operation_state")
+    if state != "stopped":
+        return (False, f"operation_state:{state}")
+    active = getattr(app.state, "operator_normal_action_active", None)
+    if callable(active):
+        try:
+            if active():
+                return (False, "operator_action_pending")
+        except Exception:
+            return (False, "activity_probe_failed")
+    maintenance = _maintenance_state_payload()
+    if maintenance.get("motion_blocked") is True:
+        return (False, "motion_blocked:" + str(maintenance.get("block_reason")))
+    return (True, None)
+
+
+def _reference_recovery_rereference() -> Mapping[str, Any]:
+    provider = _require_serial206_oem_initialization_provider("initialize_motors")
+    _require_motion_route_ready()
+    return _run_idempotent_serial206_initialization(
+        provider,
+        initialization_kind="initialize_motors",
+        idempotency_key=f"auto-reference-recovery:{int(time.time())}",
+        timeout_s=300.0,
+    )
+
+
+async def _reference_recovery_runner() -> None:
+    global _reference_recovery_monitor
+    if _reference_recovery_monitor is None:
+        _reference_recovery_monitor = ReferenceRecoveryMonitor(
+            rail_reader=_reference_recovery_rail_reader,
+            references_ready=_reference_recovery_references_ready,
+            idle_check=_reference_recovery_idle,
+            rereference=_reference_recovery_rereference,
+            state_path=runtime_state_root() / "reference_recovery_state.json",
+        )
+    await _reference_recovery_monitor.run()
 
 
 def _persist_pipette_runtime_error(channel: int, error_code: int) -> None:
@@ -1117,9 +1191,16 @@ async def lifespan(app: FastAPI):
     else:
         start_operator_control_plane()
         app.state.release_start_ready.set()
+    reference_recovery_task = asyncio.create_task(
+        _reference_recovery_runner(),
+        name="bioxp-reference-recovery-monitor",
+    )
     try:
         yield
     finally:
+        if reference_recovery_task is not None and not reference_recovery_task.done():
+            reference_recovery_task.cancel()
+            await asyncio.gather(reference_recovery_task, return_exceptions=True)
         if release_start_task is not None and not release_start_task.done():
             release_start_task.cancel()
             await asyncio.gather(release_start_task, return_exceptions=True)
@@ -5038,6 +5119,11 @@ def _status_payload() -> dict:
             "last_attempt_at": _PIPETTE_READINESS_RECOVERY["last_attempt_at"],
             "last_outcome": _PIPETTE_READINESS_RECOVERY["last_outcome"],
         },
+        "reference_recovery": (
+            _reference_recovery_monitor.status()
+            if _reference_recovery_monitor is not None
+            else {"state": "not_started"}
+        ),
     }
 
 
