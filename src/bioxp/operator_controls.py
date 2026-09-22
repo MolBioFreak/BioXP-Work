@@ -3406,6 +3406,31 @@ def install_operator_control_plane(
              if isinstance(snapshot, Mapping) else {})
         )
         if intent_only and set(board_epochs) != {"4", "5"}:
+            # A transiently busy or mid-reset initialization projection must not
+            # blank the deck lane. Fill any missing board epoch from the durable
+            # last deck-authority snapshot (cache-local; no device reads, so this
+            # never queues behind authority work). The dispatch path re-validates
+            # epochs against the live boards, so a genuinely stale fallback fails
+            # fast there with a named receipt instead of greying the controls
+            # here (epoch-blank feedback, 2026-09-21).
+            cached_reader = getattr(provider, "deck_authority_cached_snapshot", None)
+            if callable(cached_reader):
+                try:
+                    reader_arguments: dict[str, Any] = {
+                        "expected_generation": int(state.get("ownership_generation") or 0)}
+                    if getattr(provider, "deck_scoped_authority_version", None) == 1:
+                        reader_arguments["target"] = "LOC_MS"
+                    cached_snapshot = cached_reader(**reader_arguments)
+                except Exception:
+                    cached_snapshot = None
+                if isinstance(cached_snapshot, Mapping):
+                    filled = dict(board_epochs)
+                    for board, key in (("4", "board_epoch_4"), ("5", "board_epoch_5")):
+                        value = cached_snapshot.get(key)
+                        if board not in filled and type(value) is int and value >= 0:
+                            filled[board] = value
+                    board_epochs = filled
+        if intent_only and set(board_epochs) != {"4", "5"}:
             disabled_reason = disabled_reason or "deck_board_epochs_not_authoritative"
             options = [{**row, "enabled": False, "disabled_reason": disabled_reason} for row in options]
         return {
