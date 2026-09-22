@@ -6469,6 +6469,13 @@ class OperatorCommandStore:
                 parent = conn.execute("SELECT a.status,a.command_kind,c.status AS plane_status FROM operator_commands a "
                     "JOIN operator_plane_commands c USING(command_id) WHERE a.command_id=?", (parent_id,)).fetchone()
                 critical_images = command["target"] == "critical_item_images"
+                # Historical first-Park rows can predate the workflow binding of
+                # the WP8 plan into effective inputs; their immutable identity is
+                # already fully proven by the plan/authority digests, stamps,
+                # children and issued-delivery checks below (and re-enforced by
+                # the v12 authorization trigger at insert).  Keep the strict
+                # comparison whenever a plan IS carried.
+                effective_inputs = _json_load(command["effective_json"], {})
                 if (command["action_id"] != "oem.deck._finite_operation" or command["target"] not in {"thermal_door", "critical_item_images"}
                     or command["status"] not in {"ambiguous", "interrupted"}
                     or command["audit_status"] != command["status"] or command["movement_state"] != command["status"]
@@ -6478,7 +6485,7 @@ class OperatorCommandStore:
                     or plan.get("operation") != command["target"] or plan.get("source_owned") is not True
                     or (not critical_images and (plan.get("script_running") is not False or plan.get("opening") is not True))
                     or plan.get("parent_return_allows_background_pending") is not False
-                    or _json_load(command["effective_json"], {}).get("prepared_plan") != plan
+                    or (effective_inputs.get("prepared_plan") is not None and effective_inputs.get("prepared_plan") != plan)
                     or plan.get("plan_digest") != command["plan_digest"]
                     or plan.get("authority_digest") != command["authority_snapshot_digest"]
                     or _digest({k: v for k, v in plan.items() if k != "plan_digest"}) != command["plan_digest"]
