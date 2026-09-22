@@ -153,6 +153,17 @@ def test_finite_historical_missing_prepared_plan_is_admitted(finite_home, monkey
     assert decision['finite_current_state']['parent_command_id'] == ids[0]
     assert store.deck_recovery_blocker() is None
     assert raw_history(store, ids) == before
+    # The receipt projection must surface the governed resolution for the WP8
+    # finite (consumers gate deck movement on exactly these four keys).
+    projection = store.command_detail_v2(ids[1])
+    resolution = (projection.get('deck_movement') or {}).get('recovery_resolution')
+    resolution_receipt = json.loads(row['receipt_json'])
+    assert resolution == {
+        'command_id': ids[1],
+        'decision_id': row['decision_id'],
+        'semantic_state_revision': resolution_receipt['semantic_state_revision'],
+        'transition_sequence': resolution_receipt['transition_sequence'],
+    }, projection.get('deck_movement')
 
 
 def test_finite_mismatched_prepared_plan_still_refuses(finite_home, monkeypatch):

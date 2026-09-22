@@ -5436,6 +5436,44 @@ class OperatorCommandStore:
             ],
         }
 
+    def _wp8_finite_recovery_detail(self, command_id: str) -> dict[str, Any] | None:
+        """Surface the governed recovery resolution for WP8 finite receipts.
+
+        WP8 first-Park / critical-image children never capture a named-deck
+        command row, so the named-deck detail returns None for them even after
+        a reconcile wrote a decision.  Expose the same validated resolution
+        shape the deck detail would carry so consumers (the cockpit
+        reconciliation gate) can see the retained ambiguity disposed.  Read
+        only; the terminal receipt and its outcome are never rewritten.
+        """
+        decision = self.connection.execute(
+            "SELECT decision_id,command_id,decision_json,receipt_json FROM operator_plane_deck_recovery_decisions WHERE command_id=?",
+            (str(command_id),),
+        ).fetchone()
+        if decision is None:
+            return None
+        wp8 = self.connection.execute(
+            "SELECT 1 FROM operator_plane_wp8_operations WHERE command_id=?", (str(command_id),)
+        ).fetchone()
+        if wp8 is None:
+            return None
+        resolution_decision = _json_load(decision["decision_json"], {})
+        resolution_receipt = _json_load(decision["receipt_json"], {})
+        if (isinstance(resolution_decision, dict) and isinstance(resolution_receipt, dict)
+            and resolution_decision.get("command_id") == resolution_receipt.get("command_id") == str(command_id)
+            and resolution_decision.get("decision_id") == decision["decision_id"]
+            and isinstance(resolution_receipt.get("reconciliation_decision"), dict)
+            and resolution_receipt["reconciliation_decision"].get("decision_id") == decision["decision_id"]
+            and all(type(resolution_receipt.get(k)) is int and resolution_receipt[k] >= 1
+                    for k in ("semantic_state_revision", "transition_sequence"))):
+            return {"recovery_resolution": {
+                "command_id": str(command_id),
+                "decision_id": str(decision["decision_id"]),
+                "semantic_state_revision": resolution_receipt["semantic_state_revision"],
+                "transition_sequence": resolution_receipt["transition_sequence"],
+            }}
+        return None
+
     def _command_response(self, row: sqlite3.Row, *, transition_sequence: int | None = None, compact: bool = False) -> dict[str, Any]:
         if transition_sequence is None:
             transition_row = self.connection.execute("SELECT MAX(transition_sequence) FROM operator_plane_transitions WHERE command_id=?", (str(row["command_id"]),)).fetchone()
@@ -5484,6 +5522,8 @@ class OperatorCommandStore:
             deck_detail = None if deck_row is None else {"ambiguity_state": deck_row[0]}
         else:
             deck_detail = self._deck_command_detail(str(row["command_id"]))
+            if deck_detail is None:
+                deck_detail = self._wp8_finite_recovery_detail(str(row["command_id"]))
         if deck_detail is not None:
             response["deck_movement"] = deck_detail
             # A retained post-delivery exception can lack the outer class even
