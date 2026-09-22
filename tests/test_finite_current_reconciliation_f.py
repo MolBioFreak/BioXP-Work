@@ -104,6 +104,83 @@ def test_finite_current_state_home_no_tip_preserves_unknown(finite_home):
         'history_unchanged': True, 'decision': decision, 'receipt': response.json(), 'reopened': reopened}, indent=2))
 
 
+def _effective_inputs_read_fault(store, transform):
+    """Fault ONLY the consumer's read view of the WP8 child effective inputs."""
+    from contextlib import contextmanager
+    original = store._transaction
+
+    class Rows:
+        def __init__(self, rows): self.rows = rows
+        def fetchone(self): return self.rows[0] if self.rows else None
+        def fetchall(self): return self.rows
+
+    class ReadFault:
+        def __init__(self, conn): self.conn = conn
+        def execute(self, sql, args=()):
+            result = self.conn.execute(sql, args)
+            if sql.startswith('SELECT c.*,w.operation AS target'):
+                row = dict(result.fetchone())
+                effective = json.loads(row['effective_json'])
+                transform(effective)
+                row['effective_json'] = json.dumps(effective)
+                return Rows([row])
+            return result
+
+    @contextmanager
+    def faulted(*args, **kwargs):
+        with original(*args, **kwargs) as conn:
+            yield ReadFault(conn)
+    return faulted
+
+
+def test_finite_historical_missing_prepared_plan_is_admitted(finite_home, monkeypatch):
+    # Historical first-Park rows (e.g. the 2026-09-21 thermal-door child) were
+    # dispatched without the workflow binding of the WP8 plan into effective
+    # inputs.  The reconcile gate must align with the v12 authorization trigger
+    # and admit them when every other immutable-identity proof holds, instead
+    # of freezing the retained ambiguity forever.
+    app, provider, primitive, refs, root, leaf, data = finite_home
+    store = app.state.operator_command_plane.store
+    ids = [data['parent_id'], data['command_id']]
+    before = raw_history(store, ids)
+    monkeypatch.setattr(store, '_transaction',
+        _effective_inputs_read_fault(store, lambda effective: effective.pop('prepared_plan', None)))
+    response = TestClient(app).post('/operator/recovery/deck/'+data['command_id']+'/reconcile', json=home_body(provider))
+    assert response.status_code == 200, response.text
+    row = dict(store.connection.execute('SELECT * FROM operator_plane_deck_recovery_decisions WHERE command_id=?', (ids[1],)).fetchone())
+    decision = json.loads(row['decision_json'])
+    assert decision['finite_current_state']['kind'] == 'wp8_first_park_current_home_no_tip'
+    assert decision['finite_current_state']['parent_command_id'] == ids[0]
+    assert store.deck_recovery_blocker() is None
+    assert raw_history(store, ids) == before
+    # The receipt projection must surface the governed resolution for the WP8
+    # finite (consumers gate deck movement on exactly these four keys).
+    projection = store.command_detail_v2(ids[1])
+    resolution = (projection.get('deck_movement') or {}).get('recovery_resolution')
+    resolution_receipt = json.loads(row['receipt_json'])
+    assert resolution == {
+        'command_id': ids[1],
+        'decision_id': row['decision_id'],
+        'semantic_state_revision': resolution_receipt['semantic_state_revision'],
+        'transition_sequence': resolution_receipt['transition_sequence'],
+    }, projection.get('deck_movement')
+
+
+def test_finite_mismatched_prepared_plan_still_refuses(finite_home, monkeypatch):
+    # A plan that IS carried must still match the immutable WP8 plan exactly.
+    app, provider, primitive, refs, root, leaf, data = finite_home
+    store = app.state.operator_command_plane.store
+    ids = [data['parent_id'], data['command_id']]
+    before = raw_history(store, ids)
+    monkeypatch.setattr(store, '_transaction',
+        _effective_inputs_read_fault(store, lambda effective: effective.__setitem__('prepared_plan', {'tampered': True})))
+    response = TestClient(app).post('/operator/recovery/deck/'+data['command_id']+'/reconcile', json=home_body(provider))
+    assert response.status_code == 409 and 'immutable identity' in response.text, response.text
+    assert store.connection.execute('SELECT 1 FROM operator_plane_deck_recovery_decisions WHERE command_id=?', (ids[1],)).fetchone() is None
+    assert store.deck_recovery_blocker() == 'deck_recovery_hold'
+    assert raw_history(store, ids) == before
+
+
 @pytest.mark.parametrize('fault', ['collection_owner', 'collection_interrupt', 'loaded', 'unrelated_publication', 'final_collection', 'active_worker'])
 def test_finite_current_no_tip_fences(finite_home, monkeypatch, fault):
     from bioxp import api

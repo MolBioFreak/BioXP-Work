@@ -346,6 +346,8 @@ def test_api_ownership_lease_survives_waiter_end_until_delivery(tmp_path, monkey
     entered, release = threading.Event(), threading.Event()
     original_write = hardware.write
     def write(*args, **kwargs):
+        # Physical delivery owns the connection lease; the shielded delivery
+        # worker keeps that ownership even after its HTTP waiter is gone.
         assert api._tester_transition_lock.locked()
         if hardware.stop_writes == 0:
             entered.set()
@@ -370,6 +372,10 @@ def test_api_ownership_lease_survives_waiter_end_until_delivery(tmp_path, monkey
                 with pytest.raises(HTTPException) as exc:
                     await task
                 assert exc.value.status_code == 504
+            # The shielded delivery worker still owns the physical Stop and the
+            # connection lease after the waiter is gone (RCA F2: a Stop is never
+            # cancelled by its caller). Its reconciliation still runs, so the
+            # durable receipt below exists even though nobody awaited it.
             assert api._tester_transition_lock.locked()
             assert hardware.stop_writes == 0
         finally:

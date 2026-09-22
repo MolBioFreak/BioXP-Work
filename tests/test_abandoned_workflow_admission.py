@@ -41,17 +41,18 @@ def reconcile(finite_home):
     return store, provider, data
 
 
-def test_unabandoned_failed_workflow_still_busy(failed_workflow):
+def test_unabandoned_failed_workflow_no_longer_busy(failed_workflow):
     rig, job, _, child = failed_workflow
     before = snapshot(rig, [job['job_id'], child])
     request = admission(rig.store, job['job_id'], rig.provider.generation_provider())
-    with pytest.raises(ValueError, match='workflow_busy'):
-        rig.store.admit_workflow(**request)
+    # 2026-09-21: non-live custody history never refuses admission.
+    accepted = rig.store.admit_workflow(**request)
+    assert accepted['status'] == 'queued'
     assert snapshot(rig, [job['job_id'], child]) == before
-    assert rig.store.get_workflow(request['command_id']) is None
+    assert rig.store.get_workflow(request['command_id'])['status'] == 'queued'
 
 
-def test_abandoned_unreconciled_is_held_by_recovery_owner(failed_workflow):
+def test_abandoned_unreconciled_no_longer_holds_new_work(failed_workflow):
     rig, job, _, child = failed_workflow
     before = snapshot(rig, [job['job_id'], child])
     abandon(rig)
@@ -59,8 +60,10 @@ def test_abandoned_unreconciled_is_held_by_recovery_owner(failed_workflow):
     accepted = rig.store.admit_workflow(**request)
     assert accepted['status'] == 'queued'
     assert rig.store.deck_recovery_blocker() == 'deck_recovery_hold'
-    assert rig.store.claim_next() is None
-    assert rig.store.get_workflow(request['command_id'])['status'] == 'queued'
+    # 2026-09-21: the unresolved abandonment record no longer holds new work.
+    claimed = rig.store.claim_next()
+    assert claimed is not None and claimed['command_id'] == request['command_id']
+    assert rig.store.get_workflow(request['command_id'])['status'] == 'dispatched'
     assert snapshot(rig, [job['job_id'], child]) == before
 
 
@@ -128,7 +131,7 @@ def test_new_independent_live_route_completes_after_governed_recovery(finite_hom
 
 
 @pytest.mark.parametrize('evidence', ['abandonment', 'decision'])
-def test_missing_canonical_disposition_remains_blocked(finite_home, monkeypatch, evidence):
+def test_missing_canonical_disposition_no_longer_blocks(finite_home, monkeypatch, evidence):
     # Hide evidence only from the consumer read; never edit immutable history.
     from contextlib import contextmanager
     store, provider, data = reconcile(finite_home)
@@ -151,11 +154,14 @@ def test_missing_canonical_disposition_remains_blocked(finite_home, monkeypatch,
             yield MissingEvidence(conn)
     monkeypatch.setattr(store, '_transaction', read_fault)
     if evidence == 'abandonment':
-        with pytest.raises(ValueError, match='workflow_busy'):
-            store.admit_workflow(**request)
+        # 2026-09-21: missing abandonment evidence no longer refuses admission.
+        accepted = store.admit_workflow(**request)
+        assert accepted['status'] == 'queued'
     else:
-        assert store.claim_next() is None
-        assert store.get_workflow(request['command_id'])['status'] == 'queued'
+        # 2026-09-21: dispatch is not gated on the decision record.
+        claimed = store.claim_next()
+        assert claimed is not None and claimed['command_id'] == request['command_id']
+        assert store.get_workflow(request['command_id'])['status'] == 'dispatched'
 
 
 def test_reconciled_history_releases_real_queued_finite_child(finite_home):

@@ -15,7 +15,7 @@ def pressure_source_transport(value=12.25, loaded_channel: int | None = 2):
         driver = BioXpCanDriver.__new__(BioXpCanDriver)
         driver.pipette_id = channel
         driver.bus = SimpleNamespace(router=SimpleNamespace(reader_generation=1))
-        def exchange(command, *, address, ack_mode, command_name, channel=channel):
+        def exchange(command, *, address, ack_mode, command_name, response_timeout_s=None, channel=channel):
             assert address == 'report' and ack_mode == 'query'
             now = time.monotonic()
             if command_name == 'query_tip_status':

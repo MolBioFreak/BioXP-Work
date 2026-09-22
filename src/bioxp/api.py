@@ -49,6 +49,7 @@ from .oem_gripper import (
 )
 from .motion_safety import Serial206MotionAuthority, physical_aggregate_stop, prepare_motion_without_motion
 from .oem_serial206_initialization import (
+    ProviderAuthorityBusy,
     Serial206CommissioningEvidence,
     Serial206OemInitializationProvider,
     Serial206ProductionPrimitiveAdapter,
@@ -212,9 +213,31 @@ _tester_lock = asyncio.Lock()
 # lane. Normal tester work deliberately does not, so a stop can still preempt
 # an in-flight diagnostic without racing release/rebind.
 _tester_transition_lock = asyncio.Lock()
+# RCA F2: every addressed stop surface gets its own delivery lane and its own
+# single-worker executor. Four separate stop actions exist precisely so that x,
+# y, z and the aggregate abort can be delivered independently; sharing one
+# lane/worker is what let a single stuck stop swallow every other press.
+_safety_interrupt_executors: dict[str, ThreadPoolExecutor] = {}
+_safety_interrupt_lanes: dict[str, asyncio.Lock] = {}
 _safety_interrupt_executor = ThreadPoolExecutor(
     max_workers=1,
     thread_name_prefix="bioxp-safety",
+)
+# How long a stop waits for the shared connection-ownership lease before it
+# refuses, with a durable record, instead of parking silently (RCA F2).
+_INTERRUPT_CONNECTION_LEASE_S = float(
+    os.environ.get("BIOXP_INTERRUPT_CONNECTION_LEASE_S") or 2.0
+)
+# Bounded same-surface admission window: another press for the same axis may
+# wait only this long for the in-flight delivery of that axis, then is refused
+# with a durable record (never queued behind reconciliation or another surface).
+_INTERRUPT_LANE_WAIT_S = float(
+    os.environ.get("BIOXP_INTERRUPT_LANE_WAIT_S") or 0.5
+)
+# Bounded reconciliation: a delivered stop must never wait unbounded for the
+# provider lifecycle lock it may be interrupting (RCA F3).
+_INTERRUPT_RECONCILIATION_DEADLINE_S = float(
+    os.environ.get("BIOXP_INTERRUPT_RECONCILIATION_DEADLINE_S") or 5.0
 )
 _camera_stream_lock = asyncio.Lock()
 _oem_startup_program: Optional[OEMStartupProgram] = None
@@ -395,8 +418,39 @@ def serial206_oem_initialization_provider_status() -> dict[str, Any]:
     provider = _serial206_oem_initialization_provider
     scope = getattr(provider, "projection_scope", None)
     manager: Any = scope() if callable(scope) else nullcontext()
-    with manager:
-        return _serial206_oem_initialization_provider_status_snapshot()
+    try:
+        with manager:
+            return _serial206_oem_initialization_provider_status_snapshot()
+    except ProviderAuthorityBusy:
+        # Passive polls never queue behind authority work; report busy
+        # explicitly so the caller serves its busy/stale projection instead
+        # of stalling (2026-09-20 warm-lock incident).
+        return _serial206_oem_initialization_provider_status_busy()
+
+
+def _serial206_oem_initialization_provider_status_busy() -> dict[str, Any]:
+    """Display-safe busy envelope; never an admission input."""
+    provider = _serial206_oem_initialization_provider
+    busy = ["provider_authority_busy"]
+    return {
+        "schema_version": "bioxp.serial206_oem_initialization_provider_status.v1",
+        "bound": provider is not None,
+        "authority_busy": True,
+        "initialize_motors_live_available": False,
+        "initialize_motion_live_available": False,
+        "initialize_motion_partial_primitives": [],
+        "initialize_motion_missing_primitives": [],
+        "initialize_motion_ledger": None,
+        "machine_status": None,
+        "initialize_motors": None,
+        "initialize_motors_admission": {"available": False, "blockers": busy, "expected_stage": None},
+        "z_authority": {"available": False, "state": "unbound", "blockers": busy},
+        "x_authority": {"available": False, "state": "unbound", "blockers": busy},
+        "y_authority": {"available": False, "state": "unbound", "blockers": busy},
+        "physical_acceptance_required": True,
+        "provider": None if provider is None else type(provider).__name__,
+        "binding_error": _serial206_oem_initialization_provider_binding_error,
+    }
 
 
 def _serial206_oem_initialization_provider_status_snapshot() -> dict[str, Any]:
@@ -1287,8 +1341,10 @@ def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = N
         return result
 
 
-def _execute_provider_x_intent(intent: str, inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def _execute_provider_x_intent(intent: str, inputs: Mapping[str, Any] | None = None, *,
+                               defer_reconciliation: bool = False):
     """Dispatch one typed X intent through the retained OEM provider."""
+
     context = current_operator_dispatch_context()
     if context is None:
         raise HTTPException(
@@ -1313,13 +1369,19 @@ def _execute_provider_x_intent(intent: str, inputs: Mapping[str, Any] | None = N
             "expected_generation": int(context["expected_ownership_generation"]),
         }
     )
+    if defer_reconciliation:
+        # RCA F3: the Stop's physical delivery and its lifecycle reconciliation
+        # are separable. The provider returns a continuation the caller runs
+        # under a bounded deadline, outside the delivery lease.
+        payload["defer_reconciliation"] = True
     result = execute(intent, payload)
+    if callable(result) and not isinstance(result, Mapping):
+        return result
     if not isinstance(result, dict):
         raise HTTPException(status_code=409, detail={"error": "serial206_x_provider_returned_non_object"})
     if result.get("ok") is not True:
         raise HTTPException(status_code=409, detail=result)
     return result
-
 
 def _execute_runtime_provider_z_intent(
     intent: str,
@@ -4873,6 +4935,34 @@ def _drain_receiver_audits(buffers):
             "buffers": results, "durable_ownership_claimed": False}
 
 
+def _pipette_channel_status() -> list[dict[str, Any]]:
+    """Per-channel pipette state for /status: software belief + taint record.
+
+    Display-only and lock-free (momentary locks inside); never breaks the
+    envelope on an unavailable runtime.
+    """
+    rows: list[dict[str, Any]] = []
+    transport = _pipette_transport
+    channels = getattr(transport, "_transports", None)
+    if not isinstance(channels, (list, tuple)):
+        return rows
+    for index, channel_transport in enumerate(channels):
+        row: dict[str, Any] = {
+            "channel": index,
+            "software_initialized": bool(getattr(channel_transport, "_initialized", False)),
+            "completion_taint": None,
+        }
+        try:
+            driver = channel_transport._get_driver()
+            router = getattr(getattr(driver, "bus", None), "router", None)
+            if router is not None:
+                row["completion_taint"] = router.pipette_completion_taint(index)
+        except Exception:
+            pass
+        rows.append(row)
+    return rows
+
+
 def _status_payload() -> dict:
     """Compatibility envelope projected from canonical state only."""
     projection = hardware_state.project("transport", "boards", "latch", "chiller")
@@ -4892,7 +4982,23 @@ def _status_payload() -> dict:
         and ownership.get("router") == "running"
     )
     lifecycle = lifecycle_state.projection()
-    serial206_initialization = serial206_oem_initialization_provider_status()
+    # Display-only provider read: never queue behind authority-bearing work.
+    # /status is exactly what the operator Reconnect probe calls; a busy
+    # provider yields the explicit busy projection instead of a stall
+    # (2026-09-20 reconnect incident).
+    _passive_poll = None
+    token = None
+    try:
+        from .operator_controls import _PASSIVE_OPERATOR_POLL as _passive_poll
+        token = _passive_poll.set(True)
+    except Exception:
+        _passive_poll = None
+        token = None
+    try:
+        serial206_initialization = serial206_oem_initialization_provider_status()
+    finally:
+        if token is not None and _passive_poll is not None:
+            _passive_poll.reset(token)
     admission = hardware_state.project("transport", "boards", "power", "interlock", "latch", "axes", "gripper")
     deck_freshness = getattr(_serial206_oem_initialization_provider, "deck_observation_freshness", None)
     deck_observation = {"available": False, "freshness": {"state": "missing", "age_s": None}}
@@ -4926,6 +5032,12 @@ def _status_payload() -> dict:
         "oem_initialize_motors": serial206_initialization.get("initialize_motors"),
         "oem_initialize_motion": serial206_initialization.get("initialize_motion_ledger"),
         "serial206_initialization": serial206_initialization,
+        "pipette_channels": _pipette_channel_status(),
+        "pipette_readiness_recovery": {
+            "silent_streak": _PIPETTE_READINESS_RECOVERY["silent_streak"],
+            "last_attempt_at": _PIPETTE_READINESS_RECOVERY["last_attempt_at"],
+            "last_outcome": _PIPETTE_READINESS_RECOVERY["last_outcome"],
+        },
     }
 
 
@@ -5750,53 +5862,334 @@ async def _run_blocking(label: str, func, timeout_s: float | None = 30.0, *, on_
         ) from exc
 
 
-async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30.0, *, delivery_only_lease: bool = False):
-    """Retain connection ownership through the complete physical sequence.
+def _interrupt_surface_slug(label: str) -> str:
+    """Stable per-surface lane key for one stop route."""
 
-    Only Z Stop can explicitly signal the delivery boundary; its remaining
-    provider work is lifecycle/SQLite reconciliation, with generation checks.
-    Other callers retain the full lease. Timeout/cancellation never cancel the
-    underlying worker or release ownership before delivery actually finishes.
+    slug = "".join(
+        character if character.isalnum() else "-" for character in str(label or "").lower()
+    )
+    slug = "-".join(part for part in slug.split("-") if part)
+    return slug or "interrupt"
+
+
+def _safety_interrupt_lane(surface: str) -> asyncio.Lock:
+    lane = _safety_interrupt_lanes.get(str(surface))
+    if lane is None:
+        lane = asyncio.Lock()
+        _safety_interrupt_lanes[str(surface)] = lane
+    return lane
+
+
+def _safety_interrupt_worker(surface: str) -> ThreadPoolExecutor:
+    executor = _safety_interrupt_executors.get(str(surface))
+    if executor is None:
+        executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"bioxp-safety-{str(surface)[:24]}",
+        )
+        _safety_interrupt_executors[str(surface)] = executor
+    return executor
+
+
+def _interrupt_journal():
+    plane = getattr(app.state, "operator_command_plane", None)
+    return getattr(plane, "interrupt_journal", None)
+
+
+def _interrupt_attempt_identity() -> tuple[str | None, str | None]:
+    """Attempt id/action for the stop currently dispatched through this route."""
+
+    try:
+        from bioxp.operator_controls import current_operator_dispatch_context
+
+        context = current_operator_dispatch_context() or {}
+    except Exception:
+        return None, None
+    return (
+        context.get("interrupt_attempt_id"),
+        context.get("action_id") or context.get("operator_interrupt_action_id"),
+    )
+
+
+def _journal_interrupt_phase(phase: str, *, surface: str, **fields) -> dict | None:
+    """Best-effort write-ahead record. Never raises into a stop delivery path."""
+
+    attempt_id, action_id = _interrupt_attempt_identity()
+    journal = _interrupt_journal()
+    if journal is None or not attempt_id:
+        return None
+    try:
+        return journal.record(
+            interrupt_attempt_id=str(attempt_id),
+            action_id=str(action_id or surface),
+            phase=str(phase),
+            surface=str(surface),
+            **fields,
+        )
+    except Exception:
+        return None
+
+
+def _interrupt_refusal(surface: str, *, error: str, message: str, status_code: int,
+                       record: bool = True, **fields):
+    """Build a recorded refusal: no silent parking, ever."""
+
+    attempt_id, action_id = _interrupt_attempt_identity()
+    journal = _interrupt_journal()
+    journal_path = None
+    if journal is not None:
+        journal_path = str(journal.path)
+        if record and attempt_id:
+            try:
+                journal.record_rejection(
+                    interrupt_attempt_id=str(attempt_id),
+                    action_id=str(action_id or surface),
+                    reason=str(error),
+                    surface=str(surface),
+                    **fields,
+                )
+            except Exception:
+                pass
+        try:
+            plane = getattr(app.state, "operator_command_plane", None)
+            store = getattr(plane, "store", None)
+            if record and attempt_id and store is not None and str(action_id or "") in {
+                "oem.x.stop", "oem.y.stop", "oem.z.stop", "oem.g.stop",
+                "oem.abort_all", "oem.z.abort",
+            }:
+                store.record_interrupt_rejection(
+                    interrupt_attempt_id=str(attempt_id),
+                    action_id=str(action_id),
+                    reason=str(error),
+                    payload={"surface": str(surface), **fields},
+                )
+        except Exception:
+            pass
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "error": str(error),
+            "message": str(message),
+            "surface": str(surface),
+            "interrupt_attempt_id": attempt_id,
+            "admitted": False,
+            "delivered": False,
+            "delivery_attempted": False,
+            "physical_motion_commanded": False,
+            "recorded": True,
+            "journal_path": journal_path,
+            "automatic_retry": False,
+            **fields,
+        },
+    )
+
+
+async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30.0, *,
+                                         delivery_only_lease: bool = False,
+                                         surface: str | None = None):
+    """Deliver one stop on its own lane; never queue behind what it is stopping.
+
+    Bounded admission (RCA F2): a press is either admitted on this surface's lane
+    within a small bounded window or refused now with a durable record. The
+    connection lease is held only for the physical delivery and is released the
+    moment the Stop is sent -- and released when the HTTP waiter ends, so the
+    next press can never queue behind this one. Lifecycle/SQLite reconciliation
+    runs afterwards as a bounded, separable step (RCA F3); if it cannot finish
+    it reports ``reconciliation_pending`` instead of blocking, and it still runs
+    when the caller has already gone away (a delivered Stop must be recorded).
     """
 
-    ownership_lease_released = False
+    surface_key = str(surface or _interrupt_surface_slug(label))
+    lane = _safety_interrupt_lane(surface_key)
+    loop = asyncio.get_running_loop()
+    interrupt_context = copy_context()
+    state = {
+        "lease_acquired": False, "lease_released": False,
+        "delivery_attempted": False, "delivery_finished": False,
+    }
+    admitted: asyncio.Future = loop.create_future()
 
-    async def leased_interrupt():
-        nonlocal ownership_lease_released
-        async with _tester_transition_lock:
+    def _admit(outcome: HTTPException | None) -> None:
+        if not admitted.done():
+            admitted.set_result(outcome)
+
+    async def leased_delivery_then_reconciliation():
+        if lane.locked():
+            # Bounded admission: wait only for the same surface's in-flight
+            # delivery (never reconciliation, another surface or the interrupted
+            # command), then refuse with a record instead of parking.
+            try:
+                await asyncio.wait_for(lane.acquire(), timeout=_INTERRUPT_LANE_WAIT_S)
+            except asyncio.TimeoutError:
+                _admit(_interrupt_refusal(
+                    surface_key,
+                    error="interrupt_lane_busy_same_surface",
+                    message=(
+                        f"{label} already has a delivery in flight; this press was refused "
+                        "after a bounded wait, never parked behind it."
+                    ),
+                    status_code=409,
+                    lane_wait_s=_INTERRUPT_LANE_WAIT_S,
+                ))
+                return None
+        else:
+            await lane.acquire()
+        lease_held = False
+        value: Any = None
+        try:
+            try:
+                await asyncio.wait_for(
+                    _tester_transition_lock.acquire(), timeout=_INTERRUPT_CONNECTION_LEASE_S
+                )
+                lease_held = True
+            except asyncio.TimeoutError:
+                _admit(_interrupt_refusal(
+                    surface_key,
+                    error="interrupt_connection_lease_unavailable",
+                    message=(
+                        f"{label} could not take the connection lease within "
+                        f"{_INTERRUPT_CONNECTION_LEASE_S:.1f}s; refused with record rather "
+                        "than waiting behind it."
+                    ),
+                    status_code=503,
+                    connection_lease_wait_s=_INTERRUPT_CONNECTION_LEASE_S,
+                ))
+                return None
+            state["lease_acquired"] = True
             tester = _get_tester()
-            loop = asyncio.get_running_loop()
-            interrupt_context = copy_context()
 
             def invoke_interrupt():
                 return interrupt_context.run(func, tester)
 
-            result = await loop.run_in_executor(_safety_interrupt_executor, invoke_interrupt)
-            if not delivery_only_lease:
-                return result
-        ownership_lease_released = True
-        # Only the Z Stop route opts in and returns its no-controller
-        # continuation. Free BOTH the ownership lease and single safety worker
-        # before waiting for ordinary lifecycle/SQLite recording.
-        reconciliation_context = interrupt_context.copy()
-        return await loop.run_in_executor(None, reconciliation_context.run, result)
+            _admit(None)
+            state["delivery_attempted"] = True
+            _journal_interrupt_phase(
+                "delivery_attempted", surface=surface_key, connection_lease_acquired=True
+            )
+            try:
+                value = await loop.run_in_executor(
+                    _safety_interrupt_worker(surface_key), invoke_interrupt
+                )
+            except asyncio.CancelledError:
+                _journal_interrupt_phase(
+                    "failed", surface=surface_key, reason="delivery_cancelled",
+                    delivery_outcome_unknown=True,
+                )
+                raise
+            except Exception as exc:
+                _journal_interrupt_phase(
+                    "failed", surface=surface_key, reason=f"{type(exc).__name__}: {exc}"[:300]
+                )
+                raise
+            _journal_interrupt_phase("delivered", surface=surface_key)
+        finally:
+            # Delivery boundary: free the connection lease and this surface's
+            # lane immediately so no other Stop is queued behind this one.
+            state["delivery_finished"] = True
+            if lease_held:
+                state["lease_released"] = True
+                _tester_transition_lock.release()
+            lane.release()
+        if not callable(value):
+            return value
+        pending = asyncio.wrap_future(
+            loop.run_in_executor(None, interrupt_context.copy().run, value)
+        )
+        _journal_interrupt_phase("reconciliation_pending", surface=surface_key)
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(pending), timeout=_INTERRUPT_RECONCILIATION_DEADLINE_S
+            )
+        except asyncio.TimeoutError:
+            pending.add_done_callback(
+                lambda done: None if done.cancelled() else done.exception()
+            )
+            _journal_interrupt_phase(
+                "reconciliation_pending", surface=surface_key,
+                reason="interrupt_reconciliation_deadline_exceeded",
+                reconciliation_deadline_s=_INTERRUPT_RECONCILIATION_DEADLINE_S,
+            )
+            delivery_result = getattr(value, "delivery_result", None)
+            return {
+                **(
+                    dict(delivery_result)
+                    if isinstance(delivery_result, Mapping)
+                    else {"ok": True, "axis_delivery_lease_released": True}
+                ),
+                "delivered": True,
+                "delivery_completed": True,
+                "reconciliation_pending": True,
+                "reconciliation_required": True,
+                "reconciliation_deadline_s": _INTERRUPT_RECONCILIATION_DEADLINE_S,
+                "completion_ambiguous": False,
+                "physical_effect_verified": False,
+                "error": "interrupt_reconciliation_pending",
+                "recorded": True,
+            }
 
-    worker = asyncio.create_task(leased_interrupt(), name=f"bioxp-interrupt:{label}")
+    worker = asyncio.create_task(
+        leased_delivery_then_reconciliation(), name=f"bioxp-interrupt:{surface_key}"
+    )
+
+    def _resolve_admission(task: asyncio.Task) -> None:
+        # Admission is always resolved by the worker; this is a safety net so a
+        # crash before admission can never leave a Stop press hanging.
+        if admitted.done():
+            return
+        if task.cancelled():
+            admitted.set_result(None)
+            return
+        error = task.exception()
+        if error is None:
+            admitted.set_result(None)
+        else:
+            admitted.set_exception(error)
+
+    worker.add_done_callback(_resolve_admission)
+    try:
+        admission = await admitted
+    except asyncio.CancelledError:
+        # The delivery worker is shielded on purpose: a cancelled HTTP waiter
+        # must not cancel a Stop that is already being delivered.
+        worker.add_done_callback(
+            lambda task: task.exception() if not task.cancelled() else None
+        )
+        raise
+    if isinstance(admission, HTTPException):
+        raise admission
     try:
         return await asyncio.wait_for(asyncio.shield(worker), timeout=timeout_s)
     except asyncio.CancelledError:
-        worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+        worker.add_done_callback(
+            lambda task: task.exception() if not task.cancelled() else None
+        )
         raise
     except asyncio.TimeoutError as exc:
-        # Retrieve a later exception without cancelling delivery or recording.
-        worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+        # The delivery worker keeps running: it still completes the physical
+        # Stop and its durable reconciliation. Only the waiter gave up.
+        worker.add_done_callback(
+            lambda task: task.exception() if not task.cancelled() else None
+        )
+        _journal_interrupt_phase(
+            "failed", surface=surface_key,
+            reason="interrupt_delivery_deadline_exceeded",
+            delivery_deadline_s=float(timeout_s),
+            delivery_outcome_unknown=not state["delivery_finished"],
+        )
         raise HTTPException(
             status_code=504,
             detail={
                 "error": "safety_interrupt_completion_ambiguous",
-                "message": f"{label} exceeded its {timeout_s:.0f}s response bound",
+                "message": f"{label} exceeded its {timeout_s:.0f}s delivery bound",
+                "surface": surface_key,
                 "completion_ambiguous": True,
-                "connection_transition_blocked_until_worker_exit": not ownership_lease_released,
+                "outcome_unknown": True,
+                "reconciliation_required": True,
+                "retry_forbidden": True,
+                "delivery_worker_still_running": not worker.done(),
+                "physical_delivery_started": bool(state["delivery_attempted"]),
+                "connection_transition_blocked_until_worker_exit": False,
+                "recorded": True,
             },
         ) from exc
 
@@ -6644,7 +7037,19 @@ def _camera_session_projection() -> tuple[dict[str, Any] | None, dict[str, Any]]
 
 @app.get("/status")
 async def get_status():
-    return await run_in_threadpool(_status_payload)
+    # The operator connect probe budgets 10 s for this envelope; never let it
+    # wait unbounded on authority work (2026-09-20 reconnect incident).
+    worker = asyncio.ensure_future(run_in_threadpool(_status_payload))
+    try:
+        return await asyncio.wait_for(asyncio.shield(worker), timeout=20.0)
+    except asyncio.TimeoutError:
+        worker.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        return {
+            "status": "degraded",
+            "degraded": True,
+            "degraded_reason": "status_projection_timeout",
+            "startup_error": None if _startup_error is None else "startup_failed",
+        }
 
 
 def _snapshot_proves_can_ready(snapshot: Mapping[str, Any]) -> bool:
@@ -7738,12 +8143,19 @@ async def motion_diagnostics_execute(req: AxisDiagnosticExecuteRequest):
 @app.post("/motion/diagnostics/stop")
 async def motion_diagnostics_stop(req: AxisDiagnosticStopRequest):
     if req.axis == "y":
+        # RCA F6: a stop-class refusal must be recorded, not answered with
+        # silence. The write-ahead journal keeps the press falsifiable.
+        _journal_interrupt_phase(
+            "rejected", surface="diagnostics-y", reason="direct_y_diagnostic_stop_retired",
+            physical_motion_commanded=False,
+        )
         raise HTTPException(
             status_code=410,
             detail={
                 "error": "direct_y_diagnostic_stop_retired",
                 "replacement_action_id": None,
                 "physical_motion_commanded": False,
+                "recorded": True,
             },
         )
     try:
@@ -7802,6 +8214,7 @@ async def motion_diagnostics_stop(req: AxisDiagnosticStopRequest):
         f"OEM {req.axis} diagnostic stop",
         stop_and_verify,
         timeout_s=25.0,
+        surface=f"diagnostics-{req.axis}",
     )
 
 
@@ -8189,6 +8602,7 @@ async def motion_oem_y_stop():
         "serial-206 Y stop",
         lambda tester: _execute_serial206_y_call("stop"),
         timeout_s=10.0,
+        surface="y",
     )
 
 
@@ -8353,8 +8767,11 @@ async def motion_oem_x_internal_enable_xyz(req: OemXCurrentModeRequest):
 async def motion_oem_x_stop():
     return await _run_safety_interrupt_blocking(
         "serial-206 X double-stop",
-        lambda _tester: _execute_provider_x_intent("stop", {"timeout_s": 3.0}),
+        lambda _tester: _execute_provider_x_intent(
+            "stop", {"timeout_s": 3.0}, defer_reconciliation=True
+        ),
         timeout_s=10.0,
+        surface="x",
     )
 
 
@@ -8367,6 +8784,7 @@ async def motion_oem_x_abort():
             "abort", {"timeout_s": 3.0, "physical_scope": "none_software_flags_and_waiters"}
         ),
         timeout_s=10.0,
+        surface="abort",
     )
     return {
         **result,
@@ -8454,6 +8872,7 @@ async def motion_oem_z_stop():
         lambda _tester: _execute_provider_z_intent("stop", {"timeout_s": 3.0}, defer_reconciliation=True),
         timeout_s=10.0,
         delivery_only_lease=True,
+        surface="z",
     )
 
 
@@ -10259,8 +10678,19 @@ def _run_pipette_tip_query_with_deck_owner(audited_query, transport):
         return result
 
 
-def _query_and_publish_pipette_tip_status(*, runtime_binding=None):
-    """Shared query owner; called only inside the existing tester worker."""
+# The no-motion deck-readiness refresh must fail fast: a dead CAN bus must
+# not hold the provider authority lock for a full per-channel timeout x four
+# channels (2026-09-20 warm-lock incident: 240.2 s per sweep, five sweeps).
+_READINESS_TIP_PROBE_TIMEOUT_S = 3.0
+
+
+def _query_and_publish_pipette_tip_status(*, runtime_binding=None, readiness_bounded: bool = False):
+    """Shared query owner; called only inside the existing tester worker.
+
+    ``readiness_bounded`` shortens the per-channel response timeout and stops
+    the sweep at the first ack timeout — readiness is a no-motion display
+    refresh, never authority-bearing work.
+    """
     transport = _get_pipette_transport()
 
     async def inline_run(_label, callback, *, timeout_s):
@@ -10268,13 +10698,94 @@ def _query_and_publish_pipette_tip_status(*, runtime_binding=None):
 
     def audited_query():
         return asyncio.run(run_pipette_operation(
-            "tip_status", lambda owned: owned.query_tip_status_all(),
+            "tip_status",
+            lambda owned: owned.query_tip_status_all(
+                response_timeout_s=_READINESS_TIP_PROBE_TIMEOUT_S if readiness_bounded else None,
+                abort_after_first_ack_timeout=readiness_bounded,
+            ),
             get_transport=lambda: transport, run_blocking=inline_run,
             timeout_s=120.0, receipt_store=_pipette_receipts, requested_inputs={},
             runtime_binding=runtime_binding,
         ))
 
     return _run_pipette_tip_query_with_deck_owner(audited_query, transport)
+
+
+# Pipette readiness self-heal (operator directive 2026-09-21): the bounded
+# readiness tip probe is wake-less by OEM parity (QueryTipStatus).  Consecutive
+# all-silent sweeps escalate to ONE wake-carrying reinitialize so a slept
+# channel recovers without a human; bounded by a streak threshold plus a
+# cooldown, receipted, never motion, never a permanent lock.
+_PIPETTE_READINESS_RECOVERY: dict[str, Any] = {
+    "silent_streak": 0,
+    "last_attempt_at": None,
+    "last_outcome": None,
+}
+_PIPETTE_READINESS_RECOVERY_STREAK_THRESHOLD = 3
+_PIPETTE_READINESS_RECOVERY_COOLDOWN_S = 600.0
+
+
+def _pipette_readiness_sweep_replied(result: Any) -> bool | None:
+    """True when any observed channel answered; None when nothing was observed."""
+    channels = result.get("channels") if isinstance(result, Mapping) else None
+    if not isinstance(channels, list) or not channels:
+        return None
+    for row in channels:
+        inner = row.get("result") if isinstance(row, Mapping) else None
+        if not isinstance(inner, Mapping):
+            continue
+        ack_value = inner.get("ack")
+        ack = ack_value if isinstance(ack_value, Mapping) else {}
+        if inner.get("ok") is True or ack.get("received") is True:
+            return True
+    return False
+
+
+def _pipette_readiness_silent_sweep(result: Any) -> None:
+    replied = _pipette_readiness_sweep_replied(result)
+    if replied is None:
+        return
+    if replied:
+        _PIPETTE_READINESS_RECOVERY["silent_streak"] = 0
+        return
+    streak = int(_PIPETTE_READINESS_RECOVERY.get("silent_streak") or 0) + 1
+    _PIPETTE_READINESS_RECOVERY["silent_streak"] = streak
+    if streak < _PIPETTE_READINESS_RECOVERY_STREAK_THRESHOLD:
+        return
+    now = time.time()
+    last = _PIPETTE_READINESS_RECOVERY.get("last_attempt_at")
+    if isinstance(last, (int, float)) and (now - float(last)) < _PIPETTE_READINESS_RECOVERY_COOLDOWN_S:
+        return
+    _PIPETTE_READINESS_RECOVERY["last_attempt_at"] = now
+    _PIPETTE_READINESS_RECOVERY["silent_streak"] = 0
+
+    async def inline_run(_label, callback, *, timeout_s):
+        return callback()
+
+    try:
+        transport = _get_pipette_transport()
+        outcome = asyncio.run(run_pipette_operation(
+            "reinitialize",
+            lambda owned: owned.reinitialize_pipette(force_wake=True),
+            get_transport=lambda: transport,
+            run_blocking=inline_run,
+            timeout_s=180.0,
+            receipt_store=_pipette_receipts,
+            requested_inputs={"trigger": "readiness_silent_sweep"},
+            runtime_binding={
+                "caller_class": "lifecycle",
+                "entrypoint_id": "hardware.snapshot.pipette_readiness_recovery",
+                "idempotency_key": "readiness-pipette-recovery:" + uuid.uuid4().hex,
+            },
+        ))
+    except Exception as exc:
+        _PIPETTE_READINESS_RECOVERY["last_outcome"] = f"failed: {exc}"
+        return
+    _PIPETTE_READINESS_RECOVERY["last_outcome"] = (
+        "reinitialized"
+        if isinstance(outcome, Mapping) and outcome.get("ok") is True
+        else str(outcome.get("outcome") if isinstance(outcome, Mapping) else "not_ok")
+    )
 
 
 def _observe_park_tip_prerequisite(provider):
@@ -10301,12 +10812,15 @@ def _observe_park_tip_prerequisite(provider):
     try:
         # Reuse lifecycle child binding: a Refresh/admission parent must not be
         # overwritten by the pipette receipt, or replayed as a fresh observation.
-        return _query_and_publish_pipette_tip_status(runtime_binding={
+        result = _query_and_publish_pipette_tip_status(runtime_binding={
             "caller_class": "lifecycle", "entrypoint_id": "hardware.snapshot.park_tip_observation",
             "idempotency_key": "readiness-tip-query:" + uuid.uuid4().hex,
-        })
+        }, readiness_bounded=True)
+        _pipette_readiness_silent_sweep(result)
+        return result
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, Mapping) else {}
+        _pipette_readiness_silent_sweep(detail)
         return {"available": False, "queried": True, "reason": "park_tip_query_unavailable",
                 "status_code": exc.status_code, "receipt_id": detail.get("receipt_id"),
                 "command_id": detail.get("command_id")}
@@ -10740,6 +11254,7 @@ def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
         ProtocolActionKind.MOVE_COVER: _protocol_live_plate_move_handler,
         ProtocolActionKind.PLATE_PREPARE: _protocol_live_plate_prepare_handler,
         ProtocolActionKind.THERMAL_DOOR: _protocol_live_thermal_door_handler,
+        ProtocolActionKind.INSPECT: _protocol_live_inspect_cover_handler,
         ProtocolActionKind.PIPETTE_INIT: _protocol_live_pipette_handler,
         ProtocolActionKind.PIPETTE_TIP: _protocol_live_pipette_handler,
         ProtocolActionKind.TIP_EJECT: _protocol_live_pipette_handler,
@@ -10858,6 +11373,124 @@ def _protocol_snapshot_image(*, condition, artifact_id):
     runtime = PreparationCameraRuntime(_camera_provider,
         artifact_root=get_protocol_jobs_root() / binding["parent_command_id"] / "source-images")
     return runtime.snapshot_image(condition=condition, artifact_id=artifact_id)
+
+
+def _deck_inspection_settings() -> dict:
+    """Machine-bundle deck-inspection policy, camera profiles, template bytes.
+
+    Reads the validated snapshot exactly the way the preparation lane does;
+    template bytes come from the captured vision inputs, never a filesystem
+    guess. Defensive copies keep callers from mutating the snapshot records.
+    """
+    from .oem_job_preparation import capture_preparation_settings
+    from .oem_machine_bundle import get_active_oem_machine_snapshot
+    snapshot = get_active_oem_machine_snapshot()
+    settings = dict(capture_preparation_settings(snapshot)["settings"])
+    templates: dict = {}
+    for name in ("cover.jpg", "output.jpg", "outputw_foil.jpg", "output_empty.jpg",
+                 "reagentTray.jpg", "reagentEmpty.jpg", "EmptyStorage.jpg"):
+        record = snapshot.records.get(f"appdata/{name}")
+        raw = getattr(record, "raw_bytes", None) if record is not None else None
+        if isinstance(raw, (bytes, bytearray)):
+            templates[name] = bytes(raw)
+    settings["VisionTemplates"] = templates
+    return settings
+
+
+def _deck_cover_inspection_capture(*, condition: str, artifact_id: str) -> dict:
+    """One fresh source-typed inspection frame (CGrabThread single-frame port)."""
+    from .camera_provider import OemInspectionCameraSettings
+    result = _camera_provider.capture_inspection(OemInspectionCameraSettings(gain=1000, exposure=1000))
+    frame = result.frame
+    return {
+        "frame": bytes(frame.content),
+        "capture_evidence": {
+            "frame_sha256": frame.content_sha256,
+            "provider_generation": frame.provider_generation,
+            "sequence": frame.sequence,
+            "captured_at": frame.captured_at.isoformat(),
+            "source_frames_discarded": result.source_frames_discarded,
+            "condition": condition,
+            "artifact_id": str(artifact_id),
+        },
+    }
+
+
+def _deck_cover_inspection_save(*, frame, condition: str, artifact_id: str) -> dict:
+    """Save the exact decision frame under the source condition label."""
+    import hashlib as _hashlib
+    from .services.protocol_service import get_protocol_jobs_root
+    content = bytes(frame)
+    digest = _hashlib.sha256(content).hexdigest()
+    root = get_protocol_jobs_root() / "deck-cover-inspection"
+    path = root / (_hashlib.sha256(str(artifact_id).encode()).hexdigest() + ".jpg")
+    artifact = {"ok": True, "capture_ok": True, "condition": condition,
+                "artifact_id": str(artifact_id), "path": str(path),
+                "sha256": digest, "size_bytes": len(content)}
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        with path.open("xb") as output:
+            output.write(content)
+        with path.with_suffix(".json").open("x") as output:
+            json.dump(artifact, output, sort_keys=True, allow_nan=False)
+        artifact["artifact_saved"] = True
+    except (OSError, TypeError, ValueError) as exc:
+        artifact.update(ok=False, artifact_saved=False,
+                        error="source_image_logging_failed:" + str(exc))
+    return artifact
+
+
+def _bind_deck_cover_inspection(provider) -> None:
+    """Compose the cover-inspection callbacks onto the serial-206 provider."""
+    provider.bind_oem_cover_inspection_callbacks(
+        settings=_deck_inspection_settings,
+        capture=_deck_cover_inspection_capture,
+        save=_deck_cover_inspection_save,
+        led=lambda *, channel, on: _camera_provider.set_illumination(channel=channel, on=on),
+        rgb=lambda r, g, b: _get_tester().strip_set_rgb(r, g, b, reconnect_first=False, activate_first=False),
+    )
+
+
+def _protocol_live_inspect_cover_handler(action, state):
+    """OEM inspectCover as the canonical finite deck operation.
+
+    Admits `cover_inspection` (source port of ControlLib.inspectCover:3663-3768)
+    into the same canonical deck queue as move_plate, waits for its terminal,
+    then evaluates the assembled receipt against the build-time acceptance
+    contract. Movement and state writes happen only inside that admitted run.
+    """
+    from .oem_vision_acceptance import assemble_inspect_cover_receipt, evaluate_inspect_cover_receipt
+    provider = _serial206_oem_initialization_provider
+    if provider is None:
+        raise HTTPException(status_code=503, detail={"error": "serial206_provider_unavailable"})
+    _bind_deck_cover_inspection(provider)
+    settings = _deck_inspection_settings()
+    inputs = {
+        "deck_inspection": bool(settings["DeckInspection"]),
+        "screen_resolution_high": bool(settings["ScreenResolutionHigh"]),
+        "inspection_log_only": bool(settings["InspectionLogOnly"]),
+    }
+    admitter = getattr(app.state, "oem_wp8_operation_admitter", None)
+    if not callable(admitter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    job_id = str(getattr(state, "job_id", None) or getattr(state, "protocol_id", None) or "")
+    admitted = admitter(
+        "cover_inspection", inputs=inputs,
+        idempotency_key=f"protocol:{job_id}:{action.action_id}",
+    )
+    command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
+    if not isinstance(command_id, str) or not command_id:
+        raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
+    row = _wait_protocol_deck_command(command_id, timeout_s=900.0)
+    evidence = _protocol_command_store().wp8_operation_evidence(command_id)
+    receipt = assemble_inspect_cover_receipt(evidence, settings=inputs)
+    evaluation = evaluate_inspect_cover_receipt(receipt)
+    return {
+        "ok": bool(evaluation.get("receipt_validation_pass")),
+        "command_id": command_id,
+        "receipt": receipt,
+        "evaluation": evaluation,
+    }
 
 
 def _protocol_bindings(bundle, *, source_executor=None):

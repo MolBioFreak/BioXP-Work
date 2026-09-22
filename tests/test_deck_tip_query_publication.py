@@ -34,7 +34,9 @@ def query_rig(installed_retained, monkeypatch):
         driver.pipette_id = channel
         from types import SimpleNamespace
         driver.bus = SimpleNamespace(router=SimpleNamespace(reader_generation=1))
-        def exchange(command, *, address, ack_mode, command_name, channel=channel):
+        def exchange(command, *, address, ack_mode, command_name, response_timeout_s=None, channel=channel):
+            # response_timeout_s mirror: bounded readiness probes may pass a
+            # shortened window; the offline exchange models the wire, not timers.
             assert (command, address, ack_mode, command_name) == ('?31','report','query','query_tip_status')
             calls.append(channel)
             if wire.get('failure'):

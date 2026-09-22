@@ -1,7 +1,8 @@
 """Acceptance contracts for OEM CheckCamera and CVision startup operations."""
 from __future__ import annotations
 
-from typing import Any
+import json
+from typing import Any, Mapping
 
 
 class OemVisionReceiptError(ValueError):
@@ -293,4 +294,159 @@ def evaluate_inspect_cover_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
         "expected_relocations": expected_relocations,
         "source_anchor": INSPECT_COVER_SOURCE_ANCHOR,
         "camera_session_disposition": "not_released_by_inspectCover",
+    }
+
+
+def plan_cover_relocations(detected: Mapping[Any, bool]) -> dict[str, Any]:
+    """Execution planner for inspectCover's num==2 relocation block (3727-3766).
+
+    Mirrors evaluate_inspect_cover_receipt's source-order walk exactly, so the
+    executed relocations, the final custody writes and any refusal are the same
+    facts the evaluator later validates. A topology the OEM source cannot pair
+    by list index (len(found_chillers) != len(empty_storage)) refuses before
+    any motion.
+    """
+    order = (17, 19, 20, 18)
+    values: dict[int, bool] = {}
+    for location in order:
+        values[location] = _exact_bool(
+            detected.get(location, detected.get(str(location))),
+            f"cover_detected.{location}",
+        )
+    cover_count = 0
+    found: list[int] = []
+    empty: list[int] = []
+    error_status: str | None = None
+    for location in order:
+        present = values[location]
+        if location in {17, 19}:
+            if present:
+                found.append(location)
+                cover_count += 1
+            continue
+        if present:
+            if cover_count >= 2:
+                # Source marks OVER_CHILLER_COVER; the exact count beyond the
+                # gate cannot reach the num==2 relocation branch either way.
+                error_status = "OVER_CHILLER_COVER"
+                break
+            cover_count += 1
+        else:
+            empty.append(location)
+    if error_status is None and cover_count < 2:
+        error_status = "SHORT_CHILLER_COVER"
+    relocations: list[dict[str, Any]] = []
+    if cover_count == 2 and error_status is None:
+        if len(found) != len(empty):
+            raise OemVisionReceiptError("cover topology cannot be paired by the OEM source order")
+        relocations = [
+            {"cover": "reagent" if source == 19 else "output", "from": source, "to": destination}
+            for source, destination in zip(found, empty)
+        ]
+    return {
+        "detected": {location: values[location] for location in order},
+        "cover_count": cover_count,
+        "error_status": error_status,
+        "found_chillers": found,
+        "empty_storage": empty,
+        "relocations": relocations,
+        "source_anchor": INSPECT_COVER_SOURCE_ANCHOR,
+    }
+
+
+def _recursive_bool(value: Any, key: str) -> bool | None:
+    if isinstance(value, dict):
+        if type(value.get(key)) is bool:
+            return value[key]
+        for item in value.values():
+            found = _recursive_bool(item, key)
+            if found is not None:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found = _recursive_bool(item, key)
+            if found is not None:
+                return found
+    return None
+
+
+def assemble_inspect_cover_receipt(evidence: Mapping[str, Any], *, settings: Mapping[str, Any]) -> dict[str, Any]:
+    """Assemble the evaluate_inspect_cover_receipt-shaped receipt.
+
+    Everything comes from the command's own child ledger and transitions; no
+    field is synthesized that the run did not record.
+    """
+    children = [dict(row) for row in (evidence.get("children") or [])]
+    transitions = [dict(row) for row in (evidence.get("state_transitions") or [])]
+
+    def parse(row):
+        raw = row.get("terminal_evidence_json")
+        data = json.loads(raw) if isinstance(raw, str) and raw.strip() else None
+        if isinstance(data, dict):
+            inner = data.get("result")
+            return dict(inner) if isinstance(inner, dict) else dict(data)
+        return {}
+
+    def child_result(operation: str) -> dict:
+        for row in children:
+            if str(row.get("operation")) == operation:
+                return parse(row)
+        return {}
+
+    detected: dict = {}
+    methods: dict = {}
+    for row in children:
+        if str(row.get("operation")) != "inspectCoverAt":
+            continue
+        result = parse(row)
+        location = result.get("location")
+        if type(location) is int:
+            detected[str(location)] = bool(result.get("cover_detected"))
+            methods[str(location)] = str(result.get("method"))
+    relocate = child_result("coverInspectionRelocate")
+    door_close = child_result("doorOpen")
+    door_closed = _recursive_bool(door_close, "door_closed")
+
+    attempted_ms = 0
+    acknowledged_ms = 0
+    verified_ms = 0
+    stamps = sorted(
+        float(row.get("created_at") or 0.0)
+        for row in transitions
+        if int(row.get("child_order", -1)) == 0
+    )
+    if stamps:
+        attempted_ms = int(stamps[0] * 1000)
+        acknowledged_ms = int(stamps[-1] * 1000)
+        all_stamps = [float(row.get("created_at") or 0.0) for row in transitions]
+        verified_ms = int((max(all_stamps) if all_stamps else stamps[-1]) * 1000)
+    acknowledged_ms = max(attempted_ms, acknowledged_ms)
+    verified_ms = max(acknowledged_ms, verified_ms)
+    # DefaultParameters.ForceToHighHome is a software pseudo-home: the child's
+    # completion IS the publication (no controller delivery exists to ack); the
+    # receipt records exactly that, never a fabricated controller exchange.
+    force_rows = [row for row in children if str(row.get("operation")) == "sourceForceToHighHome"]
+    force_attempted = any(str(row.get("terminal_state")) != "planned" for row in force_rows)
+    force_completed = any(str(row.get("terminal_state")) == "completed" for row in force_rows)
+    return {
+        "force_to_high_home": {
+            "provider_id": "serial206-cover-inspection",
+            "command_id": str(evidence.get("operation", {}).get("command_id") or ""),
+            "attempted": bool(force_attempted),
+            "controller_acknowledged": bool(force_completed),
+            "postcondition_verified": bool(force_completed),
+            "attempted_at_ms": attempted_ms,
+            "acknowledged_at_ms": acknowledged_ms,
+            "postcondition_verified_at_ms": verified_ms,
+        },
+        "deck_inspection": bool(settings["deck_inspection"]),
+        "screen_resolution_high": bool(settings["screen_resolution_high"]),
+        "observed_locations": [17, 19, 20, 18],
+        "inspection_methods": methods,
+        "cover_detected": detected,
+        "relocations": list(relocate.get("relocations") or []),
+        "final_cover_locations": relocate.get("final_cover_locations"),
+        "door_closed_verified": bool(door_closed is True),
+        "door_open_verified": bool(relocate.get("door_open_verified") is True),
+        "inspection_log_only": bool(settings["inspection_log_only"]),
     }

@@ -87,13 +87,15 @@ def export_control(outcome, job):
             "fixture_only": True, "physical_acceptance": False, "job": job}, indent=2))
 
 
-def test_delayed_continue_reconciles_original_control_and_keeps_other_claims_out(gated_workflow):
+def test_delayed_continue_reconciles_original_control_and_allows_other_claims(gated_workflow):
     client, store, payload, gate, trace = gated_workflow
     job_id = gate["job_id"]
     assert gate["command"]["status"] == "dispatched" and not gate["command"]["terminal"]
-    with pytest.raises(ValueError, match="workflow_busy"):
-        with store.normal_mutation_scope(resources=("thermal",)):
-            pytest.fail("external mutation entered a held workflow")
+    # 2026-09-21: custody never refuses an external mutation; it may enter.
+    with store.normal_mutation_scope(resources=("thermal",)) as external:
+        assert store.connection.execute(
+            "SELECT parent_command_id FROM operator_commands WHERE command_id=?",
+            (external,)).fetchone()[0] is None
     wrong = control_body(gate, "wrong-gate", action="continue", gate="delaypoint", gate_id="old")
     assert client.post("/protocol/jobs/" + job_id + "/control", json=wrong).status_code == 409
     body = control_body(gate, "continue-once", action="continue", gate="delaypoint", gate_id="source:delay")

@@ -149,8 +149,9 @@ def test_active_child_control_delivery_not_fifo_or_tester_lock(rig, release_oper
         pending = pool.submit(run, rig, 'set_tc_temperature', 'active', dict(temp_c=60, duration=100, rate_c_s=1))
         try:
             assert entered.wait(5)
-            with pytest.raises(ValueError, match='normal_resource_busy'):
-                run(rig, 'resume_temperature', 'conflict')
+            # 2026-09-21: unrelated normal work is admitted even while a child is active.
+            conflict = run(rig, 'resume_temperature', 'conflict')
+            assert conflict['ok'] is True
             control = pool.submit(run, rig, release_operation, 'control').result(timeout=5)
             assert control['ok'] is True
             child = pending.result(timeout=5)
@@ -160,13 +161,14 @@ def test_active_child_control_delivery_not_fifo_or_tester_lock(rig, release_oper
     assert rig.store.connection.execute('SELECT COUNT(*) FROM operator_plane_commands').fetchone()[0] == 1
 
 
-def test_unrelated_normal_work_denied(rig):
+def test_unrelated_normal_work_admitted(rig):
     db = RuntimeAuditDatabase(rig.store.root)
     try:
-        with pytest.raises(ValueError, match='workflow_busy'):
-            db.claim(dict(command_id='manual', idempotency_key='manual', action_id='manual', operation='manual',
-                entrypoint_id='test', caller_class='operator', control_class='physical_command',
-                ownership_generation=1, requested_inputs={'temp': 20}, resources=('thermal',)))
+        # 2026-09-21: custody never refuses unrelated normal work.
+        child, created = db.claim(dict(command_id='manual', idempotency_key='manual', action_id='manual', operation='manual',
+            entrypoint_id='test', caller_class='operator', control_class='physical_command',
+            ownership_generation=1, requested_inputs={'temp': 20}, resources=('thermal',)))
+        assert created and child['parent_command_id'] is None
     finally:
         db.close()
     assert not rig.calls
@@ -273,8 +275,8 @@ def test_exceptional_native_timer_retains_resource_and_publishes_completion(rig,
     assert 'source_timer_future' not in json.dumps(result['receipt'])
     saved[0]('source timer still active')
     assert events == ['source timer still active']
-    with pytest.raises(ValueError, match='normal_resource_busy'):
-        run(rig, 'resume_temperature', 'conflict')
+    # 2026-09-21: an unresolved child no longer refuses unrelated work.
+    assert run(rig, 'resume_temperature', 'conflict')['ok'] is True
     replay = run(rig, 'set_tc_temperature', 'thermal:1', dict(temp_c=60, duration=10, rate_c_s=1))
     assert replay['owned_children'][0].future is owned.future
     assert len(saved) == 1
@@ -292,8 +294,8 @@ def test_exceptional_native_timer_retains_resource_and_publishes_completion(rig,
     if stopped:
         assert run(rig, 'resume_temperature', 'released')['ok']
     else:
-        with pytest.raises(ValueError, match='normal_resource_busy'):
-            run(rig, 'resume_temperature', 'still-unknown')
+        # 2026-09-21: an ambiguous outcome no longer refuses unrelated work.
+        assert run(rig, 'resume_temperature', 'still-unknown')['ok']
 
 
 def test_real_provider_and_native_software_abort_keep_reference_invalidation(rig):

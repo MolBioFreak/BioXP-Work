@@ -1058,6 +1058,7 @@ class OperatorCommandStore:
         self._priority_fence = threading.Event()
         self._axis_priority_fences = {axis: threading.Event() for axis in ("x", "y", "z")}
         self._interrupt_lock = threading.Lock()
+        self._interrupt_decision_lock = threading.Lock()
         self._pending_interrupt_lock = threading.RLock()
         self._pending_interrupt_reconciliations: list[dict[str, Any]] = []
         self._active_interrupt_deliveries: dict[str, str] = {}
@@ -1465,6 +1466,161 @@ class OperatorCommandStore:
         finally:
             self._interrupt_spool_write_depth -= 1
             connection.close()
+
+    def append_interrupt_decision(self, event: Mapping[str, Any]) -> dict[str, Any]:
+        """Append one fsync'd interrupt decision fact (refusal, materialization).
+
+        The reconcile spool admits only pending/delivered/reconciled phases, so
+        refusals and crash-materializations -- facts about a Stop that was never
+        delivered -- are kept in this plane-owned append-only log instead. It is
+        a projection of the write-ahead journal, never a replacement for it.
+        """
+
+        record = {
+            "schema": "bioxp.operator_interrupt_decision.v1",
+            "recorded_at": _now(),
+            "pid": os.getpid(),
+            **{str(key): value for key, value in dict(event).items()},
+        }
+        payload = (_canonical(record) + "\n").encode("utf-8")
+        path = self.root / "operator_interrupt_decisions.v1.jsonl"
+        with self._interrupt_decision_lock:
+            self.root.mkdir(parents=True, exist_ok=True)
+            handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.write(handle, payload)
+                os.fsync(handle)
+            finally:
+                os.close(handle)
+        return {"ok": True, "path": str(path), "record": record}
+
+    def record_interrupt_rejection(
+        self, *, interrupt_attempt_id: str, action_id: str, reason: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Durably record a refused stop press without delivering anything.
+
+        A refusal is evidence, not silence: the write-ahead journal carries the
+        authority record and this inert spool event (phase ``rejected`` is never
+        drained by ``_pending_interrupt_spool_rows``) keeps the refusal in the
+        same store as the reconcile spool. No safety epoch is bumped and no
+        interrupt fence is armed: nothing was attempted.
+        """
+
+        attempt_id = str(interrupt_attempt_id or "").strip()
+        if not attempt_id:
+            raise ValueError("interrupt attempt identity is required")
+        if action_id not in INTERRUPT_ACTIONS:
+            raise ValueError("interrupt rejection action is invalid")
+        event = {
+            "kind": "rejected",
+            "interrupt_attempt_id": attempt_id,
+            "action_id": str(action_id),
+            "reason": str(reason),
+            "admitted": False,
+            "attempted": False,
+            "acknowledged": False,
+            "response": None,
+            "error": str(reason),
+            "physical_motion_commanded": False,
+        }
+        if payload:
+            event.update({str(key): value for key, value in payload.items() if key not in event})
+        # The reconcile spool only admits pending/delivered/reconciled, and a
+        # refusal must never enter the reconciliation drain. The plane keeps its
+        # own append-only, fsync'd decision log for non-delivery interrupt facts.
+        self.append_interrupt_decision(event)
+        return {"ok": True, "phase": "rejected", "interrupt_attempt_id": attempt_id,
+                "action_id": str(action_id), "reason": str(reason), "recorded": True}
+
+    def materialize_interrupt_journal(self, journal: Any) -> dict[str, Any]:
+        """Project orphaned write-ahead interrupt attempts into durable rows (RCA F1).
+
+        Startup recovery reconciled only the nonterminal *normal* command; the
+        stops that were pressed left nothing behind. Every attempt the journal
+        still shows as unresolved is now materialized:
+
+        * ``admitted`` ledger row + safety epochs + interrupt fence (the press is
+          a fact and outstanding work is suspect until reconciled);
+        * ``attempted`` ledger row plus a pending reconciliation spool row when
+          the journal proves delivery was attempted (outcome unknown, fence stays
+          armed -> fail-closed);
+        * an inert spool ``materialized`` event when delivery was never
+          attempted, so the ledger never claims a stop that was never sent.
+        """
+
+        if journal is None or not hasattr(journal, "materialize_startup"):
+            return {"ok": True, "materialized": [], "failed": {}, "unresolved": []}
+
+        def projector(state: Mapping[str, Any]) -> dict[str, Any]:
+            attempt_id = str(state["interrupt_attempt_id"])
+            action_id = str(state.get("action_id") or "")
+            if action_id not in INTERRUPT_ACTIONS:
+                raise ValueError(f"journal interrupt action is invalid: {action_id!r}")
+            records = [row for row in state.get("records") or [] if isinstance(row, Mapping)]
+            admitted = next(
+                (row for row in records if str(row.get("phase")) == "admitted"),
+                records[0] if records else {},
+            )
+            idempotency_key = str(admitted.get("idempotency_key") or attempt_id)
+            observed_generation = int(admitted.get("observed_ownership_generation") or 0)
+            request = {
+                "idempotency_key": idempotency_key,
+                "caller_idempotency_key": admitted.get("caller_idempotency_key"),
+                "interrupt_attempt_id": attempt_id,
+                "observed_ownership_generation": observed_generation,
+                "observed_board_epoch_by_board": dict(
+                    admitted.get("observed_board_epoch_by_board") or {}
+                ),
+                "startup_materialization": True,
+            }
+            attempt_state = {
+                "ownership_generation": observed_generation,
+                "board_epoch_by_board": dict(admitted.get("observed_board_epoch_by_board") or {}),
+                "startup_materialization": True,
+                "journal_phases": list(state.get("phases") or []),
+            }
+            receipt = self.begin_interrupt(
+                action_id,
+                state=attempt_state,
+                request=request,
+                interrupt_attempt_id=attempt_id,
+            )
+            attempted = any(
+                str(row.get("phase")) == "delivery_attempted" for row in records
+            )
+            if attempted:
+                self.mark_interrupt_attempted(idempotency_key=idempotency_key)
+                self.queue_pending_interrupt_reconciliation({
+                    "action_id": action_id,
+                    "state": attempt_state,
+                    "request": request,
+                    "interrupt_attempt_id": attempt_id,
+                    "attempted": True,
+                    "acknowledged": False,
+                    "response": None,
+                    "error": "process_restart_during_interrupt_delivery",
+                })
+            else:
+                # Delivery was never attempted: the ledger must not claim a Stop
+                # that was never sent, so the fact is recorded as a decision.
+                self.append_interrupt_decision({
+                    "kind": "materialized",
+                    "interrupt_attempt_id": attempt_id,
+                    "action_id": action_id,
+                    "reason": "process_restart_before_interrupt_delivery",
+                    "attempted": False,
+                    "journal_phases": list(state.get("phases") or []),
+                })
+            return {
+                "action_id": action_id,
+                "idempotency_key": idempotency_key,
+                "delivery_attempted": attempted,
+                "persistence_state": receipt.get("persistence_state"),
+                "reconciliation_required": True,
+            }
+
+        return journal.materialize_startup(projector)
 
     def _pending_interrupt_spool_rows(self) -> list[dict[str, Any]]:
         connection = self._interrupt_spool_connection()
@@ -3221,16 +3377,11 @@ class OperatorCommandStore:
                 if existing["canonical_request_sha256"] != digest:
                     raise ValueError("idempotency key conflict")
                 return self.get_workflow(existing["command_id"])
-            # Immutable ambiguous history is not current software custody.
-            # Only the canonical cancel_pending owner can attest abandonment;
-            # physical uncertainty remains fenced by recovery/resource owners.
-            if conn.execute("SELECT 1 FROM operator_plane_lane WHERE workflow_command_id IS NOT NULL").fetchone() or conn.execute(
-                    "SELECT 1 FROM operator_commands c WHERE c.command_kind='protocol_workflow' "
-                    "AND (c.status IN ('queued','dispatched','interrupting') OR (c.status='ambiguous' "
-                    "AND NOT EXISTS (SELECT 1 FROM operator_plane_recovery_acknowledgements r "
-                    "WHERE r.command_id=c.command_id AND r.operation='cancel_pending' "
-                    "AND json_extract(r.receipt_json,'$.workflow_custody')='abandoned' "
-                    "AND json_extract(r.receipt_json,'$.workflow_command_id')=c.command_id))) LIMIT 1").fetchone():
+            # 2026-09-21: only a live workflow blocks a new workflow. Ambiguous or
+            # unresolved history is retained as record and never refuses admission.
+            if conn.execute(
+                    "SELECT 1 FROM operator_commands WHERE command_kind='protocol_workflow' "
+                    "AND status IN ('queued','dispatched','interrupting') LIMIT 1").fetchone():
                 raise ValueError("workflow_busy")
             safety = dict(conn.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone())
             footprint = {"global_epoch": safety["global_epoch"],
@@ -5285,6 +5436,44 @@ class OperatorCommandStore:
             ],
         }
 
+    def _wp8_finite_recovery_detail(self, command_id: str) -> dict[str, Any] | None:
+        """Surface the governed recovery resolution for WP8 finite receipts.
+
+        WP8 first-Park / critical-image children never capture a named-deck
+        command row, so the named-deck detail returns None for them even after
+        a reconcile wrote a decision.  Expose the same validated resolution
+        shape the deck detail would carry so consumers (the cockpit
+        reconciliation gate) can see the retained ambiguity disposed.  Read
+        only; the terminal receipt and its outcome are never rewritten.
+        """
+        decision = self.connection.execute(
+            "SELECT decision_id,command_id,decision_json,receipt_json FROM operator_plane_deck_recovery_decisions WHERE command_id=?",
+            (str(command_id),),
+        ).fetchone()
+        if decision is None:
+            return None
+        wp8 = self.connection.execute(
+            "SELECT 1 FROM operator_plane_wp8_operations WHERE command_id=?", (str(command_id),)
+        ).fetchone()
+        if wp8 is None:
+            return None
+        resolution_decision = _json_load(decision["decision_json"], {})
+        resolution_receipt = _json_load(decision["receipt_json"], {})
+        if (isinstance(resolution_decision, dict) and isinstance(resolution_receipt, dict)
+            and resolution_decision.get("command_id") == resolution_receipt.get("command_id") == str(command_id)
+            and resolution_decision.get("decision_id") == decision["decision_id"]
+            and isinstance(resolution_receipt.get("reconciliation_decision"), dict)
+            and resolution_receipt["reconciliation_decision"].get("decision_id") == decision["decision_id"]
+            and all(type(resolution_receipt.get(k)) is int and resolution_receipt[k] >= 1
+                    for k in ("semantic_state_revision", "transition_sequence"))):
+            return {"recovery_resolution": {
+                "command_id": str(command_id),
+                "decision_id": str(decision["decision_id"]),
+                "semantic_state_revision": resolution_receipt["semantic_state_revision"],
+                "transition_sequence": resolution_receipt["transition_sequence"],
+            }}
+        return None
+
     def _command_response(self, row: sqlite3.Row, *, transition_sequence: int | None = None, compact: bool = False) -> dict[str, Any]:
         if transition_sequence is None:
             transition_row = self.connection.execute("SELECT MAX(transition_sequence) FROM operator_plane_transitions WHERE command_id=?", (str(row["command_id"]),)).fetchone()
@@ -5333,6 +5522,8 @@ class OperatorCommandStore:
             deck_detail = None if deck_row is None else {"ambiguity_state": deck_row[0]}
         else:
             deck_detail = self._deck_command_detail(str(row["command_id"]))
+            if deck_detail is None:
+                deck_detail = self._wp8_finite_recovery_detail(str(row["command_id"]))
         if deck_detail is not None:
             response["deck_movement"] = deck_detail
             # A retained post-delivery exception can lack the outer class even
@@ -5452,9 +5643,6 @@ class OperatorCommandStore:
                 replay_response["idempotent_replay"] = True
                 return replay_response
             if action_id in {"oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation"}:
-                blocker = self._deck_recovery_blocker(conn)
-                if blocker is not None:
-                    raise HTTPException(status_code=409, detail={"error": blocker})
                 actual_generation = int(state.get("ownership_generation") or -1)
                 if expected_generation != actual_generation:
                     raise HTTPException(status_code=409, detail={"error": "ownership_generation_mismatch", "actual": actual_generation})
@@ -6321,6 +6509,13 @@ class OperatorCommandStore:
                 parent = conn.execute("SELECT a.status,a.command_kind,c.status AS plane_status FROM operator_commands a "
                     "JOIN operator_plane_commands c USING(command_id) WHERE a.command_id=?", (parent_id,)).fetchone()
                 critical_images = command["target"] == "critical_item_images"
+                # Historical first-Park rows can predate the workflow binding of
+                # the WP8 plan into effective inputs; their immutable identity is
+                # already fully proven by the plan/authority digests, stamps,
+                # children and issued-delivery checks below (and re-enforced by
+                # the v12 authorization trigger at insert).  Keep the strict
+                # comparison whenever a plan IS carried.
+                effective_inputs = _json_load(command["effective_json"], {})
                 if (command["action_id"] != "oem.deck._finite_operation" or command["target"] not in {"thermal_door", "critical_item_images"}
                     or command["status"] not in {"ambiguous", "interrupted"}
                     or command["audit_status"] != command["status"] or command["movement_state"] != command["status"]
@@ -6330,7 +6525,7 @@ class OperatorCommandStore:
                     or plan.get("operation") != command["target"] or plan.get("source_owned") is not True
                     or (not critical_images and (plan.get("script_running") is not False or plan.get("opening") is not True))
                     or plan.get("parent_return_allows_background_pending") is not False
-                    or _json_load(command["effective_json"], {}).get("prepared_plan") != plan
+                    or (effective_inputs.get("prepared_plan") is not None and effective_inputs.get("prepared_plan") != plan)
                     or plan.get("plan_digest") != command["plan_digest"]
                     or plan.get("authority_digest") != command["authority_snapshot_digest"]
                     or _digest({k: v for k, v in plan.items() if k != "plan_digest"}) != command["plan_digest"]
@@ -6768,10 +6963,19 @@ class OperatorCommandStore:
             safety = conn.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone()
             lane = conn.execute("SELECT * FROM operator_plane_lane WHERE singleton=1").fetchone()
             now = _now()
-            if self._deck_recovery_blocker(conn) is not None:
-                return None
             if lane["owner_id"] != self.owner_id or float(lane["owner_lease_until"] or 0.0) <= now:
                 return None
+            # 2026-09-21: stale custody is not a blocker. If the owning workflow is
+            # no longer live, release the lane instead of freezing dispatch.
+            if lane["workflow_command_id"]:
+                occupant = conn.execute(
+                    "SELECT status FROM operator_commands WHERE command_id=?",
+                    (lane["workflow_command_id"],)).fetchone()
+                if occupant is None or str(occupant["status"]) not in ("queued", "dispatched", "interrupting"):
+                    conn.execute(
+                        "UPDATE operator_plane_lane SET workflow_command_id=NULL WHERE singleton=1 AND workflow_command_id=?",
+                        (lane["workflow_command_id"],))
+                    lane = conn.execute("SELECT * FROM operator_plane_lane WHERE singleton=1").fetchone()
             queued_rows = conn.execute(
                 "SELECT * FROM operator_plane_commands WHERE status='queued' ORDER BY stream_sequence"
             ).fetchall()
@@ -6788,17 +6992,12 @@ class OperatorCommandStore:
                 if identity and identity["command_kind"] == "protocol_workflow":
                     if self._workflow_dispatcher is None:
                         return None
+                    # 2026-09-21: ambiguous or unresolved history never blocks dispatch;
+                    # only genuinely live commands exclude a new workflow.
                     if conn.execute("SELECT 1 FROM operator_commands c LEFT JOIN serial206_movement_commands m USING(command_id) "
                         "WHERE c.command_id<>? AND COALESCE(m.state,c.status) IN "
-                        "('reserved','executing','dispatched','issued_pending','interrupting','ambiguous') "
-                        "AND NOT (c.command_kind='protocol_workflow' AND c.status='ambiguous' "
-                        "AND EXISTS (SELECT 1 FROM operator_plane_recovery_acknowledgements r "
-                        "WHERE r.command_id=c.command_id AND r.operation='cancel_pending' "
-                        "AND json_extract(r.receipt_json,'$.workflow_custody')='abandoned' "
-                        "AND json_extract(r.receipt_json,'$.workflow_command_id')=c.command_id)) "
-                        "AND NOT (m.state IS 'ambiguous' AND c.status IN ('ambiguous','interrupted') "
-                        "AND EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions d "
-                        "WHERE d.command_id=c.command_id)) LIMIT 1",
+                        "('reserved','executing','dispatched','issued_pending','interrupting') "
+                        "LIMIT 1",
                         (candidate["command_id"],)).fetchone():
                         return None
                     attempt = str(uuid.uuid4())
@@ -6851,10 +7050,9 @@ class OperatorCommandStore:
                     LEFT JOIN serial206_movement_commands active_movement ON active_movement.command_id=active.command_id
                     WHERE requested.command_id=?
                       AND active.command_id<>requested.command_id
-                      AND COALESCE(active_movement.state,active.status) IN ('reserved','executing','dispatched','issued_pending','interrupting','ambiguous')
-                      AND NOT (active_movement.state='ambiguous' AND active.status IN ('ambiguous','interrupted')
-                        AND EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions d
-                          WHERE d.command_id=active.command_id))
+                      -- 2026-09-21: unresolved (ambiguous) history is record-only and never
+                      -- blocks a new command; only genuinely live holders exclude.
+                      AND COALESCE(active_movement.state,active.status) IN ('reserved','executing','dispatched','issued_pending','interrupting')
                     LIMIT 1
                     """,
                     (candidate["command_id"],),
@@ -7919,18 +8117,41 @@ class OperatorCommandStore:
 
 
 class OperatorCommandPlane:
-    def __init__(self, app: FastAPI, *, machine_state_provider: Callable[[], Mapping[str, Any]], actions: list[dict[str, Any]], dispatch: Mapping[str, Mapping[str, Any]]) -> None:
+    def __init__(self, app: FastAPI, *, machine_state_provider: Callable[[], Mapping[str, Any]], actions: list[dict[str, Any]], dispatch: Mapping[str, Mapping[str, Any]], interrupt_journal: Any = None) -> None:
         self.app = app
         self.machine_state_provider = machine_state_provider
         self.actions = actions
         self.dispatch = dispatch
         self.by_id = {str(row["action_id"]): row for row in actions}
         self.store = OperatorCommandStore()
+        if interrupt_journal is None:
+            from .interrupt_journal import InterruptJournal
+
+            interrupt_journal = InterruptJournal(self.store.root)
+        self.interrupt_journal = interrupt_journal
         self.router = APIRouter(prefix="/operator", tags=["operator-command-plane"])
         self._install_routes()
 
     def start(self) -> None:
         self.store.start(self._dispatch_one)
+        # RCA F1: a stop press must survive the process that recorded it. Any
+        # attempt the write-ahead journal still shows as unresolved is
+        # materialized into durable projection rows before new work is admitted.
+        if str(os.environ.get("BIOXP_INTERRUPT_JOURNAL_MATERIALIZE", "1")).strip().lower() not in {"0", "false", "no"}:
+            try:
+                self.interrupt_journal_materialization = self.store.materialize_interrupt_journal(
+                    self.interrupt_journal
+                )
+            except Exception as exc:  # never block startup on projection repair
+                self.interrupt_journal_materialization = {
+                    "ok": False, "materialized": [],
+                    "failed": {"*": f"{type(exc).__name__}: {exc}"[:500]},
+                }
+                # The journal itself is authoritative and untouched; keep it reachable.
+                try:
+                    print(f"[WARN] interrupt journal materialization failed: {type(exc).__name__}")
+                except Exception:
+                    pass
 
     def is_canonical(self, action_id: str) -> bool:
         return action_id in CANONICAL_ACTIONS
@@ -8876,12 +9097,14 @@ class OperatorCommandPlane:
                 "recovery_hold": True,
             }
 
-    async def compat_invoke(self, action_id: str, payload: Mapping[str, Any], *, controller_delivery: tuple[int, Any] | None = None) -> dict[str, Any]:
+    async def compat_invoke(self, action_id: str, payload: Mapping[str, Any], *, controller_delivery: tuple[int, Any] | None = None, interrupt_attempt_id: str | None = None) -> dict[str, Any]:
         if action_id in INTERRUPT_ACTIONS:
-            interrupt_attempt_id: str | None = None
             allow_fence_release = False
             try:
-                interrupt_attempt_id = str(uuid.uuid4())
+                # The caller (operator controls) mints the attempt id at
+                # admission so the write-ahead journal record and this durable
+                # projection row share one identity across a crash.
+                interrupt_attempt_id = str(interrupt_attempt_id or uuid.uuid4())
                 self.store.mark_interrupt_delivery_active(interrupt_attempt_id, action_id)
                 # Every explicit interrupt gets a storage-unique attempt. The
                 # caller key/observations are evidence, never delivery admission.

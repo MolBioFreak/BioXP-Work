@@ -2760,7 +2760,12 @@ class _OperatorPollCache:
                     self._pending = self._executor.submit(collect)
                     self._pending_key = refresh_key
                 pending = self._pending
-                if key in self._failures:
+                # A failed refresh must never turn an already-served view cold:
+                # sticky failures only gate views that have no cached body.
+                # (2026-09-20 warm-lock incident: the failure of one refresh —
+                # provider lock held by a readiness query — 503'd views that
+                # had just been served successfully.)
+                if cached is None and key in self._failures:
                     raise self._failures[key]
                 if cached is not None:
                     result, stored_at = cached
@@ -2875,6 +2880,107 @@ def install_operator_control_plane(
     reconciliation_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="operator-reconcile")
     invoke_lock = asyncio.Lock()
     interrupt_lock = asyncio.Lock()
+    # RCA F2: delivery admission is bounded where delivery happens -- one lane
+    # per addressed stop surface inside the API, released the moment the
+    # physical Stop is delivered. No lock is taken here: a stop press must never
+    # queue behind the stop (or the command) it is asking to stop.
+
+    def record_interrupt_rejection(*, action_id: str, surface: str, attempt_id: str | None,
+                                   reason: str, status_code: int, message: str,
+                                   idempotency_key: str | None = None, **detail: Any):
+        """Record a refused stop press everywhere it can be durable, then raise.
+
+        A press must never be unfalsifiable: the write-ahead journal is the
+        authority, the reconcile spool keeps the refusal beside the other
+        interrupt evidence, and a durable operator receipt keeps it visible to
+        the cockpit. Nothing was attempted, so no safety epoch is bumped.
+        """
+
+        attempt_key = str(attempt_id or uuid.uuid4().hex)
+        journal = getattr(command_plane, "interrupt_journal", None)
+        journal_path = str(journal.path) if journal is not None else None
+        if journal is not None:
+            try:
+                journal.record_rejection(
+                    interrupt_attempt_id=attempt_key,
+                    action_id=str(action_id),
+                    reason=str(reason),
+                    surface=str(surface),
+                    idempotency_key=idempotency_key,
+                    **detail,
+                )
+            except Exception:
+                pass
+        try:
+            command_plane.store.record_interrupt_rejection(
+                interrupt_attempt_id=attempt_key,
+                action_id=str(action_id),
+                reason=str(reason),
+                payload={"surface": str(surface), "idempotency_key": idempotency_key, **detail},
+            )
+        except Exception:
+            pass
+        try:
+            store.put_interrupt({
+                "schema_version": RECEIPT_SCHEMA,
+                "command_id": attempt_key,
+                "action_id": str(action_id),
+                "kind": "operator_interrupt",
+                "safety_class": "safety_interrupt",
+                "status": "rejected",
+                "idempotency_key": idempotency_key or attempt_key,
+                "ownership_generation": int(hardware_state.ownership_epoch),
+                "started_at": str(time.time()),
+                "finished_at": str(time.time()),
+                "duration_ms": 0.0,
+                "remote_acknowledged": False,
+                "controller_acknowledged": False,
+                "physical_effect_verified": False,
+                "machine_assessment": "fail",
+                "interrupt_attempt_id": attempt_key,
+                "interrupt_rejected": True,
+                "rejected_reason": str(reason),
+                "physical_motion_commanded": False,
+                "interrupt_evidence": {
+                    "persistence_state": "committed",
+                    "physical_effect_verified": False,
+                    "details": {"rejection": str(reason), "surface": str(surface), **detail},
+                },
+                "error": str(reason),
+                "response": {"http_status": int(status_code),
+                             "body": {"detail": {"error": str(reason), **detail}}},
+            })
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=int(status_code),
+            detail={
+                "error": str(reason),
+                "message": str(message),
+                "surface": str(surface),
+                "interrupt_attempt_id": attempt_key,
+                "admitted": False,
+                "delivery_attempted": False,
+                "delivery_not_attempted": True,
+                "physical_motion_commanded": False,
+                "recorded": True,
+                "journal_path": journal_path,
+                "automatic_retry": False,
+                **detail,
+            },
+        )
+
+    def interrupt_surface_key(action_id: str, target: Mapping[str, Any] | None,
+                              inputs: Mapping[str, Any] | None = None) -> str:
+        if action_id in {"oem.abort_all", "oem.z.abort"}:
+            return "abort"
+        if action_id in {"oem.x.stop", "oem.y.stop", "oem.z.stop", "oem.g.stop"}:
+            return action_id.split(".")[1]
+        path = str((target or {}).get("path") or "")
+        if path == "/motion/diagnostics/stop":
+            axis = str((inputs or {}).get("axis") or "x")
+            return f"diagnostics-{axis}"
+        return "interrupt"
     # Retain one direct owner, not a new motion queue. Competing normal actions
     # receive a prompt busy response; interrupts retain their separate lane.
     direct_requests: dict[str, tuple[dict[str, Any], asyncio.Future, asyncio.Task]] = {}
@@ -3136,7 +3242,6 @@ def install_operator_control_plane(
 
     def deck_contract(state: Mapping[str, Any], *, target: str | None = None, intent_only: bool = False, snapshots: Mapping[str, Any] | None = None, before_query=None) -> dict[str, Any]:
         disabled_reason: str | None = None
-        recovery_disabled_reason: str | None = None
         raw_maintenance = state.get("maintenance")
         raw_lifecycle = state.get("lifecycle")
         maintenance = dict(raw_maintenance) if isinstance(raw_maintenance, Mapping) else {}
@@ -3160,10 +3265,6 @@ def install_operator_control_plane(
             disabled_reason = "emergency_operation_state"
         elif operation_state != "stopped":
             disabled_reason = "operation_state_not_ready"
-        try:
-            recovery_disabled_reason = command_plane.store.deck_recovery_blocker()
-        except Exception:
-            recovery_disabled_reason = "deck_recovery_state_inconsistent"
         if not callable(getattr(app.state, "oem_deck_command_executor", None)):
             disabled_reason = "canonical_deck_executor_unavailable"
         if disabled_reason is None and (oem_deck_provider is None or oem_deck_position_table_provider is None):
@@ -3303,11 +3404,10 @@ def install_operator_control_plane(
                 }
                 for row in catalog.rows()
             ]
-        disabled_reason = recovery_disabled_reason or disabled_reason
         options = [
             {**row, "enabled": reason is None, "disabled_reason": reason}
             for row in options
-            for reason in [recovery_disabled_reason or scope_reasons.get(
+            for reason in [scope_reasons.get(
                 "full" if row["branch_kind"] == "park" else "offset.v1", disabled_reason)]
         ]
         from .operator_command_plane import _active_board_epochs
@@ -3800,7 +3900,21 @@ def install_operator_control_plane(
         nonlocal pending_named_admissions
         if action_id in {"oem.x.stop", "oem.y.stop", "oem.z.stop", "oem.abort_all"}:
             if not isinstance(payload, OperatorInterruptRequestV1):
-                raise HTTPException(status_code=422, detail={"error": "interrupt_request_schema_required"})
+                # RCA F6: a stop-class request that cannot be honored is
+                # recorded as a rejected attempt instead of a silent 422.
+                record_interrupt_rejection(
+                    action_id=action_id,
+                    surface=interrupt_surface_key(action_id, by_id.get(action_id), None),
+                    attempt_id=None,
+                    reason="interrupt_request_schema_required",
+                    status_code=422,
+                    message=(
+                        "Interrupt actions require bioxp.operator_interrupt_request.v1; "
+                        "this press was refused and recorded."
+                    ),
+                    idempotency_key=str(getattr(payload, "idempotency_key", "") or "") or None,
+                    required_schema="bioxp.operator_interrupt_request.v1",
+                )
             # Keep the approved independent delivery and canonical v2 receipt.
             # invoke_action reconciles the deck queue only after delivery.
             return _v2_compact_receipt(await invoke_action(action_id, payload))
@@ -4259,7 +4373,39 @@ def install_operator_control_plane(
                     },
                 )
         effective_inputs = {**dict(target.get("fixed_inputs") or {}), **dict(payload.inputs)}
-        action_lock = interrupt_lock if is_safety_interrupt else invoke_lock
+        interrupt_attempt_id: str | None = None
+        interrupt_surface: str | None = None
+        interrupt_journal_error: str | None = None
+        if is_safety_interrupt:
+            # RCA F1: the press becomes durable BEFORE any lock is taken and
+            # before any physical delivery. The attempt id minted here is the
+            # identity the provider, the projection rows and the cockpit all use.
+            interrupt_surface = interrupt_surface_key(action_id, target, effective_inputs)
+            interrupt_attempt_id = uuid.uuid4().hex
+            journal = getattr(command_plane, "interrupt_journal", None)
+            if journal is not None:
+                try:
+                    journal.record(
+                        interrupt_attempt_id=interrupt_attempt_id,
+                        action_id=action_id,
+                        phase="admitted",
+                        idempotency_key=payload.idempotency_key,
+                        surface=interrupt_surface,
+                        caller_class="operator_interrupt",
+                        observed_ownership_generation=int(payload.expected_generation),
+                        observed_board_epoch_by_board=dict(
+                            payload.expected_board_epoch_by_board or {}
+                        ),
+                        physical_delivery_started=False,
+                        request_received_at=request_received_at,
+                    )
+                except Exception as exc:
+                    # A recording failure is not evidence that the Stop cannot be
+                    # sent: deliver anyway, but say plainly that it is unrecorded.
+                    interrupt_journal_error = f"{type(exc).__name__}: {exc}"[:300]
+            else:
+                interrupt_journal_error = "interrupt_journal_unavailable"
+        action_lock = invoke_lock
         # From this check through acquisition there is no scheduling suspension:
         # AsyncExitStack.__aenter__ and an uncontended asyncio.Lock.acquire return
         # inline. _admitted is a private closure argument, never an HTTP field.
@@ -4277,9 +4423,13 @@ def install_operator_control_plane(
                 "message": "A normal action is active; observe its receipt before submitting another.",
                 "physical_motion_commanded": False, "automatic_retry": False})
         async with AsyncExitStack() as action_lease:
-            # Z Stop's API ownership lease + single physical worker serialize
-            # delivery. The outer lease is needed only for its reconciliation.
-            if action_id != "oem.z.stop":
+            # RCA F2: no cross-request lock is taken here. A stop press is an
+            # independent request; the admission bound lives where delivery
+            # happens (per-surface lane inside the API, plus the provider's
+            # per-axis dispatch lease), and both are released the moment the
+            # physical Stop is delivered. Holding a lane at this layer is what
+            # queued stops behind the stop they were asking for.
+            if not is_safety_interrupt:
                 await action_lease.enter_async_context(action_lock)
             lock_acquired_at = time.time()
             locked_state = None if is_safety_interrupt else await invoke_state_reader.read()
@@ -4474,6 +4624,15 @@ def install_operator_control_plane(
                 "action_id": action_id,
                 "caller_class": "manual_operator",
                 "expected_board_epoch_by_board": dict(payload.expected_board_epoch_by_board or {}),
+                **(
+                    {
+                        "interrupt_attempt_id": interrupt_attempt_id,
+                        "interrupt_surface": interrupt_surface,
+                        "operator_interrupt_action_id": action_id,
+                    }
+                    if is_safety_interrupt
+                    else {}
+                ),
                 "motion_snapshot_precheck": (
                     lambda: motion_dispatch_precheck(
                         action, effective_inputs, locked_expected,
@@ -4736,6 +4895,7 @@ def install_operator_control_plane(
                                     "observed_board_epoch_by_board": {},
                                 },
                                 controller_delivery=(int(delivered.get("http_status") or 503), delivered.get("body")),
+                                interrupt_attempt_id=interrupt_attempt_id,
                             ))
                         pending_reconciliation = asyncio.wrap_future(reconciliation_executor.submit(reconcile))
                         cancellation_requested = False
@@ -4772,6 +4932,52 @@ def install_operator_control_plane(
 
         # Delivery/reconciliation is finished. Do not make the next addressed
         # Stop wait behind this receipt's SQLite lock, busy timeout or fsync.
+        if is_safety_interrupt:
+            # RCA F1/F3: the attempt keeps its journal identity and states
+            # plainly whether delivery happened and whether reconciliation is
+            # still pending. A delivered Stop is never silent.
+            journal = getattr(command_plane, "interrupt_journal", None)
+            response_body = receipt.get("response")
+            response_body = (
+                response_body.get("body") if isinstance(response_body, Mapping) else None
+            )
+            if not isinstance(response_body, Mapping):
+                response_body = {}
+            nested = response_body.get("detail")
+            if isinstance(nested, Mapping):
+                response_body = nested
+            reconciliation_pending = bool(
+                response_body.get("reconciliation_pending") is True
+            ) or bool(
+                receipt.get("interrupt_evidence", {})
+                .get("details", {})
+                .get("deck_reconciliation", {})
+                .get("persistence_state") == "recovery_required"
+            )
+            receipt["interrupt_attempt_id"] = interrupt_attempt_id
+            receipt["interrupt_surface"] = interrupt_surface
+            receipt["reconciliation_pending"] = reconciliation_pending
+            if reconciliation_pending:
+                receipt["reconciliation_required"] = True
+            if interrupt_journal_error:
+                receipt["interrupt_journal_error"] = interrupt_journal_error
+            if journal is not None and interrupt_attempt_id:
+                try:
+                    journal.record(
+                        interrupt_attempt_id=interrupt_attempt_id,
+                        action_id=action_id,
+                        phase="terminal",
+                        surface=interrupt_surface,
+                        status=receipt.get("status"),
+                        delivered=bool(receipt.get("remote_acknowledged")),
+                        controller_stop_acknowledged=bool(
+                            receipt.get("controller_acknowledged")
+                        ),
+                        reconciliation_pending=reconciliation_pending,
+                        error=receipt.get("error"),
+                    )
+                except Exception:
+                    pass
         try:
             return await asyncio.to_thread(store.put_interrupt, receipt)
         except Exception as exc:

@@ -881,12 +881,18 @@ class NovoRouter:
             ):
                 raise ValueError("pipette expected RX ID does not match channel/family")
         with self._completion_lock:
-            taint = self._pipette_completion_taints.get(channel)
-            if taint is not None:
-                raise NovoRouterError(
-                    f"pipette {channel} completion lifecycle is tainted; router rebind is required"
-                )
+            # Record-only (operator directive 2026-09-21): a completion taint is
+            # evidence about the channel, never a gate.  Refusing here froze the
+            # only wake-carrying recovery path forever after one timed-out
+            # attempt; the record still clears itself on the next valid
+            # completion (see wait_pipette_completion).
             existing = self._pipette_completions.get(channel)
+            if existing is not None and existing.deadline_at <= self._clock():
+                # A registration past its deadline can have no live waiter
+                # (wait_pipette_completion never waits past the deadline), so a
+                # dead attempt can never block a fresh one.
+                self._pipette_completions.pop(channel, None)
+                existing = None
             if existing is not None:
                 replacement_authorized = bool(
                     isinstance(replace_owner_token, str)
@@ -1009,6 +1015,11 @@ class NovoRouter:
             and len(frame.data) == 2
             and frame.data[0] == 0x20
         )
+        if valid:
+            with self._completion_lock:
+                # Self-heal: a channel that completes validly again is no
+                # longer tainted; the record never outlives the fault.
+                self._pipette_completion_taints.pop(channel, None)
         if not valid and not generation_changed and completion.rejected_reason is None:
             with self._completion_lock:
                 self._pipette_completion_taints[channel] = {

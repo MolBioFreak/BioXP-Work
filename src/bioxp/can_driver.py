@@ -679,6 +679,7 @@ class BioXpCanDriver:
         command_name: str | None = None,
         wait_for_completion: bool = True,
         interrupt_completion_owner_token: str | None = None,
+        response_timeout_s: float | None = None,
     ) -> dict[str, Any]:
         ids = self.pipette_can_ids()
         if address not in ids:
@@ -688,7 +689,8 @@ class BioXpCanDriver:
             ids[address],
             ascii_command,
             require_ack=True,
-            response_timeout_s=self.response_timeout_s,
+            response_timeout_s=(self.response_timeout_s if response_timeout_s is None
+                                else float(response_timeout_s)),
             ack_mode=ack_mode,
             command_name=command_name or f"pipette:{ascii_command}",
             wait_for_completion=wait_for_completion,
@@ -1051,8 +1053,17 @@ class BioXpCanDriver:
         result["parameter_setup"] = setup
         return result
 
-    def query_tip_status(self):
-        result = self._send_pipette_command("?31", address="report", ack_mode="query", command_name="query_tip_status")
+    def query_tip_status(self, *, response_timeout_s: float | None = None):
+        # Only attach the override when a bounded probe asked for it; the
+        # default call shape must stay byte-identical for the offline rigs
+        # that replace _send_pipette_command.
+        kwargs: dict[str, Any] = {}
+        if response_timeout_s is not None:
+            kwargs["response_timeout_s"] = float(response_timeout_s)
+        result = self._send_pipette_command(
+            "?31", address="report", ack_mode="query", command_name="query_tip_status",
+            **kwargs,
+        )
         # ClassPipette.QueryTipStatus assigns this channel before returning 1/2.
         # A returned null is false software state, not verified hardware absence.
         # Nonnull short replies raise before this setter; earlier/asynchronous

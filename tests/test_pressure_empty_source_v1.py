@@ -171,7 +171,8 @@ def test_loaded_query_uses_real_unchanged_pressure_parser(query_rig, monkeypatch
     for channel, transport in enumerate(rig[8]._transports):
         driver = transport._driver
         original = driver._send_pipette_command
-        def exchange(command, *, address, ack_mode, command_name, channel=channel, original=original):
+        def exchange(command, *, address, ack_mode, command_name, response_timeout_s=None,
+                channel=channel, original=original):
             if command == '?31':
                 return original(command, address=address, ack_mode=ack_mode, command_name=command_name)
             assert (command, address, ack_mode, command_name) == ('?57','report','query','query_pressure')

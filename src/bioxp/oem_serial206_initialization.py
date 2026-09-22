@@ -12,6 +12,7 @@ import hashlib
 import inspect
 import json
 import math
+import os
 import uuid
 import threading
 import time
@@ -204,6 +205,25 @@ _INITIALIZE_MOTION_MISSING = tuple(
 )
 
 
+class ProviderAuthorityBusy(RuntimeError):
+    """Display-only passive read found the provider authority lock held.
+
+    Passive operator polls never queue behind authority-bearing work; they
+    surface this state so the caller can serve a busy projection instead of
+    stalling the operator surface (2026-09-20 warm-lock incident).
+    """
+
+
+def _passive_provider_read() -> bool:
+    """True inside a read-only operator poll; imports lazily to avoid cycles."""
+    try:
+        from .operator_controls import _PASSIVE_OPERATOR_POLL
+
+        return bool(_PASSIVE_OPERATOR_POLL.get())
+    except Exception:
+        return False
+
+
 class _MutationPriorityRLock:
     """Reentrant mutex that admits queued mutations before later readers."""
 
@@ -267,6 +287,54 @@ class _MutationPriorityRLock:
             yield self
         finally:
             self.release()
+
+
+#: How long an interrupt's post-delivery reconciliation may wait for the
+#: provider lifecycle lock before it must report ``reconciliation_pending``
+#: instead of queueing behind the command it is stopping (RCA F3).
+_INTERRUPT_RECONCILIATION_LOCK_DEADLINE_S = float(
+    os.environ.get("BIOXP_INTERRUPT_RECONCILIATION_LOCK_DEADLINE_S") or 1.0
+)
+
+
+class _InterruptReconciliationLockUnavailable(RuntimeError):
+    """The provider lifecycle lock is held by the interrupted command itself."""
+
+
+class _InterruptReconciliationLock:
+    """Bounded, non-preempting acquisition of the provider lifecycle lock.
+
+    A stop must never wait for a lock that the command it is stopping may hold
+    for the whole of a blocking controller exchange. Acquisition is bounded;
+    when it fails the caller records ``reconciliation_pending`` and keeps its
+    fail-closed authority invalidation instead of blocking.
+    """
+
+    def __init__(self, lock: Any, *, deadline_s: float | None = None) -> None:
+        self._lock = lock
+        self._deadline_s = float(
+            _INTERRUPT_RECONCILIATION_LOCK_DEADLINE_S if deadline_s is None else deadline_s
+        )
+        self._acquired = False
+
+    @property
+    def acquired(self) -> bool:
+        return self._acquired
+
+    def __enter__(self) -> bool:
+        try:
+            self._acquired = bool(
+                self._lock.acquire(timeout=self._deadline_s, mutation=True)
+            )
+        except TypeError:  # a plain lock without the mutation-priority extension
+            self._acquired = bool(self._lock.acquire(timeout=self._deadline_s))
+        return self._acquired
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        if self._acquired:
+            self._lock.release()
+            self._acquired = False
+        return False
 
 
 _EVIDENCE_MAX_DEPTH = 8
@@ -4394,6 +4462,8 @@ class Serial206OemInitializationProvider:
         "startMoveZPseudoHome": "wp8_start_move_z_pseudo_home",
         "updateLocation": "wp8_update_location",
         "updatePlateLocation": "wp8_update_plate_location",
+        "inspectCoverAt": "wp8_inspect_cover_at",
+        "coverInspectionRelocate": "wp8_cover_inspection_relocate",
         "updateThermalDoorOpen": "wp8_update_thermal_door_open",
         "waitMoveZOnly": "wp8_wait_move_z_only",
         "waitStop": "wp8_wait_stop",
@@ -4672,6 +4742,19 @@ class Serial206OemInitializationProvider:
             yield
 
     def deck_owner_authority_stamps(self) -> dict[str, int]:
+        # Passive operator polls must not stall on the provider lock (see
+        # projection_scope); they report busy instead of queueing.
+        if _passive_provider_read():
+            if not self._lock.acquire(blocking=False):
+                raise ProviderAuthorityBusy("provider_authority_busy")
+            try:
+                return self._deck_owner_authority_stamps_locked()
+            finally:
+                self._lock.release()
+        with self._lock:
+            return self._deck_owner_authority_stamps_locked()
+
+    def _deck_owner_authority_stamps_locked(self) -> dict[str, int]:
         ownership_generation = int(self.generation_provider())
         with self._lock:
             state = self._load_state()
@@ -5537,6 +5620,21 @@ class Serial206OemInitializationProvider:
     def projection_scope(self):
         # Preserve the existing provider -> runtime lock order. Mutation-priority
         # admission remains with this lock; the memo is only for this read pass.
+        # Passive operator polls are display-only reads: they never queue behind
+        # authority-bearing work. A held lock surfaces as ProviderAuthorityBusy
+        # so the caller serves a busy projection instead of stalling the
+        # operator surface (2026-09-20 warm-lock incident).
+        if _passive_provider_read():
+            if not self._lock.acquire(blocking=False):
+                raise ProviderAuthorityBusy("provider_authority_busy")
+            try:
+                scope = getattr(self.state_store, "serial206_projection_scope", None)
+                manager: Any = scope() if callable(scope) else nullcontext()
+                with manager:
+                    yield
+            finally:
+                self._lock.release()
+            return
         with self._lock:
             scope = getattr(self.state_store, "serial206_projection_scope", None)
             manager: Any = scope() if callable(scope) else nullcontext()
@@ -6073,6 +6171,22 @@ class Serial206OemInitializationProvider:
             except Exception as exc:
                 return {"ok": False, "axis": "x", "state": "failed_latched", "failure": f"projection_failed:{type(exc).__name__}"}
 
+    def _interrupt_reconciliation_lock(self, *, reason: str) -> "_InterruptReconciliationLock":
+        """Bounded lifecycle-lock acquisition for an interrupt's reconciliation."""
+
+        return _InterruptReconciliationLock(self._lock)
+
+    def _interrupt_reconciliation_lock_unavailable(self, *, reason: str) -> dict[str, Any]:
+        """Fail-closed record for a stop whose reconciliation cannot take the lock."""
+
+        return {
+            "reconciliation_pending": True,
+            "recovery_hold": True,
+            "lifecycle_reconciliation": "deferred_lock_unavailable",
+            "lifecycle_lock_deadline_s": _INTERRUPT_RECONCILIATION_LOCK_DEADLINE_S,
+            "reason": str(reason),
+        }
+
     def _begin_aggregate_software_abort(self, *, include_z: bool = True) -> dict[str, int]:
         # Only volatile owner fences here. Never acquire _lock, the DB writer
         # lock, or the other axis's dispatch lease before releasing waiters.
@@ -6115,41 +6229,57 @@ class Serial206OemInitializationProvider:
                         raise RuntimeError("axis reconciliation not verified")
                 except Exception as exc:
                     errors[axis] = f"{type(exc).__name__}: {exc}"
-        try:
-            with self._lock:
-                state = self._load_state()
+        # RCA F3: the durable reference invalidation is the fail-closed
+        # consequence of the abort and needs no provider lifecycle lock. It must
+        # happen even when that lock is held by the command this abort stops.
+        if self.reference_store is not None:
+            try:
+                self._z_mark_desynced("Aggregate software Abort invalidated Z authority.",
+                                      "serial206.aggregate.software_abort")
                 if invalidate_x:
-                    state["x_lifecycle"].update(
-                        state="failed_latched", active_receipt=None, pending_ticket=None,
-                        reference_state="desynced",
+                    invalidated_x = self.reference_store.mark_desynced(MarkAxisDesyncedCommand(
+                        axis="x", reason="Aggregate software Abort invalidated X authority.",
+                        source="serial206.aggregate.software_abort",
+                    ))
+                    if not self._z_reference_commit_verified(invalidated_x, expected_state="desynced"):
+                        raise RuntimeError("durable X reference invalidation unverified")
+                for axis in ("y", "g"):
+                    invalidated = self.reference_store.mark_desynced(MarkAxisDesyncedCommand(
+                        axis=axis, reason=f"Aggregate software Abort invalidated {axis.upper()} authority.",
+                        source="serial206.aggregate.software_abort",
+                    ))
+                    if not self._z_reference_commit_verified(invalidated, expected_state="desynced"):
+                        raise RuntimeError(f"durable {axis.upper()} reference invalidation unverified")
+            except Exception as exc:
+                errors["reference_invalidation"] = f"{type(exc).__name__}: {exc}"
+        lifecycle_lease = self._interrupt_reconciliation_lock(reason="aggregate_software_abort")
+        lifecycle_locked = False
+        try:
+            with lifecycle_lease:
+                lifecycle_locked = bool(lifecycle_lease.acquired)
+                if not lifecycle_locked:
+                    # Delivered, but the lifecycle lock belongs to the command
+                    # this abort is stopping. Record it and return; never queue.
+                    errors["z_lifecycle"] = "reconciliation_lock_unavailable_bounded"
+                else:
+                    state = self._load_state()
+                    if invalidate_x:
+                        state["x_lifecycle"].update(
+                            state="failed_latched", active_receipt=None, pending_ticket=None,
+                            reference_state="desynced",
+                            last_failure={"reason": "aggregate_software_abort", "command_id": command_id},
+                        )
+                    state["z_lifecycle"].update(
+                        state="failed_latched", active_receipt=None,
+                        prepared_receipt=None, board_lifecycle_generation=None,
+                        awaiting_observation_receipt_id=None, reference_state="desynced",
                         last_failure={"reason": "aggregate_software_abort", "command_id": command_id},
                     )
-                state["z_lifecycle"].update(
-                    state="failed_latched", active_receipt=None,
-                    prepared_receipt=None, board_lifecycle_generation=None,
-                    awaiting_observation_receipt_id=None, reference_state="desynced",
-                    last_failure={"reason": "aggregate_software_abort", "command_id": command_id},
-                )
-                self._save_state(state)
-                if self.reference_store is not None:
-                    self._z_mark_desynced("Aggregate software Abort invalidated Z authority.",
-                                          "serial206.aggregate.software_abort")
-                    if invalidate_x:
-                        invalidated_x = self.reference_store.mark_desynced(MarkAxisDesyncedCommand(
-                            axis="x", reason="Aggregate software Abort invalidated X authority.",
-                            source="serial206.aggregate.software_abort",
-                        ))
-                        if not self._z_reference_commit_verified(invalidated_x, expected_state="desynced"):
-                            raise RuntimeError("durable X reference invalidation unverified")
-                    for axis in ("y", "g"):
-                        invalidated = self.reference_store.mark_desynced(MarkAxisDesyncedCommand(
-                            axis=axis, reason=f"Aggregate software Abort invalidated {axis.upper()} authority.",
-                            source="serial206.aggregate.software_abort",
-                        ))
-                        if not self._z_reference_commit_verified(invalidated, expected_state="desynced"):
-                            raise RuntimeError(f"durable {axis.upper()} reference invalidation unverified")
+                    self._save_state(state)
         except Exception as exc:
             errors["z_lifecycle"] = f"{type(exc).__name__}: {exc}"
+        if not lifecycle_locked:
+            errors["reconciliation_pending"] = "aggregate_abort_lifecycle_deferred"
         # Keep retry admission fenced until the complete persistence attempt
         # (including lifecycle/reference invalidation) has a result. Every
         # member uses the generation captured before this attempt did any work.
@@ -6177,14 +6307,49 @@ class Serial206OemInitializationProvider:
                     and self._z_interrupt_recovery_owner is recovery_owner):
                 self._z_interrupt_recovery_required = bool(errors)
             self._z_interrupt_active = bool(self._z_interrupt_count or self._z_interrupt_recovery_required)
-        return {"ok": not errors, "errors": errors, "controller_dispatches": 0}
+        result = {"ok": not errors, "errors": errors, "controller_dispatches": 0}
+        if not lifecycle_locked:
+            # Extend (never replace) the reconciliation receipt: the software
+            # Abort was delivered and its lifecycle persistence is explicitly
+            # pending rather than silently assumed.
+            result["reconciliation_pending"] = True
+            result["delivery_completed"] = True
+        return result
 
     def execute_x_stop_interrupt(
         self,
         values: Mapping[str, Any] | None = None,
         *,
         abort: bool = False,
-    ) -> dict[str, Any]:
+        defer_reconciliation: bool = False,
+    ):
+        # RCA F3: delivery and reconciliation are separable. The physical OEM
+        # double Stop is delivered first; the lifecycle/reference persistence
+        # that needs the provider lifecycle lock is a bounded follow-up step.
+        steps = self._x_stop_interrupt_steps(values, abort=abort)
+        try:
+            delivery_result = next(steps)
+        except StopIteration as completed:
+            return completed.value
+
+        def reconcile():
+            try:
+                next(steps)
+            except StopIteration as completed:
+                return completed.value
+            raise RuntimeError("unexpected X Stop reconciliation boundary")
+
+        if defer_reconciliation and not abort:
+            reconcile.delivery_result = dict(delivery_result)
+            return reconcile
+        return reconcile()
+
+    def _x_stop_interrupt_steps(
+        self,
+        values: Mapping[str, Any] | None = None,
+        *,
+        abort: bool = False,
+    ):
         values = dict(values or {})
         selected = "abort" if abort else "stop"
         supplied_command_id = values.get("command_id")
@@ -6199,7 +6364,11 @@ class Serial206OemInitializationProvider:
         # Software Abort has no controller sequence to serialize. In particular,
         # another invocation must not wait behind persistence or a reentrant
         # provider owner. Addressed Stop retains its existing dispatch lease.
-        with nullcontext() if abort else self._x_interrupt_dispatch_lock:
+        # Serialize only the addressed OEM sequence. Lifecycle/SQLite
+        # reconciliation must not fence the next explicit Stop delivery (RCA F3).
+        with ExitStack() as delivery_lease:
+            if not abort:
+                delivery_lease.enter_context(self._x_interrupt_dispatch_lock)
             with self._x_interrupt_state_lock:
                 self._x_interrupt_epoch += 1
                 interrupt_epoch = self._x_interrupt_epoch
@@ -6239,8 +6408,36 @@ class Serial206OemInitializationProvider:
                     result["aggregate_authority_invalidation"] = reconciliation
                     if not aggregate_reconciled:
                         result.update(ok=False, recovery_hold=True, persistence_state="recovery_required")
+                delivery_result = {
+                    "ok": result.get("ok") is True,
+                    "axis": "x",
+                    "intent": selected,
+                    "interrupt_epoch": interrupt_epoch,
+                    "delivery_completed": True,
+                    "reconciliation_pending": True,
+                    "physical_effect_verified": False,
+                    **{
+                        key: result.get(key)
+                        for key in (
+                            "source_call_completed",
+                            "source_return_ok",
+                            "controller_command_acknowledged",
+                            "controller_terminal_state_verified",
+                        )
+                    },
+                }
+                # Physical delivery is over. Release the addressed delivery lease
+                # and yield before the lifecycle/lock step so the caller can
+                # release its connection lease and lane; the stop's own
+                # epoch/count custody stays with this generator.
+                delivery_lease.close()
+                yield delivery_result
                 try:
-                    with self._lock:
+                    with self._interrupt_reconciliation_lock(
+                        reason="x_stop_interrupt"
+                    ) as lifecycle_locked:
+                        if not lifecycle_locked:
+                            raise _InterruptReconciliationLockUnavailable("x_stop_lifecycle")
                         state = self._load_state()
                         lifecycle = state["x_lifecycle"]
                         current_active = lifecycle.get("active_receipt")
@@ -6356,6 +6553,54 @@ class Serial206OemInitializationProvider:
                             "result": _json_safe(result),
                             "authority_receipt": _json_safe(receipt),
                         }
+                except _InterruptReconciliationLockUnavailable:
+                    # RCA F3: the addressed Stop was delivered, but the
+                    # lifecycle lock is held by the command this stop
+                    # interrupted. Never wait on it: record delivery, keep the
+                    # authority fail-closed and report reconciliation pending.
+                    with self._x_interrupt_state_lock:
+                        self._x_interrupt_recovery_required = True
+                    if self.reference_store is not None:
+                        try:
+                            invalidated_x = self.reference_store.mark_desynced(
+                                MarkAxisDesyncedCommand(
+                                    axis="x",
+                                    reason="X Stop reconciliation pending: lifecycle lock unavailable.",
+                                    source="serial206.x.interrupt_reconciliation_pending",
+                                )
+                            )
+                            if not self._z_reference_commit_verified(
+                                invalidated_x, expected_state="desynced"
+                            ):
+                                raise RuntimeError(
+                                    "durable X reference invalidation unverified"
+                                )
+                        except Exception as exc:
+                            result["reference_invalidation_error"] = (
+                                f"{type(exc).__name__}: {exc}"
+                            )[:300]
+                    pending = self._interrupt_reconciliation_lock_unavailable(
+                        reason="x_stop_lifecycle"
+                    )
+                    result.update(
+                        ok=result.get("ok") is True, recovery_hold=True,
+                        reconciliation_pending=True,
+                    )
+                    return {
+                        "ok": result.get("ok") is True,
+                        "axis": "x",
+                        "intent": selected,
+                        "state": None,
+                        "interrupt_epoch": interrupt_epoch,
+                        "source_call_completed": result.get("source_call_completed") is True,
+                        "source_return_ok": result.get("source_return_ok") is True,
+                        "controller_command_acknowledged": result.get("controller_command_acknowledged") is True,
+                        "controller_terminal_state_verified": False,
+                        "physical_effect_verified": False,
+                        "authority_receipt": None,
+                        "result": _json_safe(result),
+                        **pending,
+                    }
                 except Exception as persistence_exc:
                     return {
                         "ok": False,
@@ -6600,7 +6845,11 @@ class Serial206OemInitializationProvider:
                 expected_generation=int(values.get("expected_generation", self.generation_provider())),
             )
         if selected in {"stop", "abort"}:
-            return self.execute_x_stop_interrupt(values, abort=selected == "abort")
+            return self.execute_x_stop_interrupt(
+                values,
+                abort=selected == "abort",
+                defer_reconciliation=bool(values.get("defer_reconciliation")),
+            )
         with self._x_interrupt_state_lock:
             admitted_interrupt_epoch = self._x_interrupt_epoch
             if self._x_interrupt_active:
@@ -9359,7 +9608,10 @@ class Serial206OemInitializationProvider:
             expected_generation=expected_generation, idempotency_key=idempotency_key, abort=abort)
         # The sole yield is after all OEM physical calls and release of the
         # addressed delivery lease. Keep epoch/count custody until reconciliation.
-        next(steps)
+        try:
+            delivery_result = next(steps)
+        except StopIteration as completed:
+            return completed.value
 
         def reconcile():
             try:
@@ -9368,7 +9620,14 @@ class Serial206OemInitializationProvider:
                 return completed.value
             raise RuntimeError("unexpected Z Stop reconciliation boundary")
 
-        return reconcile if defer_reconciliation and not abort else reconcile()
+        if defer_reconciliation and not abort:
+            # Delivery facts travel with the continuation so a bounded or
+            # pending reconciliation still reports the Stop that was sent.
+            reconcile.delivery_result = (
+                dict(delivery_result) if isinstance(delivery_result, Mapping) else {}
+            )
+            return reconcile
+        return reconcile()
 
     def _z_stop_interrupt_steps(
         self,
@@ -9439,12 +9698,33 @@ class Serial206OemInitializationProvider:
                     "failure": f"z_{interrupt_intent}_result_not_mapping",
                 }
                 delivery_finished_at = time.time()
+                delivery_result = {
+                    "ok": result.get("ok") is True,
+                    "axis": "z",
+                    "intent": interrupt_intent,
+                    "interrupt_epoch": interrupt_epoch,
+                    "delivery_completed": True,
+                    "physical_effect_verified": False,
+                    **{
+                        key: result.get(key)
+                        for key in (
+                            "source_call_completed",
+                            "source_return_ok",
+                            "controller_command_acknowledged",
+                            "controller_terminal_state_verified",
+                            "first_stop_acknowledged",
+                            "second_stop_acknowledged",
+                            "double_stop_acknowledged",
+                            "failure",
+                        )
+                    },
+                }
                 # Serialize only the addressed OEM sequence. SQLite/lifecycle
                 # reconciliation must not fence the next explicit Stop delivery.
                 delivery_lease.close()
                 # Resume only persistence/reference reconciliation, never
                 # controller calls, outside the API's physical-delivery worker.
-                yield
+                yield delivery_result
                 if abort:
                     reconciliation = self._reconcile_aggregate_software_abort(
                         str(command_id), invalidate_x=True,
@@ -12912,11 +13192,389 @@ class Serial206OemInitializationProvider:
     ) -> dict[str, Any]:
         if type(arguments.get("value")) is not bool:
             raise RuntimeError("source_authority_missing:updateThermalDoorOpen:value")
+        value = bool(arguments["value"])
+        # ControlLib.doorOpen keeps ONE software door flag on the machine status
+        # and every door decision (plus every operation that branches on the
+        # door) reads it. The port had split that flag: the canonical SQLite
+        # transition recorded each update, but the provider working state
+        # (machine_status.thermal_door_open) never received it, so a later door
+        # command could no-op against a stale flag while the door was physically
+        # elsewhere. Mirror into the working state first so a failed publish can
+        # never leave the next decision on the stale value; the canonical
+        # publication remains the audit record.
+        state = self._load_state()
+        machine = dict(state.get("machine_status") or {})
+        machine["thermal_door_open"] = value
+        state["machine_status"] = machine
+        self._save_state(state)
         return self._wp8_publish_semantic(
             operation=operation, command_id=command_id, child_order=child_order,
             plan_digest=plan_digest,
-            updates={"thermal_door_open": bool(arguments["value"])},
+            updates={"thermal_door_open": value},
         )
+
+    # ------------------------------------------------------------------
+    # OEM cover inspection (ControlLib.inspectCover:3663-3768)
+    # ------------------------------------------------------------------
+
+    def bind_oem_cover_inspection_callbacks(
+        self, *, settings: Callable[[], Mapping[str, Any]],
+        capture: Callable[..., Mapping[str, Any]],
+        save: Callable[..., Mapping[str, Any]],
+        led: Callable[..., Any], rgb: Callable[..., Any],
+    ) -> None:
+        """Bind the validated machine-bundle settings and shared camera owners.
+
+        The composition layer supplies these; this module never discovers a
+        camera, never re-reads settings XML and never fabricates a frame.
+        """
+        callbacks: dict[str, Any] = {
+            "settings": settings, "capture": capture, "save": save, "led": led, "rgb": rgb,
+        }
+        for name, callback in callbacks.items():
+            if not callable(callback):
+                raise TypeError(f"OEM cover inspection {name} callback must be callable")
+        self._oem_cover_inspection_callbacks = callbacks
+
+    def _cover_inspection_callbacks(self) -> Mapping[str, Any]:
+        callbacks = getattr(self, "_oem_cover_inspection_callbacks", None)
+        if not isinstance(callbacks, Mapping):
+            raise RuntimeError("source_authority_missing:cover_inspection_camera")
+        return callbacks
+
+    def _cover_inspection_settings(self) -> Mapping[str, Any]:
+        settings = self._cover_inspection_callbacks()["settings"]()
+        if not isinstance(settings, Mapping):
+            raise RuntimeError("source_authority_invalid:cover_inspection_settings")
+        return settings
+
+    def _cover_inspection_profile(self, item_name: str) -> Mapping[str, Any]:
+        """ControlLib.AdjustCamera:1883-1920 for one InspectionItems profile.
+
+        Exposure=1000 is the unchanged sentinel and the only qualified value for
+        this port; any other value refuses instead of inventing a conversion.
+        Every camera LED channel is written on/off exactly as the source does,
+        before the capture.
+        """
+        settings = self._cover_inspection_settings()
+        profiles = dict(settings.get("InspectionSettings") or {})
+        profile = profiles.get(item_name)
+        if not isinstance(profile, Mapping):
+            raise RuntimeError(f"source_authority_missing:cover_inspection_profile:{item_name}")
+        exposure = profile.get("Exposure")
+        if exposure != 1000:
+            raise RuntimeError(
+                f"source_authority_missing:cover_inspection_exposure:{item_name}:{exposure}"
+            )
+        callbacks = self._cover_inspection_callbacks()
+        for channel in (1, 2, 3):
+            callbacks["led"](channel=channel, on=bool(profile.get(f"LED{channel}")))
+        return profile
+
+    def _cover_inspection_all_leds_off(self) -> None:
+        """ControlLib.AllLEDOff:1922-1927 (all three camera LED channels)."""
+        callbacks = self._cover_inspection_callbacks()
+        for channel in (1, 2, 3):
+            callbacks["led"](channel=channel, on=False)
+
+    def _cover_inspection_template(self, name: str) -> bytes:
+        settings = self._cover_inspection_settings()
+        templates = settings.get("VisionTemplates")
+        if isinstance(templates, Mapping):
+            value = templates.get(name)
+            if isinstance(value, (bytes, bytearray)):
+                return bytes(value)
+        raise RuntimeError(f"source_authority_missing:cover_inspection_template:{name}")
+
+    def _cover_inspection_move(self, location: int, offset_x: int, offset_y: int) -> dict[str, Any]:
+        """ClassControlInterface.moveTo(loc, offX, offY):3791-3713 row + offsets.
+
+        Uses the ported position-table helper (offset math, high-limit clamp,
+        dynamic pseudo-home target) and the same source XY primitive as every
+        other deck operation.
+        """
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+
+        table = load_bound_oem_position_table()
+        row = table.resolve(location_id=LOCATION_ID_TO_NAME[location])
+        axis_x = self.primitives._axis_profile("x")
+        axis_y = self.primitives._axis_profile("y")
+        x_limit = axis_x.get("axis_max_steps")
+        y_limit = axis_y.get("axis_max_steps")
+        target = row.oem_offset_move_coordinates(
+            offset_x=int(offset_x), offset_y=int(offset_y),
+            x_high_limit=int(x_limit) if type(x_limit) is int else None,
+            y_high_limit=int(y_limit) if type(y_limit) is int else None,
+        )
+        state = self.mov_execution_machine_state()
+        pseudo = int(state["pseudo_z_home"])
+        z_result = self.primitives.oem_move_z(
+            int(pseudo), pseudo_home_steps=pseudo, motor_current=31, wait_for_stop=True,
+        )
+        move = self.primitives.oem_move_xy(
+            int(target["x"]), int(target["y"]),
+            wait_timeout_s=60.0, source_context="ControlLib.inspectCover",
+        )
+        if not isinstance(move, Mapping) or move.get("ok") is not True:
+            raise RuntimeError("cover_inspection_move_failed")
+        return {"target": dict(target), "z": _json_safe(z_result), "move": _json_safe(move)}
+
+    def _cover_inspection_move_z(self, target: int) -> dict[str, Any]:
+        state = self.mov_execution_machine_state()
+        pseudo = int(state["pseudo_z_home"])
+        result = self.primitives.oem_move_z(
+            int(target), pseudo_home_steps=pseudo, motor_current=31, wait_for_stop=True,
+        )
+        if not isinstance(result, Mapping) or result.get("ok") is not True:
+            raise RuntimeError("cover_inspection_z_move_failed")
+        return _json_safe(result)
+
+    def _cover_inspection_capture(self, *, condition: str, artifact_id: str) -> dict[str, Any]:
+        result = self._cover_inspection_callbacks()["capture"](
+            condition=condition, artifact_id=artifact_id,
+        )
+        if not isinstance(result, Mapping) or not isinstance(result.get("frame"), (bytes, bytearray)):
+            raise RuntimeError("source_authority_invalid:cover_inspection_capture")
+        return dict(result)
+
+    def _cover_inspection_location_publish(
+        self, location: int, *, command_id: str, child_order: int, plan_digest: str,
+    ) -> None:
+        # m_machineStatus.updateLocation(location, 0) inside every source check
+        # (3789/3834/3878/3921). Kept as the same canonical publication.
+        self.wp8_update_location(
+            "updateLocation", {"destination": location, "well": 0},
+            command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+        )
+
+    def wp8_inspect_cover_at(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        """One source cover check, one method per source branch.
+
+        Low resolution: ControlLib.checkChillerCover:3891-3942 for all four
+        spots. High resolution: InspectOutputLocation:3778-3823 (17),
+        checkRCCover:3825-3848 (19), checkCoverStorage:3850-3888 (18/20).
+        """
+        del operation
+        from .vision.oem_inspection import (
+            locate_cover, match_pattern, output_location_from_scores, reagent_cover_from_scores,
+        )
+
+        location = arguments.get("destination")
+        if type(location) is not int or location not in {17, 18, 19, 20}:
+            raise ValueError("cover_inspection_location_invalid")
+        screen_high = arguments.get("screen_resolution_high")
+        if type(screen_high) is not bool:
+            raise ValueError("cover_inspection_screen_resolution_invalid")
+        settings = self._cover_inspection_settings()
+        camera_x = int(settings["CameraXOffset"])
+        camera_y = int(settings["CameraYOffset"])
+        camera_z = int(settings["CameraZOffset"])
+        identity = self._wp8_identity(command_id, child_order, plan_digest)
+        details: dict[str, Any] = {}
+        snapshot_condition: str | None = None
+        frame: bytes
+
+        if not screen_high:
+            # checkChillerCover: setLEDColor(255,255,255) then item 6 profile.
+            self._cover_inspection_callbacks()["rgb"](255, 255, 255)
+            self._cover_inspection_profile("CoverInspection")
+            offset_x, offset_y = {17: (20021, 0), 19: (5923, 0), 20: (5923, 0), 18: (20021, 0)}[location]
+            details["move"] = self._cover_inspection_move(location, offset_x, offset_y)
+            self._cover_inspection_location_publish(
+                location, command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+            )
+            time.sleep(0.4)
+            time.sleep(0.5)
+            capture = self._cover_inspection_capture(
+                condition=f"check_chiller_cover_{location}", artifact_id=f"{identity}:check:{location}",
+            )
+            frame = bytes(capture["frame"])
+            details["capture_evidence"] = _json_safe(capture.get("capture_evidence"))
+            detected = bool(locate_cover(frame))
+            method = "checkChillerCover"
+            details["locate_cover"] = detected
+            if location == 19 and detected:
+                # 3926-3938 re-reads the reagent barcode and flips a positive
+                # finding when a real label answers. The shared deck context has
+                # no bound reagent barcode reader; the skip is recorded, never
+                # fabricated.
+                details["barcode_flip_applied"] = False
+                details["barcode_read_skipped"] = "no_bound_reagent_barcode_reader"
+            from .oem_compat.pathing import LOCATION_ID_TO_NAME
+            snapshot_condition = (
+                "check_chiller_cover_" + LOCATION_ID_TO_NAME[location] + ("found" if detected else "missing")
+            )
+        elif location == 17:
+            self._cover_inspection_profile("CoverInspection")
+            details["move"] = self._cover_inspection_move(1, 3435 + camera_x, -2772 + camera_y)
+            self._cover_inspection_location_publish(
+                17, command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+            )
+            time.sleep(0.7)
+            first = self._cover_inspection_capture(
+                condition="inspect_output_location_cover", artifact_id=f"{identity}:cover:{location}",
+            )
+            cover_score = match_pattern(bytes(first["frame"]), self._cover_inspection_template("cover.jpg"), 5).maximum
+            self._cover_inspection_profile("OutputPlateInspection")
+            details["z_move"] = self._cover_inspection_move_z(15000 + camera_z)
+            second = self._cover_inspection_capture(
+                condition="inspect_output_location_output", artifact_id=f"{identity}:output:{location}",
+            )
+            frame = bytes(second["frame"])
+            output = match_pattern(frame, self._cover_inspection_template("output.jpg"), 5).maximum
+            foil = match_pattern(frame, self._cover_inspection_template("outputw_foil.jpg"), 5).maximum
+            empty = match_pattern(frame, self._cover_inspection_template("output_empty.jpg"), 5).maximum
+            selected = output_location_from_scores(cover_score, output, foil, empty)
+            detected = selected == 1
+            method = "InspectOutputLocation(1)"
+            details.update(selected=selected, scores={
+                "cover": cover_score, "output": output, "foil": foil, "empty": empty,
+            })
+            if selected != 1:
+                # 3811-3813 (expectedResult=1): missing-cover snapshot.
+                from .oem_compat.pathing import LOCATION_ID_TO_NAME
+                snapshot_condition = "check_chiller_cover_" + LOCATION_ID_TO_NAME[17] + " missing"
+        elif location == 19:
+            self._cover_inspection_profile("CoverInspection")
+            details["z_move"] = self._cover_inspection_move_z(40000 + camera_z)
+            details["move"] = self._cover_inspection_move(3, 3980 + camera_x, -2606 + camera_y)
+            self._cover_inspection_location_publish(
+                19, command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+            )
+            time.sleep(0.7)
+            capture = self._cover_inspection_capture(
+                condition="check_rc_cover", artifact_id=f"{identity}:check:{location}",
+            )
+            frame = bytes(capture["frame"])
+            cover = match_pattern(frame, self._cover_inspection_template("cover.jpg"), 5).maximum
+            reagent = match_pattern(frame, self._cover_inspection_template("reagentTray.jpg"), 5).maximum
+            empty = match_pattern(frame, self._cover_inspection_template("reagentEmpty.jpg"), 5).maximum
+            detected = reagent_cover_from_scores(cover, reagent, empty)
+            method = "checkRCCover"
+            details.update(scores={"cover": cover, "reagent": reagent, "empty": empty})
+            if not detected:
+                # 3843-3844: reagent cover missing snapshot.
+                from .oem_compat.pathing import LOCATION_ID_TO_NAME
+                snapshot_condition = "Reagent_Chiller_Cover" + LOCATION_ID_TO_NAME[1] + " missing"
+        else:
+            self._cover_inspection_profile("CoverStorageInspection")
+            details["move"] = self._cover_inspection_move(location, 1990, 3198)
+            details["z_move"] = self._cover_inspection_move_z(40000 + camera_z)
+            self._cover_inspection_location_publish(
+                location, command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+            )
+            time.sleep(0.7)
+            capture = self._cover_inspection_capture(
+                condition=f"check_cover_storage_{location}", artifact_id=f"{identity}:check:{location}",
+            )
+            frame = bytes(capture["frame"])
+            empty_template = match_pattern(frame, self._cover_inspection_template("EmptyStorage.jpg"), 5).maximum
+            detected = not (empty_template > 0.7)
+            method = "checkCoverStorage"
+            details["empty_storage_score"] = empty_template
+            # 3881: the source repeats the offset move before its evidence step.
+            details["recheck_move"] = self._cover_inspection_move(location, 1990, 3198)
+            if not detected:
+                # 3884-3885: source false-positive-path snapshot.
+                from .oem_compat.pathing import LOCATION_ID_TO_NAME
+                snapshot_condition = "check_chiller_cover_" + LOCATION_ID_TO_NAME[location] + "missing"
+
+        if snapshot_condition:
+            # SnapshotImage evidence is saved from the exact frame the source
+            # decision consumed (capture-once; the OEM's internal re-grab at the
+            # same pose is not repeated).
+            self._cover_inspection_callbacks()["save"](
+                frame=frame, condition=snapshot_condition, artifact_id=f"{identity}:snapshot:{location}",
+            )
+        self._cover_inspection_all_leds_off()
+        findings = getattr(self, "_oem_cover_inspection_findings", None)
+        if not isinstance(findings, dict):
+            findings = {}
+            self._oem_cover_inspection_findings = findings
+        findings.setdefault(str(command_id), {})[location] = detected
+        return {
+            "ok": True, "delivery_attempted": True,
+            "cover_detected": detected, "location": location, "method": method,
+            "details": _json_safe(details),
+            "frame_sha256": hashlib.sha256(frame).hexdigest(),
+            "snapshot_condition": snapshot_condition,
+            "source_anchor": "ControlLib.checkChillerCover:3891-3942",
+        }
+
+    def wp8_cover_inspection_relocate(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        """ControlLib.inspectCover:3727-3766 num==2 branch as one decision child.
+
+        Reads this command's four check findings, plans the exact index-paired
+        relocations (plan_cover_relocations mirrors the acceptance evaluator),
+        executes every catch/release through the canonical nested compiles, then
+        the terminal storage writes and the doorOpen(true) terminal. Failed or
+        unpaired topologies move nothing and claim nothing.
+        """
+        del operation
+        from .oem_deck_movement import compile_cover_inspection_finalize
+        from .oem_vision_acceptance import plan_cover_relocations
+
+        log_only = arguments.get("inspection_log_only")
+        if type(log_only) is not bool:
+            raise ValueError("cover_inspection_relocate_log_only_invalid")
+        findings = getattr(self, "_oem_cover_inspection_findings", None)
+        detected = dict((findings or {}).get(str(command_id)) or {})
+        if set(detected) != {17, 19, 20, 18}:
+            raise RuntimeError("source_authority_missing:cover_inspection_findings")
+        plan = plan_cover_relocations(detected)
+        receipts: list[dict[str, Any]] = []
+        final_cover_locations: dict[str, int] | None = None
+        door_open_verified = False
+        if plan["cover_count"] == 2 and plan["error_status"] is None:
+            for relocation in plan["relocations"]:
+                plate = 4 if relocation["from"] == 17 else 5
+                catch = self._wp8_compile_and_execute(
+                    operation="catch_plate",
+                    inputs={"plate": plate, "run_in_parallel": True},
+                    command_id=command_id, owner_identity=owner_identity,
+                )
+                release = self._wp8_compile_and_execute(
+                    operation="release_plate",
+                    inputs={"destination": relocation["to"], "press_plate": False, "run_in_parallel": True},
+                    command_id=command_id, owner_identity=owner_identity,
+                )
+                receipts.append({
+                    "relocation": dict(relocation),
+                    "catch": _json_safe(catch), "release": _json_safe(release),
+                })
+            finalize = self._wp8_execute_nested_plan(
+                plan=compile_cover_inspection_finalize(),
+                command_id=command_id, owner_identity=owner_identity,
+            )
+            receipts.append({"finalize": _json_safe(finalize)})
+            door = self._wp8_compile_and_execute(
+                operation="thermal_door", inputs={"open": True},
+                command_id=command_id, owner_identity=owner_identity,
+            )
+            receipts.append({"door_open": _json_safe(door)})
+            sensors = self.wp8_read_door_sensors("readDoorSensors", {})
+            door_open_verified = isinstance(sensors, Mapping) and sensors.get("door_open") is True
+            if not door_open_verified:
+                raise RuntimeError("cover_inspection_door_open_unverified")
+            final_cover_locations = {"output": 18, "reagent": 20}
+        if isinstance(findings, dict):
+            findings.pop(str(command_id), None)
+        return {
+            "ok": True, "delivery_attempted": True,
+            "cover_count": plan["cover_count"], "error_status": plan["error_status"],
+            "detected": plan["detected"], "relocations": plan["relocations"],
+            "relocation_receipts": receipts,
+            "final_cover_locations": final_cover_locations,
+            "door_open_verified": door_open_verified,
+            "inspection_log_only": log_only,
+            "source_anchor": "ControlLib.inspectCover:3727-3766",
+        }
 
     def wp8_clear_tip_loaded(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
