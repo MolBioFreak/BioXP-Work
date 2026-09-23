@@ -13751,6 +13751,8 @@ class Serial206OemInitializationProvider:
         closed = raw.get("closed")
         if type(opened) is not bool or type(closed) is not bool:
             raise RuntimeError("thermal_door_sensor_result_incomplete")
+        if raw.get("predicates_verified") is not True:
+            raise RuntimeError("thermal_door_sensor_predicates_unverified")
         return {
             "ok": True, "delivery_attempted": False,
             "door_open": opened and not closed,
@@ -14067,10 +14069,43 @@ class Serial206OemInitializationProvider:
         owner_identity: Mapping[str, Any], **_: Any,
     ) -> dict[str, Any]:
         del operation
-        return self._wp8_compile_and_execute(
-            operation="thermal_door", inputs=arguments, command_id=command_id,
+        inputs = dict(arguments)
+        if inputs.get("open") is not False:
+            return self._wp8_compile_and_execute(
+                operation="thermal_door", inputs=inputs, command_id=command_id,
+                owner_identity=owner_identity,
+            )
+        # The OEM doorOpen(false) may no-op on the retained door flag. That
+        # flag is not a closed-door sensor receipt: inspectCover's evaluator
+        # must not fail *after* both covers move simply because the no-op has
+        # no children, or claim a closed door when the flag is stale.
+        before = self.wp8_read_door_sensors("readDoorSensors", {})
+        if before["door_closed"] is before["door_open"]:
+            raise RuntimeError("thermal_door_state_unverified_before_close")
+        # Preserve the OEM's retained-state branch; never turn a no-op into an
+        # unrequested door motion. If the model says closed but the physical
+        # thermal-door switch says open, stop before inspecting covers.
+        machine = self.wp8_operation_machine_state("thermal_door", inputs)
+        if machine.get("door_is_open") is False and before["door_open"]:
+            raise RuntimeError("thermal_door_cached_closed_but_sensor_open")
+        result = self._wp8_compile_and_execute(
+            operation="thermal_door", inputs=inputs, command_id=command_id,
             owner_identity=owner_identity,
         )
+        if result.get("ok") is not True:
+            return result
+        after = self.wp8_read_door_sensors("readDoorSensors", {})
+        if after["door_closed"] is not True:
+            raise RuntimeError("thermal_door_close_unverified")
+        return {
+            **result, "door_closed": True,
+            "thermal_door_before": {
+                "door_open": before["door_open"], "door_closed": before["door_closed"],
+            },
+            "thermal_door_after": {
+                "door_open": after["door_open"], "door_closed": after["door_closed"],
+            },
+        }
 
     def wp8_cleanup_waste_prelude(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,

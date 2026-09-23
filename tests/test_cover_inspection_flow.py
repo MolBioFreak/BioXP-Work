@@ -691,3 +691,114 @@ class TestReceiptAssembly:
         evaluation = evaluate_inspect_cover_receipt(receipt)
         assert evaluation["receipt_validation_pass"] is False
         assert evaluation["error_status"] == "SHORT_CHILLER_COVER"
+
+
+class TestDoorCloseProof:
+    @staticmethod
+    def _door_provider(observations, nested_result=None, model_open=False):
+        calls = []
+        reads = iter(observations)
+
+        def observe(*_args):
+            return next(reads)
+
+        def execute(**kwargs):
+            calls.append(kwargs)
+            return {"ok": True, "completed_children": []} if nested_result is None else nested_result
+
+        return types.SimpleNamespace(
+            wp8_read_door_sensors=observe,
+            wp8_operation_machine_state=lambda *_args: {"door_is_open": model_open},
+            _wp8_compile_and_execute=execute,
+        ), calls
+
+    @staticmethod
+    def _close(provider):
+        return Serial206OemInitializationProvider.wp8_door_open(
+            provider, "doorOpen", {"open": False},
+            command_id="inspect-1", owner_identity={"work_identity": "inspect-1"},
+        )
+
+    def test_closed_noop_has_actual_thermal_sensor_proof_for_inspection_receipt(self):
+        closed = {"door_open": False, "door_closed": True}
+        provider, calls = self._door_provider([closed, closed])
+        result = self._close(provider)
+        assert calls[0]["inputs"] == {"open": False}
+        assert result["completed_children"] == []
+        assert result["door_closed"] is True
+        evidence = TestReceiptAssembly()._evidence(
+            {17: True, 19: True, 20: False, 18: False},
+            relocations=[{"cover": "output", "from": 17, "to": 18},
+                         {"cover": "reagent", "from": 19, "to": 20}],
+            final={"output": 18, "reagent": 20}, door_open=True,
+        )
+        evidence["children"][1]["terminal_evidence_json"] = json.dumps({"result": result})
+        receipt = assemble_inspect_cover_receipt(
+            evidence, settings={"deck_inspection": True, "screen_resolution_high": False,
+                                "inspection_log_only": False},
+        )
+        assert receipt["door_closed_verified"] is True
+        assert evaluate_inspect_cover_receipt(receipt)["outcome"] == "covers_canonicalized"
+        # The prior no-op had no sensor evidence, so final validation was right
+        # to reject the claim despite the completed physical transfers.
+        evidence["children"][1]["terminal_evidence_json"] = json.dumps({
+            "result": {"ok": True, "completed_children": []},
+        })
+        assert assemble_inspect_cover_receipt(
+            evidence, settings={"deck_inspection": True, "screen_resolution_high": False,
+                                "inspection_log_only": False},
+        )["door_closed_verified"] is False
+
+    def test_open_sensor_with_stale_closed_model_refuses_before_motion(self):
+        opened = {"door_open": True, "door_closed": False}
+        provider, calls = self._door_provider([opened], model_open=False)
+        with pytest.raises(RuntimeError, match="thermal_door_cached_closed_but_sensor_open"):
+            self._close(provider)
+        assert calls == []
+
+    def test_open_sensor_with_open_model_uses_source_close_path(self):
+        opened = {"door_open": True, "door_closed": False}
+        closed = {"door_open": False, "door_closed": True}
+        provider, calls = self._door_provider([opened, closed], model_open=True)
+        result = self._close(provider)
+        assert calls[0]["inputs"] == {"open": False}
+        plan = compile_finite_plate_operation(
+            "thermal_door", source_leaf_available=True,
+            **{**calls[0]["inputs"], "door_is_open": True, "board_test_mode": False},
+        )
+        assert "moveDoorClosed" in _ops(plan) and "readDoorSensors" in _ops(plan)
+        assert result["door_closed"] is True
+
+    def test_unknown_or_failed_closed_sensor_cannot_claim_proof(self):
+        unknown = {"door_open": False, "door_closed": False}
+        provider, calls = self._door_provider([unknown])
+        with pytest.raises(RuntimeError, match="thermal_door_state_unverified_before_close"):
+            self._close(provider)
+        assert calls == []
+        opened = {"door_open": True, "door_closed": False}
+        provider, calls = self._door_provider([opened, opened], model_open=True)
+        with pytest.raises(RuntimeError, match="thermal_door_close_unverified"):
+            self._close(provider)
+        assert len(calls) == 1
+        provider, calls = self._door_provider([opened], nested_result={"ok": False}, model_open=True)
+        assert self._close(provider) == {"ok": False}
+        assert len(calls) == 1
+
+    def test_unverified_thermal_sensor_reply_is_not_closed_proof(self):
+        provider = types.SimpleNamespace(primitives=types.SimpleNamespace(
+            motor_thermal_door_status=lambda: {
+                "closed": True, "opened": False, "predicates_verified": False,
+            },
+        ))
+        with pytest.raises(RuntimeError, match="thermal_door_sensor_predicates_unverified"):
+            Serial206OemInitializationProvider.wp8_read_door_sensors(
+                provider, "readDoorSensors", {},
+            )
+
+    def test_open_operation_preserves_oem_branch_without_extra_close_reads(self):
+        provider, calls = self._door_provider([])
+        result = Serial206OemInitializationProvider.wp8_door_open(
+            provider, "doorOpen", {"open": True}, command_id="inspect-1", owner_identity={},
+        )
+        assert calls[0]["inputs"] == {"open": True}
+        assert result["ok"] is True
