@@ -63,7 +63,7 @@ class TransferNative(OfflineNative):
 
     def motor_thermal_door_status(self):
         opened = self.positions[6, 0] != 0
-        return {'ok': True, 'predicates_verified': True, 'opened': opened, 'closed': not opened}
+        return {'ok': True, 'opened': opened, 'closed': not opened}
 
 
 @pytest.fixture
