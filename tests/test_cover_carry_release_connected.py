@@ -1,7 +1,7 @@
 """Offline provider -> finite plans -> real adapters -> native seams + SQLite.
 
 No planner, child handler, semantic reader, or publisher success doubles.
-SSD ControlLib 22215-22312, 26286-26508; crossed pairing is intentional.
+SSD ControlLib 22215-22312, 26286-26508; OEM crossed pairing is unsafe.
 """
 from types import SimpleNamespace
 
@@ -161,7 +161,7 @@ def test_both_covers_reach_storage_before_release_and_finalize(connected):
     _, positions = connected.provider._wp8_calibration()
     lowers = [(i, e) for i, e in enumerate(events)
               if e[:3] == ('move', 'z', 105981)]
-    assert [e[3:] for _, e in lowers] == [(84252, 36267), (84252, 6057)]
+    assert [e[3:] for _, e in lowers] == [(84252, 6057), (84252, 36267)]
     for i, e in lowers:
         assert any(x[:3] == ('move', 'g', positions['open']) and x[3:] == e[3:]
                    for x in events[i + 1:])
@@ -184,6 +184,21 @@ def test_both_covers_reach_storage_before_release_and_finalize(connected):
     observed = json.loads(subprocess.check_output(
         [sys.executable, '-c', code, str(Path(connected.root) / 'bioxp_runtime.db')], text=True))
     assert observed == [state['movable_plate_locations'], None]
+
+
+def test_occupied_target_never_commands_transfer_or_final_storage_write(connected):
+    # The observation layer is the only injected input; execution and SQLite
+    # publication remain real, with hardware replaced only at the native seam.
+    connected.provider._oem_cover_inspection_findings['offline-inspection'] = {
+        17: True, 19: False, 20: True, 18: False,
+    }
+    before = connected.store.deck_semantic_state()['movable_plate_locations']
+    result = relocate(connected)
+    assert result['error_status'] == 'UNSAFE_COVER_TOPOLOGY'
+    assert result['relocations'] == []
+    assert result['final_cover_locations'] is None
+    assert not connected.native.events
+    assert connected.store.deck_semantic_state()['movable_plate_locations'] == before
 
 
 @pytest.mark.parametrize('phase', ['catch', 'release'])

@@ -1610,9 +1610,10 @@ def compile_cleanup_waste_prelude() -> dict[str, Any]:
 def compile_cover_inspection_finalize() -> dict[str, Any]:
     """ControlLib.inspectCover:3745-3752 terminal custody writes.
 
-    The interchangeable covers are re-labelled after the source's crossed
-    relocations. Publish the two source assignments atomically: publishing
-    only the first temporarily assigns both cover names to the same storage.
+    The OEM unconditionally re-labels both covers after index-paired moves.
+    Only invoke this terminal confirmation after both same-identity releases
+    have completed; neither the source's crossed path nor partial custody may
+    be masked by these assignments.
     """
     children: list[dict[str, Any]] = []
     _wp8_child(

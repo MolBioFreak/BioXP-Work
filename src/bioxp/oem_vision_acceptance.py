@@ -250,14 +250,19 @@ def evaluate_inspect_cover_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
         error_status = "SHORT_CHILLER_COVER"
     expected_relocations: list[dict[str, Any]] = []
     if cover_count == 2 and error_status is None:
-        if len(found_chillers) != len(empty_storage):
-            raise OemVisionReceiptError("cover topology cannot be paired by the OEM source order")
-        expected_relocations = [
-            {"cover": "reagent" if source == 19 else "output", "from": source, "to": destination}
-            for source, destination in zip(found_chillers, empty_storage)
-        ]
+        # The OEM zips stations [17,19] with empty storage [20,18],
+        # crossing both covers. Storage observations do not identify a cover;
+        # only two observed station identities and two empty targets prove a
+        # safe complete transfer and justify the terminal custody assertion.
+        if found_chillers != [17, 19] or empty_storage != [20, 18]:
+            error_status = "UNSAFE_COVER_TOPOLOGY"
+        else:
+            expected_relocations = [
+                {"cover": "output", "from": 17, "to": 18},
+                {"cover": "reagent", "from": 19, "to": 20},
+            ]
     if row["relocations"] != expected_relocations:
-        raise OemVisionReceiptError("relocations do not match the exact OEM detected/empty list order")
+        raise OemVisionReceiptError("relocations do not match safe observed source-to-storage pairing")
 
     semantic_pass = error_status is None and cover_count == 2
     if semantic_pass:
@@ -275,7 +280,9 @@ def evaluate_inspect_cover_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     if not semantic_pass and error_status is not None:
         failures.append(error_status.lower())
     receipt_validation_pass = semantic_pass and not force_failures
-    oem_effective_pass = not force_failures and (semantic_pass or bool(inspection_log_only and error_status is not None))
+    oem_effective_pass = not force_failures and (
+        semantic_pass or bool(inspection_log_only and error_status in {"OVER_CHILLER_COVER", "SHORT_CHILLER_COVER"})
+    )
     return {
         "ok": receipt_validation_pass,
         "status": "receipt_valid" if receipt_validation_pass else "receipt_rejected",
@@ -300,11 +307,9 @@ def evaluate_inspect_cover_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
 def plan_cover_relocations(detected: Mapping[Any, bool]) -> dict[str, Any]:
     """Execution planner for inspectCover's num==2 relocation block (3727-3766).
 
-    Mirrors evaluate_inspect_cover_receipt's source-order walk exactly, so the
-    executed relocations, the final custody writes and any refusal are the same
-    facts the evaluator later validates. A topology the OEM source cannot pair
-    by list index (len(found_chillers) != len(empty_storage)) refuses before
-    any motion.
+    Preserve the OEM's source-order observations and count errors, but never
+    execute its crossed index pairing. Only identified covers at both stations
+    with both storage targets empty can justify a complete, safe relocation.
     """
     order = (17, 19, 20, 18)
     values: dict[int, bool] = {}
@@ -337,12 +342,13 @@ def plan_cover_relocations(detected: Mapping[Any, bool]) -> dict[str, Any]:
         error_status = "SHORT_CHILLER_COVER"
     relocations: list[dict[str, Any]] = []
     if cover_count == 2 and error_status is None:
-        if len(found) != len(empty):
-            raise OemVisionReceiptError("cover topology cannot be paired by the OEM source order")
-        relocations = [
-            {"cover": "reagent" if source == 19 else "output", "from": source, "to": destination}
-            for source, destination in zip(found, empty)
-        ]
+        if found != [17, 19] or empty != [20, 18]:
+            error_status = "UNSAFE_COVER_TOPOLOGY"
+        else:
+            relocations = [
+                {"cover": "output", "from": 17, "to": 18},
+                {"cover": "reagent", "from": 19, "to": 20},
+            ]
     return {
         "detected": {location: values[location] for location in order},
         "cover_count": cover_count,

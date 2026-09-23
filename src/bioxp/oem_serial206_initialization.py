@@ -13562,11 +13562,11 @@ class Serial206OemInitializationProvider:
     ) -> dict[str, Any]:
         """ControlLib.inspectCover:3727-3766 num==2 branch as one decision child.
 
-        Reads this command's four check findings, plans the exact index-paired
-        relocations (plan_cover_relocations mirrors the acceptance evaluator),
-        executes every catch/release through the canonical nested compiles, then
-        the terminal storage writes and the doorOpen(true) terminal. Failed or
-        unpaired topologies move nothing and claim nothing.
+        Reads this command's four source-order check findings and plans safe
+        same-identity relocations (as validated by the acceptance evaluator).
+        Executes only identity-matched releases to empty targets, then
+        terminal storage writes and doorOpen(true). Unsafe topologies move
+        nothing and claim no canonical custody.
         """
         del operation
         from .oem_deck_movement import compile_cover_inspection_finalize

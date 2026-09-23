@@ -3,8 +3,7 @@
 Source: ControlLib.inspectCover:3663-3768 and the branch methods
 (checkChillerCover:3891-3942, InspectOutputLocation:3778-3823,
 checkRCCover:3825-3848, checkCoverStorage:3850-3888). These tests pin the
-source child graph, the index-paired relocation semantics (crossed when both
-storages are empty), the refusals that must never move, and the receipt shape
+source child graph, safe source-to-storage pairing, the refusals that must never move, and the receipt shape
 the acceptance evaluator requires.
 """
 from __future__ import annotations
@@ -21,6 +20,7 @@ import pytest
 
 from bioxp.oem_deck_movement import (
     FINITE_PLATE_OPERATIONS,
+    DeckExecutionFailure,
     WP8_COMPILED_CHILD_OPERATIONS,
     WP8_OPERATION_INTENT_KEYS,
     compile_finite_plate_operation,
@@ -216,23 +216,33 @@ class TestCompileContract:
 
 
 class TestRelocationPlanner:
-    def test_crossed_pairing_when_both_storages_empty(self):
+    def test_identity_pairing_when_both_storages_empty(self):
         plan = plan_cover_relocations({17: True, 19: True, 20: False, 18: False})
         assert plan["cover_count"] == 2 and plan["error_status"] is None
-        # OEM 3732-3744 pairs list[] with list2[] by index: with both storages
-        # empty the source order crosses the covers (17->20, 19->18).
+        # OEM source order zips [17,19] against [20,18], crossing covers;
+        # the port must pair each observed identity with its own empty storage.
         assert plan["relocations"] == [
-            {"cover": "output", "from": 17, "to": 20},
-            {"cover": "reagent", "from": 19, "to": 18},
-        ]
-
-    def test_single_storage_pairs_by_index(self):
-        assert plan_cover_relocations({17: True, 19: False, 20: True, 18: False})["relocations"] == [
             {"cover": "output", "from": 17, "to": 18},
-        ]
-        assert plan_cover_relocations({17: False, 19: True, 20: False, 18: True})["relocations"] == [
             {"cover": "reagent", "from": 19, "to": 20},
         ]
+
+    @pytest.mark.parametrize("detected", [
+        {17: True, 19: False, 20: True, 18: False},
+        {17: False, 19: True, 20: False, 18: True},
+        {17: True, 19: False, 20: False, 18: True},
+        {17: False, 19: True, 20: True, 18: False},
+        {17: False, 19: False, 20: True, 18: True},
+    ])
+    def test_unidentified_or_occupied_storage_fails_closed(self, detected):
+        plan = plan_cover_relocations(detected)
+        assert plan["cover_count"] == 2
+        assert plan["error_status"] == "UNSAFE_COVER_TOPOLOGY"
+        assert plan["relocations"] == []
+        receipt = _receipt(plan, log_only=True)
+        evaluation = evaluate_inspect_cover_receipt(receipt)
+        assert not evaluation["receipt_validation_pass"]
+        assert not evaluation["oem_effective_pass"]
+        assert evaluation["expected_relocations"] == []
 
     def test_short_and_over_error_statuses(self):
         short = plan_cover_relocations({17: True, 19: False, 20: False, 18: False})
@@ -279,6 +289,20 @@ def _receipt(plan, *, log_only=False):
 
 
 class TestEvaluatorAgreement:
+    def test_rejects_crossed_oem_receipt_and_unreleased_final_claim(self):
+        plan = plan_cover_relocations({17: True, 19: True, 20: False, 18: False})
+        crossed = _receipt(plan)
+        crossed["relocations"] = [
+            {"cover": "output", "from": 17, "to": 20},
+            {"cover": "reagent", "from": 19, "to": 18},
+        ]
+        with pytest.raises(OemVisionReceiptError, match="safe observed"):
+            evaluate_inspect_cover_receipt(crossed)
+        unsafe = _receipt(plan_cover_relocations({17: True, 19: False, 20: True, 18: False}))
+        unsafe["final_cover_locations"] = {"output": 18, "reagent": 20}
+        with pytest.raises(OemVisionReceiptError, match="cannot claim final"):
+            evaluate_inspect_cover_receipt(unsafe)
+
     def test_planner_and_evaluator_agree_across_all_combinations(self):
         for bits in product((False, True), repeat=4):
             detected = dict(zip((17, 19, 20, 18), bits))
@@ -532,9 +556,9 @@ class TestRelocate:
         provider, result = self._run({17: True, 19: True, 20: False, 18: False})
         assert provider.nested == [
             ("catch_plate", {"plate": 4, "run_in_parallel": True}),
-            ("release_plate", {"destination": 20, "press_plate": False, "run_in_parallel": True}),
-            ("catch_plate", {"plate": 5, "run_in_parallel": True}),
             ("release_plate", {"destination": 18, "press_plate": False, "run_in_parallel": True}),
+            ("catch_plate", {"plate": 5, "run_in_parallel": True}),
+            ("release_plate", {"destination": 20, "press_plate": False, "run_in_parallel": True}),
             ("thermal_door", {"open": True}),
         ]
         finalize_children = provider.finalize[0]["children"]
@@ -542,8 +566,8 @@ class TestRelocate:
             {"locations": [{"plate": 4, "location": 18}, {"plate": 5, "location": 20}]},
         ]
         assert result["relocations"] == [
-            {"cover": "output", "from": 17, "to": 20},
-            {"cover": "reagent", "from": 19, "to": 18},
+            {"cover": "output", "from": 17, "to": 18},
+            {"cover": "reagent", "from": 19, "to": 20},
         ]
         assert result["final_cover_locations"] == {"output": 18, "reagent": 20}
         assert result["door_open_verified"] is True
@@ -556,6 +580,44 @@ class TestRelocate:
         assert result["error_status"] == "SHORT_CHILLER_COVER"
         assert result["relocations"] == [] and result["final_cover_locations"] is None
         assert result["door_open_verified"] is False
+
+    def test_unsafe_topology_moves_nothing_and_never_finalizes(self):
+        for findings in (
+            {17: True, 19: False, 20: True, 18: False},
+            {17: True, 19: False, 20: False, 18: True},
+            {17: False, 19: False, 20: True, 18: True},
+        ):
+            provider, result = self._run(findings, log_only=True)
+            assert provider.nested == [] and provider.finalize == []
+            assert result["error_status"] == "UNSAFE_COVER_TOPOLOGY"
+            assert result["final_cover_locations"] is None
+            assert result["door_open_verified"] is False
+
+    def test_second_release_failure_preserves_partial_receipt_without_false_finalization(self):
+        provider = _RelocateProvider()
+        provider._oem_cover_inspection_findings = {
+            "cmd": {17: True, 19: True, 20: False, 18: False},
+        }
+        execute = provider._wp8_compile_and_execute
+
+        def fail_second_release(**kwargs):
+            if kwargs["operation"] == "release_plate" and kwargs["inputs"]["destination"] == 20:
+                provider.nested.append((kwargs["operation"], dict(kwargs["inputs"])))
+                return {"ok": False, "failed_child": "release20"}
+            return execute(**kwargs)
+
+        provider._wp8_compile_and_execute = fail_second_release
+        with pytest.raises(DeckExecutionFailure, match="cover_inspection_release_failed") as caught:
+            Serial206OemInitializationProvider.wp8_cover_inspection_relocate(
+                provider, "coverInspectionRelocate", {"inspection_log_only": False},
+                command_id="cmd", child_order=8, plan_digest="d", owner_identity={},
+            )
+        assert provider.finalize == []
+        assert not any(op == "thermal_door" for op, _ in provider.nested)
+        assert caught.value.provider_results[0]["relocation"] == {
+            "cover": "output", "from": 17, "to": 18,
+        }
+        assert caught.value.provider_results[-1]["result"]["failed_child"] == "release20"
 
     def test_missing_findings_refuse(self):
         provider = _RelocateProvider()
@@ -603,8 +665,8 @@ class TestReceiptAssembly:
     def test_canonical_receipt_passes_evaluator(self):
         evidence = self._evidence(
             {17: True, 19: True, 20: False, 18: False},
-            relocations=[{"cover": "output", "from": 17, "to": 20},
-                         {"cover": "reagent", "from": 19, "to": 18}],
+            relocations=[{"cover": "output", "from": 17, "to": 18},
+                         {"cover": "reagent", "from": 19, "to": 20}],
             final={"output": 18, "reagent": 20}, door_open=True,
         )
         receipt = assemble_inspect_cover_receipt(
