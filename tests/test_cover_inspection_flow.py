@@ -61,6 +61,47 @@ class TestBarcodeDecoder:
         assert scan_barcode(_jpeg(image)) == ""
 
 
+class TestCameraPreflight:
+    def test_initialize_illumination_before_deck_admission(self, monkeypatch):
+        from bioxp import api
+        from fastapi import HTTPException
+
+        class Camera:
+            initialized = False
+
+            def initialize_illumination(self):
+                self.initialized = True
+                return {"ok": True}
+
+        camera = Camera()
+        calls = []
+        monkeypatch.setattr(api, "_camera_provider", camera)
+        monkeypatch.setattr(api, "_serial206_oem_initialization_provider", object())
+        monkeypatch.setattr(api, "_bind_deck_cover_inspection", lambda _: None)
+        monkeypatch.setattr(api, "_deck_inspection_settings", lambda: {
+            "DeckInspection": True, "ScreenResolutionHigh": False, "InspectionLogOnly": False,
+        })
+
+        class Admitted(Exception):
+            pass
+
+        def admit(operation, **kwargs):
+            assert camera.initialized and operation == "cover_inspection"
+            calls.append(operation)
+            raise Admitted
+
+        monkeypatch.setattr(api.app.state, "oem_wp8_operation_admitter", admit, raising=False)
+        action = types.SimpleNamespace(action_id="inspect-covers")
+        state = types.SimpleNamespace(job_id="test-cover-preflight")
+        with pytest.raises(Admitted):
+            api._protocol_live_inspect_cover_handler(action, state)
+        assert calls == ["cover_inspection"]
+        camera.initialize_illumination = lambda: {"ok": False}
+        with pytest.raises(HTTPException) as error:
+            api._protocol_live_inspect_cover_handler(action, state)
+        assert error.value.status_code == 503 and calls == ["cover_inspection"]
+
+
 class TestRetainedTrayCleanPath:
     def test_oem_tip_available_is_independent_of_motor_epoch(self):
         provider = object.__new__(Serial206OemInitializationProvider)

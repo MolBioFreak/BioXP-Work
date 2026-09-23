@@ -11573,6 +11573,12 @@ def _protocol_live_inspect_cover_handler(action, state):
     if provider is None:
         raise HTTPException(status_code=503, detail={"error": "serial206_provider_unavailable"})
     _bind_deck_cover_inspection(provider)
+    # OEM preparation initializes the camera XU before AdjustCamera writes LEDs.
+    # Do this before deck admission: a cold camera must never turn an otherwise
+    # motion-free inspection attempt into an ambiguous dispatched command.
+    initialized = _camera_provider.initialize_illumination()
+    if not isinstance(initialized, Mapping) or initialized.get("ok") is not True:
+        raise HTTPException(status_code=503, detail={"error": "cover_inspection_camera_initialization_failed"})
     settings = _deck_inspection_settings()
     inputs = {
         "deck_inspection": bool(settings["DeckInspection"]),
