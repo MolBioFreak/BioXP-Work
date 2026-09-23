@@ -5046,7 +5046,7 @@ class Serial206OemInitializationProvider:
             "tip_dirty": tip_dirty, "tip_location": tip_location, "clean_path": clean_path,
             "plate_on_gantry": machine.get("plate_on_gantry"),
             "movable_plate_locations": canonical_movable_object_locations(
-                machine.get("movable_plate_locations")
+                machine.get("movable_plate_locations"), require_complete=True,
             ),
             "pseudo_z_home": pseudo_z_home, "ownership_generation": observed_generation,
             "board_epoch_4": board_epoch_4, "board_epoch_5": board_epoch_5,
@@ -13364,8 +13364,11 @@ class Serial206OemInitializationProvider:
         for attempt, (offset_x, offset_y) in enumerate(((x, y), (x + 2000, y - 4000))):
             move = self._cover_inspection_move(3, offset_x, offset_y)
             z_move = self._cover_inspection_move_z(z)
+            # Each source move owns a distinct canonical update, including
+            # both barcode attempts within the same inspectCoverAt child.
             self._cover_inspection_location_publish(
-                3, command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+                3, command_id=f"{command_id}:reagent-barcode:{attempt}",
+                child_order=child_order, plan_digest=plan_digest,
             )
             if attempt == 0:
                 time.sleep(0.2)

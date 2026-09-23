@@ -4214,7 +4214,9 @@ class OperatorCommandStore:
         except ValueError as exc:
             raise ValueError("deck bootstrap plate state is not authoritative") from exc
         try:
-            movable = canonical_movable_object_locations(snapshot.get("movable_plate_locations"))
+            movable = canonical_movable_object_locations(
+                snapshot.get("movable_plate_locations"), require_complete=True,
+            )
         except ValueError as exc:
             raise ValueError("deck bootstrap movable plate state is not authoritative") from exc
 
@@ -4366,9 +4368,11 @@ class OperatorCommandStore:
         movable = values.get("movable_plate_locations")
         if movable is not None:
             try:
-                values["movable_plate_locations"] = canonical_movable_object_locations(movable)
+                values["movable_plate_locations"] = canonical_movable_object_locations(
+                    movable, require_complete=False,
+                )
             except ValueError as exc:
-                raise ValueError("movable plate locations must be complete and authoritative") from exc
+                raise ValueError("movable plate locations must be authoritative") from exc
         upstream_id = str(source_command_id)
         if not upstream_id.strip():
             raise ValueError("source command identity is required")

@@ -151,6 +151,10 @@ def compiled_wp8_machine_targets(plan_or_child: Mapping[str, Any]) -> frozenset[
         if not isinstance(child, Mapping):
             continue
         operation = str(child.get("operation") or "")
+        # ClassMachineStatus.updatePlateLocation records custody, not travel.
+        # LOC_GANTRY (29) is a valid custody location without a deck XY row.
+        if operation == "updatePlateLocation":
+            continue
         arguments = child.get("arguments")
         if isinstance(arguments, Mapping):
             for key in ("destination", "location", "location_id", "pressure_target"):
@@ -203,8 +207,14 @@ OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS: dict[str, str] = {
 }
 
 
-def canonical_movable_object_locations(value: Any) -> dict[str, str]:
-    if not isinstance(value, Mapping) or set(value) != set(OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS):
+def canonical_movable_object_locations(
+    value: Any, *, require_complete: bool = True,
+) -> dict[str, str]:
+    # Bootstrap requires the complete constructor state; an observed source
+    # update may know only one object. Missing objects remain unknown.
+    if (not isinstance(value, Mapping)
+            or not set(value) <= set(OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS)
+            or (require_complete and set(value) != set(OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS))):
         raise ValueError("movable plate state is not authoritative")
     locations = configured_location_names()
     canonical: dict[str, str] = {}
