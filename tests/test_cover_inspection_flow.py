@@ -25,7 +25,7 @@ from bioxp.oem_deck_movement import (
     WP8_OPERATION_INTENT_KEYS,
     compile_finite_plate_operation,
 )
-from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider
+from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider, Serial206ProductionPrimitiveAdapter
 from bioxp.oem_vision_acceptance import (
     OemVisionReceiptError,
     assemble_inspect_cover_receipt,
@@ -59,6 +59,21 @@ class TestBarcodeDecoder:
         assert np.array_equal(seen[0], cv2.cvtColor(cv2.imdecode(np.frombuffer(_jpeg(image), np.uint8), 1), 7))
         symbols.append(types.SimpleNamespace(data=b"SECOND"))
         assert scan_barcode(_jpeg(image)) == ""
+
+
+class TestSourceThreadContext:
+    def test_inspect_cover_uses_oem_motion_thread_mta_wait(self):
+        adapter = object.__new__(Serial206ProductionPrimitiveAdapter)
+        adapter.tester = types.SimpleNamespace(
+            motor_oem_axis_board_present=lambda axis: axis != "y",
+        )
+        adapter.x_move_absolute = lambda **kwargs: {"ok": True}
+        result = adapter.move_xy(100, 200, wait_timeout_s=5, source_context="ControlLib.inspectCover")
+        assert result["ok"] is True
+        assert result["source_context_sealed"] is True
+        assert result["wait_schedule"] == "MTA_WaitAll"
+        with pytest.raises(ValueError, match="unsealed_moveXY_source_context"):
+            adapter.move_xy(100, 200, wait_timeout_s=5, source_context="unknown")
 
 
 class TestCameraPreflight:
@@ -294,6 +309,7 @@ class _FakePrimitives:
 
     def oem_move_xy(self, x, y, *, wait_timeout_s=5.0, source_context=None):
         self.calls.append(("xy", int(x), int(y)))
+        self.source_context = source_context
         return {"ok": True}
 
 
@@ -403,6 +419,7 @@ class TestInspectCoverAt:
         assert (2, True) in calls["led"] and (1, False) in calls["led"]
         assert calls["led"][-3:] == [(1, False), (2, False), (3, False)]
         assert ("xy", 1324 + 20021, 42129) in provider.primitives.calls
+        assert provider.primitives.source_context == "ControlLib.inspectCover"
         assert ("z", 500) in provider.primitives.calls
         assert calls["update"] == [("updateLocation", {"destination": 17, "well": 0})]
         assert calls["save"] == ["check_chiller_cover_LOC_OC_COVERfound"]

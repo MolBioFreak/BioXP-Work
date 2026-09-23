@@ -3572,11 +3572,10 @@ class Serial206ProductionPrimitiveAdapter:
         wait_timeout_s: float,
         source_context: str | None = None,
     ) -> dict[str, Any]:
-        # Source context, not the Linux worker thread: App.Main is STA and
-        # btnLOC1_Click calls both moveTo overloads then moveXY synchronously
-        # (BioXPControlLib IL_075c -> IL_007c -> IL_01e6). Other callers have
-        # not yet been sealed; retain their legacy WaitAll without claiming MTA.
-        if source_context not in (None, "ClassControlInterface.btnLOC1_Click"):
+        # Source thread, not Linux's worker: the UI button runs on STA, while
+        # BioXPMainWindow's dedicated Motion thread invokes inspectCover on MTA.
+        # ClassControlInterface.moveXY uses WaitAny on STA and WaitAll on MTA.
+        if source_context not in (None, "ClassControlInterface.btnLOC1_Click", "ControlLib.inspectCover"):
             raise ValueError("unsealed_moveXY_source_context")
         sta_sequential = source_context == "ClassControlInterface.btnLOC1_Click"
         requested = {"x": int(x), "y": int(y)}
@@ -3595,7 +3594,11 @@ class Serial206ProductionPrimitiveAdapter:
             "oem_wait_timeout_ms": 5000,
             "source_context": source_context,
             "source_context_sealed": source_context is not None,
-            "wait_schedule": "STA_WaitAny_X_then_Y" if sta_sequential else "unsealed_legacy_WaitAll",
+            "wait_schedule": (
+                "STA_WaitAny_X_then_Y" if sta_sequential else
+                "MTA_WaitAll" if source_context == "ControlLib.inspectCover" else
+                "unsealed_legacy_WaitAll"
+            ),
         }
         if not present["y"]:
             fallback = self.x_move_absolute(position_steps=requested["x"], source_mode="moveXY.missing_y.moveX", clamp_low_to_60=True)
