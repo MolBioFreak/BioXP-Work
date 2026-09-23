@@ -307,8 +307,10 @@ class _FakePrimitives:
         self.calls.append(("z", int(position)))
         return {"ok": True}
 
-    def oem_move_xy(self, x, y, *, wait_timeout_s=5.0, source_context=None):
-        self.calls.append(("xy", int(x), int(y)))
+    def oem_move_to(self, x, y, z, *, source_context=None, **state):
+        # Camera/decision tests only; connected movement coverage is in
+        # test_cover_inspection_movement.py (real moveTo, XY and axis adapters).
+        self.calls.append(("move_to", int(x), int(y), int(z)))
         self.source_context = source_context
         return {"ok": True}
 
@@ -386,7 +388,8 @@ def _make_provider(*, frames, scores=None, monkeypatch=None, barcode_reads=()):
         rgb=lambda r, g, b: calls["rgb"].append((r, g, b)),
         barcode=barcode,
     )
-    provider.mov_execution_machine_state = lambda: {"pseudo_z_home": 500}
+    provider.mov_execution_machine_state = lambda: {"pseudo_z_home": 500, "tip_loaded": False}
+    provider._deck_gripper_confirmed = lambda: True
     provider.wp8_update_location = lambda operation, arguments, **kwargs: calls["update"].append(
         (operation, dict(arguments))
     )
@@ -418,9 +421,9 @@ class TestInspectCoverAt:
         assert calls["rgb"] == [(255, 255, 255)]
         assert (2, True) in calls["led"] and (1, False) in calls["led"]
         assert calls["led"][-3:] == [(1, False), (2, False), (3, False)]
-        assert ("xy", 1324 + 20021, 42129) in provider.primitives.calls
+        assert ("move_to", 1324 + 20021, 42129, 500) in provider.primitives.calls
         assert provider.primitives.source_context == "ControlLib.inspectCover"
-        assert ("z", 500) in provider.primitives.calls
+        assert not any(call[0] == "z" for call in provider.primitives.calls)
         assert calls["update"] == [("updateLocation", {"destination": 17, "well": 0})]
         assert calls["save"] == ["check_chiller_cover_LOC_OC_COVERfound"]
         assert provider._oem_cover_inspection_findings["cmd-1"] == {17: True}
@@ -434,7 +437,7 @@ class TestInspectCoverAt:
         )
         name = {19: "LOC_RC_COVER", 20: "LOC_RC_COVER_STORAGE", 18: "LOC_OC_COVER_STORAGE"}[location]
         x, y = _BASE[name]
-        assert ("xy", x + offset, y) in provider.primitives.calls
+        assert ("move_to", x + offset, y, 500) in provider.primitives.calls
         assert result["cover_detected"] is False
 
     def test_low_path_missing_names_snapshot_missing(self):
@@ -457,7 +460,7 @@ class TestInspectCoverAt:
         assert result["cover_detected"] is False
         assert result["details"]["barcode_flip_applied"] is True
         assert provider._test_calls["capture"] == 2
-        assert ("xy", 42788 - 23930 + 3499, 44972 + 7582 - 7744) in provider.primitives.calls
+        assert ("move_to", 42788 - 23930 + 3499, 44972 + 7582 - 7744, 500) in provider.primitives.calls
         assert ("z", 3145) in provider.primitives.calls
         assert provider._test_calls["update"][-1] == ("updateLocation", {"destination": 3, "well": 0})
 
@@ -471,7 +474,7 @@ class TestInspectCoverAt:
         )
         assert result["cover_detected"] is True
         assert provider._test_calls["capture"] == 3
-        assert ("xy", 42788 - 23930 + 3499 + 2000, 44972 + 7582 - 7744 - 4000) in provider.primitives.calls
+        assert ("move_to", 42788 - 23930 + 3499 + 2000, 44972 + 7582 - 7744 - 4000, 500) in provider.primitives.calls
         assert len(result["details"]["reagent_barcode_attempts"]) == 2
 
     def test_high_output_location_selection(self, monkeypatch):

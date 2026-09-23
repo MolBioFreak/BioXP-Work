@@ -13289,11 +13289,11 @@ class Serial206OemInitializationProvider:
         raise RuntimeError(f"source_authority_missing:cover_inspection_template:{name}")
 
     def _cover_inspection_move(self, location: int, offset_x: int, offset_y: int) -> dict[str, Any]:
-        """ClassControlInterface.moveTo(loc, offX, offY):3791-3713 row + offsets.
+        """OEM offset moveTo overload (SSD 7726-7744 -> 8355-8504).
 
-        Uses the ported position-table helper (offset math, high-limit clamp,
-        dynamic pseudo-home target) and the same source XY primitive as every
-        other deck operation.
+        Preserve moveTo's conditional Z clearance and loaded-state routing;
+        only its confirmed-gripper/no-tip branch calls moveXY. Inspection runs
+        on the OEM motion worker (MTA), not the manual UI (STA).
         """
         from .oem_compat.pathing import LOCATION_ID_TO_NAME
 
@@ -13310,16 +13310,19 @@ class Serial206OemInitializationProvider:
         )
         state = self.mov_execution_machine_state()
         pseudo = int(state["pseudo_z_home"])
-        z_result = self.primitives.oem_move_z(
-            int(pseudo), pseudo_home_steps=pseudo, motor_current=31, wait_for_stop=True,
-        )
-        move = self.primitives.oem_move_xy(
-            int(target["x"]), int(target["y"]),
-            wait_timeout_s=60.0, source_context="ControlLib.inspectCover",
+        location19 = table.resolve(location_id="LOC_RC_COVER")
+        move = self.primitives.oem_move_to(
+            int(target["x"]), int(target["y"]), pseudo,
+            pseudo_home_steps=pseudo, run_in_parallel=True,
+            gripper_confirmed=self._deck_gripper_confirmed(),
+            tip_loaded=bool(state["tip_loaded"]),
+            plate_on_gantry=state.get("plate_on_gantry"),
+            location19_y=int(location19.base_coordinates["y"]),
+            source_context="ControlLib.inspectCover",
         )
         if not isinstance(move, Mapping) or move.get("ok") is not True:
             raise RuntimeError("cover_inspection_move_failed")
-        return {"target": dict(target), "z": _json_safe(z_result), "move": _json_safe(move)}
+        return {"target": dict(target), "move": _json_safe(move)}
 
     def _cover_inspection_move_z(self, target: int) -> dict[str, Any]:
         state = self.mov_execution_machine_state()
