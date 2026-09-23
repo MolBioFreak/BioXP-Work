@@ -4930,9 +4930,7 @@ class Serial206OemInitializationProvider:
             source_command_id=source_command_id,
         )
 
-    def _clean_path_from_tip_tray_authority(
-        self, *, ownership_generation: int, board_epoch_4: int, board_epoch_5: int
-    ) -> bool:
+    def _clean_path_from_tip_tray_authority(self) -> bool:
         reader = getattr(self, "_tip_tray_state_reader", None)
         if not callable(reader):
             raise RuntimeError("tray_0_tip_availability_unavailable")
@@ -4947,20 +4945,17 @@ class Serial206OemInitializationProvider:
             or not tray_zero["command_id"].strip()
         ):
             raise RuntimeError("tray_0_tip_availability_unavailable")
-        authority = {
-            "ownership_generation": ownership_generation,
-            "board_epoch_4": board_epoch_4,
-            "board_epoch_5": board_epoch_5,
-        }
-        if any(tray_zero.get(key) != value for key, value in authority.items()):
-            raise RuntimeError("tray_0_tip_availability_unavailable")
+        # ControlLib.cleanPath reads ClassMachineStatus.tipAvailable(0), a
+        # retained software tray latch. A board reset changes motion epochs but
+        # neither reconstructs that tray nor replenishes its tips. Do not demand
+        # current motor epochs of the retained tray fact; publication below is
+        # stamped with the current deck owner instead.
         return not tray_zero["tip_available"]
 
     def _derived_clean_path_from_tray_zero(self, *, expected_clean_path: bool) -> bool:
         if type(expected_clean_path) is not bool:
             raise TypeError("clean_path expectation must be boolean")
-        authority = self.deck_owner_authority_stamps()
-        clean_path = self._clean_path_from_tip_tray_authority(**authority)
+        clean_path = self._clean_path_from_tip_tray_authority()
         if expected_clean_path is not clean_path:
             raise ValueError("clean_path expectation does not match OEM tray-0 authority")
         return clean_path
@@ -4971,8 +4966,9 @@ class Serial206OemInitializationProvider:
         """Publish OEM ``!tipAvailable(0)``; caller input is expectation only.
 
         ControlLib.cleanPath:413-423 reads ClassMachineStatus.tipAvailable(0).
-        The tray observation must be a current-generation source-owner record;
-        no request Boolean can create or overwrite that authority.
+        The tray latch must be a retained source-owner record; motor-board
+        lifecycles do not reset or refill it. The publication below acquires
+        current deck stamps, and no request Boolean overwrites tray authority.
         """
         clean_path = self._derived_clean_path_from_tray_zero(
             expected_clean_path=expected_clean_path
@@ -9020,11 +9016,7 @@ class Serial206OemInitializationProvider:
         gripper_confirmed = shared["gripper_confirmed"] if shared is not None else self._deck_gripper_confirmed()
         semantic = (self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed, allow_recovery=_allow_recovery)
                     if scope == "offset.v1" else self._canonical_deck_semantic_state(allow_recovery=_allow_recovery, no_tip_park=scope == "park.full"))
-        clean_path = None if scope == "offset.v1" or (scope == "park.full" and semantic["clean_path"] is None) else self._clean_path_from_tip_tray_authority(
-            ownership_generation=int(semantic["ownership_generation"]),
-            board_epoch_4=int(semantic["board_epoch_4"]),
-            board_epoch_5=int(semantic["board_epoch_5"]),
-        )
+        clean_path = None if scope == "offset.v1" or (scope == "park.full" and semantic["clean_path"] is None) else self._clean_path_from_tip_tray_authority()
         table = load_bound_oem_position_table()
         with self._lock:
             state = self._load_state()
@@ -13222,6 +13214,7 @@ class Serial206OemInitializationProvider:
         capture: Callable[..., Mapping[str, Any]],
         save: Callable[..., Mapping[str, Any]],
         led: Callable[..., Any], rgb: Callable[..., Any],
+        barcode: Callable[[bytes], str],
     ) -> None:
         """Bind the validated machine-bundle settings and shared camera owners.
 
@@ -13230,6 +13223,7 @@ class Serial206OemInitializationProvider:
         """
         callbacks: dict[str, Any] = {
             "settings": settings, "capture": capture, "save": save, "led": led, "rgb": rgb,
+            "barcode": barcode,
         }
         for name, callback in callbacks.items():
             if not callable(callback):
@@ -13347,6 +13341,42 @@ class Serial206OemInitializationProvider:
             command_id=command_id, child_order=child_order, plan_digest=plan_digest,
         )
 
+    def _cover_inspection_read_reagent_barcode(
+        self, *, command_id: str, child_order: int, plan_digest: str,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """ControlLib.ReadBarcode(REAGENT_ID): two OEM camera poses and scans."""
+        settings = self._cover_inspection_settings()
+        x = -23930 + int(settings["CameraXOffset"])
+        y = 7582 + int(settings["CameraYOffset"])
+        z = int(settings["CameraZOffset"])
+        attempts: list[dict[str, Any]] = []
+        for attempt, (offset_x, offset_y) in enumerate(((x, y), (x + 2000, y - 4000))):
+            move = self._cover_inspection_move(3, offset_x, offset_y)
+            z_move = self._cover_inspection_move_z(z)
+            self._cover_inspection_location_publish(
+                3, command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+            )
+            if attempt == 0:
+                time.sleep(0.2)
+            self._cover_inspection_profile("ScanBarCode")
+            time.sleep(0.2)
+            capture = self._cover_inspection_capture(
+                condition="read_reagent_barcode", artifact_id=f"{command_id}:{child_order}:barcode:{attempt}",
+            )
+            barcode = self._cover_inspection_callbacks()["barcode"](bytes(capture["frame"]))
+            self._cover_inspection_all_leds_off()
+            if type(barcode) is not str:
+                raise RuntimeError("source_authority_invalid:reagent_barcode")
+            attempts.append({
+                "move": move, "z_move": z_move,
+                "frame_sha256": hashlib.sha256(bytes(capture["frame"])).hexdigest(),
+                "capture_evidence": _json_safe(capture.get("capture_evidence")),
+                "barcode": barcode,
+            })
+            if barcode and barcode != "BLACK":
+                return barcode.lower(), attempts
+        return "", attempts
+
     def wp8_inspect_cover_at(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
         child_order: int, plan_digest: str, **_: Any,
@@ -13381,7 +13411,7 @@ class Serial206OemInitializationProvider:
             # checkChillerCover: setLEDColor(255,255,255) then item 6 profile.
             self._cover_inspection_callbacks()["rgb"](255, 255, 255)
             self._cover_inspection_profile("CoverInspection")
-            offset_x, offset_y = {17: (20021, 0), 19: (5923, 0), 20: (5923, 0), 18: (20021, 0)}[location]
+            offset_x, offset_y = {17: (20021, 0), 19: (20021, 0), 20: (5923, 0), 18: (5923, 0)}[location]
             details["move"] = self._cover_inspection_move(location, offset_x, offset_y)
             self._cover_inspection_location_publish(
                 location, command_id=command_id, child_order=child_order, plan_digest=plan_digest,
@@ -13397,12 +13427,13 @@ class Serial206OemInitializationProvider:
             method = "checkChillerCover"
             details["locate_cover"] = detected
             if location == 19 and detected:
-                # 3926-3938 re-reads the reagent barcode and flips a positive
-                # finding when a real label answers. The shared deck context has
-                # no bound reagent barcode reader; the skip is recorded, never
-                # fabricated.
-                details["barcode_flip_applied"] = False
-                details["barcode_read_skipped"] = "no_bound_reagent_barcode_reader"
+                barcode, attempts = self._cover_inspection_read_reagent_barcode(
+                    command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+                )
+                details["reagent_barcode_attempts"] = attempts
+                details["barcode_flip_applied"] = bool(barcode)
+                if barcode:
+                    detected = False
             from .oem_compat.pathing import LOCATION_ID_TO_NAME
             snapshot_condition = (
                 "check_chiller_cover_" + LOCATION_ID_TO_NAME[location] + ("found" if detected else "missing")

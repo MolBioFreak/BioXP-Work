@@ -9,7 +9,10 @@ the acceptance evaluator requires.
 """
 from __future__ import annotations
 
+import importlib
 import json
+import sys
+import types
 from itertools import product
 
 import cv2
@@ -39,6 +42,45 @@ def _jpeg(image: np.ndarray) -> bytes:
     ok, encoded = cv2.imencode(".jpg", image)
     assert ok
     return bytes(encoded.tobytes())
+
+
+class TestBarcodeDecoder:
+    def test_oem_gray_and_one_symbol_rule(self, monkeypatch):
+        scan_barcode = importlib.import_module("bioxp.vision.oem_inspection").scan_barcode
+        seen = []
+        symbols = [types.SimpleNamespace(data=b"  ABC123  ")]
+        scanner = types.ModuleType("pyzbar.pyzbar")
+        setattr(scanner, "decode", lambda gray: (seen.append(gray.copy()), list(symbols))[1])
+        monkeypatch.setitem(sys.modules, "pyzbar", types.ModuleType("pyzbar"))
+        monkeypatch.setitem(sys.modules, "pyzbar.pyzbar", scanner)
+        image = np.zeros((2, 2, 3), np.uint8)
+        image[:] = (10, 60, 180)
+        assert scan_barcode(_jpeg(image)) == "ABC123"
+        assert np.array_equal(seen[0], cv2.cvtColor(cv2.imdecode(np.frombuffer(_jpeg(image), np.uint8), 1), 7))
+        symbols.append(types.SimpleNamespace(data=b"SECOND"))
+        assert scan_barcode(_jpeg(image)) == ""
+
+
+class TestRetainedTrayCleanPath:
+    def test_oem_tip_available_is_independent_of_motor_epoch(self):
+        provider = object.__new__(Serial206OemInitializationProvider)
+        provider._tip_tray_state_reader = lambda tray_id: {
+            "tip_available": True, "revision": 3,
+            "operation_id": "reset:tray0", "command_id": "reset",
+            "ownership_generation": 1, "board_epoch_4": 76, "board_epoch_5": 2,
+        }
+        provider.deck_owner_authority_stamps = lambda: {
+            "ownership_generation": 1, "board_epoch_4": 107, "board_epoch_5": 1,
+        }
+        assert provider._derived_clean_path_from_tray_zero(expected_clean_path=False) is False
+        with pytest.raises(ValueError, match="does not match"):
+            provider._derived_clean_path_from_tray_zero(expected_clean_path=True)
+
+    def test_missing_source_tray_still_refuses(self):
+        provider = object.__new__(Serial206OemInitializationProvider)
+        provider._tip_tray_state_reader = lambda tray_id: {"tip_available": True}
+        with pytest.raises(RuntimeError, match="tray_0_tip_availability_unavailable"):
+            provider._derived_clean_path_from_tray_zero(expected_clean_path=False)
 
 
 class TestCompileContract:
@@ -218,6 +260,7 @@ _BASE = {
     "LOC_OC": (26213, 42413),
     "LOC_OC_COVER": (1324, 42129),
     "LOC_RC_COVER": (42788, 44972),
+    "LOC_RC": (42788, 44972),
     "LOC_OC_COVER_STORAGE": (84252, 6057),
     "LOC_RC_COVER_STORAGE": (84252, 36267),
 }
@@ -226,6 +269,7 @@ _SETTINGS = {
     "CameraXOffset": 3499, "CameraYOffset": -7744, "CameraZOffset": 3145,
     "InspectionSettings": {
         "CoverInspection": {"Exposure": 1000, "Gain": 1000, "LED1": False, "LED2": True, "LED3": False},
+        "ScanBarCode": {"Exposure": 1000, "Gain": 1000, "LED1": False, "LED2": False, "LED3": False},
         "OutputPlateInspection": {"Exposure": 1000, "Gain": 1000, "LED1": False, "LED2": False, "LED3": False},
         "CoverStorageInspection": {"Exposure": 1000, "Gain": 1000, "LED1": True, "LED2": True, "LED3": True},
     },
@@ -235,11 +279,16 @@ _SETTINGS = {
 }
 
 
-def _make_provider(*, frames, scores=None, monkeypatch=None):
+def _make_provider(*, frames, scores=None, monkeypatch=None, barcode_reads=()):
     provider = object.__new__(Serial206OemInitializationProvider)
     primitives = _FakePrimitives()
-    calls = {"led": [], "rgb": [], "save": [], "capture": 0, "update": []}
+    calls = {"led": [], "rgb": [], "save": [], "capture": 0, "update": [], "barcode": []}
     frame_iter = list(frames)
+    barcode_iter = iter(barcode_reads)
+
+    def barcode(frame):
+        calls["barcode"].append(frame)
+        return next(barcode_iter, "")
 
     def capture(*, condition, artifact_id):
         calls["capture"] += 1
@@ -256,6 +305,7 @@ def _make_provider(*, frames, scores=None, monkeypatch=None):
         save=save,
         led=lambda *, channel, on: calls["led"].append((channel, on)),
         rgb=lambda r, g, b: calls["rgb"].append((r, g, b)),
+        barcode=barcode,
     )
     provider.mov_execution_machine_state = lambda: {"pseudo_z_home": 500}
     provider.wp8_update_location = lambda operation, arguments, **kwargs: calls["update"].append(
@@ -295,6 +345,18 @@ class TestInspectCoverAt:
         assert calls["save"] == ["check_chiller_cover_LOC_OC_COVERfound"]
         assert provider._oem_cover_inspection_findings["cmd-1"] == {17: True}
 
+    @pytest.mark.parametrize("location,offset", [(19, 20021), (20, 5923), (18, 5923)])
+    def test_low_path_uses_oem_station_vs_storage_offset(self, location, offset):
+        provider = _make_provider(frames=[_jpeg(_GRAY_EMPTY)])
+        result = provider.wp8_inspect_cover_at(
+            "inspectCoverAt", {"destination": location, "screen_resolution_high": False},
+            command_id="cmd-offset", child_order=2, plan_digest="d",
+        )
+        name = {19: "LOC_RC_COVER", 20: "LOC_RC_COVER_STORAGE", 18: "LOC_OC_COVER_STORAGE"}[location]
+        x, y = _BASE[name]
+        assert ("xy", x + offset, y) in provider.primitives.calls
+        assert result["cover_detected"] is False
+
     def test_low_path_missing_names_snapshot_missing(self):
         provider = _make_provider(frames=[_jpeg(_GRAY_EMPTY)])
         result = provider.wp8_inspect_cover_at(
@@ -303,6 +365,34 @@ class TestInspectCoverAt:
         )
         assert result["cover_detected"] is False
         assert provider._test_calls["save"] == ["check_chiller_cover_LOC_RC_COVERmissing"]
+
+    def test_low_reagent_barcode_flips_positive_after_oem_camera_move(self):
+        provider = _make_provider(
+            frames=[_jpeg(_GRAY_WITH_COVER), _jpeg(_GRAY_EMPTY)], barcode_reads=("REAGENT123",),
+        )
+        result = provider.wp8_inspect_cover_at(
+            "inspectCoverAt", {"destination": 19, "screen_resolution_high": False},
+            command_id="cmd-barcode", child_order=4, plan_digest="d",
+        )
+        assert result["cover_detected"] is False
+        assert result["details"]["barcode_flip_applied"] is True
+        assert provider._test_calls["capture"] == 2
+        assert ("xy", 42788 - 23930 + 3499, 44972 + 7582 - 7744) in provider.primitives.calls
+        assert ("z", 3145) in provider.primitives.calls
+        assert provider._test_calls["update"][-1] == ("updateLocation", {"destination": 3, "well": 0})
+
+    def test_low_reagent_empty_barcode_retries_second_oem_pose(self):
+        provider = _make_provider(
+            frames=[_jpeg(_GRAY_WITH_COVER), _jpeg(_GRAY_EMPTY)], barcode_reads=("", ""),
+        )
+        result = provider.wp8_inspect_cover_at(
+            "inspectCoverAt", {"destination": 19, "screen_resolution_high": False},
+            command_id="cmd-empty-barcode", child_order=4, plan_digest="d",
+        )
+        assert result["cover_detected"] is True
+        assert provider._test_calls["capture"] == 3
+        assert ("xy", 42788 - 23930 + 3499 + 2000, 44972 + 7582 - 7744 - 4000) in provider.primitives.calls
+        assert len(result["details"]["reagent_barcode_attempts"]) == 2
 
     def test_high_output_location_selection(self, monkeypatch):
         import bioxp.vision.oem_inspection as cvmod

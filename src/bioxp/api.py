@@ -11549,12 +11549,14 @@ def _deck_cover_inspection_save(*, frame, condition: str, artifact_id: str) -> d
 
 def _bind_deck_cover_inspection(provider) -> None:
     """Compose the cover-inspection callbacks onto the serial-206 provider."""
+    from .vision.oem_inspection import scan_barcode
     provider.bind_oem_cover_inspection_callbacks(
         settings=_deck_inspection_settings,
         capture=_deck_cover_inspection_capture,
         save=_deck_cover_inspection_save,
         led=lambda *, channel, on: _camera_provider.set_illumination(channel=channel, on=on),
         rgb=lambda r, g, b: _get_tester().strip_set_rgb(r, g, b, reconnect_first=False, activate_first=False),
+        barcode=scan_barcode,
     )
 
 

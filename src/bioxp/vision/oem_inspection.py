@@ -76,6 +76,18 @@ def match_pattern(image: bytes | np.ndarray, template: bytes | np.ndarray,
     return PatternMatch(float(maximum), int(location[0]), int(location[1]))
 
 
+def scan_barcode(image: bytes | np.ndarray) -> str:
+    """CVisionLib.ScanBarcode: RGB2GRAY, ZBar, exactly one decoded symbol."""
+    try:
+        from pyzbar.pyzbar import decode
+    except (ImportError, OSError) as exc:
+        raise RuntimeError("source_authority_missing:zbar_barcode_decoder") from exc
+    symbols = decode(_gray(image))
+    if len(symbols) != 1:
+        return ""
+    return symbols[0].data.decode("utf-8").strip()
+
+
 def check_purification_station(image: bytes | np.ndarray) -> bool:
     """7428-7688: >20000 pixels strictly >40, full-width TOP half."""
     gray = _gray(image)

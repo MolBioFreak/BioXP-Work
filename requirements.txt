@@ -8,3 +8,5 @@ rfc8785
 # CPU inspection port qualified against captured OEM pixels (OEM OpenCV 3.2).
 numpy==1.26.4
 opencv-python-headless==3.4.18.65
+# OEM CVisionLib.ScanBarcode uses ZBar; runtime image also needs libzbar0.
+pyzbar==0.1.9
