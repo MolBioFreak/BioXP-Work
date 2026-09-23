@@ -26,12 +26,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       psmisc \
       v4l-utils \
       libusb-1.0-0 \
+      libzbar0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir --requirement /app/requirements.txt
+RUN pip install --no-cache-dir --requirement /app/requirements.txt \
+    && python -c 'from pyzbar.pyzbar import decode'
 
 # The build context must be produced by bioxp_source_manifest.py materialize.
 # Its generated .bioxp-release manifest is not a source file and is removed
