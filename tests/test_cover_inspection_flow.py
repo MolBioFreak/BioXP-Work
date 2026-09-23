@@ -82,6 +82,28 @@ class TestRetainedTrayCleanPath:
         with pytest.raises(RuntimeError, match="tray_0_tip_availability_unavailable"):
             provider._derived_clean_path_from_tray_zero(expected_clean_path=False)
 
+    def test_gripper_version_comes_from_machine_binding_when_legacy_state_is_empty(self, monkeypatch):
+        from contextlib import nullcontext
+        module = importlib.import_module("bioxp.oem_serial206_initialization")
+        provider = object.__new__(Serial206OemInitializationProvider)
+        provider._lock = nullcontext()
+        provider._load_state = lambda: {"machine_status": {"thermal_door_open": False}}
+        provider._canonical_deck_semantic_state = lambda: {
+            "current_location": "LOC_RC_COVER_STORAGE", "semantic_state_revision": 581,
+            "ownership_generation": 1, "board_epoch_4": 108, "board_epoch_5": 1,
+            "current_well": 0, "tip_loaded": False, "tip_dirty": False,
+            "tip_location": -1, "clean_path": False, "pseudo_z_home": 500,
+        }
+        monkeypatch.setattr(module, "load_bound_oem_position_table",
+                            lambda: types.SimpleNamespace(rows=lambda: [], digest="position-revision"))
+        monkeypatch.setattr(module, "load_oem_parity_config",
+                            lambda unused: types.SimpleNamespace(values={"GripperVersion": 1}))
+        assert provider.mov_execution_machine_state()["gripper_version"] == 1
+        monkeypatch.setattr(module, "load_oem_parity_config",
+                            lambda unused: types.SimpleNamespace(values={"GripperVersion": None}))
+        with pytest.raises(RuntimeError, match="source_authority_missing:GripperVersion"):
+            provider.mov_execution_machine_state()
+
 
 class TestCompileContract:
     def test_membership_and_intent_keys(self):

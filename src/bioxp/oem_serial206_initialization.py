@@ -11566,6 +11566,11 @@ class Serial206OemInitializationProvider:
                 table_rows[str(location_id)] = row
         with self._lock:
             legacy = dict(self._load_state().get("machine_status") or {})
+        gripper_version = legacy.get("GripperVersion", legacy.get("gripper_version"))
+        if type(gripper_version) is not int:
+            gripper_version = load_oem_parity_config(None).values.get("GripperVersion")
+        if type(gripper_version) is not int or gripper_version not in (0, 1):
+            raise RuntimeError("source_authority_missing:GripperVersion")
         authority = {
             "semantic_state_revision": int(semantic["semantic_state_revision"]),
             "ownership_generation": int(semantic["ownership_generation"]),
@@ -11588,7 +11593,7 @@ class Serial206OemInitializationProvider:
             "pseudo_z_home": int(semantic["pseudo_z_home"]),
             "plate_on_gantry": semantic.get("plate_on_gantry"),
             "thermal_door_open": legacy.get("thermal_door_open"),
-            "gripper_version": legacy.get("GripperVersion", legacy.get("gripper_version")),
+            "gripper_version": gripper_version,
             "board_test_mode": legacy.get("BoardTestMode", legacy.get("board_test_mode")),
             "save_tip": bool(semantic.get("save_tip", legacy.get("m_savetip", False))),
             "old_well": bool(semantic.get("old_well", legacy.get("m_oldWell", False))),
