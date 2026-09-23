@@ -186,24 +186,65 @@ def contract_payload(prepare=True, inspection=True):
 
 
 @pytest.mark.parametrize('prepare,inspection', [(False, False), (False, True), (True, False)])
-def test_nonproducer_still_requires_manifest(prepare, inspection):
+def test_nonproducer_missing_manifest_is_record_only(prepare, inspection):
     payload = contract_payload(prepare, inspection)
-    with pytest.raises(ProtocolLiveContractError) as exc:
-        _build_live_execution_contract(payload=payload, compiled=compile_protocol_source(payload), handlers={})
-    assert 'deck_manifest' in exc.value.details['missing_contract_fields']
+    contract = _build_live_execution_contract(payload=payload, compiled=compile_protocol_source(payload), handlers={})
+    assert 'deck_manifest' not in contract
+    assert contract['artifacts']['refs'] == ['offline-explicit-preflight']
 
 
-def test_selected_real_producer_only_defers_manifest_not_other_guards():
+def test_live_record_fields_do_not_refuse_execution():
     payload = contract_payload()
     original = copy.deepcopy(payload)
     contract = _build_live_execution_contract(payload=payload, compiled=compile_protocol_source(payload), handlers={})
-    assert contract['deck_manifest'] == {} and contract['deck_manifest_producer'] == 'lifecycle:prepare'
+    assert 'deck_manifest' not in contract and contract['deck_manifest_producer'] == 'lifecycle:prepare'
     assert payload == original
-    for field in ('operator_id', 'live_execution_ack', 'physical_console_verified', 'artifact_refs'):
-        bad = copy.deepcopy(payload)
-        del bad['live_execution'][field]
-        with pytest.raises(ProtocolLiveContractError):
-            _build_live_execution_contract(payload=bad, compiled=compile_protocol_source(bad), handlers={})
+    for field in ('operator_id', 'physical_console_verified', 'artifact_refs', 'reference_snapshot'):
+        record_only = copy.deepcopy(payload)
+        del record_only['live_execution'][field]
+        observed = _build_live_execution_contract(
+            payload=record_only, compiled=compile_protocol_source(record_only), handlers={})
+        if field == 'operator_id':
+            assert 'operator_id' not in observed
+        if field == 'physical_console_verified':
+            assert 'physical_console_verified' not in observed
+        if field == 'artifact_refs':
+            assert 'artifacts' not in observed
+        if field == 'reference_snapshot':
+            assert 'reference_snapshot' not in observed.get('preflight', {})
+    no_ack = copy.deepcopy(payload)
+    del no_ack['live_execution']['live_execution_ack']
+    with pytest.raises(ProtocolLiveContractError) as exc:
+        _build_live_execution_contract(payload=no_ack, compiled=compile_protocol_source(no_ack), handlers={})
+    assert exc.value.details['missing_contract_fields'] == ['live_execution_ack']
+
+
+def test_native_cover_move_keeps_missing_observations_as_records():
+    from bioxp.protocols.models import ProtocolActionKind
+    payload = {'source_type': 'native', 'document': {
+        'protocol_id': 'bms-deck-compound', 'version': 1, 'stages': [{
+            'stage_id': 'deck', 'actions': [{
+                'action_id': 'transfer', 'stage_id': 'deck', 'kind': 'move_cover',
+                'params': {'cover_id': 'CV_OUTPUT', 'target_location': 'LOC_OCS'},
+            }],
+        }]}, 'live_execution': {'live_execution_ack': True}}
+    contract = _build_live_execution_contract(
+        payload=payload, compiled=compile_protocol_source(payload),
+        handlers={ProtocolActionKind.MOVE_COVER: lambda *_: None},
+    )
+    assert contract['reference_required_action_kinds'] == ['move_cover']
+    assert 'preflight' not in contract
+    assert 'deck_manifest' not in contract
+    assert 'artifacts' not in contract
+    assert 'operator_id' not in contract
+    assert 'physical_console_verified' not in contract
+    from bioxp import api
+    request = api.ProtocolExecuteRequest.model_validate({
+        **payload, 'dry_run': False, 'idempotency_key': 'offline-click'})
+    assert request.model_dump(exclude_none=True, exclude_unset=True)['live_execution'] == {'live_execution_ack': True}
+    with pytest.raises(ProtocolLiveContractError) as missing_handler:
+        _build_live_execution_contract(payload=payload, compiled=compile_protocol_source(payload), handlers={})
+    assert missing_handler.value.details['missing_live_handlers'] == ['move_cover']
 
 
 def test_ordinary_review_rejects_inspection_decision():
@@ -277,4 +318,84 @@ def test_canonical_sqlite_review_gate_and_child_identity(integrated_rig, monkeyp
     assert payload == original
     assert_reopened(rig, done)
     assert done['operator']['reviews'][-1]['decision'] == decision
-    assert done['execution']['live_contract']['deck_manifest'] == {}
+    assert 'deck_manifest' not in done['execution']['live_contract']
+
+
+def test_record_only_contract_does_not_write_attestation(tmp_path):
+    from bioxp.services.protocol_service import ProtocolOperatorBundleStore
+    payload = {'source_type': 'native', 'document': {'protocol_id': 'p', 'stages': [
+        {'stage_id': 's', 'actions': [{'action_id': 'n', 'kind': 'note'}]}]},
+        'live_execution': {'live_execution_ack': True}}
+    contract = _build_live_execution_contract(
+        payload=payload, compiled=compile_protocol_source(payload), handlers={})
+    store = ProtocolOperatorBundleStore(tmp_path)
+    bundle = store.save({'job_id': 'record-only', 'execution': {'live_contract': contract}})
+    assert 'preflight_path' not in bundle['artifacts']
+    assert not (tmp_path / 'record-only' / 'preflight.json').exists()
+    assert store.load('record-only')['execution']['live_contract'] == contract
+
+
+def test_plate_command_result_enters_executor_with_raw_child_evidence(monkeypatch):
+    """Transport-replaced command queue; neither the child nor placement is inferred."""
+    from types import SimpleNamespace
+    from fastapi import HTTPException
+    from bioxp import api
+    from bioxp.protocols.executor import ProtocolExecutor
+    from bioxp.protocols.models import ProtocolActionKind
+    payload = {'source_type': 'native', 'document': {'protocol_id': 'deck-offline',
+        'stages': [{'stage_id': 's', 'actions': [
+            {'action_id': 'catch-release', 'kind': 'move_cover',
+             'params': {'cover_id': 'CV_OUTPUT', 'target_location': 'LOC_OCS'}},
+            {'action_id': 'prepare', 'kind': 'plate_prepare', 'params': {'plate_ids': ['PL_OUTPUT']}},
+        ]}]}}
+    document = compile_protocol_source(payload).document
+    monkeypatch.setattr(api.app.state, 'oem_deck_position_table_provider',
+                        lambda: {'target': {'location_id': 'LOC_OC_COVER_STORAGE'}}, raising=False)
+    commands = []
+    rows = {}
+    def admit(operation, *, inputs, idempotency_key):
+        cid = 'offline-' + str(len(commands))
+        commands.append((operation, inputs, idempotency_key))
+        rows[cid] = {'command_id': cid, 'status': 'completed',
+                     'physical_effect_verified': False,
+                     'terminal_evidence': {'children': [
+                         {'operation': 'catchPlate', 'terminal_state': 'completed'},
+                         {'operation': 'releasePlate', 'terminal_state': 'completed'}]}}
+        return {'command_id': cid}
+    monkeypatch.setattr(api.app.state, 'oem_wp8_operation_admitter', admit, raising=False)
+    monkeypatch.setattr(api.app.state, 'operator_command_plane',
+                        SimpleNamespace(store=SimpleNamespace(get_command=rows.get)), raising=False)
+    handlers = {ProtocolActionKind.MOVE_COVER: api._protocol_live_plate_move_handler,
+                ProtocolActionKind.PLATE_PREPARE: api._protocol_live_plate_prepare_handler}
+    executor = ProtocolExecutor(dry_run=False, handlers=handlers)
+    state = executor.execute(document)
+    assert state.completed
+    assert [command[0] for command in commands] == ['move_plate', 'press_plates']
+    assert commands[0][1] == {'plate': 4, 'destination': 18, 'press_plate': False}
+    for result in state.action_results:
+        assert result['ok'] is True and result['command'] == rows[result['command_id']]
+        assert result['command']['physical_effect_verified'] is False
+        assert 'physical_effect_verified' not in result
+    # A terminal failure preserves its full row in the queue exception; it is
+    # not reclassified as a successful completed action.
+    rows['offline-0']['status'] = 'failed'
+    with pytest.raises(HTTPException) as error:
+        api._protocol_deck_action_result('offline-0')
+    assert error.value.detail['command'] == rows['offline-0']
+
+
+def test_class_move_to_command_result_uses_same_explicit_executor_outcome(monkeypatch):
+    from types import SimpleNamespace
+    from bioxp import api
+    row = {'command_id': 'mov-offline', 'status': 'completed',
+           'physical_effect_verified': False, 'terminal_evidence': {'children': [{'stage': 'moveXY'}]}}
+    monkeypatch.setattr(api, '_require_motion_route_ready', lambda: None)
+    monkeypatch.setattr(api.app.state, 'oem_mov_execution_admitter',
+                        lambda intent, *, idempotency_key: {'command_id': 'mov-offline'}, raising=False)
+    monkeypatch.setattr(api.app.state, 'operator_command_plane',
+                        SimpleNamespace(store=SimpleNamespace(get_command=lambda _: row)), raising=False)
+    result = api._protocol_live_move_handler(
+        SimpleNamespace(params={'script_line': 1, 'location_id': 6}, action_id='move'),
+        SimpleNamespace(job_id='job-offline'))
+    assert result == {'ok': True, 'command_id': 'mov-offline', 'command': row}
+    assert 'physical_effect_verified' not in result

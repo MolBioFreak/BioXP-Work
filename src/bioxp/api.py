@@ -2998,7 +2998,7 @@ class ProtocolExecuteRequest(ProtocolCompileRequest):
     )
     live_execution: Optional[dict[str, Any]] = Field(
         None,
-        description="Required contract block for dry_run=false live execution: operator ack, deck manifest, preflight, and artifact refs.",
+        description="Live execution click intent and optional operator observation records.",
     )
     live_execution_ack: bool = Field(False, description="Explicit operator acknowledgement for dry_run=false live protocol execution.")
     operator_id: Optional[str] = Field(None, max_length=120)
@@ -11139,7 +11139,7 @@ def _protocol_live_move_handler(action, state):
     command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
     if not isinstance(command_id, str) or not command_id:
         raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
-    return _wait_protocol_deck_command(command_id)
+    return _protocol_deck_action_result(command_id)
 
 
 def _protocol_live_pipette_handler(action, state):
@@ -11266,6 +11266,14 @@ def _wait_protocol_deck_command(command_id: str, *, timeout_s: float = 180.0) ->
     )
 
 
+def _protocol_deck_action_result(command_id: str) -> dict[str, Any]:
+    # Terminal queue status is a command outcome, not physical placement proof.
+    # Preserve the complete command row and its nested terminal/child evidence.
+    command = _wait_protocol_deck_command(command_id)
+    return {"ok": command.get("status") == "completed", "command_id": command_id,
+            "command": command}
+
+
 def _protocol_live_plate_move_handler(action, state):
     from .oem_deck_movement import require_serial206_machine_target, translate_oem_plate_move
 
@@ -11290,7 +11298,7 @@ def _protocol_live_plate_move_handler(action, state):
     command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
     if not isinstance(command_id, str) or not command_id:
         raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
-    return _wait_protocol_deck_command(command_id)
+    return _protocol_deck_action_result(command_id)
 
 
 def _protocol_live_plate_prepare_handler(action, state):
@@ -11310,7 +11318,7 @@ def _protocol_live_plate_prepare_handler(action, state):
     command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
     if not isinstance(command_id, str) or not command_id:
         raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
-    return _wait_protocol_deck_command(command_id)
+    return _protocol_deck_action_result(command_id)
 
 
 def _protocol_live_thermal_door_handler(action, state):
@@ -11895,7 +11903,7 @@ async def protocol_execute(req: ProtocolExecuteRequest):
             bind_protocol_dispatcher(command_store, binding_factory=_protocol_bindings)
         result = await run_in_threadpool(
             create_protocol_job,
-            req.model_dump(exclude_none=True),
+            req.model_dump(exclude_none=True, exclude_unset=True),
             dry_run=bool(req.dry_run), command_store=command_store,
             binding_factory=None if req.dry_run else _protocol_bindings,
             authority_factory=None if req.dry_run else _protocol_authority,

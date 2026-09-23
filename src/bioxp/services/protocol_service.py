@@ -160,14 +160,12 @@ def _build_live_execution_contract(
             get_value("operator_acknowledged_risk"),
         )
     )
-    physical_console_verified = any(
-        value is True
-        for value in (
-            get_value("physical_console_verified"),
-            preflight.get("physical_console_verified"),
-            preflight.get("operator_console_verified"),
-        )
-    )
+    console_records = [value for value in (
+        get_value("physical_console_verified"),
+        preflight.get("physical_console_verified"),
+        preflight.get("operator_console_verified"),
+    ) if type(value) is bool]
+    physical_console_verified = any(console_records) if console_records else None
 
     actions = _iter_document_actions(compiled.document)
     hardware_action_kinds = sorted(
@@ -205,24 +203,16 @@ def _build_live_execution_contract(
     missing_contract_fields: list[str] = []
     if not live_ack:
         missing_contract_fields.append("live_execution_ack")
-    if not operator_id:
-        missing_contract_fields.append("operator_id")
-    if not physical_console_verified:
-        missing_contract_fields.append("physical_console_verified")
+    # Console attestation, operator name, recorded reference snapshots and
+    # artifact pointers are observations, not OEM admission interlocks.
     # This selected native producer runs only after admission. Its real output
     # is required by the executor before RunJob; do not fabricate stock here.
     preparation_manifest = (compiled.document.metadata.get("oem_prepare") is True
                             and compiled.document.metadata.get("source_settings", {}).get("DeckInspection") is True)
-    if not deck_manifest and not preparation_manifest:
-        missing_contract_fields.append("deck_manifest")
-    if not artifact_refs:
-        missing_contract_fields.append("preflight.artifact_refs")
-    if reference_required_action_kinds and not reference_snapshot:
-        missing_contract_fields.append("preflight.reference_snapshot")
 
-    if validate and (missing_contract_fields or missing_reference_axes or missing_live_handlers):
+    if validate and (missing_contract_fields or missing_live_handlers):
         raise ProtocolLiveContractError(
-            "Live protocol execution requires an explicit operator contract, verified preflight, artifacts, and registered hardware handlers.",
+            "Live protocol execution requires an explicit command and registered hardware handlers.",
             details={
                 "missing_contract_fields": missing_contract_fields,
                 "missing_reference_axes": missing_reference_axes,
@@ -237,27 +227,22 @@ def _build_live_execution_contract(
         "schema_version": PROTOCOL_LIVE_CONTRACT_SCHEMA_VERSION,
         "mode": "live",
         "created_at": _utc_now_iso(),
-        "operator_id": operator_id,
         "live_execution_ack": live_ack,
-        "physical_console_verified": physical_console_verified,
+        **({"operator_id": operator_id} if operator_id else {}),
+        **({"physical_console_verified": physical_console_verified} if physical_console_verified is not None else {}),
         "protocol_id": compiled.document.protocol_id,
         "source_type": compiled.source_type,
         "action_count": len(actions),
         "hardware_action_kinds": hardware_action_kinds,
         "reference_required_action_kinds": reference_required_action_kinds,
-        "deck_manifest": deck_manifest,
+        **({"deck_manifest": deck_manifest} if deck_manifest else {}),
         **({"deck_manifest_producer": "lifecycle:prepare"} if preparation_manifest else {}),
-        "preflight": {
-            "reference_snapshot": reference_snapshot,
-            "reference_axes_verified": reference_axes_verified,
-            "required_reference_axes": list(LIVE_REFERENCE_REQUIRED_AXES) if reference_required_action_kinds else [],
-            "artifact_refs": artifact_refs,
-        },
-        "artifacts": {
-            "required": True,
-            "refs": artifact_refs,
-            "preflight_artifact_name": "preflight.json",
-        },
+        **({"preflight": {
+            **({"reference_snapshot": reference_snapshot,
+                "reference_axes_verified": reference_axes_verified} if reference_snapshot else {}),
+            **({"artifact_refs": artifact_refs} if artifact_refs else {}),
+        }} if reference_snapshot or artifact_refs else {}),
+        **({"artifacts": {"refs": artifact_refs}} if artifact_refs else {}),
     }
 
 
@@ -400,25 +385,24 @@ class ProtocolOperatorBundleStore:
             "bundle_path": str(self._bundle_path(job_id)),
         }
         live_contract = _as_mapping(_as_mapping(payload.get("execution")).get("live_contract"))
-        if live_contract:
+        if live_contract.get("preflight"):
+            # Persist supplied observations only; admission does not create an
+            # attestation document when none was provided.
             preflight_path = job_dir / "preflight.json"
             artifacts["preflight_path"] = str(preflight_path)
             self._save_json_atomically(
                 preflight_path,
                 {
-                        "schema_version": live_contract.get("schema_version"),
-                        "job_id": job_id,
-                        "protocol_id": live_contract.get("protocol_id"),
-                        "created_at": live_contract.get("created_at"),
-                        "operator_id": live_contract.get("operator_id"),
-                        "physical_console_verified": live_contract.get("physical_console_verified"),
-                        "deck_manifest": live_contract.get("deck_manifest"),
-                        "preflight": live_contract.get("preflight"),
-                        "artifact_requirements": {
-                            "required": _as_mapping(live_contract.get("artifacts")).get("required"),
-                            "preflight_artifact_name": _as_mapping(live_contract.get("artifacts")).get("preflight_artifact_name"),
-                        },
-                    },
+                    "schema_version": live_contract.get("schema_version"),
+                    "job_id": job_id,
+                    "protocol_id": live_contract.get("protocol_id"),
+                    "created_at": live_contract.get("created_at"),
+                    **({"operator_id": live_contract["operator_id"]} if "operator_id" in live_contract else {}),
+                    **({"physical_console_verified": live_contract["physical_console_verified"]}
+                       if "physical_console_verified" in live_contract else {}),
+                    **({"deck_manifest": live_contract["deck_manifest"]} if "deck_manifest" in live_contract else {}),
+                    "preflight": live_contract["preflight"],
+                },
             )
         payload["artifacts"] = artifacts
         self._save_json_atomically(self._bundle_path(job_id), payload)
