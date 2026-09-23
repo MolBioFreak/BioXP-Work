@@ -4551,6 +4551,7 @@ class Serial206OemInitializationProvider:
         self._z_interrupt_recovery_required = False
         self._z_interrupt_epoch = 0
         self._z_interrupt_active = False
+        self._pending_software_abort_reconciliation: tuple[str, bool] | None = None
         self._memory_state: dict[str, Any] | None = None
         self._board_transition_scope: dict[str, Any] | None = None
         self.y_provider: Any | None = None
@@ -6313,7 +6314,27 @@ class Serial206OemInitializationProvider:
             # pending rather than silently assumed.
             result["reconciliation_pending"] = True
             result["delivery_completed"] = True
+        if errors:
+            self._pending_software_abort_reconciliation = (command_id, invalidate_x)
+        else:
+            self._pending_software_abort_reconciliation = None
         return result
+
+    def reconcile_software_abort_without_motion(self) -> dict[str, Any]:
+        """Retry only the abort's authority writes, after its owner releases the lifecycle lock.
+
+        Never replay the OEM abort, issue a Stop, or claim a controller terminal state.
+        This is a prerequisite to preparation, not an alternative to physical clearance.
+        """
+        with self._lock:
+            pending = self._pending_software_abort_reconciliation
+            if pending is None:
+                return {"ok": True, "pending": False, "controller_dispatches": 0}
+            with self._x_interrupt_state_lock, self._z_interrupt_state_lock:
+                if self._x_interrupt_count or self._z_interrupt_count:
+                    return {"ok": False, "failure": "software_abort_delivery_in_progress",
+                            "controller_dispatches": 0}
+            return self._reconcile_aggregate_software_abort(*pending[:1], invalidate_x=pending[1])
 
     def execute_x_stop_interrupt(
         self,
@@ -6402,7 +6423,10 @@ class Serial206OemInitializationProvider:
                     "failure": f"x_{selected}_result_not_mapping",
                 }
                 if abort:
-                    reconciliation = self._reconcile_aggregate_software_abort(str(command_id))
+                    # Aggregate Abort invalidates X independently of the later
+                    # X receipt write, which may itself be blocked by the old owner.
+                    reconciliation = self._reconcile_aggregate_software_abort(
+                        str(command_id), invalidate_x=True)
                     aggregate_reconciled = reconciliation["ok"] is True
                     result["aggregate_authority_invalidation"] = reconciliation
                     if not aggregate_reconciled:
@@ -6559,6 +6583,11 @@ class Serial206OemInitializationProvider:
                     # authority fail-closed and report reconciliation pending.
                     with self._x_interrupt_state_lock:
                         self._x_interrupt_recovery_required = True
+                    if abort:
+                        # The aggregate write may have succeeded before the
+                        # old command reclaimed the lock for the X receipt.
+                        # Retain a persistence-only retry for that race too.
+                        self._pending_software_abort_reconciliation = (str(command_id), True)
                     if self.reference_store is not None:
                         try:
                             invalidated_x = self.reference_store.mark_desynced(
@@ -6643,6 +6672,10 @@ class Serial206OemInitializationProvider:
         a home/reference. Keep the existing all-component call exactly once.
         """
         with self._lock:
+            reconciliation = self.reconcile_software_abort_without_motion()
+            if reconciliation.get("ok") is not True:
+                return {"ok": False, "failure": "software_abort_reconciliation_pending",
+                        "reconciliation": reconciliation, "physical_motion_commanded": False}
             generation = int(self.generation_provider())
             with self._x_interrupt_state_lock:
                 interrupt_epoch = self._x_interrupt_epoch
