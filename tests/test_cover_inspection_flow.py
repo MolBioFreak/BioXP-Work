@@ -538,8 +538,8 @@ class TestRelocate:
             ("thermal_door", {"open": True}),
         ]
         finalize_children = provider.finalize[0]["children"]
-        assert [(c["arguments"]["plate"], c["arguments"]["location"]) for c in finalize_children] == [
-            (4, 18), (5, 20),
+        assert [c["arguments"] for c in finalize_children] == [
+            {"locations": [{"plate": 4, "location": 18}, {"plate": 5, "location": 20}]},
         ]
         assert result["relocations"] == [
             {"cover": "output", "from": 17, "to": 20},

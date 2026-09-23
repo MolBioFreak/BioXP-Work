@@ -216,7 +216,8 @@ def canonical_movable_object_locations(
             or not set(value) <= set(OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS)
             or (require_complete and set(value) != set(OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS))):
         raise ValueError("movable plate state is not authoritative")
-    locations = configured_location_names()
+    # Gantry is source custody, not a calibrated deck travel target.
+    locations = set(configured_location_names()) | {"LOC_GANTRY"}
     canonical: dict[str, str] = {}
     for key, location in value.items():
         if type(key) is not str or type(location) is not str or location not in locations:
@@ -1609,18 +1610,14 @@ def compile_cleanup_waste_prelude() -> dict[str, Any]:
 def compile_cover_inspection_finalize() -> dict[str, Any]:
     """ControlLib.inspectCover:3745-3752 terminal custody writes.
 
-    The source re-records both covers at their storage corners after the
-    relocations; this nested plan carries exactly those two state children so
-    they stay first-class ledger receipts of the same parent command.
+    The interchangeable covers are re-labelled after the source's crossed
+    relocations. Publish the two source assignments atomically: publishing
+    only the first temporarily assigns both cover names to the same storage.
     """
     children: list[dict[str, Any]] = []
     _wp8_child(
         children, "updatePlateLocation",
-        arguments={"plate": 4, "location": 18},
-    )
-    _wp8_child(
-        children, "updatePlateLocation",
-        arguments={"plate": 5, "location": 20},
+        arguments={"locations": [{"plate": 4, "location": 18}, {"plate": 5, "location": 20}]},
     )
     return _wp8_plan("cover_inspection_finalize", children, source_caller="ControlLib.inspectCover:3745-3752")
 

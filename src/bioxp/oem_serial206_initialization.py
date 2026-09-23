@@ -11725,7 +11725,9 @@ class Serial206OemInitializationProvider:
             run_in_parallel=run_parallel, tip_loaded=bool(state["tip_loaded"]),
             tip_dirty=bool(state["tip_dirty"]), tip_location=int(state["tip_location"]),
             clean_path=bool(state["clean_path"]), pseudo_home_steps=int(state["pseudo_z_home"]),
-            plate_on_gantry=state.get("plate_on_gantry"), location19_y=None,
+            plate_on_gantry=state.get("plate_on_gantry"),
+            location19_y=int(load_bound_oem_position_table().resolve(
+                location_id="LOC_RC_COVER").base_coordinates["y"]),
             gripper_confirmed=self._deck_gripper_confirmed(),
         )
 
@@ -11738,7 +11740,9 @@ class Serial206OemInitializationProvider:
             run_in_parallel=run_parallel, tip_loaded=bool(state["tip_loaded"]),
             tip_dirty=bool(state["tip_dirty"]), tip_location=int(state["tip_location"]),
             clean_path=bool(state["clean_path"]), pseudo_home_steps=int(state["pseudo_z_home"]),
-            plate_on_gantry=state.get("plate_on_gantry"), location19_y=None,
+            plate_on_gantry=state.get("plate_on_gantry"),
+            location19_y=int(load_bound_oem_position_table().resolve(
+                location_id="LOC_RC_COVER").base_coordinates["y"]),
             gripper_confirmed=self._deck_gripper_confirmed(),
             expected_plan_digest=None if expected_digest is None else str(expected_digest),
             source_plan=source_plan if isinstance(source_plan, Mapping) else None,
@@ -13172,14 +13176,17 @@ class Serial206OemInitializationProvider:
     ) -> dict[str, Any]:
         from .oem_compat.pathing import LOCATION_ID_TO_NAME
 
-        plate = canonical_plate_name(arguments.get("plate"))
-        location = int(arguments["location"])
-        name = plate_name_for_storage(plate) if plate is not None else None
-        if name is None or location not in LOCATION_ID_TO_NAME:
-            raise RuntimeError("source_authority_missing:updatePlateLocation")
         state = self._canonical_deck_semantic_state()
         movable = dict(state.get("movable_plate_locations") or {})
-        movable[name] = LOCATION_ID_TO_NAME[location]
+        # Ordinary catches/releases publish one assignment. inspectCover's
+        # final re-labelling publishes both assignments in one SQLite update.
+        for assignment in arguments.get("locations", [arguments]):
+            plate = canonical_plate_name(assignment.get("plate"))
+            location = int(assignment["location"])
+            name = plate_name_for_storage(plate) if plate is not None else None
+            if name is None or location not in LOCATION_ID_TO_NAME:
+                raise RuntimeError("source_authority_missing:updatePlateLocation")
+            movable[name] = LOCATION_ID_TO_NAME[location]
         return self._wp8_publish_semantic(
             operation=operation, command_id=command_id, child_order=child_order,
             plan_digest=plan_digest,
@@ -13576,6 +13583,20 @@ class Serial206OemInitializationProvider:
         receipts: list[dict[str, Any]] = []
         final_cover_locations: dict[str, int] | None = None
         door_open_verified = False
+
+        def require_completed(phase: str, result: Mapping[str, Any]) -> None:
+            if result.get("ok") is not True:
+                from .oem_deck_movement import DeckExecutionFailure
+
+                # catchPlate/releasePlate log and suppress source exceptions.
+                # That normal return is not a completed transfer: retain its
+                # evidence and never enter final storage writes or door/Park.
+                raise DeckExecutionFailure(
+                    f"cover_inspection_{phase}_failed:{result.get('failed_child')}",
+                    delivery_attempted=True,
+                    provider_results=[*receipts, {"phase": phase, "result": dict(result)}],
+                )
+
         if plan["cover_count"] == 2 and plan["error_status"] is None:
             for relocation in plan["relocations"]:
                 plate = 4 if relocation["from"] == 17 else 5
@@ -13584,6 +13605,7 @@ class Serial206OemInitializationProvider:
                     inputs={"plate": plate, "run_in_parallel": True},
                     command_id=command_id, owner_identity=owner_identity,
                 )
+                require_completed("catch", catch)
                 release = self._wp8_compile_and_execute(
                     operation="release_plate",
                     inputs={"destination": relocation["to"], "press_plate": False, "run_in_parallel": True},
@@ -13591,18 +13613,21 @@ class Serial206OemInitializationProvider:
                 )
                 receipts.append({
                     "relocation": dict(relocation),
-                    "catch": _json_safe(catch), "release": _json_safe(release),
+                    "catch": catch, "release": release,
                 })
+                require_completed("release", release)
             finalize = self._wp8_execute_nested_plan(
                 plan=compile_cover_inspection_finalize(),
                 command_id=command_id, owner_identity=owner_identity,
             )
-            receipts.append({"finalize": _json_safe(finalize)})
+            receipts.append({"finalize": finalize})
+            require_completed("finalize", finalize)
             door = self._wp8_compile_and_execute(
                 operation="thermal_door", inputs={"open": True},
                 command_id=command_id, owner_identity=owner_identity,
             )
-            receipts.append({"door_open": _json_safe(door)})
+            receipts.append({"door_open": door})
+            require_completed("door_open", door)
             sensors = self.wp8_read_door_sensors("readDoorSensors", {})
             door_open_verified = isinstance(sensors, Mapping) and sensors.get("door_open") is True
             if not door_open_verified:
@@ -13924,23 +13949,39 @@ class Serial206OemInitializationProvider:
         if not callable(fence_checker):
             raise RuntimeError("wp8_execution_fence_checker_missing")
 
+        failures: list[dict[str, Any]] = []
+
         def invoke(child: Mapping[str, Any]) -> Any:
-            fence_checker(
-                command_id,
-                boundary=f"before_nested_child_{int(child['order'])}",
-            )
-            result = self.execute_wp8_child(
-                {**dict(child), "_delivery_identity": dict(owner_identity)},
-                command_id=command_id,
-                child_order=int(child["order"]), plan_digest=digest,
-            )
-            if isinstance(result, Mapping) and result.get("ok") is not True:
-                raise RuntimeError(f"wp8_nested_child_failed:{child['operation']}")
-            return result
+            result = None
+            try:
+                fence_checker(
+                    command_id,
+                    boundary=f"before_nested_child_{int(child['order'])}",
+                )
+                result = self.execute_wp8_child(
+                    {**dict(child), "_delivery_identity": dict(owner_identity)},
+                    command_id=command_id,
+                    child_order=int(child["order"]), plan_digest=digest,
+                )
+                if isinstance(result, Mapping) and result.get("ok") is not True:
+                    raise RuntimeError(f"wp8_nested_child_failed:{child['operation']}")
+                return result
+            except Exception as exc:
+                # The source catch/release executor suppresses exceptions;
+                # preserve their actual cause and any returned failure receipt.
+                failures.append({
+                    "operation": child["operation"], "order": child["order"],
+                    "exception_type": type(exc).__name__, "exception_message": str(exc),
+                    "result": result,
+                    "provider_results": getattr(exc, "provider_results", None),
+                    "motion_evidence": getattr(exc, "motion_evidence", None),
+                })
+                raise
 
         result = execute_finite_plate_operation(plan, invoke)
         return {
             **dict(result),
+            "failure_evidence": failures,
             "source_children": list(result.get("completed_children") or []),
             "source_plan_digest": digest,
         }
@@ -14044,8 +14085,16 @@ class Serial206OemInitializationProvider:
             "board_epoch_4": int(delivery_identity.get("board_epoch_4", -1)),
             "board_epoch_5": int(delivery_identity.get("board_epoch_5", -1)),
         }
+        # A nested source call has its own occurrence path even when its
+        # compiled body is identical (e.g. both sendZandGripperHome calls).
+        source_plan_identity = str(plan_digest)
+        if delivery_identity.get("source_identity"):
+            source_plan_identity = hashlib.sha256(
+                f"{delivery_identity['source_identity']}:{plan_digest}".encode()
+            ).hexdigest()
         owner_identity = {
             **handler_identity,
+            "source_identity": self._wp8_identity(command_id, child_order, source_plan_identity),
             "work_identity": str(
                 delivery_identity.get("work_identity")
                 or f"child:{int(child_order)}:{operation}"
@@ -14076,7 +14125,15 @@ class Serial206OemInitializationProvider:
             arguments,
             command_id=command_id,
             child_order=child_order,
-            plan_digest=owner_plan_digest,
+            # Semantic source publications belong to this compiled plan, not
+            # the root lock/task owner. Nested catches reuse local child order.
+            # Keep canonical owner authorization unchanged for every handler.
+            plan_digest=(source_plan_identity if operation in {
+                "updateLocation", "updatePlateLocation", "updateThermalDoorOpen",
+                "clearTipLoaded", "inspectCoverAt", "SnapshotImage",
+                "startMoveZPseudoHome", "startGripperHomeAndUnlock",
+                "backgroundGripperHomeAndUnlock", "waitMoveZOnly",
+            } else owner_plan_digest),
             **handler_identity,
         )
 
