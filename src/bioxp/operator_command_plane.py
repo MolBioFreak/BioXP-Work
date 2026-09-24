@@ -3714,8 +3714,15 @@ class OperatorCommandStore:
         ready = []
         with self._lock:
             for command_id, future in list(self._workflow_child_waiters.items()):
-                receipt = self.get_command(command_id)
-                if receipt is not None and receipt["status"] in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"}:
+                # Pending children need only a durable status check. Building
+                # the full receipt here repeatedly defeats completion wakeups.
+                row = self.connection.execute(
+                    "SELECT COALESCE(m.state,p.status) AS status FROM operator_plane_commands p "
+                    "LEFT JOIN serial206_movement_commands m ON m.command_id=p.command_id "
+                    "WHERE p.command_id=?", (command_id,),
+                ).fetchone()
+                if row is not None and row["status"] in COMMAND_TERMINAL | {"rejected"}:
+                    receipt = self.get_command(command_id)
                     ready.append((future, {"ok": receipt["status"] == "completed", "command_id": command_id,
                                            "status": receipt["status"], "receipt": receipt}))
                     del self._workflow_child_waiters[command_id]

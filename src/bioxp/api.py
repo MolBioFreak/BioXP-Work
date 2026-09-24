@@ -11248,18 +11248,25 @@ def _wait_protocol_deck_command(command_id: str, *, timeout_s: float = 180.0) ->
     if not callable(getter):
         raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        row = getter(command_id)
-        if isinstance(row, Mapping):
-            status = str(row.get("status") or "")
-            if status == "completed":
-                return dict(row)
-            if status in COMMAND_TERMINAL:
-                raise HTTPException(
-                    status_code=409,
-                    detail={"error": "canonical_deck_command_failed", "command": dict(row)},
-                )
-        time.sleep(0.05)
+    row = getter(command_id) if timeout_s > 0 else None
+    if timeout_s > 0 and (not isinstance(row, Mapping) or row.get("status") not in COMMAND_TERMINAL):
+        # The existing dispatcher settles this future from SQLite after a
+        # completion/control wake. No per-action receipt polling or retry.
+        from concurrent.futures import TimeoutError as FutureTimeoutError
+        try:
+            row = store.workflow_child_completion(command_id).result(
+                timeout=max(0.0, deadline - time.monotonic()),
+            )["receipt"]
+        except FutureTimeoutError:
+            row = None
+    if isinstance(row, Mapping):
+        if row.get("status") == "completed":
+            return dict(row)
+        if row.get("status") in COMMAND_TERMINAL:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "canonical_deck_command_failed", "command": dict(row)},
+            )
     raise HTTPException(
         status_code=504,
         detail={"error": "canonical_deck_command_timeout", "command_id": command_id},
