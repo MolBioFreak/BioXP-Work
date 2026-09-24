@@ -3009,7 +3009,9 @@ class Serial206ProductionPrimitiveAdapter:
         target = result.get("motor_effective_target")
         source_noop_wrapper = (result.get("schema") == "bioxp.serial206_y_provider.v2"
             and result.get("completion_class") == "oem_source_noop")
-        if result.get("source_mode") == "moveXY.near_axis.moveX":
+        # Both callers retain the same x_move_absolute native no-op receipt.
+        if result.get("source_mode") in {
+                "moveXY.near_axis.moveX", "ClassControlInterface.moveTo.moveX"}:
             native = result.get("move")
             target = result.get("target_position_steps")
             source_noop_wrapper = result.get("source_noop") is True
