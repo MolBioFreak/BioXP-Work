@@ -10183,6 +10183,39 @@ def _camera_jpeg_response(frame: CameraFrame) -> Response:
     )
 
 
+class CameraIlluminationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    channel: StrictInt = Field(ge=1, le=3)
+    on: StrictBool
+
+
+@app.get("/camera/illumination/state")
+async def camera_illumination_state(request: Request):
+    if request.query_params or await request.body():
+        raise HTTPException(status_code=422, detail="Camera illumination state accepts no fields")
+    provider = _camera_provider
+    result = await run_in_threadpool(provider.illumination_state)
+    if provider is not _camera_provider or provider.generation != result["provider_generation"]:
+        raise HTTPException(status_code=503, detail="camera owner changed during illumination state read")
+    return result
+
+
+@app.post("/camera/illumination")
+async def camera_illumination(request: Request, req: CameraIlluminationRequest):
+    if request.query_params:
+        raise HTTPException(status_code=422, detail="Camera illumination accepts no query fields")
+    provider = _camera_provider
+    try:
+        result = await run_in_threadpool(provider.command_illumination, channel=req.channel, on=req.on)
+        if provider is not _camera_provider or provider.generation != result["provider_generation"]:
+            raise CameraError("camera owner changed during illumination command")
+    except (CameraError, OSError, RuntimeError, ValueError) as exc:
+        # Never replay an uncertain native write or turn it into success.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return result
+
+
 @app.get("/camera/status", response_model=CameraStatusResponse)
 async def camera_status():
     provider = _camera_provider
