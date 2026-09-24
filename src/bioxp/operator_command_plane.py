@@ -1077,6 +1077,7 @@ class OperatorCommandStore:
         self._workflow_controls: dict[str, Callable] = {}
         self._workflow_interrupt_notified: set[str] = set()
         self._workflow_child_waiters: dict[str, Any] = {}
+        self._workflow_verified_snapshot: tuple[tuple[Any, ...], int] | None = None
         self._interrupt_spool_write_depth = 0
         self._deck_owner_authority_reader: Callable[[], Mapping[str, Any]] | None = None
         self._deck_owner_authority_scope: Callable[[], AbstractContextManager[Any]] = nullcontext
@@ -3445,13 +3446,24 @@ class OperatorCommandStore:
                 # not the legacy board-5 projection. Read on this transaction's
                 # connection: never acquire the provider lock beneath a writer.
                 snapshot = conn.execute(
-                    "SELECT state_json,state_sha256 FROM serial206_authority_snapshots "
+                    "SELECT state_json,state_sha256,sequence FROM serial206_authority_snapshots "
                     "ORDER BY sequence DESC LIMIT 1").fetchone()
-                state = _json_load(snapshot[0], {}) if snapshot else {}
-                if snapshot and (snapshot[0] != json.dumps(state, sort_keys=True, separators=(",", ":"), allow_nan=False)
-                        or hashlib.sha256(snapshot[0].encode("utf-8")).hexdigest() != snapshot[1]):
-                    raise ValueError("workflow_board_epoch_changed")
-                actual = (state.get("x_lifecycle") or {}).get("board_lifecycle_generation")
+                # Like OEMRuntimeStore's exact-byte verification memo, this is
+                # one bounded entry, never a substitute for the live SQLite read.
+                # Retain only verified bytes/hash and an immutable generation;
+                # reused sequence/digest cannot hide changed snapshot bytes.
+                key = tuple(snapshot) if snapshot else None
+                memo = self._workflow_verified_snapshot
+                if key is not None and memo is not None and memo[0] == key:
+                    actual = memo[1]
+                else:
+                    state = _json_load(snapshot[0], {}) if snapshot else {}
+                    if snapshot and (snapshot[0] != json.dumps(state, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                            or hashlib.sha256(snapshot[0].encode("utf-8")).hexdigest() != snapshot[1]):
+                        raise ValueError("workflow_board_epoch_changed")
+                    actual = (state.get("x_lifecycle") or {}).get("board_lifecycle_generation")
+                    if key is not None and type(actual) is int:
+                        self._workflow_verified_snapshot = (key, actual)
             else:
                 table = "serial206_board_authority" if str(board) == "4" else "operator_plane_board_authority"
                 selected = conn.execute(f"SELECT active_board_epoch FROM {table} WHERE board_id=?", (int(board),)).fetchone()
