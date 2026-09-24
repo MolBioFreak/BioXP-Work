@@ -3066,6 +3066,7 @@ class LedRgbRequest(BaseModel):
     g: int = Field(..., ge=0, le=255)
     b: int = Field(..., ge=0, le=255)
     reconnect_first: bool = True
+    activate_first: bool = True
 
 
 class LedIntensityRequest(BaseModel):
@@ -7974,6 +7975,7 @@ async def led_rgb(req: LedRgbRequest):
             req.g,
             req.b,
             reconnect_first=bool(req.reconnect_first),
+            activate_first=bool(req.activate_first),
         ),
         timeout_s=20.0,
     )
