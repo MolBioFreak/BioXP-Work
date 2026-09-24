@@ -210,9 +210,32 @@ def test_xy_native_read_counts_movement_and_exact_noop(monkeypatch, before, targ
         # CI source delta read + fresh board pre-TX read + one final read.
         assert leaf.reads == {(5, 0): 3, (4, 0): 3}
         assert result['controller_terminal_state_verified'] is True
-        assert leaf.windows == [{'duration_s': 0.30, 'timeout_ms': 12, 'max_events': 128}]
+        assert leaf.windows == [{'duration_s': 0.0, 'timeout_ms': 12, 'max_events': 128}]
         assert result['after'] == {'x': max(0, target[0]), 'y': max(0, target[1])}
         assert result['commands']['y']['before'] == result['commands']['y']['move']['before']
+
+
+def test_zero_duration_collector_retains_buffered_terminal_and_error(monkeypatch):
+    """Real bus decoder/snapshot path; only the receive queue is synthetic."""
+    from types import SimpleNamespace
+    from bioxp.usb_driver import BioXpTester
+
+    frames = []
+    for sequence, status in enumerate((128, 130), start=1):
+        payload = [0, 0, 0, 0, 8, 4, status, 0, 0, 0, 0, 0, 0]
+        raw = [126, *payload, sum(payload) & 255, 126]
+        frames.append({'raw': raw, 'receive_sequence': sequence,
+                       'receive_owner': 'offline-receiver', 'owner_generation': 3})
+    tester = object.__new__(BioXpTester)
+    tester.novo_router = SimpleNamespace(
+        queue_snapshot=lambda name: frames if name == 'valid_async' else [])
+    monkeypatch.setattr('bioxp.usb_driver.time.sleep',
+                        lambda seconds: pytest.fail('post-terminal collector must not sleep'))
+    events = tester._collect_bus_events_locked(duration_s=0.0, timeout_ms=12, max_events=128)
+    assert [(row['board'], row['motor'], row['status']) for row in events] == [
+        (4, 0, 128), (4, 0, 130)]
+    assert [row['event_sequence'] for row in events] == [1, 2]
+    assert len(frames) == 2  # snapshot, not consuming/clearing the receive queue
 
 
 @pytest.mark.parametrize('fault', ['missing_event', 'missing_ack', 'wrong_position', 'moving', 'stale', 'controller_error'])

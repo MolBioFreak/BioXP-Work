@@ -1325,7 +1325,11 @@ class Serial206ProductionPrimitiveAdapter:
 
     def _finalize_move_xy_receipt(self, receipt: dict[str, Any], *, commands: Mapping[str, Any], waits: Mapping[str, Any], after: Mapping[str, int], restore: Mapping[str, Any], required_axes: tuple[str, ...]) -> dict[str, Any]:
         axis_address = {"x": (5, 0), "y": (4, 0)}
-        events = self.tester.collect_bus_events(duration_s=0.30, timeout_ms=12, max_events=128) if required_axes else []
+        # Axis waits have already consumed their terminal notifications. The
+        # receive owner continuously buffers events; take its current snapshot
+        # without adding a non-OEM post-completion dwell. Keep every existing
+        # freshness/error/position/speed check below.
+        events = self.tester.collect_bus_events(duration_s=0.0, timeout_ms=12, max_events=128) if required_axes else []
         evidence: dict[str, Any] = {}
         fresh_after: dict[str, int] = dict(after)
         # Board lower clamps precede their exact-position return. Keep the
