@@ -1392,8 +1392,11 @@ def _compile_finite_plate_operation_unchecked(
             _wp8_child(children, "StopCloseGripper", arguments={"reset_speed": False})
         wide = destination in {0, 1, 2, 21, 23, 25}
         _wp8_child(children, "OpenGripperWide" if wide else "OpenGripper", arguments={"recover": True})
+        led_order = len(children)
         _wp8_child(children, "led2On", ignored_return=True)
-        _wp8_child(children, "Sleep", arguments={"milliseconds": 1000})
+        # ControlLib's one-second settle is inside m_ledControl != null.
+        _wp8_child(children, "Sleep", arguments={"milliseconds": 1000},
+                   source_condition={"child_order": led_order, "result_field": "led_owner_present", "equals": True})
         _wp8_child(children, "SnapshotImage", arguments={"name": "CatchPlate"}, ignored_return=True)
         _wp8_child(children, "Sleep", arguments={"milliseconds": 100})
         _wp8_child(children, "led2Off", ignored_return=True)
@@ -1444,8 +1447,11 @@ def _compile_finite_plate_operation_unchecked(
         plate = inputs.get("current_tray")
         _wp8_child(children, "updatePlateLocation", arguments={"plate": plate, "location": destination}, state_mutation={"plate": plate, "location": destination})
         _wp8_child(children, "updateLocation", arguments={"destination": destination, "well": 0}, state_mutation={"current_location": destination, "current_well": 0})
+        led_order = len(children)
         _wp8_child(children, "led2On", ignored_return=True)
-        _wp8_child(children, "Sleep", arguments={"milliseconds": 1000})
+        # ControlLib's one-second settle is inside m_ledControl != null.
+        _wp8_child(children, "Sleep", arguments={"milliseconds": 1000},
+                   source_condition={"child_order": led_order, "result_field": "led_owner_present", "equals": True})
         _wp8_child(children, "SnapshotImage", arguments={"name": "ReleasePlate"}, ignored_return=True)
         _wp8_child(children, "Sleep", arguments={"milliseconds": 100})
         _wp8_child(children, "led2Off", ignored_return=True)

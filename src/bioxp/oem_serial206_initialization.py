@@ -1268,13 +1268,15 @@ class Serial206ProductionPrimitiveAdapter:
         return result
 
     def _move_xy_y_issue_absolute(self, requested: int, *, event_window: Any) -> dict[str, Any]:
-        before = self.tester.motor_get_position(4, motor=0)
-        before_value = self._x_value(before)
         target = max(0, int(requested))
-        if type(before_value) is not int:
-            return {"ok": False, "failure": "y_position_before_unavailable", "command_issued": False}
-        assert type(before_value) is int
         move = self.tester.motor_oem_move_absolute(4, target, motor=0, wait_for_stop=False, max_position=102956)
+        # The board primitive owns the fresh pre-TX position check, including
+        # exact-target and high-limit branches. Reuse that actual observation.
+        before = move.get("before") if isinstance(move, Mapping) else None
+        before_value = self._x_value(before)
+        if isinstance(move, Mapping) and move.get("failure") == "current_position_unavailable":
+            return {"ok": False, "failure": "y_position_before_unavailable", "command_issued": False,
+                    "move": _json_safe(move)}
         acknowledged = bool(
             isinstance(move, Mapping)
             and move.get("ok") is True
@@ -1335,8 +1337,10 @@ class Serial206ProductionPrimitiveAdapter:
             moved = isinstance(command, Mapping) and command.get("command_issued") is True
             board, motor = axis_address[axis]
             position = self.tester.motor_get_position(board, motor=motor)
+            # Reuse this final observation for the receipt and terminal checks.
+            # Preserve the former outer _read_axis_position failure semantics.
+            position_value = self._position_value(position)
             speed = self.tester.motor_get_speed(board, motor=motor)
-            position_value = self._x_value(position)
             speed_value = speed.get("speed") if isinstance(speed, Mapping) else None
             if type(position_value) is int:
                 fresh_after[axis] = position_value
@@ -3801,8 +3805,6 @@ class Serial206ProductionPrimitiveAdapter:
                 for axis, board in (("x", 5), ("y", 4)):
                     waits[axis] = wait_fn(board, motor=0, timeout_s=5.0, event_window=shared_event_window)
             restore = {"x": self.tester.motor_set_axis_param(5, 5, 350, motor=0), "y": self.tester.motor_set_axis_param(4, 5, 400, motor=0)}
-            for axis in ("x", "y"):
-                after[axis] = self._read_axis_position(axis)
             receipt.update({"branch": "parallel", "acceleration_selected": {"x": x_acc, "y": y_acc}, "acceleration_set": _json_safe(acceleration_set), "acceleration_setup_verified": setup_ok, "event_window": _json_safe(shared_event_window), "launch_order": launch_order, "stagger_ms": stagger_ms, "pre_wait_sleep_ms": 5, "pair_wait": _json_safe(pair_wait) if "pair_wait" in locals() else None})
             return self._finalize_move_xy_receipt(receipt, commands=commands, waits=waits, after=after, restore=restore, required_axes=("x", "y"))
         except Exception as exc:
@@ -5181,7 +5183,8 @@ class Serial206OemInitializationProvider:
             dict(provenance), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         return semantic
 
-    def _canonical_deck_semantic_state(self, *, allow_recovery: bool = False, no_tip_park: bool = False) -> dict[str, Any]:
+    def _canonical_deck_semantic_state(self, *, allow_recovery: bool = False, no_tip_park: bool = False,
+                                       require_latch_observation: bool = True) -> dict[str, Any]:
         reader = self._deck_semantic_state_reader
         if not callable(reader):
             raise RuntimeError("deck_semantic_state_reader_not_bound")
@@ -5229,6 +5232,12 @@ class Serial206OemInitializationProvider:
             "machine_latch_closed": bool,
             "latch_observation_id": str,
         }
+        if not require_latch_observation:
+            # Native movExecution/scriptmoveTo do not consume manual-button
+            # latch provenance. A location publication can replace that record;
+            # absent observations must not become a native compile prerequisite.
+            for key in ("latch_status", "machine_latch_closed", "latch_observation_id"):
+                branch_types.pop(key)
         # ControlLib.parkGantry(false) -> scriptmoveTo(...,28,...,2):
         # verified absence skips tip cleanup and never consults tray CleanPath.
         # Keep absence explicit and all other full-state/owner fences intact.
@@ -5240,7 +5249,7 @@ class Serial206OemInitializationProvider:
         for key, expected_type in branch_types.items():
             if type(semantic.get(key)) is not expected_type:
                 raise RuntimeError(f"deck_semantic_state_not_authoritative:{key}")
-        if not semantic["latch_observation_id"].strip():
+        if require_latch_observation and not semantic["latch_observation_id"].strip():
             raise RuntimeError("deck_semantic_state_not_authoritative:latch_observation_id")
         tip_location = int(semantic["tip_location"])
         if tip_location not in {-1, 0, 1, 2, 3}:
@@ -5278,9 +5287,9 @@ class Serial206OemInitializationProvider:
             "ownership_generation": int(semantic["ownership_generation"]),
             "board_epoch_4": int(semantic["board_epoch_4"]),
             "board_epoch_5": int(semantic["board_epoch_5"]),
-            "latch_status": bool(semantic["latch_status"]),
-            "machine_latch_closed": bool(semantic["machine_latch_closed"]),
-            "latch_observation_id": str(semantic["latch_observation_id"]),
+            "latch_status": semantic.get("latch_status"),
+            "machine_latch_closed": semantic.get("machine_latch_closed"),
+            "latch_observation_id": semantic.get("latch_observation_id"),
             "ambiguity_state": str(ambiguity_state),
         }
 
@@ -11598,7 +11607,7 @@ class Serial206OemInitializationProvider:
         from .oem_deck_movement import OEM_PLATE_NAME_ORDINALS
         from .oem_compat.pathing import LOCATION_ID_TO_NAME
 
-        semantic = self._canonical_deck_semantic_state()
+        semantic = self._canonical_deck_semantic_state(require_latch_observation=False)
         name_to_location = {name: ordinal for ordinal, name in LOCATION_ID_TO_NAME.items()}
         current_name = str(semantic["current_location"])
         if current_name not in name_to_location:
@@ -11676,6 +11685,13 @@ class Serial206OemInitializationProvider:
             # These literal leaves resolve only their selected source facts at
             # native entry. Do not introduce a gripper GAP into every leaf.
             return {}
+        if operation == "move_plate":
+            # The outer wrapper consumes only the cached source door flag.
+            # Catch/release resolve live routing and custody at native entry;
+            # neither this plan nor admission uses a gripper GAP or table copy.
+            with self._lock:
+                machine = dict(self._load_state().get("machine_status") or {})
+            return {"thermal_door_open": machine.get("thermal_door_open")}
         if operation == "thermal_door":
             # Door planning consumes the source door flag and board-test mode.
             # Its Park child performs its own scoped custody/collection reads.
@@ -13835,13 +13851,14 @@ class Serial206OemInitializationProvider:
         if not callable(owner):
             return {
                 "ok": True, "delivery_attempted": False,
-                "source_noop": "m_ledControl_null",
+                "source_noop": "m_ledControl_null", "led_owner_present": False,
                 "source_anchor": "CVisionLib.ClassLEDControl.led2On/led2Off",
             }
         result = owner(operation == "led2On")
         row = dict(result) if isinstance(result, Mapping) else {}
         return {
             **row, "ok": row.get("ok") is True, "delivery_attempted": True,
+            "led_owner_present": True,
             "source_anchor": "CVisionLib.ClassLEDControl.led2On/led2Off",
         }
 
