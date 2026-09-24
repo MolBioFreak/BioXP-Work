@@ -3469,7 +3469,23 @@ class Serial206ProductionPrimitiveAdapter:
             interruption = interrupted("complete", branch)
             if interruption is not None:
                 return {**interruption, "restore_acc": _json_safe(restore)}
-            child_evidence = [self._oem_controller_child_evidence(row) for row in results]
+            # move_axis(Y) already verified the native exact-target no-op and
+            # projected its typed command/ACK/terminal evidence above. Its
+            # diagnostic `move` may be bounded; re-normalizing this wrapper
+            # treats the absent no-op ACK as a missing commanded ACK.
+            child_evidence = [
+                {
+                    "command_required": row["controller_command_required"],
+                    "acknowledged": row["controller_command_acknowledged"],
+                    "terminal": row["controller_terminal_state_verified"],
+                } if (isinstance(row, Mapping) and row.get("axis") == "y"
+                      and isinstance(row.get("move"), Mapping)
+                      and all(type(row.get(field)) is bool for field in (
+                          "controller_command_required", "controller_command_acknowledged",
+                          "controller_terminal_state_verified")))
+                else self._oem_controller_child_evidence(row)
+                for row in results
+            ]
             commanded = [row for row in child_evidence if row["command_required"]]
             controller_acknowledged = bool(commanded) and all(row["acknowledged"] for row in commanded)
             controller_completion_verified = bool(child_evidence) and all(
