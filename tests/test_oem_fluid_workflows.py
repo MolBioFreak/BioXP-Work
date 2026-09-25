@@ -89,6 +89,20 @@ def test_tip_query_repeats_until_clear_without_retry_cap():
     assert len([x for x in source.calls if x[0] == "query"]) == 4
 
 
+def test_source_ignores_false_load_tips_return_and_continues_sampling():
+    from dataclasses import replace
+    source = Source()
+    def returned_false():
+        source.record("loadTips", 50, True)
+        return {"ok": False, "source_return": False}
+    result = z_offset("STRIP", replace(source.bindings(), load_tips=returned_false),
+                      transfer_fluid=False, skip_steps=12)
+    assert result["source_return"] == 102
+    assert len([x for x in source.calls if x[0] == "detect"]) == 2
+    assert [s["result"]["source_return"] for s in result["steps"]
+            if s["operation"] == "loadTips"] == [False, False]
+
+
 def test_ms_skips_prefill_and_failure_keeps_partial_effects():
     source = Source()
     result = z_offset("MS", source.bindings())

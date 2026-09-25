@@ -73,7 +73,8 @@ def z_offset(plate: str, bindings: FluidScanBindings, *, speed: int = 300,
 
     heights: list[int] = []
     for well in samples:
-        step("loadTips", bindings.load_tips)
+        # The OEM ignores loadTips' Boolean here and proceeds to the move.
+        seq.step("loadTips", bindings.load_tips, allow_false=True)
         saved = bindings.facts()
         move(location, well, 1)
         measured = step("scrFluidDetection", lambda: bindings.detect(speed))
