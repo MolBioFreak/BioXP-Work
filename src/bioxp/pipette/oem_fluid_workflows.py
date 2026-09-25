@@ -17,6 +17,7 @@ Result = dict[str, Any]
 @dataclass(frozen=True)
 class FluidScanBindings:
     facts: Callable[[], Mapping[str, Any]]
+    publish_plate: Callable[[int, int], Result]  # updatePlateLocation at scan entry
     load_tips: Callable[[], Result]  # source loadTips(T50, forcenewtip:true)
     move: Callable[[int, str | int, int], Result]  # scriptmoveTo, position flag 0 or 1
     publish: Callable[[int, int], Result]  # updateLocation, including source return quirk
@@ -49,6 +50,7 @@ def z_offset(plate: str, bindings: FluidScanBindings, *, speed: int = 300,
         step("scriptmoveTo", lambda: bindings.move(target, well, flag))
         step("updateLocation", lambda: bindings.publish(target, well_id_from_label(well)))
 
+    step("updatePlateLocation", lambda: bindings.publish_plate(location, plate_id))
     if transfer_fluid and location != 0:
         seq.step("loadTips", bindings.load_tips, allow_false=True)
         saved = bindings.facts()

@@ -40,6 +40,7 @@ class Source:
 
     def bindings(self):
         return FluidScanBindings(facts=self.facts,
+            publish_plate=lambda location, plate: self.record("plate", location, plate),
             load_tips=lambda: self.record("loadTips", 50, True),
             move=self.move, publish=self.publish,
             aspirate=lambda volume: self.record("masp", 100, volume),
@@ -53,6 +54,7 @@ def test_diagnostic_scan_a_then_b_and_source_return_publication():
     source = Source()
     result = z_offset("STRIP", source.bindings(), transfer_fluid=False, skip_steps=1)
     assert result["ok"] is True
+    assert source.calls[0] == ("plate", 12, 8)
     assert [sample["well"] for sample in result["samples"]] == ["A1", "B1", "A2", "B2", "A3", "B3"]
     assert result["source_return"] == 104  # int(mean(101..106) + .5)
     assert ("move", 7, 3, 1) in source.calls
@@ -92,10 +94,10 @@ def test_ms_skips_prefill_and_failure_keeps_partial_effects():
     result = z_offset("MS", source.bindings())
     assert len(result["samples"]) == 6
     assert not any(x[0] == "masp" for x in source.calls)
-    failed = Source(fail_at=5)
+    failed = Source(fail_at=6)
     with pytest.raises(CalibrationExecutionError) as info:
         z_offset("TC", failed.bindings(), transfer_fluid=False)
     assert info.value.evidence["ok"] is False
     assert [x["operation"] for x in info.value.evidence["steps"]] == [
-        "loadTips", "scriptmoveTo", "updateLocation", "scrFluidDetection"]
+        "updatePlateLocation", "loadTips", "scriptmoveTo", "updateLocation", "scrFluidDetection"]
     assert not any(x[0] == "eject" for x in failed.calls)
