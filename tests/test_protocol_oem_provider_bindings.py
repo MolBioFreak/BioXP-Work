@@ -77,7 +77,7 @@ def test_builder_is_pure_and_roster_is_concrete(rig):
         "set_z_current_max", "remove_tip", "script_move_to_waste", "source_error_event"}
     assert {leaf for leaf, _ in OEM_PIPETTE_LEAVES.values()} <= set(p.wp8_child_binding_inventory())
     assert set(p.wp8_child_binding_inventory()) == WP8_COMPILED_CHILD_OPERATIONS
-    assert c["source_bindings"].check_tips is None  # CV is not a camera alias
+    assert callable(c["source_bindings"].check_tips)  # semantic ClungTips callback, not rack CV
     for name in OEM_PIPETTE_LEAVES:
         assert p.wp8_operation_machine_state(name, {}) == {}
     assert trace == plans == []

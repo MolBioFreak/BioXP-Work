@@ -1106,6 +1106,7 @@ OEM_PIPETTE_LEAVES = {
     "pipette_location": ("updateLocation", ("destination", "well")),
     "pipette_tip_state": ("sourceTipState", ("changes",)),
     "pipette_tip_transition": ("sourceTipTransition", ("tray_id", "well_ids", "transition")),
+    "pipette_check_tips": ("sourceCheckTips", ("tray_id", "tip_location", "tip_type", "check_for_static_tip_loss")),
     "pipette_pierce": ("sourceWellPierced", ("plate", "well", "single")),
     "pipette_lift": ("sourceLiftTo", ("location", "height")),
     "pipette_lower": ("sourceLowerTo", ("location",)),
@@ -1740,6 +1741,10 @@ def execute_finite_plate_operation(
         leaf_result = completed[-1]["result"]
         if isinstance(leaf_result, Mapping):
             source_return.update({key: leaf_result[key] for key in ("source_return", "x", "y", "z", "door_ok") if key in leaf_result})
+            if plan.get("operation") == "pipette_check_tips":
+                source_return.update({key: leaf_result[key] for key in (
+                    "removed_wells", "inspection_completed", "source_exception", "skip_reason")
+                    if key in leaf_result})
     if plan.get("source_stop_scripts"):
         source_return["source_stop_scripts"] = True
     return {

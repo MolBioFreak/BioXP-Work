@@ -4497,6 +4497,7 @@ class Serial206OemInitializationProvider:
         "waitZ": "wp8_wait_z",
         "sourceTipState": "wp8_pipette_source_leaf",
         "sourceTipTransition": "wp8_pipette_source_leaf",
+        "sourceCheckTips": "wp8_check_tips",
         "sourceWellPierced": "wp8_pipette_source_leaf",
         "sourceLiftTo": "wp8_pipette_source_leaf",
         "sourceLowerTo": "wp8_pipette_source_leaf",
@@ -12475,7 +12476,19 @@ class Serial206OemInitializationProvider:
             return run("pipette_hotel", action, state, location=15, column=0, row=1,
                        high_pos=True, run_in_parallel=False)
 
+        def check_tips(tray, well, action, state):
+            result = run("pipette_check_tips", action, state, tray_id=tray, tip_location=well,
+                         tip_type=state.source_model.tip_trays[tray].tip_type,
+                         check_for_static_tip_loss=captured.get("CheckForStaticTipLoss"))
+            # As with normal pickup, update the source model only for removals
+            # already committed by the canonical occupancy publisher.
+            for index in result.get("removed_wells", ()):
+                item = state.source_model.tip_trays[tray].wells[index]
+                item.empty, item.content = True, None
+            return result
+
         native = OemPipetteSourceBindings(
+            check_tips=check_tips,
             facts=facts, lift_to=leaf("pipette_lift", ("location", "height")),
             lower_to=leaf("pipette_lower", ("location",)), move_xy=leaf("pipette_move_xy", ("x", "y")),
             position=leaf("pipette_position", ()), home=leaf("pipette_home", ("rehome",)),
@@ -12509,6 +12522,89 @@ class Serial206OemInitializationProvider:
             tip_load_move=lambda location, column, row, action, state: script_move(location, column, row, action, state, flag=2, parallel=False),
             move_z_home=native.home, set_z_current_max=lambda action, state: native.set_z_current_max(None, action, state),
             remove_tip=remove_tip, script_move_to_waste=leaf("pipette_script_waste", ()), source_error_event=source_error_event)
+
+    def wp8_check_tips(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        """ControlLib.checkTips:9918-10222 under the existing finite owner.
+
+        This is static loss beside the pickup, not whole-rack missingTps.
+        OEM exceptions retain the current flag; inspection evidence is separate
+        from that source boolean. No additional success/admission criterion.
+        """
+        from .vision.oem_tips import clung_tips, clung_tip_wells
+
+        flag = True
+        receipt: dict[str, Any] = {"ok": True, "source_return": True,
+            "inspection_completed": False, "delivery_attempted": False,
+            "captures": [], "moves": [], "removed_wells": []}
+        identity = self._wp8_identity(command_id, child_order, plan_digest)
+        try:
+            settings = self._cover_inspection_settings()
+            enabled = arguments["check_for_static_tip_loss"]
+            if enabled is None:
+                # ClassBioXPSettings.cs:1650 constructor, captured policy wins.
+                enabled = settings.get("CheckForStaticTipLoss", False)
+            text = arguments["tip_location"]
+            column = int(text[1:])
+            ordinal = (column - 1) * 2 + (text[0] == "B")
+            if not enabled or arguments["tip_type"] == 200 or ordinal >= 23:
+                self._cover_inspection_callbacks()["led"](channel=2, on=False)
+                receipt["source_noop"] = True
+                receipt["skip_reason"] = ("static_tip_loss_disabled" if not enabled else
+                    "200ul_tip" if arguments["tip_type"] == 200 else "tip_location_ge_23")
+            else:
+                profile = self._cover_inspection_profile("ClungTips")
+                threshold = int(profile["Parameters"]["threshold"])
+
+                def move(axis, steps):
+                    # CI.moveSteps (not direct board.moveSteps): retain the
+                    # public wrapper's final getCurrentPosition and null-board
+                    # semantics through the existing source-native driver.
+                    method = (self.primitives.tester.motor_x_move_relative_strict if axis == "x"
+                              else self.primitives.tester.motor_y_move_relative_strict)
+                    receipt["delivery_attempted"] = True
+                    result = method(steps)
+                    receipt["moves"].append({"axis": axis, "steps": steps, "result": result})
+                    # Source moveSteps return is ignored; controller exceptions
+                    # reach the original checkTips catch below.
+
+                move("y", 3198 + settings["CameraYOffset"] - (2132 if "B" in text else 0))
+                move("x", -1066 + settings["CameraXOffset"])
+                for half in (0, 1):
+                    if half:
+                        move("y", 8528)
+                    self.sleep(0.2)
+                    artifact = f"{identity}:checkTips:{half}"
+                    capture = self._cover_inspection_capture(condition="ClungTips", artifact_id=artifact)
+                    status = clung_tips(capture["frame"], threshold, "12" in text)
+                    wells = clung_tip_wells(status, text, half)
+                    evidence = {"half": half, "tipstatus": status,
+                                "capture_evidence": capture.get("capture_evidence"),
+                                "missing_wells": list(wells)}
+                    receipt["captures"].append(evidence)
+                    for well in wells:
+                        tray = self._tip_tray_state_reader(arguments["tray_id"])
+                        if tray["occupancy"][well]:
+                            flag = False
+                        self.publish_tip_tray_transition(
+                            tray_id=arguments["tray_id"], transition="remove", well_ids=[well],
+                            operation_id=f"{artifact}:remove:{well}", command_id=command_id,
+                            provenance={"source_operation": "checkTips", "source_child": identity})
+                        receipt["removed_wells"].append(well)
+                    if not flag:
+                        evidence["artifact"] = self._cover_inspection_callbacks()["save"](
+                            frame=capture["frame"], condition="ClungTips", artifact_id=artifact)
+                receipt["inspection_completed"] = True
+        except Exception as exc:
+            # Deliberately preserve OEM's fail-open/current-flag catch. Never
+            # describe this source return as a successful physical inspection.
+            receipt["source_exception"] = str(exc)
+        finally:
+            self._cover_inspection_all_leds_off()
+        receipt["source_return"] = flag
+        return receipt
 
     def wp8_pipette_source_leaf(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
