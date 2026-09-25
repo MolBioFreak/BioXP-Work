@@ -44,7 +44,9 @@ def z_offset(plate: str, bindings: FluidScanBindings, *, speed: int = 300,
                       skip_steps=skip_steps, samples=[], location=location)
 
     def step(name: str, fn: Callable[[], Result]) -> Result:
-        return seq.step(name, fn)
+        # zOffset ignores child return codes; only source exceptions unwind it.
+        # Keep unsuccessful child receipts as evidence, not an invented stop.
+        return seq.step(name, fn, allow_false=True)
 
     def move(target: int, well: str | int, flag: int) -> None:
         step("scriptmoveTo", lambda: bindings.move(target, well, flag))
@@ -52,7 +54,7 @@ def z_offset(plate: str, bindings: FluidScanBindings, *, speed: int = 300,
 
     step("updatePlateLocation", lambda: bindings.publish_plate(location, plate_id))
     if transfer_fluid and location != 0:
-        seq.step("loadTips", bindings.load_tips, allow_false=True)
+        step("loadTips", bindings.load_tips)
         saved = bindings.facts()
         # Source integer division, including its (40+49)/50 = 1 branch.
         batches = (volume + 49) // 50
@@ -73,8 +75,7 @@ def z_offset(plate: str, bindings: FluidScanBindings, *, speed: int = 300,
 
     heights: list[int] = []
     for well in samples:
-        # The OEM ignores loadTips' Boolean here and proceeds to the move.
-        seq.step("loadTips", bindings.load_tips, allow_false=True)
+        step("loadTips", bindings.load_tips)
         saved = bindings.facts()
         move(location, well, 1)
         measured = step("scrFluidDetection", lambda: bindings.detect(speed))

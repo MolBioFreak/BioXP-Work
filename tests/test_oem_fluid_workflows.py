@@ -103,6 +103,19 @@ def test_source_ignores_false_load_tips_return_and_continues_sampling():
             if s["operation"] == "loadTips"] == [False, False]
 
 
+def test_ignored_source_move_return_is_recorded_without_new_stop():
+    from dataclasses import replace
+    source = Source()
+    def returned_false(target, well, flag):
+        result = source.move(target, well, flag)
+        return {**result, "ok": False}
+    result = z_offset("STRIP", replace(source.bindings(), move=returned_false),
+                      transfer_fluid=False, skip_steps=12)
+    assert len(result["samples"]) == 2
+    assert any(s["result"].get("ok") is False for s in result["steps"]
+               if s["operation"] == "scriptmoveTo")
+
+
 def test_ms_skips_prefill_and_failure_keeps_partial_effects():
     source = Source()
     result = z_offset("MS", source.bindings())
