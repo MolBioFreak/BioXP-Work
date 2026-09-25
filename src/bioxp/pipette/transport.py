@@ -2195,6 +2195,43 @@ class FourPipetteTransport:
             setattr(exc, "oem_partial_results", partial)
             raise
 
+    def query_tip_status_for_oem_load_tips(self) -> dict[str, Any]:
+        """Source queryTipStatus(-1): query all four in order, count only 1s."""
+        with self._transaction_lock:
+            channels: list[dict[str, Any]] = []
+            for channel, transport in enumerate(self._transports):
+                try:
+                    result = transport._safe_query_tip_status(
+                        transport._get_driver(), required=True, source_continue=True,
+                    )
+                except Exception as exc:
+                    partial = {"observed_channels": channels, "failed_channel": channel,
+                               "source_return_completed": False, "source_exception": True}
+                    if isinstance(exc, PipetteCommandError):
+                        exc.details.update(partial)
+                        raise
+                    raise PipetteCommandError(
+                        str(exc), details={**partial, "exception": repr(exc)},
+                    ) from exc
+                channels.append({"channel": channel, "result": result})
+            return {
+                "ok": True,
+                "source_return_completed": True,
+                "source_return": sum(row["result"].get("source_return") == 1 for row in channels),
+                "source_tip_exists": any(t._tip_loaded for t in self._transports),
+                "source_tip_missing": any(t._tip_loaded != 1 for t in self._transports),
+                "tip_type": self._tip_type,
+                "channels": channels,
+                "hardware_postcondition_verified": all(
+                    row["result"].get("ok") is True
+                    and row["result"].get("semantic_ok") is True
+                    and row["result"].get("hardware_truth_level") == "hardware_query"
+                    for row in channels
+                ),
+                "physical_effect_verified": False,
+                "oem_source_anchor": "ClassPipetteCollection.queryTipStatus:1336-1357",
+            }
+
     def query_tip_status_for_oem_script(self, pipette: int) -> dict[str, Any]:
         """Source single-channel queryTipStatus:1349–1357; no group query."""
         if type(pipette) is not int or pipette not in self.CHANNELS:
