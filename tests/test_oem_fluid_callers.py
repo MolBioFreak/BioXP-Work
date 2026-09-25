@@ -46,6 +46,12 @@ def setup(settings=None, *, choice=True, failure=None):
 
 REF = {"REVISION": 17, "FLUID_TC_OFFSET": 100, "FLUID_RC_OFFSET": 200, "FLUID_STRIP_OFFSET": 300}
 
+def test_installed_oem_fluid_reference_is_available_to_calibration(settings):
+    assert dict(settings.active_snapshot.fluid_reference) == {
+        "REVISION": 0, "FLUID_TC_OFFSET": 5178,
+        "FLUID_RC_OFFSET": 5300, "FLUID_STRIP_OFFSET": 9200,
+    }
+
 
 def test_diagnostic_order_and_early_catch():
     b, events = setup()

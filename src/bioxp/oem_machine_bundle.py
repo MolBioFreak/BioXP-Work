@@ -195,6 +195,7 @@ class OemMachineSnapshot:
     inspection_profile_name: str
     inspection_profile: Mapping[str, Any]
     calibration_comparison: Mapping[str, Any]
+    fluid_reference: Mapping[str, int]
     process_times: Mapping[str, float]
     mutable_seeds: Mapping[str, OemRecordProvenance]
     operator_label_matched: bool
@@ -923,6 +924,11 @@ def load_oem_machine_snapshot(
         inspection_profile_name="Settings3200",
         inspection_profile=inspection,
         calibration_comparison=comparison,
+        # ClassCalibrationReference reads m_appDir/calreference.xml for the
+        # in-process FluidReference; the newer current-directory copy is only
+        # a possible update, not the reference used by adjustZ.
+        fluid_reference=_freeze({"REVISION": installed_cal["fluid"]["revision"],
+                                 **installed_cal["fluid"]["parameters"]}),
         process_times=process_times,
         mutable_seeds=MappingProxyType(mutable),
         operator_label_matched=label_matched,
