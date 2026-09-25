@@ -2769,6 +2769,11 @@ class PipetteTipRequest(BaseModel):
     operator: Optional[str] = Field(None, max_length=120)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+class PipetteTipTypeRequest(BaseModel):
+    """OEM combo selection: software type only, never physical pickup."""
+    model_config = ConfigDict(extra="forbid")
+    tip_type: Literal[50, 200, 201]
+
 
 class PipetteEjectAllRequest(BaseModel):
     channels: Optional[list[int]] = None
@@ -10607,6 +10612,18 @@ async def liquid_tip(req: PipetteTipRequest):
         receipt_store=_pipette_receipts,
     )
 
+
+@app.post("/liquid/pipette/tip-type")
+async def liquid_pipette_tip_type(req: PipetteTipTypeRequest):
+    return await run_pipette_operation(
+        "select_tip_type",
+        lambda transport: transport.loadTip(req.tip_type),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=10.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs={"tip_type": req.tip_type},
+    )
 
 @app.post("/liquid/eject-all")
 async def liquid_eject_all(req: PipetteEjectAllRequest):
