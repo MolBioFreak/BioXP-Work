@@ -2982,7 +2982,8 @@ class BarcodeReadRequest(BaseModel):
     include_image_data: bool = False
 
 
-from .manual_pipetting import ManualPipettingRequest, bind_manual_position_handler, compile_manual_pipetting
+from .manual_pipetting import (ManualPipettingRequest, bind_manual_position_handler,
+                              bind_manual_physical_handler, compile_manual_pipetting)
 
 
 class ProtocolCompileRequest(BaseModel):
@@ -11428,6 +11429,17 @@ def _protocol_live_manual_position_handler(action, state):
     return handler(action, state)
 
 
+def _protocol_live_manual_physical_handler(action, state):
+    handler = bind_manual_physical_handler(
+        command_store=_protocol_command_store(),
+        execute_plan=app.state.oem_workflow_plan_executor,
+        require_motion_ready=_require_motion_route_ready,
+        provider_getter=lambda: _serial206_oem_initialization_provider,
+        receipt_store_getter=lambda: _pipette_receipts,
+    )
+    return handler(action, state)
+
+
 def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
     return {
         ProtocolActionKind.MOVE: _protocol_live_move_handler,
@@ -11438,6 +11450,7 @@ def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
         ProtocolActionKind.INSPECT: _protocol_live_inspect_cover_handler,
         ProtocolActionKind.PIPETTE_INIT: _protocol_live_pipette_handler,
         ProtocolActionKind.PIPETTE_POSITION: _protocol_live_manual_position_handler,
+        ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL: _protocol_live_manual_physical_handler,
         ProtocolActionKind.PIPETTE_TIP: _protocol_live_pipette_handler,
         ProtocolActionKind.TIP_EJECT: _protocol_live_pipette_handler,
         ProtocolActionKind.PIPETTE_ASPIRATE: _protocol_live_pipette_handler,
@@ -11801,6 +11814,9 @@ def _protocol_bindings(bundle, *, source_executor=None):
             )
         return result
     if provider is not None and canonical_plan is not None:
+        # checkTips shares the same camera/illumination owner as inspection.
+        # Binding callbacks does not acquire the camera or command any motion.
+        _bind_deck_cover_inspection(provider)
         callbacks = provider.build_oem_pipette_source_callbacks(
             execute_plan=pipette_plan, start_child=start_child,
             stopped=lambda: executor().source_stopped(), settings=settings,

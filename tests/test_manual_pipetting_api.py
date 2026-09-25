@@ -31,6 +31,7 @@ def test_native_handler_map_is_lazy_and_contains_position_owner(monkeypatch):
     monkeypatch.setattr(api, "_protocol_command_store", lambda: pytest.fail("premature owner lookup"))
     handlers = api._protocol_live_handlers()
     assert handlers[ProtocolActionKind.PIPETTE_POSITION] is api._protocol_live_manual_position_handler
+    assert handlers[ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL] is api._protocol_live_manual_physical_handler
 
 
 def test_manual_execute_routes_exact_intent_to_existing_native_owner(monkeypatch):
@@ -74,7 +75,7 @@ def test_catalog_publishes_full_discriminated_step_schema():
     assert schema["type"] == "array"
     assert schema["items"]["discriminator"]["propertyName"] == "operation"
     assert schema["items"]["discriminator"]["mapping"]["move"] == "#/$defs/ManualMove"
-    assert {"ManualMove", "ManualLower", "ManualLift", "ManualLiquid", "ManualMix"} <= set(schema["$defs"])
+    assert {"ManualMove", "ManualLower", "ManualLift", "ManualLiquid", "ManualMix", "ManualLoadTip", "ManualMeasureFluidHeight"} <= set(schema["$defs"])
     assert schema["$defs"]["ManualLift"]["properties"]["height_steps"]["anyOf"][1] == {"type": "null"}
 
 
