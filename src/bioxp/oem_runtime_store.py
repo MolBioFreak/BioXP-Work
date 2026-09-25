@@ -4985,6 +4985,28 @@ class OEMRuntimeStore:
                 raise
             return json.loads(readback)
 
+    def restore_machine_calibration_revision(
+        self, baseline_lock_sha256: str, previous: dict[str, Any] | None,
+    ) -> None:
+        """Restore an OEM comparison backup, including an absent prior revision."""
+        key = "machine_calibration_v1:" + baseline_lock_sha256
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                if previous is None:
+                    self._db.execute("DELETE FROM runtime_metadata WHERE key=?", (key,))
+                else:
+                    encoded = json.dumps(previous, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                    self._db.execute(
+                        "INSERT INTO runtime_metadata(key,value,updated_at) VALUES(?,?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                        (key, encoded, time.time()),
+                    )
+                self._db.execute("COMMIT")
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
+
     def next_seq(self) -> int:
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")

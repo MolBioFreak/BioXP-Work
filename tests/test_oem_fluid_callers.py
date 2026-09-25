@@ -25,12 +25,8 @@ def setup(settings=None, *, choice=True, failure=None):
         return {"source_return": {"TC": 2000, "MS": 2100, "OC": 2200, "RC": 2300, "STRIP": 2400}[plate]}
     def restore(previous):
         event("restore", None if previous is None else previous["revision_id"])
-        if previous is None:
-            # Owner of the canonical store is responsible for an atomic removal.
-            settings.store._db.execute("DELETE FROM runtime_metadata WHERE key=?",
-                ("machine_calibration_v1:" + settings.active_snapshot.lock_sha256,))
-        else:
-            settings.store.update_machine_calibration_revision(settings.active_snapshot.lock_sha256, lambda _: previous)
+        assert settings is not None
+        settings.restore(previous)
     b = FluidCallerBindings(
         log_file=lambda: event("log"), initiate_group=lambda: event("initiate"),
         catch_plate=lambda n: event("catch", n),
@@ -74,6 +70,9 @@ def test_calibration_saves_each_adjustment_and_next_startup_only(settings):
     assert len({m["saved_revision_id"] for m in r["measurements"]}) == 5
     assert r["measurements"][-1]["calculated_z_lows"]["LOC_STRIP2"] == 1200
     assert r["fluid_reference_revision"] == "17"
+    assert settings.read()["saved_liquid_calibration"]["m_liquid_cal_reversion"] == "17"
+    assert settings.read()["saved_liquid_calibration"]["m_Liquid_Cal"] is True
+    assert settings.read()["active_liquid_calibration"]["m_liquid_cal_reversion"] != "17"
     assert r["pending_restart"] and r["active_revision_id"] is None
     state = settings.read()
     saved = {p["name"]: p["zLow"] for p in state["saved_positions"]}

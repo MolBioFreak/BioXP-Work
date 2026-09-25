@@ -78,6 +78,7 @@ class CalibrationRevision(BaseModel):
     baseline_lock_sha256: str
     saved_at: str
     positions: tuple[PositionCalibrationPatch, ...]
+    liquid_calibration: dict[str, str | bool] | None = None
 
 
 def _revision(snapshot: OemMachineSnapshot, payload: dict) -> CalibrationRevision:
@@ -113,7 +114,16 @@ def project_calibration(snapshot: OemMachineSnapshot, payload: dict | None) -> O
         row["calibration_revision_id"] = revision.revision_id
         row["baseline_source"] = "serial_206_oem_machine_snapshot:appdata/config.xml"
         rows.append(_freeze(row))
-    return replace(snapshot, position_table=tuple(rows), calibration_revision=_freeze(revision.model_dump(mode="json")))
+    sections = _thaw(snapshot.config_sections)
+    if revision.liquid_calibration is not None:
+        liquid = revision.liquid_calibration
+        sections["calibration"].update({
+            "m_Liquid_Cal": liquid["calibrated"],
+            "m_Liquid_Cal_date": liquid["saved_at"],
+            "m_liquid_cal_reversion": liquid["reference_revision"],
+        })
+    return replace(snapshot, position_table=tuple(rows), config_sections=_freeze(sections),
+                   calibration_revision=_freeze(revision.model_dump(mode="json")))
 
 
 def load_saved_calibration(snapshot: OemMachineSnapshot, store: OEMRuntimeStore) -> OemMachineSnapshot:
@@ -143,6 +153,8 @@ class CalibrationSettingsService:
             "saved_revision": saved,
             "active_revision_id": active_id,
             "saved_revision_id": saved_id,
+            "active_liquid_calibration": _thaw(snapshot.config_sections["calibration"]),
+            "saved_liquid_calibration": _thaw(prospective.config_sections["calibration"]),
             "pending_restart": pending,
             "application_status": "pending_restart" if pending else "bound_configuration",
             "application_semantics": "next ordinary process startup; no live refresh or hardware execution",
@@ -156,7 +168,7 @@ class CalibrationSettingsService:
             "motion_commanded": False,
         }
 
-    def save(self, patch: CalibrationSettingsPatch) -> dict:
+    def save(self, patch: CalibrationSettingsPatch, *, liquid_reference_revision: str | None = None) -> dict:
         # Validate even for callers using model_construct or non-HTTP callers.
         patch = CalibrationSettingsPatch.model_validate(patch.model_dump(exclude_unset=True))
         snapshot = self.active_snapshot
@@ -168,11 +180,19 @@ class CalibrationSettingsService:
             }
             for row in patch.positions:
                 merged.setdefault(row.name, {"name": row.name}).update(row.model_dump(exclude_unset=True))
+            timestamp = datetime.now(timezone.utc).isoformat()
+            liquid = (None if prior is None else prior.liquid_calibration)
+            if liquid_reference_revision is not None:
+                # OEM adjustZ sets FluidReference; each saveConfig writes the
+                # liquid-calibrated flag, reference revision and current date.
+                liquid = {"calibrated": True, "saved_at": timestamp,
+                          "reference_revision": liquid_reference_revision}
             revision = CalibrationRevision(
                 revision_id=uuid4().hex,
                 baseline_lock_sha256=snapshot.lock_sha256,
-                saved_at=datetime.now(timezone.utc).isoformat(),
+                saved_at=timestamp,
                 positions=tuple(PositionCalibrationPatch.model_validate(merged[name]) for name in sorted(merged)),
+                liquid_calibration=liquid,
             ).model_dump(mode="json", exclude_unset=True)
             # Fill the schema default explicitly in the persisted contract.
             revision["schema_version"] = "bioxp.machine_calibration.v1"
@@ -183,3 +203,9 @@ class CalibrationSettingsService:
         result = self.read()
         result["committed_revision_id"] = committed["revision_id"]
         return result
+
+    def restore(self, previous: dict | None) -> dict:
+        if previous is not None:
+            _revision(self.active_snapshot, previous)
+        self.store.restore_machine_calibration_revision(self.active_snapshot.lock_sha256, previous)
+        return self.read()

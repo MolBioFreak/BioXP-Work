@@ -107,7 +107,7 @@ def calwith_fluid(bindings: FluidCallerBindings, settings: CalibrationSettingsSe
         patch = CalibrationSettingsPatch(positions=tuple(
             PositionCalibrationPatch(name=cast(PositionName, id_names[idx]), zLow=low) for idx, low in updates.items()))
         # Source adjustZ then saveConfig, including each intermediate saved revision.
-        saved = settings.save(patch)
+        saved = settings.save(patch, liquid_reference_revision=str(fluid_reference["REVISION"]))
         measurements.append({"plate": plate, "measured_raw_z": z,
             "calculated_z_lows": {id_names[idx]: low for idx, low in updates.items()},
             "settings_updates": derived["settings_updates"],
