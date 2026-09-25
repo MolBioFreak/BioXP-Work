@@ -101,8 +101,12 @@ class ManualFluidOffset(_Request):
     skip_steps: int = Field(default=4, ge=1)
 
 
+class DiagnosticDetectFluid(_Request):
+    operation: Literal["diagnostic_detect_fluid"]
+
+
 ManualStep = Annotated[Union[ManualMove, ManualLower, ManualLift, ManualLiquid, ManualMix,
-    ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset], Field(discriminator="operation")]
+    ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset, DiagnosticDetectFluid], Field(discriminator="operation")]
 
 
 class ManualPipettingRequest(_Request):
@@ -135,7 +139,7 @@ def compile_manual_pipetting(request: ManualPipettingRequest | Mapping[str, Any]
     for index, step in enumerate(req.steps):
         if isinstance(step, (ManualMove, ManualLower, ManualLift)):
             add(ProtocolActionKind.PIPETTE_POSITION, step.model_dump(), index)
-        elif isinstance(step, (ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset)):
+        elif isinstance(step, (ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset, DiagnosticDetectFluid)):
             add(ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL, step.model_dump(), index)
         elif isinstance(step, ManualLiquid):
             liquid(step.operation, step.channels, step.volume_ul, step.speed, index)
@@ -191,13 +195,15 @@ def bind_manual_position_handler(*, command_store: Any, execute_plan: Callable,
 
 def manual_physical_plan(params: Mapping[str, Any]) -> dict[str, Any]:
     models = {"load_tip": ManualLoadTip, "measure_fluid_height": ManualMeasureFluidHeight,
-              "source_fluid_offset": ManualFluidOffset}
+              "source_fluid_offset": ManualFluidOffset,
+              "diagnostic_detect_fluid": DiagnosticDetectFluid}
     try:
         model = models[params["operation"]]
     except (KeyError, TypeError):
         raise ValueError("unknown manual physical operation") from None
     step = model.model_validate(dict(params))
-    operation = ("manual_load_tip" if isinstance(step, ManualLoadTip) else
+    operation = ("diagnostic_detect_fluid" if isinstance(step, DiagnosticDetectFluid) else
+                 "manual_load_tip" if isinstance(step, ManualLoadTip) else
                  "source_fluid_offset" if isinstance(step, ManualFluidOffset) else "measure_fluid_height")
     return compile_finite_plate_operation(operation, source_leaf_available=True,
                                          **step.model_dump(exclude={"operation"}))
@@ -235,7 +241,7 @@ def bind_manual_physical_handler(*, command_store: Any, execute_plan: Callable,
             command_store.assert_workflow_current(state.job_id)
             provider = provider_getter()
             provider._manual_pipette_receipt_runner = receipt
-            if plan["operation"] == "source_fluid_offset":
+            if plan["operation"] in {"source_fluid_offset", "diagnostic_detect_fluid"}:
                 from .runtime_state import get_active_oem_runtime_state_store
                 from .pipette.manual_settings import read_pipette_operation_settings
                 from .oem_job_preparation import construct_new_machine_source_model

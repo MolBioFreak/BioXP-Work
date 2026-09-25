@@ -4427,6 +4427,7 @@ class Serial206OemInitializationProvider:
     """One durable expected-next stage per generation-bound approval."""
 
     _WP8_CHILD_BINDINGS: Mapping[str, str] = {
+        "sourceDiagnosticDetectFluid": "wp8_diagnostic_detect_fluid",
         "sourceForceToHighHome": "wp8_preparation_force_high_home",
         "sourceMoveTo": "wp8_source_move_to",
         "sourceImageGantryLoad": "wp8_source_image_gantry_load",
@@ -12682,6 +12683,85 @@ class Serial206OemInitializationProvider:
             state=self._manual_pipette_source_state,
             settings=self._manual_pipette_source_settings), "delivery_attempted": True}
 
+    def wp8_diagnostic_detect_fluid(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        """ControlLib diagnostic button, including all five scans, inside one owner."""
+        from .pipette.oem_fluid_callers import FluidCallerBindings, detect_fluid
+        from .pipette.oem_fluid_owner import run_z_offset_inline
+
+        state = self._manual_pipette_source_state
+        settings = self._manual_pipette_source_settings
+        events: list[dict[str, Any]] = []
+        serial = 0
+
+        def identity(name: str) -> dict[str, Any]:
+            nonlocal serial
+            serial += 1
+            return {**owner_identity, "source_identity":
+                    f"{owner_identity['source_identity']}:detect:{serial}:{name}"}
+
+        def record(name: str, call: Any) -> Any:
+            nested = identity(name)
+            self._wp8_execution_fence_checker(command_id, boundary=nested["source_identity"])
+            try:
+                result = call(nested)
+                events.append({"operation": name, "source_identity": nested["source_identity"],
+                               "result": result})
+                if isinstance(result, Mapping) and result.get("ok") is not True:
+                    raise RuntimeError(f"diagnostic_source_failure:{name}")
+                return result
+            except Exception as exc:
+                if not events or events[-1].get("source_identity") != nested["source_identity"]:
+                    events.append({"operation": name, "source_identity": nested["source_identity"],
+                                   "error": str(exc), "evidence": getattr(exc, "evidence", None)})
+                raise
+
+        def finite(name: str, **inputs: Any) -> Any:
+            return record(name, lambda nested: self._wp8_compile_and_execute(
+                operation=name, inputs=inputs, command_id=command_id, owner_identity=nested))
+
+        def scan(plate: str, speed: int, transfer: bool, skip: int) -> Any:
+            def run(nested: Mapping[str, Any]) -> Any:
+                result = run_z_offset_inline(self, plate=plate, speed=speed,
+                    transfer_fluid=transfer, skip_steps=skip, command_id=command_id,
+                    owner_identity=nested, state=state, settings=settings)
+                if result.get("error"):
+                    return {**result, "ok": False}
+                return {**result, "ok": True}
+            return record(f"zOffset:{plate}", run)
+
+        def initiate() -> None:
+            record("initiateGroup", lambda nested: self._manual_pipette_receipt_runner(
+                "initiate_group_once_for_oem_detect_fluid",
+                lambda transport: transport.initiate_group_once_for_oem_detect_fluid(),
+                command_id, nested, {"diagnostic": "detect_fluid"}))
+
+        def mark_strip() -> None:
+            # The source changes m_strip[1] in memory before the STRIP scan.
+            def mark(_nested: Mapping[str, Any]) -> dict[str, Any]:
+                strip = state.source_model.strips[1]
+                strip.strip_color = "X"
+                return {"ok": True, "strip_index": 1, "strip_color": strip.strip_color,
+                        "delivery_attempted": False}
+            record("markStripX", mark)
+
+        result = detect_fluid(FluidCallerBindings(
+            log_file=lambda: events.append({"operation": "setLogFileName",
+                "source_path": r"c:\logfile\fluid-level.txt", "effect": "source_diagnostic_log_path_recorded"}),
+            initiate_group=initiate,
+            catch_plate=lambda plate: finite("catch_plate", plate=plate, run_in_parallel=False),
+            release_plate=lambda destination, press: finite("release_plate", destination=destination,
+                press_plate=press, run_in_parallel=False),
+            press_plates=lambda plates: finite("press_plates", plates=list(plates), run_in_parallel=False),
+            scan=scan, mark_strip=mark_strip,
+            park=lambda: finite("park_gantry"),
+            error=lambda source, exc: None,
+        ))
+        return {**result, "ok": result["completed"], "events": events,
+                "delivery_attempted": True}
+
     def wp8_manual_pipette_physical(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
         child_order: int, plan_digest: str, owner_identity: Mapping[str, Any], **_: Any,
@@ -13489,7 +13569,8 @@ class Serial206OemInitializationProvider:
         result = self.primitives.motor_wait_stopped(
             4, motor=1, timeout_s=float(arguments["timeout_ms"]) / 1000.0,
         )
-        stopped = bool(isinstance(result, Mapping) and (result.get("stopped") is True or result.get("ok") is True))
+        observed = result.get("wait") if isinstance(result, Mapping) and isinstance(result.get("wait"), Mapping) else result
+        stopped = bool(isinstance(observed, Mapping) and (observed.get("stopped") is True or observed.get("ok") is True))
         return {
             "ok": stopped, "delivery_attempted": False,
             "controller_command_acknowledged": False,

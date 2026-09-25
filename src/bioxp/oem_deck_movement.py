@@ -1137,7 +1137,7 @@ OEM_PIPETTE_LEAVES = {
 }
 
 FINITE_PLATE_OPERATIONS = frozenset({
-    "manual_pipette_move",
+    "manual_pipette_move", "diagnostic_detect_fluid",
     "catch_plate", "release_plate", "park_gantry", "waste_sequence",
     "press_plate", "press_plates", "send_z_and_gripper_home", "thermal_door", "cleanup",
     "move_plate", "script_snapshot", "cut_seal", "shakeoff", "ordinary_pause_prepare", "critical_item_images",
@@ -1145,6 +1145,7 @@ FINITE_PLATE_OPERATIONS = frozenset({
 })
 
 WP8_OPERATION_INTENT_KEYS: Mapping[str, frozenset[str]] = {
+    "diagnostic_detect_fluid": frozenset(),
     "manual_pipette_move": frozenset({"location", "well", "position_flag"}),
     "move_plate": frozenset({"plate", "destination", "press_plate"}),
     "catch_plate": frozenset({"plate", "run_in_parallel"}),
@@ -1164,6 +1165,7 @@ WP8_OPERATION_INTENT_KEYS: Mapping[str, frozenset[str]] = {
 }
 
 WP8_COMPILED_CHILD_OPERATIONS = frozenset({
+    "sourceDiagnosticDetectFluid",
     "CloseGripper", "HomeAxisD", "LoadGantry", "LoadGantryNull", "LockGripperOperation",
     "MoveZHome", "OpenGripper", "OpenGripperWide", "ReleaseLockGripperOperation", "Sleep",
     "SnapshotImage", "StopCloseGripper", "backgroundGripperHomeAndUnlock", "catchPlate",
@@ -1202,6 +1204,10 @@ def _compile_finite_plate_operation_unchecked(
     if not source_leaf_available:
         raise RuntimeError(f"source_authority_missing:{operation}")
     children: list[dict[str, Any]] = []
+
+    if operation == "diagnostic_detect_fluid":
+        _wp8_child(children, "sourceDiagnosticDetectFluid")
+        return _wp8_plan(operation, children, source_caller="ControlLib.btnDetectFluid_Click:1440-1469")
 
     if operation == "manual_pipette_move":
         # ControlLib.movExecution: scriptmoveTo then updateLocation, without

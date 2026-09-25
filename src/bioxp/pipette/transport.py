@@ -1328,6 +1328,13 @@ class FourPipetteTransport:
                 "retry_selected_by_transport": False,
             }
 
+    def initiate_group_once_for_oem_detect_fluid(self) -> dict[str, Any]:
+        """Diagnostic button's one initiateGroup call; no initialization retry."""
+        with self._transaction_lock:
+            return {**dict(self._run_group_cycle(PipetteInitCommand(), cycle="detectFluid.initiateGroup")),
+                    "oem_source_anchor": "ControlLib.btnDetectFluid_Click:1449; ClassPipetteCollection.initiateGroup:677-693",
+                    "single_group_cycle": True}
+
     def checked_pipette_status_for_oem_initialize_motion(self, *, attempt: str) -> dict[str, Any]:
         """Exact four-channel `checkedPipetteStatus()` query and error gate."""
         selected = str(attempt).strip()
