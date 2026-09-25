@@ -734,7 +734,7 @@ def _resolve_schema(schema: Mapping[str, Any], document: Mapping[str, Any]) -> d
     return selected
 
 
-def _input_spec(name: str, schema: Mapping[str, Any], *, required: bool, location: str, description: str = "") -> dict[str, Any]:
+def _input_spec(name: str, schema: Mapping[str, Any], *, required: bool, location: str, description: str = "", form_schema: Mapping[str, Any] | None = None) -> dict[str, Any]:
     enum_values = schema.get("enum") if isinstance(schema.get("enum"), list) else []
     raw_type = schema.get("type")
     value_type = "enum" if enum_values else raw_type if raw_type in {"string", "integer", "number", "boolean"} else "json"
@@ -753,7 +753,9 @@ def _input_spec(name: str, schema: Mapping[str, Any], *, required: bool, locatio
         "maximum": schema.get("maximum") if isinstance(schema.get("maximum"), (int, float)) else None,
         "exclusive_minimum": schema.get("exclusiveMinimum") if isinstance(schema.get("exclusiveMinimum"), (int, float)) else None,
         "exclusive_maximum": schema.get("exclusiveMaximum") if isinstance(schema.get("exclusiveMaximum"), (int, float)) else None,
-        "default": _bounded_json(default, 4096) if default is not None else None,
+        "default": default,
+        # Native request shape is presentation metadata, never a new gate.
+        "json_schema": dict(form_schema if form_schema is not None else schema),
     }
 
 
@@ -1621,6 +1623,7 @@ def _path_action_id(method: str, path: str, operation_id: str | None) -> str:
 
 
 def _extract_inputs(operation: Mapping[str, Any], document: Mapping[str, Any]) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    from .operator_input_schema import native_form_schema
     specs: list[dict[str, Any]] = []
     locations: dict[str, dict[str, Any]] = {}
     for parameter in operation.get("parameters", []):
@@ -1631,7 +1634,7 @@ def _extract_inputs(operation: Mapping[str, Any], document: Mapping[str, Any]) -
             continue
         location = str(parameter["in"])
         schema = _resolve_schema(parameter.get("schema", {}), document)
-        spec = _input_spec(name, schema, required=bool(parameter.get("required")), location=location, description=str(parameter.get("description") or ""))
+        spec = _input_spec(name, schema, required=bool(parameter.get("required")), location=location, description=str(parameter.get("description") or ""), form_schema=native_form_schema(parameter.get("schema", {}), document))
         specs.append(spec)
         locations[spec["name"]] = {"location": location, "wire_name": name}
     request_body = operation.get("requestBody")
@@ -1651,12 +1654,12 @@ def _extract_inputs(operation: Mapping[str, Any], document: Mapping[str, Any]) -
                         "implicit_operator_control": True,
                     }
                     continue
-                spec = _input_spec(name, schema, required=raw_name in required_names, location="body")
+                spec = _input_spec(name, schema, required=raw_name in required_names, location="body", form_schema=native_form_schema(raw_schema, document))
                 spec["wire_name"] = str(raw_name)
                 specs.append(spec)
                 locations[name] = {"location": "body", "wire_name": str(raw_name)}
         else:
-            specs.append(_input_spec("body", body_schema, required=bool(request_body.get("required")), location="body", description=str(request_body.get("description") or "Request JSON body")))
+            specs.append(_input_spec("body", body_schema, required=bool(request_body.get("required")), location="body", description=str(request_body.get("description") or "Request JSON body"), form_schema=native_form_schema(request_body.get("content", {}).get("application/json", {}).get("schema", {}), document)))
             locations["body"] = {"location": "body", "wire_name": "body"}
     return specs, locations
 
