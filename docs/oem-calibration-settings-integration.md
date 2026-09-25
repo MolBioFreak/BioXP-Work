@@ -24,21 +24,21 @@ a failed transaction rolls back. The revision is the latest saved configuration,
 not an append-only audit/history service. Concurrent partial saves merge under
 the canonical store's writer lock and SQLite BEGIN IMMEDIATE.
 
-## Parent API changes (not made in this child)
+## Integrated API and startup path
 
-1. At API lifespan startup, after canonical runtime schema preparation and before
-   `configure_oem_machine_snapshot_from_env`, obtain an `OEMRuntimeStore` at the
-   existing resolved `runtime_root`. Keep that owner on `app.state` for the
-   settings service and close it during lifespan shutdown. Do not make settings
-   depend on a connected hardware provider: configuration editing is offline.
+1. API lifespan calls `_configure_machine_calibration(runtime_root)` after
+   canonical runtime schema preparation. It opens an `OEMRuntimeStore` at the
+   existing root, binds saved configuration before constructing providers, and
+   keeps the settings service on `app.state`. The store closes at shutdown.
+   Reading and saving settings does not require a connected hardware provider.
 2. Call:
    ```python
    machine_snapshot = configure_oem_machine_snapshot_from_env(
-       require_operator_label=True, runtime_store=app.state.calibration_runtime_store,
+       require_operator_label=True, runtime_store=store,
    )
    configure_oem_runtime_state_from_env(machine_snapshot)
    app.state.calibration_settings = CalibrationSettingsService(
-       app.state.calibration_runtime_store, machine_snapshot,
+       store, machine_snapshot,
    )
    ```
    This is before provider construction and the one existing snapshot bind. Do
@@ -61,8 +61,9 @@ active/saved revision IDs distinctly. Save response includes committed_revision_
 so a concurrent later writer cannot be mistaken for this transaction. A save
 never mutates the service's active snapshot; only next ordinary startup consumes
 it. `bound_configuration` means the process's bound configuration, not a physical
-accuracy or hardware calibration verification. Without the startup call above,
-this child does not claim the API automatically consumes saved settings.
+accuracy or hardware calibration verification. The API startup helper and
+GET/PATCH round trip are exercised by `tests/test_calibration_settings_api.py`
+with real SQLite and captured configuration, without hardware or a live restart.
 
 ## Source and consumer chain
 

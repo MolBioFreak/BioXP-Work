@@ -34,6 +34,7 @@ from .hardware_status import CANONICAL_DOMAINS, CollectionContext, hardware_stat
 from .reference_recovery import ReferenceRecoveryMonitor
 from .lifecycle_state import LifecycleStateError, lifecycle_state
 from .oem_machine_bundle import configure_oem_machine_snapshot_from_env
+from .oem_calibration_settings import CalibrationSettingsPatch, CalibrationSettingsService
 from .runtime_state import configure_oem_runtime_state_from_env
 from .oem_axis_diagnostics import AxisDiagnosticContractError, diagnostic_catalog, resolve_axis_diagnostic
 from .oem_gripper import (
@@ -1062,6 +1063,20 @@ def _require_motion_not_blocked_by_maintenance() -> None:
     )
 
 
+def _configure_machine_calibration(runtime_root):
+    """Bind saved configuration once, before ordinary provider construction."""
+    store = OEMRuntimeStore(runtime_root)
+    try:
+        snapshot = configure_oem_machine_snapshot_from_env(
+            require_operator_label=True, runtime_store=store,
+        )
+        configure_oem_runtime_state_from_env(snapshot)
+    except Exception:
+        store.close()
+        raise
+    return snapshot, store, CalibrationSettingsService(store, snapshot)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _tester, _tester_quarantine, _startup_error, _pipette_transport, _pipette_receipts
@@ -1110,6 +1125,8 @@ async def lifespan(app: FastAPI):
         )
         _operator_reports_installed = True
     app.state.report_export_reconciliation = reconcile_operator_report_exports(_pipette_receipts)
+    calibration_runtime_store = None
+    app.state.calibration_settings = None
     try:
         _pipette_receipts.attest_first_install_absence()
         app.state.pipette_migration = _pipette_receipts.migrate_legacy_jsonl()
@@ -1119,8 +1136,8 @@ async def lifespan(app: FastAPI):
         app.state.pipette_migration = {"status": "failed", "error": str(exc)}
         raise RuntimeError(_startup_error) from exc
     try:
-        machine_snapshot = configure_oem_machine_snapshot_from_env(require_operator_label=True)
-        configure_oem_runtime_state_from_env(machine_snapshot)
+        machine_snapshot, calibration_runtime_store, settings_service = _configure_machine_calibration(runtime_root)
+        app.state.calibration_settings = settings_service
         # OEM BioXPMainWindow sets BoardTestMode only when the process command
         # line contains the separate token "boardtest".  It is not StartMode.
         board_test_mode = os.environ.get("BIOXP_BOARD_TEST_MODE", "").strip().lower() in {"1", "true", "yes", "boardtest"}
@@ -1219,6 +1236,12 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        calibration_close_error = None
+        if calibration_runtime_store is not None:
+            try:
+                await asyncio.to_thread(calibration_runtime_store.close)
+            except Exception as exc:
+                calibration_close_error = f"calibration store close: {exc}"
         if reference_recovery_task is not None and not reference_recovery_task.done():
             reference_recovery_task.cancel()
             await asyncio.gather(reference_recovery_task, return_exceptions=True)
@@ -1230,7 +1253,7 @@ async def lifespan(app: FastAPI):
         # waiter, but it cannot publish an owner after this shutdown completes.
         async with _tester_lock:
             async with _tester_transition_lock:
-                shutdown_errors = []
+                shutdown_errors = [calibration_close_error] if calibration_close_error else []
                 try:
                     await _stop_owned_camera_session(reason="lifespan shutdown")
                 except Exception as exc:
@@ -11995,6 +12018,28 @@ async def protocol_execute(req: ProtocolExecuteRequest):
         return JSONResponse(status_code=status, content=result)
     except ProtocolLiveContractError as exc:
         raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _calibration_settings_service() -> CalibrationSettingsService:
+    service = getattr(app.state, "calibration_settings", None)
+    if service is None:
+        raise HTTPException(status_code=503, detail="Machine calibration configuration is unavailable")
+    return service
+
+
+@app.get("/motion/oem/calibration_settings")
+async def calibration_settings_read():
+    """Read active and saved settings. No hardware read, motion or rebind."""
+    return await run_in_threadpool(_calibration_settings_service().read)
+
+
+@app.patch("/motion/oem/calibration_settings")
+async def calibration_settings_save(req: CalibrationSettingsPatch):
+    """Save final PositionTable values for next ordinary startup; no motion."""
+    try:
+        return await run_in_threadpool(_calibration_settings_service().save, req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

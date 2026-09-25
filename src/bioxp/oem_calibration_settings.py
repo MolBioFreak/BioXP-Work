@@ -30,8 +30,21 @@ PositionName = Literal[
 ]
 
 
+def _position_patch_schema(schema: dict) -> None:
+    # Omission means unchanged; explicit null is not an OEM integer. Keep the
+    # public schema aligned with the runtime validator so typed editors do not
+    # seed rejected null defaults into otherwise valid partial updates.
+    schema["minProperties"] = 2
+    for name, field in schema.get("properties", {}).items():
+        if name == "name":
+            continue
+        branches = field.pop("anyOf", ())
+        field.update(next(branch for branch in branches if branch.get("type") != "null"))
+        field.pop("default", None)
+
+
 class PositionCalibrationPatch(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, json_schema_extra=_position_patch_schema)
     name: PositionName
     x: OemInt32 | None = None
     y: OemInt32 | None = None

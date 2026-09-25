@@ -800,6 +800,7 @@ _LATCH_CAPABLE_INITIALIZATION_PATHS = {
 
 _NO_MOTION_PREPARATION_PATHS = {
     "/liquid/manual/compile",
+    "/motion/oem/calibration_settings",
     "/motion/oem/prepare_without_motion",
     "/motion/arm/strict_startup",
     # ClassMotor.setHome is a controller-coordinate write (SAP1=0), not a
@@ -829,7 +830,7 @@ def _safety(method: str, path: str) -> str:
     if any(token in lower for token in ("/stop", "/abort", "/cancel")) or lower == "/oem/runtime/events/pause":
         return "stop"
     if lower in _NO_MOTION_PREPARATION_PATHS:
-        return "service"
+        return "read_only" if method == "GET" else "service"
     if "constructor_pipettes" in lower:
         return "service" if method != "GET" else "read_only"
     if lower in _PIPETTE_QUERY_PATHS:
