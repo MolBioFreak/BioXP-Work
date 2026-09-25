@@ -352,6 +352,16 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
     from bioxp.protocols.executor import ProtocolExecutor
     from tests.test_deck_complete_admission import ready
     app, provider, primitive, references, root, _, calls, wire, transport = query_rig
+    store = app.state.operator_command_plane.store
+    provider.bind_pipette_collection_state_reader(api._pipette_collection_state)
+    from tests.test_deck_tip_query_publication import query
+    partial = getattr(request, 'param', None) == 'partial-clean-path'
+    # Publish the partial predecessor first, so ready's bootstrap cannot
+    # convert an already sourced canonical row into a full one.
+    if partial:
+        tip_query = query(query_rig, key='integrated-predecessor-tip-status')
+    else:
+        tip_query = None
     motor_leaf, raw_moves = ready((app, provider, primitive, references, root), monkeypatch, retained_rig)
     # Select the fixture's actual immutable serial206 configuration, as in
     # the native initializer tests; this is not motor setup/reference evidence.
@@ -376,10 +386,19 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
         reference_store=references)
     adapter.y_provider = provider.y_provider
     monkeypatch.setattr(api, '_get_tester', lambda: native.tester)
-    store = app.state.operator_command_plane.store
+    # The full predecessor is already bootstrapped by ready(); its query now
+    # publishes a fresh real collection claim without changing clean_path.
+    if not partial:
+        tip_query = query(query_rig, key='integrated-predecessor-tip-status')
+    assert tip_query is not None
+    assert tip_query['hardware_query_verified'] is True, tip_query
+    assert tip_query['semantic_query_response_verified'] is True, tip_query
+    assert tip_query['deck_state_publication']['status'] == 'published', tip_query
+    assert api._pipette_collection_state()['tip_exists'] is False
     primitive.calls.clear()
     machine = provider._load_state()
     machine['machine_status']['GripperVersion'] = 1
+    machine['machine_status']['thermal_door_open'] = False  # Matches the synthetic closed-position leaf.
     provider._save_state(machine)  # Synthetic configuration, not observed hardware.
     if getattr(request, 'param', None) == 'partial-clean-path':
         # Explicit offline partial predecessor, built through real publishers.
@@ -401,9 +420,38 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
                 updates=updates, **stamps)
         assert store.deck_semantic_state()['clean_path'] is None
     else:
-        qualify_full_predecessor((provider, primitive, retained_rig[2], references, store, root))
+        # ready() has already published a canonical predecessor. This is not
+        # the cold-bootstrap scenario covered by qualify_full_predecessor.
+        # Set this fixture's explicit synthetic initial values through the
+        # real publishers, not a legacy machine_status overwrite ignored by SQL.
+        from tests.test_deck_scoped_authority import qualify_test_references
+        from bioxp.oem_deck_movement import OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS
+        qualify_test_references(references)
         stamps = provider.deck_owner_authority_stamps()
-        provider.refresh_deck_semantic_bootstrap(expected_generation=stamps['ownership_generation'])
+        provider.bind_tip_tray_state_reader(store.tip_tray_state)
+        store.publish_tip_tray_transition(tray_id=0, transition='construct',
+            operation_id='integration-fixture-0', command_id='integration-fixture-0',
+            provenance={'synthetic_test_inventory': True}, **stamps)
+        before_revision = store.deck_semantic_state()['semantic_state_revision']
+        predecessor = (
+            ('updateLocation', {'current_location': 'LOC_PARK', 'current_well': 0}),
+            ('pipette_owner', {'tip_loaded': False, 'tip_dirty': False, 'tip_location': -1}),
+            ('clean_path_calculation', {'clean_path': False}),
+            # Synthetic thermal leaf starts at its closed position zero.
+            ('updateThermalDoorOpen', {'thermal_door_open': False}),
+            ('plate_operation', {'plate_on_gantry': None}),
+            ('updatePlateLocation', {'movable_plate_locations': dict(OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS)}),
+        )
+        for operation, updates in predecessor:
+            store.publish_deck_owner_state(source_operation=operation,
+                source_command_id='offline-full-predecessor:' + operation,
+                updates=updates, **stamps)
+        snapshot = provider.deck_authority_snapshot(
+            expected_generation=int(provider.generation_provider()), target='LOC_PARK')
+        assert snapshot['machine_state_revision'] == before_revision + len(predecessor)
+        assert snapshot['current_location_id'] == 'LOC_PARK' and snapshot['latch_status'] is True
+        assert sum(c[0] == 'latch' for c in primitive.calls) == 1
+        assert provider._load_state()['machine_status'].get('construction_id') == machine['machine_status'].get('construction_id')
     for tray in range(1, 4):
         store.publish_tip_tray_transition(tray_id=tray, transition='construct',
             operation_id=f'integration-fixture-{tray}', command_id=f'integration-fixture-{tray}',
@@ -459,6 +507,12 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
     # The provider captures this dependency at construction; bind its genuine
     # generation reader to the same native adapter, never a fixed epoch.
     monkeypatch.setattr(provider, 'preparation_provider', adapter)
+    if getattr(request, 'param', None) == {'cold_transport': True}:
+        # Predecessor query established a durable collection claim. Release
+        # only the synthetic CAN connections so run_job is the first driver
+        # acquisition in the explicitly cold-transport scenario.
+        transport.close()
+        assert all(channel._driver is None for channel in transport._transports)
     calls.clear()
     try:
         yield rig
