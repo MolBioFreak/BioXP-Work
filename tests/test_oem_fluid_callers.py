@@ -125,8 +125,10 @@ def test_reject_without_previous_revision_restores_absence(settings):
     assert settings.read()["saved_revision"] is None
 
 
-def test_absent_backup_does_not_claim_user_acceptance(settings):
+def test_absent_backup_uses_oem_result_comparison_without_user_acceptance(settings):
     b, events = setup(settings, choice=True)
     r = calwith_fluid(b, settings, REF, machine_calibrated=False)
-    assert r["body_completed"] and r["outcome"] == "incomplete"
+    assert r["body_completed"] and r["outcome"] == "accepted_no_previous_values"
+    assert r["comparison_choice"] is True
+    assert r["comparison_source"] == "no_previous_values"
     assert ("compare", None) not in events and ("history", None) not in events

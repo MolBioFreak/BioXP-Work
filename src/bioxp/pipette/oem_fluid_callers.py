@@ -75,9 +75,10 @@ def calwith_fluid(bindings: FluidCallerBindings, settings: CalibrationSettingsSe
                   fluid_reference: Mapping[str, int], *, machine_calibrated: bool) -> dict[str, Any]:
     """Calibration worker body, after dialog backup/UI setup in the OEM outer click.
 
-    `compare` supplies the explicit acceptance choice (True, False, or None).
+    `compare` supplies the comparison choice (True, False, or None) if the OEM
+    backed up a previously calibrated machine. Without a backup, OEM
+    resultComparison() returns true without opening a comparison dialog.
     `restore` must atomically reinstate the prior saved revision, including None.
-    Without a decision/restore, the outcome is incomplete, never accepted.
     """
     before = settings.read()
     measurements: list[dict[str, Any]] = []
@@ -145,7 +146,12 @@ def calwith_fluid(bindings: FluidCallerBindings, settings: CalibrationSettingsSe
             required("completed")()
             # OEM compares even after a body failure. Backup exists only when
             # m_calibrated==1; absent backup yields OEM's true, not user consent.
-            if machine_calibrated and bindings.compare is not None:
+            if not machine_calibrated:
+                result["comparison_choice"] = True
+                result["comparison_source"] = "no_previous_values"
+                if result["body_completed"]:
+                    result["outcome"] = "accepted_no_previous_values"
+            elif bindings.compare is not None:
                 choice = bindings.compare(before, settings.read())
                 result["comparison_choice"] = choice
                 if choice is True and result["body_completed"]:
