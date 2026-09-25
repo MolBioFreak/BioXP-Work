@@ -19,7 +19,8 @@ def test_load_tips_missing_owner_does_not_return_success(rig):
 
 
 @pytest.mark.parametrize("rgb_false", [False, True])
-def test_source_force_new_tip_provider_connected(rig, monkeypatch, tmp_path, rgb_false):
+@pytest.mark.parametrize("initial_loaded", [False, True])
+def test_source_force_new_tip_provider_connected(rig, monkeypatch, tmp_path, rgb_false, initial_loaded):
     p = rig.provider
     from bioxp.pipette.receipts import PipetteReceiptStore
     from bioxp.services.pipette_service import run_pipette_operation
@@ -61,20 +62,24 @@ def test_source_force_new_tip_provider_connected(rig, monkeypatch, tmp_path, rgb
     p.publish_tip_tray_transition(tray_id=0, transition="construct",
         operation_id="offline-load:construct", command_id="offline-load",
         provenance={"source_operation": "ClassMachineStatus.constructor"})
-    # The source first queries an empty pipette, then queries after pickup.
+    # The source queries existing tips first, optionally ejects, then picks up.
     for t in rig.group._transports:
-        t._tip_loaded = False
-    rig.group._tip_type = 201
+        t._tip_loaded = initial_loaded
+    rig.group._tip_type = 50 if initial_loaded else 201
     calls = []
     for driver in rig.drivers:
         def query(d=driver):
             calls.append(d.channel)
-            loaded = len(calls) > 4
+            loaded = (len(calls) <= 8 or len(calls) > 12) if initial_loaded else len(calls) > 4
             d.events.append(("query", d.channel))
             return {"ok": True, "semantic_ok": True, "tip_loaded": loaded,
                 "source_return_completed": True, "source_return": int(loaded),
                 "source_tip_loaded": loaded, "hardware_truth_level": "hardware_query"}
         monkeypatch.setattr(driver, "query_tip_status", query)
+        def eject(d=driver):
+            d.events.append(("eject", d.channel))
+            return {"ok": True, "outcome": "completed"}
+        monkeypatch.setattr(driver, "pipette_eject_tip", eject, raising=False)
     plan = compile_finite_plate_operation("pipette_load_tips", source_leaf_available=True,
                                           tip_type=50, force_new_tip=True)
     try:
@@ -87,11 +92,14 @@ def test_source_force_new_tip_provider_connected(rig, monkeypatch, tmp_path, rgb
     assert body["source_return"] is True
     assert body["selected_tray"] == 0 and body["selected_group"] == 0
     assert calls[:8] == [0, 1, 2, 3] * 2
+    assert len([event for event in rig.drivers[0].events if event[0] == "eject"]) == (4 if initial_loaded else 0)
     assert body["steps"][1]["result"]["source_children"][0]["ok"] is not rgb_false
     journal = receipt_store.read(limit=100)
-    assert len(journal) == 3
+    assert len(journal) == (4 if initial_loaded else 3)
     assert len({row["command_id"] for row in receipt_store.connection.execute(
-        "SELECT command_id FROM pipette_operations")}) == 3
+        "SELECT command_id FROM pipette_operations")}) == (4 if initial_loaded else 3)
     assert rig.store.tip_tray_state(0)["occupancy"][0] is False
     names = [step["operation"] for step in body["steps"]]
+    if initial_loaded:
+        assert names.index("ejectAllTips") < names.index("MoveZHome.before")
     assert names.index("MoveZHome.before") < names.index("scriptmoveTo.tray") < names.index("lowerPipette") < names.index("MoveZHome.after") < names.index("removeTip.loaded")
