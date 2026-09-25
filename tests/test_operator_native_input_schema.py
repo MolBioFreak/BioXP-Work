@@ -68,6 +68,13 @@ def test_catalog_retains_nullable_native_objects_and_large_defaults():
     assert locations["source"] == {"location": "body", "wire_name": "source"}
 
 
+def test_reference_shaped_default_remains_literal_request_data():
+    literal = {"$ref": "#/components/schemas/Target"}
+    schema = {"type": "object", "default": literal, "examples": [literal]}
+    document = {"components": {"schemas": {"Target": {"type": "string"}}}}
+    assert native_form_schema(schema, document) == schema
+
+
 def test_schema_metadata_never_becomes_wire_input():
     specs, locations = _extract_inputs({"parameters": [{"name": "channel", "in": "path", "required": True, "schema": {"type": "integer", "enum": [0, 1, 2, 3]}}]}, {})
     assert specs[0]["json_schema"]["enum"] == [0, 1, 2, 3]

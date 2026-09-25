@@ -23,7 +23,12 @@ def native_form_schema(schema: Mapping[str, Any], document: Mapping[str, Any]) -
 
     def visit(value: Any) -> Any:
         if isinstance(value, Mapping):
-            result = {key: visit(item) for key, item in value.items() if key != "$ref"}
+            # These keywords contain literal request data, not subschemas.
+            literals = {"default", "const", "enum", "examples", "example"}
+            result = {
+                key: deepcopy(item) if key in literals else visit(item)
+                for key, item in value.items() if key != "$ref"
+            }
             reference = value.get("$ref")
             if isinstance(reference, str):
                 prefix = "#/components/schemas/"
