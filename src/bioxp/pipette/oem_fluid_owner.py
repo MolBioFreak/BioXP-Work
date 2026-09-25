@@ -187,8 +187,9 @@ def run_calwith_fluid_inline(provider: Any, *, command_id: str,
         nested = identity(name)
         provider._wp8_execution_fence_checker(command_id, boundary=nested["source_identity"])
         raw = record(name, call())
-        if not isinstance(raw, Mapping) or raw.get("ok") is not True:
-            raise RuntimeError(f"calwithFluid:{name}:controller_failed")
+        # setMaxAcc and the sleep in this caller are void OEM calls. Preserve
+        # the returned controller evidence, but do not make a false receipt a
+        # new source refusal; actual exceptions still unwind as in ControlLib.
         return dict(raw)
 
     def scan(plate: str, speed: int, transfer: bool, skip: int) -> dict[str, Any]:
@@ -203,24 +204,22 @@ def run_calwith_fluid_inline(provider: Any, *, command_id: str,
         return raw
 
     def tips_exist() -> bool:
-        nested = identity("TipExist")
-        provider._wp8_execution_fence_checker(command_id, boundary=nested["source_identity"])
-        raw = record("TipExist", provider._manual_pipette_receipt_runner(
-            "query_all_pipette_tip_states", lambda transport: transport.query_tip_status_all(),
-            command_id, nested, {"source": "ControlLib.calwithFluid:TipExist"}))
-        if raw.get("ok") is not True:
-            raise RuntimeError("calwithFluid:TipExist:query_failed")
-        return any(row["tip_loaded"] for row in raw["channels"])
+        # ClassPipetteCollection.TipExist reads cached TipLoaded fields; it
+        # does not send a fresh status query or require a readback contract.
+        raw = provider.primitives.pipette_transport.get_status()
+        loaded = any(row["tip_loaded"] for row in raw["channels"])
+        record("TipExist", {"tip_exists": loaded, "source": "cached_transport_state"})
+        return loaded
 
     def eject() -> None:
         nested = identity("ejectAllTips")
         provider._wp8_execution_fence_checker(command_id, boundary=nested["source_identity"])
-        raw = record("ejectAllTips", provider._manual_pipette_receipt_runner(
+        record("ejectAllTips", provider._manual_pipette_receipt_runner(
             "eject_all_tips", lambda transport: transport.eject_all_tips(
                 check_missing_tip=True, wait=True, channels=None), command_id, nested,
             {"source": "ControlLib.calwithFluid:finally"}))
-        if raw.get("ok") is not True:
-            raise RuntimeError("calwithFluid:ejectAllTips:failed")
+        # OEM discards ejectAllTips's Boolean. Keep its receipt, then execute
+        # the rest of the finally unless the call itself raised an exception.
 
     def reset_status() -> None:
         # ClassMachineStatus.resetStatus:655-689 reloads five tip trays,
@@ -273,7 +272,8 @@ def run_calwith_fluid_inline(provider: Any, *, command_id: str,
     )
     controller("setMaxAcc(z):outer", lambda: provider.primitives.z_set_max_acc(176))
     result = calwith_fluid(bindings, calibration_settings,
-        calibration_settings.active_snapshot.fluid_reference, machine_calibrated=True)
+        calibration_settings.active_snapshot.fluid_reference,
+        machine_calibrated=calibration_settings.active_snapshot.machine_calibrated)
     # A source finally exception can skip the worker's normal final readback;
     # retain the exact durable revision and comparison evidence regardless.
     saved = calibration_settings.read()

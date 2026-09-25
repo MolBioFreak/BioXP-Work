@@ -268,7 +268,9 @@ def bind_manual_physical_handler(*, command_store: Any, execute_plan: Callable,
                         raise RuntimeError("calibration settings service not bound")
                     provider._manual_calibration_settings = calibration_settings_getter()
             result = execute_plan(plan, action, state)
+        children = result.get("completed_children") or result.get("source_children") or []
+        saved_revision_id = (children[0].get("result") or {}).get("saved_revision_id") if children else None
         return {**dict(result), "physical_effect_verified": False,
                 "calibration_persisted": plan["operation"] == "source_calwith_fluid" and
-                result.get("source_children", [{}])[0].get("result", {}).get("saved_revision_id") is not None}
+                saved_revision_id is not None}
     return handle
