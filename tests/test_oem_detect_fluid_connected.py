@@ -27,7 +27,23 @@ def test_typed_diagnostic_is_one_finite_child():
         manual_physical_plan({"operation": "diagnostic_detect_fluid", "skip_steps": 12})
 
 
-@pytest.mark.parametrize("failure", [None, "second_catch", "third_scan"])
+def test_diagnostic_void_initiate_continues_pressure_sequence_after_wait_false(rig, monkeypatch):
+    streams = []
+    for driver in rig.drivers:
+        monkeypatch.setattr(driver, "pipette_initiate_group", lambda d=driver: {
+            **d.issue("WR"), "immediate_ack_received": True}, raising=False)
+        monkeypatch.setattr(driver, "wait_pipette_initialization_completion",
+                            lambda timeout: {"ok": False}, raising=False)
+        monkeypatch.setattr(driver, "enable_pressure_stream",
+                            lambda on, d=driver: (streams.append((d.channel, on)) or {"ok": True}), raising=False)
+    result = rig.group.initiate_group_once_for_oem_detect_fluid()
+    assert result["ok"] is False
+    assert result["outcome"] == "group_completion_timeout_or_error"
+    assert [row["result"]["ok"] for row in result["delayed_completions"]] == [False] * 4
+    assert streams == [(channel, True) for channel in range(4)] + [(channel, False) for channel in range(4)]
+
+
+@pytest.mark.parametrize("failure", [None, "initiate_boolean_false", "second_catch", "third_scan"])
 def test_diagnostic_real_provider_sqlite_and_transport_seams(rig, monkeypatch, tmp_path, failure):
     from tests.test_deck_tip_query_publication import bind_collection_test_identity
     bind_collection_test_identity(monkeypatch)
@@ -126,6 +142,10 @@ def test_diagnostic_real_provider_sqlite_and_transport_seams(rig, monkeypatch, t
                 return {**result, "ok": False}
             return result
         monkeypatch.setattr(driver, "wait_pipette_command_completion", fail_third_scan)
+    if failure == "initiate_boolean_false":
+        monkeypatch.setattr(rig.group, "initiate_group_once_for_oem_detect_fluid",
+            lambda: {"ok": False, "cycle": "detectFluid.initiateGroup",
+                     "outcome": "source_ignored_false_return"})
 
     doc = compile_manual_pipetting({"protocol_id": "detect", "steps": [
         {"operation": "diagnostic_detect_fluid"}]})
@@ -162,7 +182,7 @@ def test_diagnostic_real_provider_sqlite_and_transport_seams(rig, monkeypatch, t
         else:
             rows = (getattr(exc, "evidence", {}).get("failure_evidence") or [{}])
             body = rows[0].get("result") or {}
-        if failure:
+        if failure in {"second_catch", "third_scan"}:
             assert not body["completed"]
             assert not any(e["operation"] == "park_gantry" for e in body["events"])
             if failure == "second_catch":
@@ -180,7 +200,7 @@ def test_diagnostic_real_provider_sqlite_and_transport_seams(rig, monkeypatch, t
             (e.get("result") or {}).get("failed_child"), (e.get("result") or {}).get("error"),
             str((e.get("result") or {}).get("failure_evidence"))[:600],
             str(e.get("evidence"))[:400]) for e in body.get("events", [])]}))
-    assert failure is None, f"injected transport failure was not observed: BR={sum(e[0] == 'BR' for e in rig.events)}, moves={rig.native.moves[:12]}"
+    assert failure in {None, "initiate_boolean_false"}, f"injected transport failure was not observed: BR={sum(e[0] == 'BR' for e in rig.events)}, moves={rig.native.moves[:12]}"
     assert body["completed"], [(e["operation"], e.get("error"),
         (e.get("result") or {}).get("failed_child")) for e in body["events"]]
     assert result["calibration_persisted"] is False
@@ -193,6 +213,8 @@ def test_diagnostic_real_provider_sqlite_and_transport_seams(rig, monkeypatch, t
     assert len(ids) == len(set(ids))
     assert [e["result"]["cycle"] for e in body["events"] if e["operation"] == "initiateGroup"] == [
         "detectFluid.initiateGroup"]
+    if failure == "initiate_boolean_false":
+        assert [e["result"]["ok"] for e in body["events"] if e["operation"] == "initiateGroup"] == [False]
     assert p._manual_pipette_source_state.source_model.strips[1].strip_color == "X"
     assert len(receipts.read(limit=1000)) > 20
     keys = [row[0] for row in receipts.connection.execute("SELECT command_id FROM pipette_operations")]

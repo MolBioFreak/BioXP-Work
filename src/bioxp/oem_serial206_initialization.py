@@ -12702,14 +12702,14 @@ class Serial206OemInitializationProvider:
             return {**owner_identity, "source_identity":
                     f"{owner_identity['source_identity']}:detect:{serial}:{name}"}
 
-        def record(name: str, call: Any) -> Any:
+        def record(name: str, call: Any, *, ignored_result: bool = False) -> Any:
             nested = identity(name)
             self._wp8_execution_fence_checker(command_id, boundary=nested["source_identity"])
             try:
                 result = call(nested)
                 events.append({"operation": name, "source_identity": nested["source_identity"],
                                "result": result})
-                if isinstance(result, Mapping) and result.get("ok") is not True:
+                if not ignored_result and isinstance(result, Mapping) and result.get("ok") is not True:
                     raise RuntimeError(f"diagnostic_source_failure:{name}")
                 return result
             except Exception as exc:
@@ -12736,7 +12736,7 @@ class Serial206OemInitializationProvider:
             record("initiateGroup", lambda nested: self._manual_pipette_receipt_runner(
                 "initiate_group_once_for_oem_detect_fluid",
                 lambda transport: transport.initiate_group_once_for_oem_detect_fluid(),
-                command_id, nested, {"diagnostic": "detect_fluid"}))
+                command_id, nested, {"diagnostic": "detect_fluid"}), ignored_result=True)
 
         def mark_strip() -> None:
             # The source changes m_strip[1] in memory before the STRIP scan.
