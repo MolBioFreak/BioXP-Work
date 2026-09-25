@@ -12,6 +12,7 @@ from .oem_fluid_workflows import FluidScanBindings, z_offset
 from ..oem_compat.position_table import well_id_from_label
 from ..oem_deck_movement import compile_finite_plate_operation
 from ..services.pipette_service import build_oem_prefill_subprocedures
+from .oem_fluid_callers import FluidCallerBindings, calwith_fluid
 
 
 def run_z_offset_inline(provider: Any, *, plate: str, speed: int, transfer_fluid: bool,
@@ -148,3 +149,145 @@ def run_z_offset_inline(provider: Any, *, plate: str, speed: int, transfer_fluid
                         skip_steps=skip_steps)
     except CalibrationExecutionError as exc:
         return {**exc.evidence, "error": str(exc)}
+
+
+def run_calwith_fluid_inline(provider: Any, *, command_id: str,
+                             owner_identity: Mapping[str, Any], state: Any,
+                             pipette_settings: Mapping[str, Any],
+                             calibration_settings: Any) -> dict[str, Any]:
+    """ControlLib.calwithFluid under the ordinary finite protocol claim.
+
+    The WPF comparison dialog has no native operator choice here. Keep all
+    per-plate saved revisions and the prior revision visible; never infer an
+    acceptance decision from successful motion or a missing UI callback.
+    """
+    events: list[dict[str, Any]] = []
+    occurrence = 0
+
+    def identity(name: str) -> dict[str, Any]:
+        nonlocal occurrence
+        occurrence += 1
+        return {**owner_identity, "source_identity":
+                f"{owner_identity['source_identity']}:cal:{occurrence}:{name}"}
+
+    def record(name: str, result: Any) -> Any:
+        events.append({"operation": name, "result": result})
+        return result
+
+    def finite(name: str, **inputs: Any) -> dict[str, Any]:
+        nested = identity(name)
+        provider._wp8_execution_fence_checker(command_id, boundary=nested["source_identity"])
+        machine = provider.wp8_operation_machine_state(name, inputs)
+        plan = compile_finite_plate_operation(name, source_leaf_available=True,
+                                               **{**machine, **inputs})
+        return record(name, provider._wp8_execute_nested_plan(
+            plan=plan, command_id=command_id, owner_identity=nested))
+
+    def controller(name: str, call: Any) -> dict[str, Any]:
+        nested = identity(name)
+        provider._wp8_execution_fence_checker(command_id, boundary=nested["source_identity"])
+        raw = record(name, call())
+        if not isinstance(raw, Mapping) or raw.get("ok") is not True:
+            raise RuntimeError(f"calwithFluid:{name}:controller_failed")
+        return dict(raw)
+
+    def scan(plate: str, speed: int, transfer: bool, skip: int) -> dict[str, Any]:
+        nested = identity(f"zOffset:{plate}")
+        provider._wp8_execution_fence_checker(command_id, boundary=nested["source_identity"])
+        raw = record(f"zOffset:{plate}", run_z_offset_inline(provider, plate=plate,
+            speed=speed, transfer_fluid=transfer, skip_steps=skip,
+            command_id=command_id, owner_identity=nested, state=state,
+            settings=pipette_settings))
+        if raw.get("ok") is not True or type(raw.get("source_return")) is not int:
+            raise RuntimeError(f"calwithFluid:zOffset:{plate}:failed:{raw.get('error')}")
+        return raw
+
+    def tips_exist() -> bool:
+        nested = identity("TipExist")
+        provider._wp8_execution_fence_checker(command_id, boundary=nested["source_identity"])
+        raw = record("TipExist", provider._manual_pipette_receipt_runner(
+            "query_all_pipette_tip_states", lambda transport: transport.query_tip_status_all(),
+            command_id, nested, {"source": "ControlLib.calwithFluid:TipExist"}))
+        if raw.get("ok") is not True:
+            raise RuntimeError("calwithFluid:TipExist:query_failed")
+        return any(row["tip_loaded"] for row in raw["channels"])
+
+    def eject() -> None:
+        nested = identity("ejectAllTips")
+        provider._wp8_execution_fence_checker(command_id, boundary=nested["source_identity"])
+        raw = record("ejectAllTips", provider._manual_pipette_receipt_runner(
+            "eject_all_tips", lambda transport: transport.eject_all_tips(
+                check_missing_tip=True, wait=True, channels=None), command_id, nested,
+            {"source": "ControlLib.calwithFluid:finally"}))
+        if raw.get("ok") is not True:
+            raise RuntimeError("calwithFluid:ejectAllTips:failed")
+
+    def reset_status() -> None:
+        # ClassMachineStatus.resetStatus:655-689 reloads five tip trays,
+        # reconstructs plate/strip wells, and resets movable locations to
+        # source defaults. These are logical declarations, not physical proof.
+        from ..oem_job_preparation import (construct_new_machine_source_model,
+                                           reset_loaded_job_tip_inventory)
+        from ..oem_deck_movement import OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS
+        reset_loaded_job_tip_inventory(state, execute_native=lambda name, inputs, _: finite(name, **inputs))
+        defaults = construct_new_machine_source_model()
+        state.source_model.trays = defaults.trays
+        state.source_model.strips = defaults.strips
+        state.source_model.fluid_name = None
+        nested = identity("resetStatus:locations")
+        provider._wp8_execution_fence_checker(command_id, boundary=nested["source_identity"])
+        record("resetStatus", provider._wp8_publish_semantic(
+            operation="updatePlateLocation", updates={
+                "movable_plate_locations": dict(OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS)},
+            command_id=command_id, child_order=occurrence,
+            plan_digest=nested["source_identity"]))
+
+    bindings = FluidCallerBindings(
+        log_file=lambda: record("setFileName", {"path": r"c:\logfile\fluid-level.txt",
+                                                "log_only": True}),
+        initiate_group=lambda: None,
+        catch_plate=lambda plate: finite("catch_plate", plate=plate, run_in_parallel=False),
+        release_plate=lambda destination, press: finite("release_plate",
+            destination=destination, press_plate=press, run_in_parallel=False),
+        press_plates=lambda plates: finite("press_plates", plates=plates, run_in_parallel=False),
+        scan=scan, mark_strip=lambda: record("markStrip", _mark_calibration_strip(state)),
+        park=lambda: finite("park_gantry", rehome=False),
+        error=lambda name, exc: record("source_error", {"method": name, "message": str(exc),
+            "traceback": __import__("traceback").format_exception(exc)}),
+        reset_status=reset_status,
+        tip_exists=tips_exist,
+        move_waste=lambda: finite("pipette_waste", location=6, offset_x=0,
+                                  offset_y=0, run_in_parallel=False),
+        sleep_ms=lambda milliseconds: controller("Sleep", lambda: provider.wp8_sleep(
+            "Sleep", {"milliseconds": milliseconds})),
+        eject_tips=eject,
+        completed=lambda: record("Completed fluid calibration", {"log_only": True}),
+        finish_ui=lambda: record("finish_ui", {"ui_not_bound": True}),
+        set_z_acceleration=lambda value: controller("setMaxAcc(z)",
+            lambda: provider.primitives.z_set_max_acc(value)),
+        # No WPF comparison dialog is connected to a running finite claim.
+        compare=lambda before, after: record("comparison_pending", {
+            "before_revision_id": before["saved_revision_id"],
+            "after_revision_id": after["saved_revision_id"]}) and None,
+        restore=calibration_settings.restore,
+    )
+    controller("setMaxAcc(z):outer", lambda: provider.primitives.z_set_max_acc(176))
+    result = calwith_fluid(bindings, calibration_settings,
+        calibration_settings.active_snapshot.fluid_reference, machine_calibrated=True)
+    # A source finally exception can skip the worker's normal final readback;
+    # retain the exact durable revision and comparison evidence regardless.
+    saved = calibration_settings.read()
+    result.setdefault("saved_revision_id", saved["saved_revision_id"])
+    result.setdefault("pending_restart", saved["pending_restart"])
+    result.setdefault("comparison_choice", None)
+    return {**result, "ok": result["body_completed"] and "finalization_error" not in result,
+            "delivery_attempted": True, "source_events": events,
+            "comparison_gap": "OEM resultComparison requires an operator choice; no dialog is bound"
+                              if result.get("comparison_choice") is None else None,
+            "physical_effect_verified": False}
+
+
+def _mark_calibration_strip(state: Any) -> dict[str, Any]:
+    # m_strip[1] is the second strip, not the first tray or a physical read.
+    state.source_model.strips[1].strip_color = "X"
+    return {"strip_index": 1, "strip_color": "X", "logical_only": True}

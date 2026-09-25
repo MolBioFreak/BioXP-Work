@@ -105,8 +105,13 @@ class DiagnosticDetectFluid(_Request):
     operation: Literal["diagnostic_detect_fluid"]
 
 
+class ManualCalwithFluid(_Request):
+    operation: Literal["source_calwith_fluid"]
+
+
 ManualStep = Annotated[Union[ManualMove, ManualLower, ManualLift, ManualLiquid, ManualMix,
-    ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset, DiagnosticDetectFluid], Field(discriminator="operation")]
+    ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset, DiagnosticDetectFluid,
+    ManualCalwithFluid], Field(discriminator="operation")]
 
 
 class ManualPipettingRequest(_Request):
@@ -139,7 +144,8 @@ def compile_manual_pipetting(request: ManualPipettingRequest | Mapping[str, Any]
     for index, step in enumerate(req.steps):
         if isinstance(step, (ManualMove, ManualLower, ManualLift)):
             add(ProtocolActionKind.PIPETTE_POSITION, step.model_dump(), index)
-        elif isinstance(step, (ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset, DiagnosticDetectFluid)):
+        elif isinstance(step, (ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset,
+                               DiagnosticDetectFluid, ManualCalwithFluid)):
             add(ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL, step.model_dump(), index)
         elif isinstance(step, ManualLiquid):
             liquid(step.operation, step.channels, step.volume_ul, step.speed, index)
@@ -196,13 +202,15 @@ def bind_manual_position_handler(*, command_store: Any, execute_plan: Callable,
 def manual_physical_plan(params: Mapping[str, Any]) -> dict[str, Any]:
     models = {"load_tip": ManualLoadTip, "measure_fluid_height": ManualMeasureFluidHeight,
               "source_fluid_offset": ManualFluidOffset,
-              "diagnostic_detect_fluid": DiagnosticDetectFluid}
+              "diagnostic_detect_fluid": DiagnosticDetectFluid,
+              "source_calwith_fluid": ManualCalwithFluid}
     try:
         model = models[params["operation"]]
     except (KeyError, TypeError):
         raise ValueError("unknown manual physical operation") from None
     step = model.model_validate(dict(params))
     operation = ("diagnostic_detect_fluid" if isinstance(step, DiagnosticDetectFluid) else
+                 "source_calwith_fluid" if isinstance(step, ManualCalwithFluid) else
                  "manual_load_tip" if isinstance(step, ManualLoadTip) else
                  "source_fluid_offset" if isinstance(step, ManualFluidOffset) else "measure_fluid_height")
     return compile_finite_plate_operation(operation, source_leaf_available=True,
@@ -211,7 +219,7 @@ def manual_physical_plan(params: Mapping[str, Any]) -> dict[str, Any]:
 
 def bind_manual_physical_handler(*, command_store: Any, execute_plan: Callable,
         require_motion_ready: Callable[[], None], provider_getter: Callable,
-        receipt_store_getter: Callable) -> Callable:
+        receipt_store_getter: Callable, calibration_settings_getter: Callable | None = None) -> Callable:
     """Ordinary native binding; receipt work runs inline inside the finite owner.
 
     No fake OEM opcode/arguments, separate scheduler, or request-selected callback.
@@ -241,7 +249,7 @@ def bind_manual_physical_handler(*, command_store: Any, execute_plan: Callable,
             command_store.assert_workflow_current(state.job_id)
             provider = provider_getter()
             provider._manual_pipette_receipt_runner = receipt
-            if plan["operation"] in {"source_fluid_offset", "diagnostic_detect_fluid"}:
+            if plan["operation"] in {"source_fluid_offset", "diagnostic_detect_fluid", "source_calwith_fluid"}:
                 from .runtime_state import get_active_oem_runtime_state_store
                 from .pipette.manual_settings import read_pipette_operation_settings
                 from .oem_job_preparation import construct_new_machine_source_model
@@ -255,6 +263,12 @@ def bind_manual_physical_handler(*, command_store: Any, execute_plan: Callable,
                 provider._manual_pipette_source_state = state
                 provider._manual_pipette_source_settings = read_pipette_operation_settings(
                     get_active_oem_runtime_state_store())["runtime_values"]
+                if plan["operation"] == "source_calwith_fluid":
+                    if calibration_settings_getter is None:
+                        raise RuntimeError("calibration settings service not bound")
+                    provider._manual_calibration_settings = calibration_settings_getter()
             result = execute_plan(plan, action, state)
-        return {**dict(result), "physical_effect_verified": False, "calibration_persisted": False}
+        return {**dict(result), "physical_effect_verified": False,
+                "calibration_persisted": plan["operation"] == "source_calwith_fluid" and
+                result.get("source_children", [{}])[0].get("result", {}).get("saved_revision_id") is not None}
     return handle

@@ -11480,6 +11480,7 @@ def _protocol_live_manual_physical_handler(action, state):
         require_motion_ready=_require_motion_route_ready,
         provider_getter=lambda: _serial206_oem_initialization_provider,
         receipt_store_getter=lambda: _pipette_receipts,
+        calibration_settings_getter=_calibration_settings_service,
     )
     return handler(action, state)
 

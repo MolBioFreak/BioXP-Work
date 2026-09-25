@@ -4503,6 +4503,7 @@ class Serial206OemInitializationProvider:
         "sourceLoadTips": "wp8_load_tips",
         "sourceMeasureFluidHeight": "wp8_manual_pipette_physical",
         "sourceFluidOffset": "wp8_source_fluid_offset",
+        "sourceCalwithFluid": "wp8_source_calwith_fluid",
         "sourceWellPierced": "wp8_pipette_source_leaf",
         "sourceLiftTo": "wp8_pipette_source_leaf",
         "sourceLowerTo": "wp8_pipette_source_leaf",
@@ -12761,6 +12762,17 @@ class Serial206OemInitializationProvider:
         ))
         return {**result, "ok": result["completed"], "events": events,
                 "delivery_attempted": True}
+
+    def wp8_source_calwith_fluid(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        """Run the source worker and its nested operations inside this claim."""
+        from .pipette.oem_fluid_owner import run_calwith_fluid_inline
+        return run_calwith_fluid_inline(self, command_id=command_id,
+            owner_identity=owner_identity, state=self._manual_pipette_source_state,
+            pipette_settings=self._manual_pipette_source_settings,
+            calibration_settings=self._manual_calibration_settings)
 
     def wp8_manual_pipette_physical(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,

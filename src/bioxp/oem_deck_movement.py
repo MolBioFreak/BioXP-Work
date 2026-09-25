@@ -1106,6 +1106,7 @@ OEM_PIPETTE_LEAVES = {
     "manual_load_tip": ("sourceManualLoadTip", ("tray", "well", "overpress", "lift_z")),
     "measure_fluid_height": ("sourceMeasureFluidHeight", ("speed",)),
     "source_fluid_offset": ("sourceFluidOffset", ("plate", "speed", "transfer_fluid", "skip_steps")),
+    "source_calwith_fluid": ("sourceCalwithFluid", ()),
     "pipette_script_move": ("scriptmoveTo", ("destination", "column", "row", "position_flag", "run_in_parallel")),
     "pipette_location": ("updateLocation", ("destination", "well")),
     "pipette_tip_state": ("sourceTipState", ("changes",)),
@@ -1394,7 +1395,7 @@ def _compile_finite_plate_operation_unchecked(
 
     if operation == "catch_plate":
         plate = int(inputs.get("plate", 0))
-        location = int(inputs.get("plate_location", inputs.get("location", 0)))
+        location = int(inputs.get("plate_location") if inputs.get("plate_location") is not None else inputs.get("location", 0))
         destination = {1: 21, 2: 23, 0: 25}.get(location, location)
         door_open = inputs.get("thermal_door_open")
         if type(door_open) is not bool:
@@ -1424,7 +1425,8 @@ def _compile_finite_plate_operation_unchecked(
         _wp8_child(children, "SnapshotImage", arguments={"name": "CatchPlate"}, ignored_return=True)
         _wp8_child(children, "Sleep", arguments={"milliseconds": 100})
         _wp8_child(children, "led2Off", ignored_return=True)
-        offset = -30236 if destination == 25 and int(inputs.get("output_plate_location", -1)) in {25, 0} else 0
+        output_location = inputs.get("output_plate_location")
+        offset = -30236 if destination == 25 and output_location in {25, 0} else 0
         _wp8_child(children, "moveZ", arguments={"location": destination, "z_low_offset": offset})
         _wp8_child(children, "Sleep", arguments={"milliseconds": 100})
         if plate == 0:
@@ -1448,7 +1450,8 @@ def _compile_finite_plate_operation_unchecked(
     if operation == "release_plate":
         destination = int(inputs["destination"])
         parallel = bool(inputs.get("run_in_parallel", True))
-        offset = -30236 if destination == 25 and int(inputs.get("plate_on_gantry", -1)) == 1 and int(inputs.get("output_plate_location", -1)) in {25, 29} else 0
+        offset = (-30236 if destination == 25 and inputs.get("plate_on_gantry") == 1
+                  and inputs.get("output_plate_location") in {25, 29} else 0)
         _wp8_child(children, "scriptmoveTo", arguments={"destination": destination, "well": 0, "position_flag": 0}, ignored_return=True)
         _wp8_child(children, "moveZLow", arguments={"location": destination, "z_low_offset": offset})
         _wp8_child(children, "Sleep", arguments={"milliseconds": 5})
