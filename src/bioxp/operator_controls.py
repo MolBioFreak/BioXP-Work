@@ -801,6 +801,8 @@ _LATCH_CAPABLE_INITIALIZATION_PATHS = {
 _NO_MOTION_PREPARATION_PATHS = {
     "/liquid/manual/compile",
     "/motion/oem/calibration_settings",
+    "/motion/oem/pipette/tip_tray_set",
+    "/liquid/pipette/settings",
     "/motion/oem/prepare_without_motion",
     "/motion/arm/strict_startup",
     # ClassMotor.setHome is a controller-coordinate write (SAP1=0), not a

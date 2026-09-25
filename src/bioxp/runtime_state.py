@@ -507,6 +507,15 @@ class OemRuntimeStateStore:
     def write_operation_parameters(self, data: bytes, *, writer: str, call_path: str) -> RuntimeStateTransaction:
         return self.write_record("appdata/Operation_parameters.xml", data, writer=writer, call_path=call_path)
 
+    def update_operation_parameters(self, transform, *, writer: str, call_path: str) -> RuntimeStateTransaction:
+        """Serialize a read/modify/write under the canonical record's transaction owner."""
+        with self._lock, self._transaction_guard():
+            before = self._verified_read("appdata/Operation_parameters.xml")
+            return self.write_record(
+                "appdata/Operation_parameters.xml", transform(before), writer=writer,
+                call_path=call_path, _transaction_guard_held=True,
+            )
+
     def write_process_times(self, data: bytes, *, writer: str, call_path: str) -> RuntimeStateTransaction:
         return self.write_record("appdata/processtime.xml", data, writer=writer, call_path=call_path)
 

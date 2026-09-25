@@ -35,7 +35,11 @@ from .reference_recovery import ReferenceRecoveryMonitor
 from .lifecycle_state import LifecycleStateError, lifecycle_state
 from .oem_machine_bundle import configure_oem_machine_snapshot_from_env
 from .oem_calibration_settings import CalibrationSettingsPatch, CalibrationSettingsService
-from .runtime_state import configure_oem_runtime_state_from_env
+from .runtime_state import configure_oem_runtime_state_from_env, get_active_oem_runtime_state_store
+from .pipette.manual_settings import (
+    ManualTipTraySet, PipetteOperationSettingsPatch, manual_tip_tray_set,
+    read_pipette_operation_settings, save_pipette_operation_settings,
+)
 from .oem_axis_diagnostics import AxisDiagnosticContractError, diagnostic_catalog, resolve_axis_diagnostic
 from .oem_gripper import (
     gripper_clear,
@@ -12040,6 +12044,33 @@ async def calibration_settings_save(req: CalibrationSettingsPatch):
     """Save final PositionTable values for next ordinary startup; no motion."""
     try:
         return await run_in_threadpool(_calibration_settings_service().save, req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/motion/oem/pipette/tip_tray_set")
+async def pipette_tip_tray_set(req: ManualTipTraySet):
+    """Capture controller Z once, save both OEM tray rows for next startup."""
+    service = _calibration_settings_service()
+    provider = _require_serial206_oem_initialization_provider("initialize_motors")
+    try:
+        return await run_in_threadpool(
+            manual_tip_tray_set, req, service,
+            lambda: provider.primitives._read_axis_position("z"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/liquid/pipette/settings")
+async def pipette_operation_settings_read():
+    return await run_in_threadpool(read_pipette_operation_settings, get_active_oem_runtime_state_store())
+
+
+@app.patch("/liquid/pipette/settings")
+async def pipette_operation_settings_save(req: PipetteOperationSettingsPatch):
+    try:
+        return await run_in_threadpool(save_pipette_operation_settings, get_active_oem_runtime_state_store(), req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
