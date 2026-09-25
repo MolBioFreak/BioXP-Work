@@ -14519,7 +14519,8 @@ class Serial206OemInitializationProvider:
             # Keep canonical owner authorization unchanged for every handler.
             plan_digest=(source_plan_identity if operation in {
                 "updateLocation", "updatePlateLocation", "updateThermalDoorOpen",
-                "clearTipLoaded", "sourceTipState", "inspectCoverAt", "SnapshotImage",
+                "clearTipLoaded", "sourceTipState", "sourceTipTransition",
+                "sourceWellPierced", "inspectCoverAt", "SnapshotImage",
                 "startMoveZPseudoHome", "startGripperHomeAndUnlock",
                 "backgroundGripperHomeAndUnlock", "waitMoveZOnly",
             } else owner_plan_digest),

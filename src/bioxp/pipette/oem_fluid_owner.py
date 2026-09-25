@@ -76,11 +76,30 @@ def run_z_offset_inline(provider: Any, *, plate: str, speed: int, transfer_fluid
     source = provider.build_oem_pipette_source_callbacks(
         execute_plan=execute_plan, start_child=lambda *args: None,
         stopped=lambda: False, settings=settings)
+    from dataclasses import replace
+    from ..oem_compat.position_table import load_bound_oem_position_table
+    from ..oem_compat.pathing import LOCATION_ID_TO_NAME
+
+    def source_facts(action: Any, runtime_state: Any) -> dict[str, Any]:
+        machine = provider.mov_execution_machine_state()
+        status = provider.primitives.pipette_transport.get_status()
+        channel = status["channels"][0]
+        location = machine["current_location"]
+        location_name = LOCATION_ID_TO_NAME[location]
+        position = load_bound_oem_position_table().resolve(location_id=location_name)
+        return {"current_location": location, "current_well": machine["current_well"],
+            "current_tray": provider._deck_semantic_state_reader().get("current_tray"),
+            "tip_type": status["tip_type"],
+            "tip_location": machine["tip_location"], "fluid_level": channel["liquid_level_ul"],
+            "speed": channel["top_speed"], "current_location_name": location_name,
+            "z_high": position.z_high}
+
+    source_bindings = replace(source["source_bindings"], facts=source_facts)
     aspirate, dispense = build_oem_prefill_subprocedures(
         state=state, source_occurrence_id=base,
         before_native_entry=lambda label, runtime_state: fence(label),
         pipette_call=lambda name, call, action, runtime_state, step_id: receipt(name, call),
-        source_bindings=source["source_bindings"], settings=settings)
+        source_bindings=source_bindings, settings=settings)
 
     def move(destination: int, well: str | int, flag: int) -> dict[str, Any]:
         value = well_id_from_label(well)

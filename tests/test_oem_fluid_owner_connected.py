@@ -28,7 +28,9 @@ def test_typed_manual_scan_compiles_one_finite_child_without_execution():
         manual_physical_plan({**step, "tip_loaded": True})
 
 
-def test_inline_scan_under_one_owner_with_distinct_source_occurrences(rig, monkeypatch, tmp_path):
+@pytest.mark.parametrize("plate,transfer_fluid", [("STRIP", False), ("RC", True)])
+def test_inline_scan_under_one_owner_with_distinct_source_occurrences(rig, monkeypatch, tmp_path,
+                                                                      plate, transfer_fluid):
     from tests.test_deck_tip_query_publication import bind_collection_test_identity
     bind_collection_test_identity(monkeypatch)
     monkeypatch.setattr(socket, "socket", lambda family=socket.AF_INET, *a, **kw:
@@ -42,7 +44,12 @@ def test_inline_scan_under_one_owner_with_distinct_source_occurrences(rig, monke
     p = rig.provider
     p._wp8_execution_fence_checker = lambda *a, **kw: None
     p._oem_pipette_rgb_writer = lambda *a: {"ok": True}
-    p._manual_pipette_source_state = SimpleNamespace(source_model=None)
+    from bioxp.protocols.runtime_state import ProtocolSourceModel, SourceTray, SourceWell
+    model = ProtocolSourceModel()
+    if transfer_fluid:
+        model.trays["REAGENT_PLATE"] = SourceTray("REAGENT_PLATE", 3,
+            [SourceWell(None, 0.0, 200.0) for _ in range(96)])
+    p._manual_pipette_source_state = SimpleNamespace(source_model=model)
     p._manual_pipette_source_settings = {"LogPressure": False, "CheckForStaticTipLoss": False}
     p._read_constructed_tip_tray = lambda i: {"tip_type": "T50" if i == 0 else "T200",
         "location": 7 + i, "construction_id": "fixture", "tip_available": True,
@@ -84,11 +91,15 @@ def test_inline_scan_under_one_owner_with_distinct_source_occurrences(rig, monke
             return d.issue("eject", **kwargs)
         monkeypatch.setattr(driver, "query_tip_status", query)
         monkeypatch.setattr(driver, "pipette_eject_tip", eject, raising=False)
+        monkeypatch.setattr(driver, "aspirate", lambda volume, d=driver, **kw:
+            d.issue("aspirate", volume=volume, **kw), raising=False)
+        monkeypatch.setattr(driver, "dispense", lambda volume, d=driver, **kw:
+            d.issue("dispense_liquid", volume=volume, **kw), raising=False)
     plan = compile_finite_plate_operation("source_fluid_offset", source_leaf_available=True,
-        plate="STRIP", speed=300, transfer_fluid=False, skip_steps=12)
+        plate=plate, speed=300, transfer_fluid=transfer_fluid, skip_steps=12)
     try:
         result = p._wp8_execute_nested_plan(plan=plan, command_id="offset-parent",
-            owner_identity={"source_identity": "offset-parent:scan:STRIP"})
+            owner_identity={"source_identity": f"offset-parent:scan:{plate}"})
     except Exception as exc:
         evidence = getattr(exc, "evidence", {})
         body = (evidence.get("failure_evidence") or [{}])[0].get("result") or {}
@@ -97,14 +108,13 @@ def test_inline_scan_under_one_owner_with_distinct_source_occurrences(rig, monke
             "load_failures": [(s.get("result") or {}).get("error") for s in body.get("steps", []) if s["operation"] == "loadTips"],
             "ops": [s["operation"] for s in body.get("steps", [])],
             "failures": [(step["operation"], step.get("error"),
-                         [(row.get("operation"), row.get("error")) for row in
-                          ((step.get("evidence") or {}).get("failure_evidence") or [{}])[0].get("result", {}).get("steps", [])
-                          if row.get("error")]) for step in body.get("steps", []) if step.get("error")]}))
+                str(step.get("evidence"))[:500]) for step in body.get("steps", [])
+                         if step.get("error")]}))
     assert result["ok"], result
     body = result["source_children"][0]["result"]
     assert [s["well"] for s in body["samples"]] == ["A1", "B1"]
-    assert [s["operation"] for s in body["steps"]].count("loadTips") == 2
-    assert [s["operation"] for s in body["steps"]].count("ejectAllTips") == 2
+    assert [s["operation"] for s in body["steps"]].count("loadTips") == (3 if transfer_fluid else 2)
+    assert [s["operation"] for s in body["steps"]].count("ejectAllTips") == (3 if transfer_fluid else 2)
     assert body["source_return"] == 88000
     assert len(receipts.read(limit=100)) > 4
     keys = [row[0] for row in receipts.connection.execute(
