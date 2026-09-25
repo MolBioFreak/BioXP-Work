@@ -123,13 +123,13 @@ def run_z_offset_inline(provider: Any, *, plate: str, speed: int, transfer_fluid
                                       command_id=command_id, owner_identity=nested)
 
     def query() -> dict[str, Any]:
-        raw = receipt("query_tip_status_all", lambda t: t.query_tip_status_all())
-        channels = raw.get("channels")
-        if channels is None and isinstance(raw.get("result"), Mapping):
-            channels = raw["result"].get("channels")
-        return {"ok": raw.get("ok", True), "tip_exists": any(
-            isinstance(channel, Mapping) and channel.get("tip_loaded") is True
-            for channel in (channels or ())), "controller_evidence": raw}
+        # zOffset calls the same source queryTipStatus(-1) as loadTips. The
+        # generic all-channel query imposes a stricter readback contract that
+        # the OEM does not use here; keep its uncertainty in the child receipt.
+        raw = receipt("query_all_pipette_tip_states",
+                      lambda t: t.query_tip_status_for_oem_load_tips())
+        return {"ok": raw["ok"], "tip_exists": raw["source_tip_exists"],
+                "controller_evidence": raw}
 
     bindings = FluidScanBindings(
         facts=provider.mov_execution_machine_state,

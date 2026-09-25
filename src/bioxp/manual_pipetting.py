@@ -238,6 +238,14 @@ def bind_manual_physical_handler(*, command_store: Any, execute_plan: Callable,
             if plan["operation"] == "source_fluid_offset":
                 from .runtime_state import get_active_oem_runtime_state_store
                 from .pipette.manual_settings import read_pipette_operation_settings
+                from .oem_job_preparation import construct_new_machine_source_model
+                # The OEM ClassMachineStatus constructor always creates its
+                # logical plate/well objects, even for a diagnostic manual
+                # action without RunJob preparation. An ordinary manual
+                # document has no prepared source_model; model those default
+                # empty wells without asserting anything about physical fluid.
+                if not state.source_model.trays:
+                    state.source_model = construct_new_machine_source_model()
                 provider._manual_pipette_source_state = state
                 provider._manual_pipette_source_settings = read_pipette_operation_settings(
                     get_active_oem_runtime_state_store())["runtime_values"]

@@ -28,6 +28,39 @@ def test_typed_manual_scan_compiles_one_finite_child_without_execution():
         manual_physical_plan({**step, "tip_loaded": True})
 
 
+def test_manual_scan_handler_supplies_oem_constructor_logical_wells(monkeypatch):
+    from contextlib import nullcontext
+    from bioxp.manual_pipetting import bind_manual_physical_handler
+    from bioxp.protocols.runtime_state import ProtocolRuntimeState
+    doc = compile_manual_pipetting({"protocol_id": "manual-rc", "steps": [{
+        "operation": "source_fluid_offset", "plate": "RC", "speed": 300,
+        "transfer_fluid": True, "skip_steps": 12}]})
+    state = ProtocolRuntimeState.from_document(doc, dry_run=False, job_id="manual-rc-owner")
+    assert not state.source_model.trays
+    action = doc.stages[0].actions[0]
+    provider = SimpleNamespace()
+    store = SimpleNamespace(workflow_context=lambda *a, **kw: nullcontext(),
+                            assert_workflow_current=lambda *a: None)
+    monkeypatch.setattr("bioxp.runtime_state.get_active_oem_runtime_state_store", lambda: object())
+    monkeypatch.setattr("bioxp.pipette.manual_settings.read_pipette_operation_settings",
+                        lambda _: {"runtime_values": {"LogPressure": False,
+                                                       "CheckForStaticTipLoss": False}})
+    def execute(plan, action, runtime):
+        assert runtime is state
+        assert provider._manual_pipette_source_state is state
+        assert provider._manual_pipette_source_settings["LogPressure"] is False
+        wells = state.source_model.trays["REAGENT_PLATE"].wells
+        assert len(wells) == 96 and wells[0].volume == 0.0
+        assert wells[0].capacity == 1081.0
+        assert state.source_model.trays["TROUGH"].location == 16
+        assert plan["children"][0]["operation"] == "sourceFluidOffset"
+        return {"ok": True, "source_return": 88000}
+    handle = bind_manual_physical_handler(command_store=store, execute_plan=execute,
+        require_motion_ready=lambda: None, provider_getter=lambda: provider,
+        receipt_store_getter=lambda: None)
+    assert handle(action, state)["source_return"] == 88000
+
+
 @pytest.mark.parametrize("plate,transfer_fluid", [("STRIP", False), ("RC", True)])
 def test_inline_scan_under_one_owner_with_distinct_source_occurrences(rig, monkeypatch, tmp_path,
                                                                       plate, transfer_fluid):
