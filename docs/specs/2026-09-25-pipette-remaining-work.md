@@ -4,7 +4,7 @@
 
 ## Integrated local candidate (not installed)
 
-Robot `feat/oem-well-pipetting` at `43c5fdc`; BMS `integrate/pipette-bms-dev-20260925` at `8c46d8d`. **Neither is deployed or physically qualified.** These local commits supersede the older candidate hashes and uncommitted-fixture note below.
+Robot branch `feat/oem-well-pipetting`; BMS branch `integrate/pipette-bms-dev-20260925`. **Neither is deployed or physically qualified.** Earlier candidate hashes and fixture status are superseded.
 
 - BMS **Well pipetting** is mounted in the cockpit (`BioXpCockpit.tsx:1631–1634`). Its typed single/ordered steps submit through the existing BMS protocol relay to robot `/protocol/execute`. `manual_pipetting.py` binds actual selected location/well Move, calibrated in-place Lower/Lift, explicit-channel Aspirate/Dispense, and repeated-stroke Mix. Channels select plungers, **not** head alignment or source `TipLocation`; Mix is not OEM `mixAll`/`mmix`. No implicit tip pickup, initialization, sweep, cleanup or Park.
 - `load_tip` is a physical tray/well move/lower/query/optional lift in the ordinary finite owner. `measure_fluid_height` runs the BR/Z/completion/height sequence at the **current** well, without an XY move or calibration save (`pipette/oem_calibration.py`). Neither manufactures tip inventory or a calibrated result.
