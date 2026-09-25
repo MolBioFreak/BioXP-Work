@@ -18,7 +18,7 @@ from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .critical_logging import critical_receipt
 from .oem_runtime_types import OEMRuntimeSnapshot, utc_ts
@@ -4950,6 +4950,40 @@ class OEMRuntimeStore:
             "SELECT value FROM runtime_metadata WHERE key='runtime_sequence'"
         ).fetchone()
         return int(row[0]) if row is not None else 0
+
+    def read_machine_calibration_revision(self, baseline_lock_sha256: str) -> dict[str, Any] | None:
+        """User-authored config, never a serial206 hardware-authority record."""
+        key = "machine_calibration_v1:" + baseline_lock_sha256
+        with self._lock:
+            row = self._db.execute("SELECT value FROM runtime_metadata WHERE key=?", (key,)).fetchone()
+            return None if row is None else json.loads(row[0])
+
+    def update_machine_calibration_revision(
+        self,
+        baseline_lock_sha256: str,
+        update: Callable[[dict[str, Any] | None], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Merge and persist under the existing SQLite writer owner atomically."""
+        key = "machine_calibration_v1:" + baseline_lock_sha256
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute("SELECT value FROM runtime_metadata WHERE key=?", (key,)).fetchone()
+                payload = update(None if row is None else json.loads(row[0]))
+                encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                self._db.execute(
+                    "INSERT INTO runtime_metadata(key,value,updated_at) VALUES(?,?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                    (key, encoded, time.time()),
+                )
+                readback = self._db.execute("SELECT value FROM runtime_metadata WHERE key=?", (key,)).fetchone()[0]
+                if readback != encoded:
+                    raise RuntimeError("machine calibration save readback mismatch")
+                self._db.execute("COMMIT")
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
+            return json.loads(readback)
 
     def next_seq(self) -> int:
         with self._lock:
