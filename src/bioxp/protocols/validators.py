@@ -8,6 +8,7 @@ from .models import ProtocolActionKind, ProtocolDocument, OEM_OPERATION_FORMS, O
 
 _ACTION_CAPABILITY_MAP: dict[ProtocolActionKind, CapabilityName | None] = {
     ProtocolActionKind.MOVE: CapabilityName.MOTION,
+    ProtocolActionKind.PIPETTE_POSITION: CapabilityName.MOTION,
     ProtocolActionKind.HOME: CapabilityName.MOTION,
     ProtocolActionKind.PIPETTE_INIT: CapabilityName.PIPETTE,
     ProtocolActionKind.PIPETTE_TIP: CapabilityName.PIPETTE,

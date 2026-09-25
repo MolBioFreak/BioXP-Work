@@ -23,6 +23,7 @@ PROTOCOL_LIVE_RESERVATION_SCHEMA_VERSION = "bioxp.protocol_live_idempotency_rese
 LIVE_REFERENCE_REQUIRED_AXES = ("x", "y", "z")
 REFERENCE_REQUIRED_ACTION_KINDS = {
     ProtocolActionKind.MOVE,
+    ProtocolActionKind.PIPETTE_POSITION,
     ProtocolActionKind.PIPETTE_TIP,
     ProtocolActionKind.PIPETTE_ASPIRATE,
     ProtocolActionKind.PIPETTE_DISPENSE,

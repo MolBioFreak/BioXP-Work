@@ -11687,7 +11687,7 @@ class Serial206OemInitializationProvider:
         if operation not in WP8_OPERATION_INTENT_KEYS:
             raise RuntimeError(f"source_authority_missing:{operation}")
         from .oem_deck_movement import OEM_PIPETTE_LEAVES
-        if operation in OEM_PIPETTE_LEAVES or operation in {"pipette_shift_camera", "pipette_script_waste", "pipette_unlock", "park_gantry", "critical_item_images"}:
+        if operation in OEM_PIPETTE_LEAVES or operation in {"manual_pipette_move", "pipette_shift_camera", "pipette_script_waste", "pipette_unlock", "park_gantry", "critical_item_images"}:
             # These literal leaves resolve only their selected source facts at
             # native entry. Do not introduce a gripper GAP into every leaf.
             return {}

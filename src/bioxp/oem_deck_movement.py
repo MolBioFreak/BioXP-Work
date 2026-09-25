@@ -1132,6 +1132,7 @@ OEM_PIPETTE_LEAVES = {
 }
 
 FINITE_PLATE_OPERATIONS = frozenset({
+    "manual_pipette_move",
     "catch_plate", "release_plate", "park_gantry", "waste_sequence",
     "press_plate", "press_plates", "send_z_and_gripper_home", "thermal_door", "cleanup",
     "move_plate", "script_snapshot", "cut_seal", "shakeoff", "ordinary_pause_prepare", "critical_item_images",
@@ -1139,6 +1140,7 @@ FINITE_PLATE_OPERATIONS = frozenset({
 })
 
 WP8_OPERATION_INTENT_KEYS: Mapping[str, frozenset[str]] = {
+    "manual_pipette_move": frozenset({"location", "well", "position_flag"}),
     "move_plate": frozenset({"plate", "destination", "press_plate"}),
     "catch_plate": frozenset({"plate", "run_in_parallel"}),
     "release_plate": frozenset({"destination", "press_plate", "run_in_parallel"}),
@@ -1196,6 +1198,17 @@ def _compile_finite_plate_operation_unchecked(
         raise RuntimeError(f"source_authority_missing:{operation}")
     children: list[dict[str, Any]] = []
 
+    if operation == "manual_pipette_move":
+        # ControlLib.movExecution: scriptmoveTo then updateLocation, without
+        # piercing, job preparation, sweep, lid or Park. Geometry/custody remain
+        # owned by the existing scriptmoveTo provider and live PositionTable.
+        location, well = inputs["location"], well_id_from_label(inputs["well"])
+        _wp8_child(children, "scriptmoveTo", arguments={
+            "destination": location, "column": well % 12, "row": well // 12,
+            "position_flag": inputs["position_flag"], "run_in_parallel": True,
+        })
+        _wp8_child(children, "updateLocation", arguments={"destination": location, "well": well})
+        return _wp8_plan(operation, children)
     if operation == "preparation_force_high_home":
         _wp8_child(children, "sourceForceToHighHome", state_mutation={"pseudo_z_home": 500})
         return _wp8_plan(operation, children, source_caller="ControlLib.DefaultParameters.ForceToHighHome")
