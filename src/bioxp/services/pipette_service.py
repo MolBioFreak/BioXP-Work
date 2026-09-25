@@ -1006,6 +1006,19 @@ class _OemPipetteBody:
         speed = _source_option(o, "m_speed", 30.0)
         delay = int(_source_option(o, "m_delay", 1000.0))
         height = _source_option(o, "m_aspirateheight", -1.0)
+        return self._masp_transfer(volume, air, speed, delay, height)
+
+    def prefill_aspirate(self, volume):
+        # ControlLib:7752-7755 masp(100, v) -> masp(v, 10, 100, 0).
+        return self._masp_transfer(volume, 10.0, 100.0, 0, -1.0, prefill=True)
+
+    def _masp_transfer(self, volume, air, speed, delay, height, *, prefill=False):
+        def aspirate(amount):
+            if prefill:
+                return self.pipette("aspirate_for_oem_script", lambda t: t.aspirate_for_oem_script(
+                    amount, pressure_stream=self.settings["LogPressure"]))
+            return self.asp(amount, self.settings["LogPressure"])
+
         self.speed(speed)
         self.lift_air()
         self.air(air)
@@ -1014,12 +1027,12 @@ class _OemPipetteBody:
             if volume > 130.0 and tray in (0, 1):
                 half = volume / 2.0
                 self.lift(max(0, round(self.height(half)) - 6045))
-                self.asp(half, self.settings["LogPressure"])
+                aspirate(half)
                 self.fluid_name(); self.fluid(-half); self.delay(delay)
-                self.lower(); self.asp(half, self.settings["LogPressure"])
+                self.lower(); aspirate(half)
                 self.fluid(-half); self.delay(delay); self.lift(500); self.delay(300)
             else:
-                self.lower(); self.asp(volume, self.settings["LogPressure"])
+                self.lower(); aspirate(volume)
                 self.delay(delay); self.lift(500); self.delay(300)
                 self.fluid_name(); self.fluid(-volume)
         else:
@@ -1027,12 +1040,12 @@ class _OemPipetteBody:
             if volume > 130.0 and tray == 0:
                 half = volume / 2.0
                 self.lift(max(0, min(int(height), round(self.height(half)) + 6045)))
-                self.asp(half, self.settings["LogPressure"])
+                aspirate(half)
                 self.fluid_name(); self.fluid(-half); self.delay(delay)
-                self.lift(int(height)); self.asp(half, self.settings["LogPressure"])
+                self.lift(int(height)); aspirate(half)
                 self.fluid(-half); self.delay(delay); self.lift(max(500, int(height))); self.delay(300)
             else:
-                self.lift(int(height)); self.asp(volume, self.settings["LogPressure"])
+                self.lift(int(height)); aspirate(volume)
                 self.delay(delay); self.lift(max(500, int(height))); self.delay(300)
                 self.fluid_name(); self.fluid(-volume)
         self.pierced_after()
@@ -1048,21 +1061,35 @@ class _OemPipetteBody:
         dh = _source_option(o, "m_dispensehigh", False)
         heights = _source_option(o, "m_dispenseheight", -1.0)
         purge_speed = _source_option(o, "m_purgespeed", speed)
+        return self._mdsa_transfer(speed, delay, purge, ntd, dh, heights, purge_speed)
+
+    def prefill_dispense(self):
+        # ControlLib:7944-7947 mdsa(100) -> mdsa(100, 0), with defaults.
+        return self._mdsa_transfer(100.0, 0, True, False, False, -1.0, 30.0, prefill=True)
+
+    def _mdsa_transfer(self, speed, delay, purge, ntd, dh, heights, purge_speed, *, prefill=False):
+        def dispense(amount):
+            if prefill:
+                return self.pipette("dispense_for_oem_script", lambda t: t.dispense_for_oem_script(
+                    amount, pressure_stream=self.settings["LogPressure"]))
+            return self.dsp(amount, self.settings["LogPressure"])
+
         f = self.facts(); fluid = f["fluid_level"]
         if f["current_location"] == 32:
             raise ValueError("dispense to unknow location")
         self.speed(speed)
         high = (44346 if f["current_tray"] == 2 else 18141) if heights == -1.0 else int(heights * 2015.748)
         height = min(self.n.z_low(f["current_location"], self.action, self.state), high) if dh else round(self.height(self.volume()) - 2015.0)
-        self.lift(max(0, height))
         if fluid > 130.0 and f["current_tray"] in (0, 1):
             half = fluid / 2.0
-            self.dsp(half, self.settings["LogPressure"]); self.fluid(half)
+            self.lift(max(0, height))
+            dispense(half); self.fluid(half)
             self.lift(max(0, round(self.height(self.volume()) - 2015.0)))
-            self.dsp(fluid - half, self.settings["LogPressure"])
+            dispense(fluid - half)
             self.delay(delay); self.fluid(fluid - half)
         else:
-            self.dsp(fluid, self.settings["LogPressure"])
+            self.lift(max(0, height))
+            dispense(fluid)
             self.delay(delay); self.fluid(fluid)
         if purge:
             self.purge(purge_speed, ntd=ntd)
@@ -1439,6 +1466,44 @@ class _OemLifecycleContext:
     source_occurrence_id: str
     source_key: None = None
     params: Any = None
+
+
+def build_oem_prefill_subprocedures(
+    *, state: Any, source_occurrence_id: str, before_native_entry: Callable,
+    pipette_call: Callable, source_bindings: OemPipetteSourceBindings,
+    settings: Mapping[str, Any],
+) -> tuple[Callable[[int], dict[str, Any]], Callable[[], dict[str, Any]]]:
+    """Bind zOffset's two liquid calls inside the existing finite owner's claim.
+
+    The caller owns movement, tip loading and the scan. Each invocation gets a
+    distinct source identity, including repeated aliquots at the same well.
+    """
+    if not source_occurrence_id:
+        raise ValueError("prefill requires the finite owner's source identity")
+    occurrence = 0
+
+    def run(name, method, *args):
+        nonlocal occurrence
+        occurrence += 1
+        context = _OemLifecycleContext(
+            f"{source_occurrence_id}:prefill:{occurrence}:{name}", params={"arguments": ()})
+        body = _OemPipetteBody(context, state, source_bindings, pipette_call,
+                               before_native_entry, settings)
+        try:
+            result = method(body, *args)
+        except Exception as exc:
+            if not hasattr(exc, "oem_partial_results"):
+                setattr(exc, "oem_partial_results", list(body.steps))
+            raise
+        return {**result, "source_return": None}
+
+    def aspirate(volume):
+        return run("masp(100,v)", _OemPipetteBody.prefill_aspirate, volume)
+
+    def dispense():
+        return run("mdsa(100)", _OemPipetteBody.prefill_dispense)
+
+    return aspirate, dispense
 
 
 def build_oem_pipette_lifecycle_helpers(
