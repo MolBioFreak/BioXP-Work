@@ -1838,8 +1838,11 @@ class FourPipetteTransport:
         post_send_delay_s: float = 0.0,
         timeout_failure_sleep_s: float = 0.0,
         check_forceabort_after_wait: bool = False,
+        after_sends: Callable[[], None] | None = None,
+        set_allow_to_stop: bool = True,
     ) -> dict[str, Any]:
-        self._allow_to_stop = False
+        if set_allow_to_stop:
+            self._allow_to_stop = False
         rows: list[dict[str, Any]] = []
         operation_interrupt_epoch = self._interrupt_epoch
         try:
@@ -1861,6 +1864,12 @@ class FourPipetteTransport:
         except Exception as exc:
             self._last_error = {"operation": operation, "error": repr(exc), "channels": rows}
             raise
+
+        # ControlLib.detectFluidLevel starts Z only after all four BR owners
+        # are captured, before waiting. Keep motion outside the send lock so
+        # terminatecommands can interrupt it; the epoch below preserves Stop.
+        if after_sends is not None:
+            after_sends()
 
         completion_rows: list[dict[str, Any]] = []
         if defer_completion:
