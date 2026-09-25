@@ -1105,6 +1105,7 @@ OEM_PIPETTE_LEAVES = {
     "pipette_load_tips": ("sourceLoadTips", ("tip_type", "force_new_tip")),
     "manual_load_tip": ("sourceManualLoadTip", ("tray", "well", "overpress", "lift_z")),
     "measure_fluid_height": ("sourceMeasureFluidHeight", ("speed",)),
+    "source_fluid_offset": ("sourceFluidOffset", ("plate", "speed", "transfer_fluid", "skip_steps")),
     "pipette_script_move": ("scriptmoveTo", ("destination", "column", "row", "position_flag", "run_in_parallel")),
     "pipette_location": ("updateLocation", ("destination", "well")),
     "pipette_tip_state": ("sourceTipState", ("changes",)),

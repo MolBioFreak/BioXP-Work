@@ -4501,6 +4501,7 @@ class Serial206OemInitializationProvider:
         "sourceManualLoadTip": "wp8_manual_pipette_physical",
         "sourceLoadTips": "wp8_load_tips",
         "sourceMeasureFluidHeight": "wp8_manual_pipette_physical",
+        "sourceFluidOffset": "wp8_source_fluid_offset",
         "sourceWellPierced": "wp8_pipette_source_leaf",
         "sourceLiftTo": "wp8_pipette_source_leaf",
         "sourceLowerTo": "wp8_pipette_source_leaf",
@@ -12667,6 +12668,19 @@ class Serial206OemInitializationProvider:
                     "error": str(exc), "partial_evidence": evidence}
         return {**result, "ok": result.get("source_return") is True,
                 "delivery_attempted": True}
+
+    def wp8_source_fluid_offset(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        """One source zOffset body inline under the existing finite child."""
+        from .pipette.oem_fluid_owner import run_z_offset_inline
+        return {**run_z_offset_inline(
+            self, plate=arguments["plate"], speed=arguments["speed"],
+            transfer_fluid=arguments["transfer_fluid"], skip_steps=arguments["skip_steps"],
+            command_id=command_id, owner_identity=owner_identity,
+            state=self._manual_pipette_source_state,
+            settings=self._manual_pipette_source_settings), "delivery_attempted": True}
 
     def wp8_manual_pipette_physical(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
