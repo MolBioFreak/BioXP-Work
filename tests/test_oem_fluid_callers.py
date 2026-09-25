@@ -1,6 +1,7 @@
 import pytest
 
-from bioxp.oem_calibration_settings import CalibrationSettingsPatch, CalibrationSettingsService
+from bioxp.oem_calibration_settings import (CalibrationSettingsPatch, CalibrationSettingsService,
+    load_saved_calibration)
 from bioxp.oem_runtime_store import OEMRuntimeStore
 from bioxp.pipette.oem_fluid_callers import FluidCallerBindings, calwith_fluid, detect_fluid
 from oem_machine_bundle_test_support import bind_serial206_oem_snapshot
@@ -73,6 +74,10 @@ def test_calibration_saves_each_adjustment_and_next_startup_only(settings):
     assert settings.read()["saved_liquid_calibration"]["m_liquid_cal_reversion"] == "17"
     assert settings.read()["saved_liquid_calibration"]["m_Liquid_Cal"] is True
     assert settings.read()["active_liquid_calibration"]["m_liquid_cal_reversion"] != "17"
+    at_next_startup = load_saved_calibration(settings.active_snapshot, settings.store)
+    assert at_next_startup.config_sections["calibration"]["m_liquid_cal_reversion"] == "17"
+    assert at_next_startup.config_sections["calibration"]["m_Liquid_Cal"] is True
+    assert CalibrationSettingsService(settings.store, at_next_startup).read()["pending_restart"] is False
     assert r["pending_restart"] and r["active_revision_id"] is None
     state = settings.read()
     saved = {p["name"]: p["zLow"] for p in state["saved_positions"]}
@@ -91,6 +96,7 @@ def test_reject_restores_prior_revision_and_failure_still_finalizes(settings):
     assert r["outcome"] == "rejected_restored"
     assert r["saved_revision_id"] == prior["saved_revision_id"]
     assert settings.read()["saved_revision_id"] == prior["saved_revision_id"]
+    assert settings.read()["saved_liquid_calibration"] == settings.read()["active_liquid_calibration"]
     assert ("history", None) not in events and ("restore", prior["saved_revision_id"]) in events
     b, events = setup(settings, failure="scan")
     r = calwith_fluid(b, settings, REF, machine_calibrated=True)
