@@ -1102,6 +1102,7 @@ def _wp8_plan(operation: str, children: list[dict[str, Any]], **metadata: Any) -
 # Finite ControlLib pipette/lifecycle leaves. These are internal compiler
 # operations, never a public arbitrary-method dispatch surface.
 OEM_PIPETTE_LEAVES = {
+    "pipette_load_tips": ("sourceLoadTips", ("tip_type", "force_new_tip")),
     "manual_load_tip": ("sourceManualLoadTip", ("tray", "well", "overpress", "lift_z")),
     "measure_fluid_height": ("sourceMeasureFluidHeight", ("speed",)),
     "pipette_script_move": ("scriptmoveTo", ("destination", "column", "row", "position_flag", "run_in_parallel")),

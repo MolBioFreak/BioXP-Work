@@ -4499,6 +4499,7 @@ class Serial206OemInitializationProvider:
         "sourceTipTransition": "wp8_pipette_source_leaf",
         "sourceCheckTips": "wp8_check_tips",
         "sourceManualLoadTip": "wp8_manual_pipette_physical",
+        "sourceLoadTips": "wp8_load_tips",
         "sourceMeasureFluidHeight": "wp8_manual_pipette_physical",
         "sourceWellPierced": "wp8_pipette_source_leaf",
         "sourceLiftTo": "wp8_pipette_source_leaf",
@@ -12421,6 +12422,8 @@ class Serial206OemInitializationProvider:
         from .oem_deck_movement import _pierced
 
         captured = copy.deepcopy(dict(settings or {}))
+        self._oem_pipette_load_tips_settings = captured
+        self._oem_pipette_source_error_event = source_error_event
         if rgb_writer is not None:
             self._oem_pipette_rgb_writer = rgb_writer
 
@@ -12524,6 +12527,146 @@ class Serial206OemInitializationProvider:
             tip_load_move=lambda location, column, row, action, state: script_move(location, column, row, action, state, flag=2, parallel=False),
             move_z_home=native.home, set_z_current_max=lambda action, state: native.set_z_current_max(None, action, state),
             remove_tip=remove_tip, script_move_to_waste=leaf("pipette_script_waste", ()), source_error_event=source_error_event)
+
+    def wp8_load_tips(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        """ControlLib.loadTips(T50, true) inline under the owning WP8 child.
+
+        The finite compiler executes every nested deck leaf in this owner, and
+        the existing pipette receipt runner executes repeated CAN calls inline.
+        No second worker or request-selected method dispatch is introduced.
+        """
+        from .pipette.oem_load_tips import LoadTipsBindings, load_tips
+        from .oem_compat.position_table import tip_group_well_ids
+        from .oem_machine_bundle import get_active_oem_machine_snapshot
+
+        runner = getattr(self, "_manual_pipette_receipt_runner", None)
+        if not callable(runner):
+            raise RuntimeError("source_authority_missing:loadTips:pipette_receipt_runner")
+        occurrence = 0
+
+        def identity(name):
+            nonlocal occurrence
+            occurrence += 1
+            return {**owner_identity, "source_identity":
+                f"{owner_identity['source_identity']}:loadTips:{occurrence}:{name}"}
+
+        def finite(name, **inputs):
+            plan = compile_finite_plate_operation(name, source_leaf_available=True, **inputs)
+            try:
+                return self._wp8_execute_nested_plan(plan=plan, command_id=command_id,
+                                                     owner_identity=identity(name))
+            except RuntimeError as exc:
+                # loadTips ignores primitive false returns, but not exceptions.
+                # Keep the failed child receipt without converting a false into
+                # an extra source admission gate.
+                failures = getattr(exc, "evidence", {}).get("failure_evidence", [])
+                if (len(failures) == 1 and failures[0]["exception_message"] ==
+                        f"wp8_nested_child_failed:{plan['children'][0]['operation']}"
+                        and isinstance(failures[0].get("result"), Mapping)):
+                    return {"ok": False, "source_children": [
+                        {"result": failures[0]["result"]}], "failure_evidence": failures}
+                raise
+
+        def pipette(name, call):
+            child_identity = identity(name)
+            self._wp8_execution_fence_checker(command_id, boundary=child_identity["source_identity"])
+            operation_name = ("query_all_pipette_tip_states"
+                              if name == "query_tip_status_for_oem_load_tips" else name)
+            return runner(operation_name, call, command_id, child_identity, arguments)
+
+        def query():
+            raw = pipette("query_tip_status_for_oem_load_tips",
+                lambda transport: transport.query_tip_status_for_oem_load_tips())
+            return {**raw, "tip_exists": raw["source_tip_exists"],
+                    "tip_missing": raw["source_tip_missing"]}
+
+        def tray(index):
+            constructed = self._read_constructed_tip_tray(index)
+            reader = getattr(self, "_tip_tray_state_reader", None)
+            if constructed is None or not callable(reader):
+                raise RuntimeError("source_authority_missing:loadTips:tip_tray")
+            state = reader(index)
+            occupancy = state["occupancy"]
+            tip_type = {"T50": 50, "T200": 200, "T201": 201}[constructed["tip_type"]]
+            return {"tip_type": tip_type,
+                    "tip_available": state["tip_available"], "location": constructed["location"],
+                    "next_group": next((group for group in range(24)
+                        if all(occupancy[well] for well in tip_group_well_ids(group))), 24)}
+
+        def remove(index, group):
+            return finite("pipette_tip_transition", tray_id=index,
+                well_ids=list(tip_group_well_ids(group)), transition="remove")
+
+        def inspect(index, group):
+            well = f"{'AB'[group % 2]}{group // 2 + 1}"
+            result = finite("pipette_check_tips", tray_id=index, tip_location=well,
+                tip_type=arguments["tip_type"], check_for_static_tip_loss=None)
+            # The plan wrapper preserves the source return in its first child.
+            child = result["source_children"][0]["result"]
+            return {**result, "source_return": child["source_return"]}
+
+        def light():
+            color = finite("pipette_color", r=255, g=255, b=255)
+            led = finite("pipette_led2")
+            stall = finite("pipette_stall", value=10)
+            return {"ok": True, "source_children": [color, led, stall]}
+
+        def load_type(value):
+            return pipette("load_tip_metadata", lambda transport: transport.loadTip(value, -1))
+
+        def eject(check_missing):
+            return pipette("eject_all_tips_for_oem_load_tips", lambda transport:
+                transport.eject_all_tips(check_missing_tip=check_missing, wait=True, channels=None))
+
+        def home():
+            result = finite("pipette_home", rehome=False)
+            child = result["source_children"][0]["result"]
+            return {**result, "source_return": child["source_return"]}
+
+        def event(message):
+            callback = getattr(self, "_oem_pipette_source_error_event", None)
+            if callable(callback):
+                return {"ok": True, "source_return": callback(message), "delivery_attempted": False}
+            return {"ok": True, "source_noop": "errorEvent_null", "delivery_attempted": False}
+
+        bindings = LoadTipsBindings(
+            facts=self.mov_execution_machine_state, query=query, light=light,
+            stall_default=lambda: finite("pipette_stall", value=None), tray=tray,
+            move=lambda location, column, row: finite("pipette_script_move",
+                destination=location, column=column, row=row, position_flag=0,
+                run_in_parallel=True),
+            publish=lambda location, well: finite("pipette_location", destination=location, well=well),
+            home=home,
+            lower=lambda location: finite("pipette_lower_pipette", location=location),
+            lift=lambda location: finite("pipette_lift_pipette", location=location),
+            eject=eject,
+            tip_state=lambda changes: finite("pipette_tip_state", changes=dict(changes)),
+            remove=remove, load_type=load_type, inspect=inspect,
+            current_max=lambda: finite("pipette_current", value=None),
+            log_missing=lambda: {"ok": True, "source_log": "loadTips:tip_missing"},
+            error_event=event,
+            unlock_door=lambda: finite("pipette_unlock"),
+            start_mode=lambda: {"DevMode": 0, "WebMode": 1, "LocalMode": 2, "TradeShowMode": 3}[
+                get_active_oem_machine_snapshot().operation_parameters["Mode"]],
+            # The installed WPF checkbox is two-state, so IsChecked.HasValue
+            # is true even when unchecked. No synthetic null/unlock branch.
+            overpress_checked_has_value=lambda: True,
+            camera_ready=lambda: (
+                get_active_oem_machine_snapshot().fields["machine.camera_installed"].value is True
+                and get_active_oem_machine_snapshot().camera_calibrated),
+        )
+        try:
+            result = load_tips(arguments["tip_type"], bindings,
+                               force_new_tip=arguments["force_new_tip"])
+        except Exception as exc:
+            evidence = getattr(exc, "evidence", None)
+            return {"ok": False, "delivery_attempted": True,
+                    "error": str(exc), "partial_evidence": evidence}
+        return {**result, "ok": result.get("source_return") is True,
+                "delivery_attempted": True}
 
     def wp8_manual_pipette_physical(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
