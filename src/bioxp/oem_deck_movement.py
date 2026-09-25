@@ -1102,6 +1102,8 @@ def _wp8_plan(operation: str, children: list[dict[str, Any]], **metadata: Any) -
 # Finite ControlLib pipette/lifecycle leaves. These are internal compiler
 # operations, never a public arbitrary-method dispatch surface.
 OEM_PIPETTE_LEAVES = {
+    "manual_load_tip": ("sourceManualLoadTip", ("tray", "well", "overpress", "lift_z")),
+    "measure_fluid_height": ("sourceMeasureFluidHeight", ("speed",)),
     "pipette_script_move": ("scriptmoveTo", ("destination", "column", "row", "position_flag", "run_in_parallel")),
     "pipette_location": ("updateLocation", ("destination", "well")),
     "pipette_tip_state": ("sourceTipState", ("changes",)),
@@ -1741,6 +1743,11 @@ def execute_finite_plate_operation(
         leaf_result = completed[-1]["result"]
         if isinstance(leaf_result, Mapping):
             source_return.update({key: leaf_result[key] for key in ("source_return", "x", "y", "z", "door_ok") if key in leaf_result})
+            if plan.get("operation") in {"manual_load_tip", "measure_fluid_height"}:
+                source_return.update({key: leaf_result[key] for key in (
+                    "position_steps", "fluid_timestamps", "timing", "location", "well_id",
+                    "lost_steps", "lost_steps_warning", "calibration_persisted", "physical_effect_verified")
+                    if key in leaf_result})
             if plan.get("operation") == "pipette_check_tips":
                 source_return.update({key: leaf_result[key] for key in (
                     "removed_wells", "inspection_completed", "source_exception", "skip_reason")

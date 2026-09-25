@@ -29,6 +29,55 @@ Do not set `input_mode="oem_prepared"` or use `oem_operation` for these buttons.
 The existing protocol dry run remains nonphysical. Catch compiler `ValueError`
 as request validation, as the ordinary protocol route already does.
 
+### Physical pickup / measurement binder
+
+Import `bind_manual_physical_handler` from `.manual_pipetting` and add:
+
+```python
+ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL: bind_manual_physical_handler(
+    command_store=_protocol_command_store(),
+    execute_plan=app.state.oem_workflow_plan_executor,
+    require_motion_ready=_require_motion_route_ready,
+    provider_getter=lambda: _serial206_oem_initialization_provider,
+    receipt_store_getter=lambda: _pipette_receipts,
+),
+```
+
+Both operations compile to ordinary `pipette_manual_physical` actions, not OEM
+metadata. Each action submits ONE finite compound (`manual_load_tip` or
+`measure_fluid_height`). Source finite subcalls execute inline in that provider
+child's existing owner, preserving nested receipts, `z`, `source_return`, partial
+failures and occurrence-scoped semantic publications. The BR completion callback
+starts nonblocking Z before the shared pipette wait; no nested queue submission.
+Pipette calls use the real receipt service and shared collection inline, with
+`caller_class=protocol_manual`, distinct per-call receipt identities and the
+finite command recorded as parent (never reused as the pipette claim ID).
+
+Pickup reads location from the provider's persisted source machine object's
+`machine_status.constructed_tip_trays[index].location`; this is the existing
+ClassMachineStatus projection, not a new model/occupancy constructor. It reads
+no occupancy, timestamp, or tip-history admission evidence. Measurement captures
+`config_sections.offsets.m_Z_MOTOR_MAX_CURRENT_DOWN` from the active source machine
+snapshot; no numeric fallback. Existing source positioning reads the canonical
+location/well and active PositionTable.
+
+Results retain the complete source `steps` under the compound child result and
+promote actual `position_steps`, `source_return`, `timing`, `fluid_timestamps`, or
+pickup lost-step fields through the finite response. Success is not physical
+verification or persisted calibration. No lifecycle prep, sweep or Park is added.
+The repeated `zOffset` scan remains unsupported: source loadTips and modeled
+volume dependencies have not been supplied here; no misleading scan button.
+
+Offline qualification: `tests/test_manual_physical_native.py` exercises ordinary
+native dispatch, real OperatorCommandStore and PipetteReceiptStore, production
+provider/motion adapters and real collection/channel transports, replacing only
+native IO and captured source inputs. Repeated operations verify distinct durable
+identities; missing fluid timestamps still succeed; native failure stops without
+invented cleanup; BR -> owned nonblocking Z -> wait ordering is asserted.
+Combined qualification: 191 passed, 1 deselected across manual/native calibration,
+provider, native protocol, binding closure, OEM air/stream and composite suites.
+The deselection is the documented unchanged RGB baseline expectation below.
+
 ## Typed authoring request
 
 Top-level fields: `protocol_id: nonempty string`, `steps: nonempty array`.
@@ -36,6 +85,8 @@ Every step rejects extra fields and has one of these exact shapes:
 
 | operation | Required fields | Meaning |
 |---|---|---|
+| `load_tip` | `tray: int (1..5)`, `well: A1..B12`, `overpress: bool = false`, `lift_z: bool = false` | Physical source manual pickup; no fabricated TipLoaded/type/inventory mutation |
+| `measure_fluid_height` | `speed: int = 300` | Source fluid-height measurement at current well, no durable calibration Apply |
 | `move` | `location_id: int`, `well: string or int`, `position_flag: 0 or 1 or 2` | Actual calibrated XY plus source Z routing, then location publication |
 | `lower` | `location_id: int` | In-place source `lowerTo`: calibrated `zLow` |
 | `lift` | `location_id: int`, `height_steps: int or null` | In-place source `liftTo`: null selects `zHigh`; integer selects `zLow - height_steps` |

@@ -241,7 +241,7 @@ def measure_fluid_height(request: FluidHeightRequest, bindings: CalibrationBindi
 
 def bind_calibration_provider(provider: Any, *, finite: Callable, native: Callable,
                               pipette: Callable, tray_location: Callable[[int], int],
-                              z_current_down: int, sleep: Callable = time.sleep,
+                              z_current_down: int | None, sleep: Callable = time.sleep,
                               clock: Callable = time.monotonic) -> CalibrationBindings:
     """Connect real provider primitives to the existing owner's child runners.
 

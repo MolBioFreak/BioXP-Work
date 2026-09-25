@@ -4498,6 +4498,8 @@ class Serial206OemInitializationProvider:
         "sourceTipState": "wp8_pipette_source_leaf",
         "sourceTipTransition": "wp8_pipette_source_leaf",
         "sourceCheckTips": "wp8_check_tips",
+        "sourceManualLoadTip": "wp8_manual_pipette_physical",
+        "sourceMeasureFluidHeight": "wp8_manual_pipette_physical",
         "sourceWellPierced": "wp8_pipette_source_leaf",
         "sourceLiftTo": "wp8_pipette_source_leaf",
         "sourceLowerTo": "wp8_pipette_source_leaf",
@@ -12523,6 +12525,61 @@ class Serial206OemInitializationProvider:
             move_z_home=native.home, set_z_current_max=lambda action, state: native.set_z_current_max(None, action, state),
             remove_tip=remove_tip, script_move_to_waste=leaf("pipette_script_waste", ()), source_error_event=source_error_event)
 
+    def wp8_manual_pipette_physical(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        """One finite owner; nested source calls never submit another queue item."""
+        from .pipette.oem_calibration import (bind_calibration_provider, manual_load_tip,
+            measure_fluid_height, ManualTipLoadRequest, FluidHeightRequest, CalibrationExecutionError)
+        from .oem_machine_bundle import get_active_oem_machine_snapshot
+
+        runner = getattr(self, "_manual_pipette_receipt_runner")
+        occurrence = 0
+
+        def identity(name):
+            nonlocal occurrence
+            occurrence += 1
+            return {**owner_identity, "source_identity":
+                f"{owner_identity['source_identity']}:manual:{occurrence}:{name}"}
+
+        def finite(name, inputs):
+            plan = compile_finite_plate_operation(name, source_leaf_available=True, **inputs)
+            return self._wp8_execute_nested_plan(plan=plan, command_id=command_id,
+                                                 owner_identity=identity(name))
+
+        def native(name, call, inputs):
+            child_identity = identity(name)
+            self._wp8_execution_fence_checker(command_id, boundary=child_identity["source_identity"])
+            result = call()
+            return {**result, "source_identity": child_identity["source_identity"], "inputs": dict(inputs)}
+
+        def pipette(name, call):
+            child_identity = identity(name)
+            self._wp8_execution_fence_checker(command_id, boundary=child_identity["source_identity"])
+            return runner(name, call, command_id, child_identity, arguments)
+
+        def tray_location(index):
+            # Read only location from the actual persisted source machine object.
+            # Occupancy/history is neither synthesized nor an admission condition.
+            with self._lock:
+                return self._load_state()["machine_status"]["constructed_tip_trays"][index]["location"]
+
+        # Pickup does not consume motor-current settings. Detection does.
+        current = (get_active_oem_machine_snapshot().config_sections["offsets"]["m_Z_MOTOR_MAX_CURRENT_DOWN"]
+                   if operation == "sourceMeasureFluidHeight" else None)
+        bindings = bind_calibration_provider(self, finite=finite, native=native, pipette=pipette,
+            tray_location=tray_location, z_current_down=current, sleep=self.sleep)
+        try:
+            result = (manual_load_tip(ManualTipLoadRequest(**arguments), bindings)
+                      if operation == "sourceManualLoadTip" else
+                      measure_fluid_height(FluidHeightRequest(**arguments), bindings))
+        except CalibrationExecutionError as exc:
+            # Return partial source receipts for canonical terminalization, not
+            # an exception string that loses already-completed physical children.
+            result = {**exc.evidence, "error": str(exc)}
+        return {**result, "delivery_attempted": True}
+
     def wp8_check_tips(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
         child_order: int, plan_digest: str, **_: Any,
@@ -14118,6 +14175,7 @@ class Serial206OemInitializationProvider:
             raise RuntimeError("wp8_execution_fence_checker_missing")
 
         failures: list[dict[str, Any]] = []
+        completed: list[dict[str, Any]] = []
 
         def invoke(child: Mapping[str, Any]) -> Any:
             result = None
@@ -14133,6 +14191,7 @@ class Serial206OemInitializationProvider:
                 )
                 if isinstance(result, Mapping) and result.get("ok") is not True:
                     raise RuntimeError(f"wp8_nested_child_failed:{child['operation']}")
+                completed.append({"operation": child["operation"], "order": child["order"], "result": result})
                 return result
             except Exception as exc:
                 # The source catch/release executor suppresses exceptions;
@@ -14146,7 +14205,12 @@ class Serial206OemInitializationProvider:
                 })
                 raise
 
-        result = execute_finite_plate_operation(plan, invoke)
+        try:
+            result = execute_finite_plate_operation(plan, invoke)
+        except Exception as exc:
+            setattr(exc, "evidence", {"ok": False, "completed_children": completed,
+                                     "failure_evidence": failures, "source_plan_digest": digest})
+            raise
         return {
             **dict(result),
             "failure_evidence": failures,
@@ -14298,7 +14362,7 @@ class Serial206OemInitializationProvider:
             # Keep canonical owner authorization unchanged for every handler.
             plan_digest=(source_plan_identity if operation in {
                 "updateLocation", "updatePlateLocation", "updateThermalDoorOpen",
-                "clearTipLoaded", "inspectCoverAt", "SnapshotImage",
+                "clearTipLoaded", "sourceTipState", "inspectCoverAt", "SnapshotImage",
                 "startMoveZPseudoHome", "startGripperHomeAndUnlock",
                 "backgroundGripperHomeAndUnlock", "waitMoveZOnly",
             } else owner_plan_digest),

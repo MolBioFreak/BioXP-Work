@@ -68,6 +68,7 @@ class ProtocolActionKind(str, Enum):
     HOME = "home"
     PIPETTE_INIT = "pipette_init"
     PIPETTE_POSITION = "pipette_position"
+    PIPETTE_MANUAL_PHYSICAL = "pipette_manual_physical"
     PIPETTE_TIP = "pipette_tip"
     PIPETTE_ASPIRATE = "pipette_aspirate"
     PIPETTE_DISPENSE = "pipette_dispense"

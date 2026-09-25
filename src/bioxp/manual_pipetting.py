@@ -80,7 +80,21 @@ class ManualMix(_Request):
     cycles: int = Field(ge=1, le=50)
 
 
-ManualStep = Annotated[Union[ManualMove, ManualLower, ManualLift, ManualLiquid, ManualMix], Field(discriminator="operation")]
+class ManualLoadTip(_Request):
+    operation: Literal["load_tip"]
+    tray: int = Field(ge=1, le=5)
+    well: str = Field(pattern=r"^[ABab](?:[1-9]|1[0-2])$")
+    overpress: bool = False
+    lift_z: bool = False
+
+
+class ManualMeasureFluidHeight(_Request):
+    operation: Literal["measure_fluid_height"]
+    speed: int = 300
+
+
+ManualStep = Annotated[Union[ManualMove, ManualLower, ManualLift, ManualLiquid, ManualMix,
+    ManualLoadTip, ManualMeasureFluidHeight], Field(discriminator="operation")]
 
 
 class ManualPipettingRequest(_Request):
@@ -113,6 +127,8 @@ def compile_manual_pipetting(request: ManualPipettingRequest | Mapping[str, Any]
     for index, step in enumerate(req.steps):
         if isinstance(step, (ManualMove, ManualLower, ManualLift)):
             add(ProtocolActionKind.PIPETTE_POSITION, step.model_dump(), index)
+        elif isinstance(step, (ManualLoadTip, ManualMeasureFluidHeight)):
+            add(ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL, step.model_dump(), index)
         elif isinstance(step, ManualLiquid):
             liquid(step.operation, step.channels, step.volume_ul, step.speed, index)
         else:
@@ -162,4 +178,53 @@ def bind_manual_position_handler(*, command_store: Any, execute_plan: Callable,
         # Preserve canonical failures and raw child receipts. Never promote
         # completed status or absent outcome to proof of physical placement.
         return {**dict(result), "physical_effect_verified": False}
+    return handle
+
+
+def manual_physical_plan(params: Mapping[str, Any]) -> dict[str, Any]:
+    models = {"load_tip": ManualLoadTip, "measure_fluid_height": ManualMeasureFluidHeight}
+    try:
+        model = models[params["operation"]]
+    except (KeyError, TypeError):
+        raise ValueError("unknown manual physical operation") from None
+    step = model.model_validate(dict(params))
+    operation = "manual_load_tip" if isinstance(step, ManualLoadTip) else "measure_fluid_height"
+    return compile_finite_plate_operation(operation, source_leaf_available=True,
+                                         **step.model_dump(exclude={"operation"}))
+
+
+def bind_manual_physical_handler(*, command_store: Any, execute_plan: Callable,
+        require_motion_ready: Callable[[], None], provider_getter: Callable,
+        receipt_store_getter: Callable) -> Callable:
+    """Ordinary native binding; receipt work runs inline inside the finite owner.
+
+    No fake OEM opcode/arguments, separate scheduler, or request-selected callback.
+    The provider and receipt store are the application's existing shared owners.
+    """
+    import asyncio
+    from .services.pipette_service import run_pipette_operation
+
+    def receipt(name: str, call, command_id, identity, inputs):
+        provider = provider_getter()
+        async def inline(label, body, *, timeout_s):
+            command_store.assert_deck_execution_current(command_id, boundary="manual_pipette_inline")
+            return body()
+        operation = {"query_tip_status_all": "query_all_pipette_tip_states"}.get(name, name)
+        return asyncio.run(run_pipette_operation(operation, call,
+            get_transport=lambda: provider.primitives.pipette_transport,
+            run_blocking=inline, receipt_store=receipt_store_getter(),
+            requested_inputs={"manual_inputs": dict(inputs), "source_occurrence_id": identity["source_identity"]},
+            runtime_binding={"idempotency_key": identity["source_identity"],
+                "entrypoint_id": "protocol.pipette_manual_physical", "caller_class": "protocol_manual",
+                "parent_operator_command_id": command_id}))
+
+    def handle(action: ProtocolAction, state: Any) -> Mapping[str, Any]:
+        plan = manual_physical_plan(action.params)
+        require_motion_ready()
+        with command_store.workflow_context(state.job_id, source_occurrence_id=f"manual:{action.action_id}"):
+            command_store.assert_workflow_current(state.job_id)
+            provider = provider_getter()
+            provider._manual_pipette_receipt_runner = receipt
+            result = execute_plan(plan, action, state)
+        return {**dict(result), "physical_effect_verified": False, "calibration_persisted": False}
     return handle

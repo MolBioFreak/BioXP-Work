@@ -25,7 +25,7 @@ Timeout preserves source TR then exception; source timing rejection preserves it
 - `pipette(name, collection_callback)` runs against the existing shared collection/receipt service. Fluid detection is a compound pipette + Z operation: its callback starts the owned Z child between the sends and waits, without releasing the parent deck ownership. Do not use an independent nested submission that deadlocks waiting for this parent.
 - `tray_location(zero_based_tray)` comes from canonical source `get_tip_tray_location`, allowing the source's tray-location assignments including hotel. No added occupancy/proof admission is requested.
 - `z_current_down` must be the captured setting. No guessed default. Bound PositionTable supplies high/low Z; normal source pseudo-home clamping stays in the real Z primitive (the C# appAdjustment parameter is unused in moveZ).
-- Parent API/UI is intentionally untouched. These functions are not yet a claim that installed controls can invoke them.
+- Canonical ordinary native binding is now provided by `bind_manual_physical_handler` (see manual-pipetting-backend.md). Parent API/UI edits and installed deployment remain separate; no claim of live hardware validation.
 
 ## Original caller inventory and remaining unsupported composition
 

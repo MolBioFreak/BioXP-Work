@@ -291,7 +291,7 @@ async def _run_transport_call(
         binding = effective_runtime_binding
         outer_command_id = dispatch_context.get("operator_command_id")
         # Lifecycle steps have their own keys; only direct pipette actions share the outer claim.
-        if outer_command_id and binding.get("caller_class") == "lifecycle":
+        if outer_command_id and binding.get("caller_class") in {"lifecycle", "protocol_manual"}:
             binding["parent_operator_command_id"] = str(outer_command_id)
             outer_command_id = None
         direct_command_id = binding.get("command_id")
