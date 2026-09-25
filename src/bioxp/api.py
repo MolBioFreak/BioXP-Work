@@ -1340,7 +1340,8 @@ app.include_router(oem_homing_router)
 
 @app.middleware("http")
 async def bind_direct_pipette_idempotency(request: Request, call_next):
-    if request.method == "POST" and request.url.path.startswith("/liquid/"):
+    if (request.method == "POST" and request.url.path.startswith("/liquid/")
+            and request.url.path != "/liquid/manual/compile"):
         dispatch_context = current_operator_dispatch_context() or {}
         trusted_key = dispatch_context.get("idempotency_key")
         key = str(trusted_key or request.headers.get("idempotency-key", "")).strip()
@@ -2981,6 +2982,9 @@ class BarcodeReadRequest(BaseModel):
     include_image_data: bool = False
 
 
+from .manual_pipetting import ManualPipettingRequest, bind_manual_position_handler, compile_manual_pipetting
+
+
 class ProtocolCompileRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     source_type: str = Field("native", pattern=r"^(native|oem_xml)$")
@@ -3007,6 +3011,15 @@ class ProtocolExecuteRequest(ProtocolCompileRequest):
     preflight: Optional[dict[str, Any]] = None
     artifact_refs: list[str] = Field(default_factory=list)
     snapshot_refs: list[str] = Field(default_factory=list)
+
+
+class ManualPipettingExecuteRequest(ManualPipettingRequest):
+    """Typed manual steps with the existing native execution intent contract."""
+
+    dry_run: bool = True
+    idempotency_key: StrictStr | None = Field(default=None, min_length=1, max_length=256)
+    live_execution: dict[str, Any] | None = None
+    live_execution_ack: bool = False
 
 
 class ProtocolControlTarget(BaseModel):
@@ -11404,6 +11417,17 @@ def _protocol_live_thermal_door_handler(action, state):
     }
 
 
+def _protocol_live_manual_position_handler(action, state):
+    # Resolve only when invoked. Building a dry-run handler map is motionless
+    # and must not acquire a live owner or demand initialized hardware.
+    handler = bind_manual_position_handler(
+        command_store=_protocol_command_store(),
+        execute_plan=app.state.oem_workflow_plan_executor,
+        require_motion_ready=_require_motion_route_ready,
+    )
+    return handler(action, state)
+
+
 def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
     return {
         ProtocolActionKind.MOVE: _protocol_live_move_handler,
@@ -11413,6 +11437,7 @@ def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
         ProtocolActionKind.THERMAL_DOOR: _protocol_live_thermal_door_handler,
         ProtocolActionKind.INSPECT: _protocol_live_inspect_cover_handler,
         ProtocolActionKind.PIPETTE_INIT: _protocol_live_pipette_handler,
+        ProtocolActionKind.PIPETTE_POSITION: _protocol_live_manual_position_handler,
         ProtocolActionKind.PIPETTE_TIP: _protocol_live_pipette_handler,
         ProtocolActionKind.TIP_EJECT: _protocol_live_pipette_handler,
         ProtocolActionKind.PIPETTE_ASPIRATE: _protocol_live_pipette_handler,
@@ -11956,6 +11981,31 @@ async def protocol_execute(req: ProtocolExecuteRequest):
         raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/liquid/manual/compile")
+async def liquid_manual_compile(req: ManualPipettingRequest):
+    """Compile explicit manual steps; no hardware connection or motion."""
+    try:
+        document = compile_manual_pipetting(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await protocol_compile(ProtocolCompileRequest(source_type="native", document=document.to_payload()))
+
+
+@app.post("/liquid/manual/execute")
+async def liquid_manual_execute(req: ManualPipettingExecuteRequest):
+    """Use the one native workflow owner; append no preparation or cleanup."""
+    try:
+        authored = ManualPipettingRequest(protocol_id=req.protocol_id, steps=req.steps)
+        document = compile_manual_pipetting(authored)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await protocol_execute(ProtocolExecuteRequest(
+        source_type="native", document=document.to_payload(), dry_run=req.dry_run,
+        idempotency_key=req.idempotency_key, live_execution=req.live_execution,
+        live_execution_ack=req.live_execution_ack,
+    ))
 
 
 @app.get("/protocol/jobs")

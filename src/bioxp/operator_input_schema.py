@@ -29,6 +29,12 @@ def native_form_schema(schema: Mapping[str, Any], document: Mapping[str, Any]) -
                 key: deepcopy(item) if key in literals else visit(item)
                 for key, item in value.items() if key != "$ref"
             }
+            discriminator = result.get("discriminator")
+            if isinstance(discriminator, dict) and isinstance(discriminator.get("mapping"), dict):
+                discriminator["mapping"] = {
+                    key: visit({"$ref": ref})["$ref"] if isinstance(ref, str) else ref
+                    for key, ref in discriminator["mapping"].items()
+                }
             reference = value.get("$ref")
             if isinstance(reference, str):
                 prefix = "#/components/schemas/"
