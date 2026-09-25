@@ -47,7 +47,16 @@ def run_z_offset_inline(provider: Any, *, plate: str, speed: int, transfer_fluid
         fence(nested["source_identity"])
         context = dict(command_id=command_id, child_order=serial, plan_digest=nested["source_identity"])
         if name == "updatePlateLocation":
-            return provider.wp8_update_plate_location(name, args, **context)
+            from ..oem_deck_movement import canonical_plate_name, plate_name_for_storage
+            from ..oem_compat.pathing import LOCATION_ID_TO_NAME
+            # The scan reads movable plate inventory, not the manual deck
+            # button's latch observation. Preserve the existing publisher.
+            semantic = provider._canonical_deck_semantic_state(require_latch_observation=False)
+            movable = dict(semantic.get("movable_plate_locations") or {})
+            plate_name = plate_name_for_storage(canonical_plate_name(args["plate"]))
+            movable[plate_name] = LOCATION_ID_TO_NAME[args["location"]]
+            return provider._wp8_publish_semantic(operation=name, updates={
+                "movable_plate_locations": movable}, **context)
         if name == "updateLocation":
             return provider.wp8_update_location(name, args, **context)
         if name == "clearTipLoaded":
