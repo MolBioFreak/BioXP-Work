@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .oem_compat.pathing import LOCATION_ID_TO_NAME
 from .oem_compat.position_table import well_id_from_label
 from .oem_deck_movement import compile_finite_plate_operation
+from .pipette.oem_diagnostics import DiagnosticRequest
 from .pipette.models import PipetteAspirateCommand, PipetteDispenseCommand, PipetteValidationError
 from .protocols.models import ProtocolAction, ProtocolActionKind, ProtocolDocument, ProtocolStage
 from .protocols.validators import validate_protocol_document
@@ -148,13 +149,28 @@ class DiagnosticDetectFluid(_Request):
     operation: Literal["diagnostic_detect_fluid"]
 
 
+class ManualDiagnosticPipette(_Request):
+    operation: Literal["diagnostic_pipette"]
+    diagnostic: DiagnosticRequest
+
+    @field_validator("diagnostic", mode="before")
+    @classmethod
+    def thaw_native_params(cls, value):
+        if isinstance(value, Mapping):
+            value = dict(value)
+            if isinstance(value.get("channels"), tuple):
+                value["channels"] = list(value["channels"])
+        return value
+
+
 class ManualCalwithFluid(_Request):
     operation: Literal["source_calwith_fluid"]
 
 
 ManualStep = Annotated[Union[ManualMove, ManualLower, ManualLift, ManualLiquid, ManualMix,
     ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset, DiagnosticDetectFluid,
-    ManualCalwithFluid, SourceLoadTips, SourceMix, SourceAir, SourcePurge], Field(discriminator="operation")]
+    ManualCalwithFluid, SourceLoadTips, SourceMix, SourceAir, SourcePurge,
+    ManualDiagnosticPipette], Field(discriminator="operation")]
 
 
 class ManualPipettingRequest(_Request):
@@ -188,7 +204,7 @@ def compile_manual_pipetting(request: ManualPipettingRequest | Mapping[str, Any]
         if isinstance(step, (ManualMove, ManualLower, ManualLift)):
             add(ProtocolActionKind.PIPETTE_POSITION, step.model_dump(), index)
         elif isinstance(step, (ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset,
-                               DiagnosticDetectFluid, ManualCalwithFluid,
+                               DiagnosticDetectFluid, ManualCalwithFluid, ManualDiagnosticPipette,
                                SourceLoadTips, SourceMix, SourceAir, SourcePurge)):
             add(ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL, step.model_dump(), index)
         elif isinstance(step, ManualLiquid):
@@ -251,13 +267,15 @@ def manual_physical_plan(params: Mapping[str, Any]) -> dict[str, Any]:
     models = {"load_tip": ManualLoadTip, "measure_fluid_height": ManualMeasureFluidHeight,
               "source_fluid_offset": ManualFluidOffset,
               "diagnostic_detect_fluid": DiagnosticDetectFluid,
-              "source_calwith_fluid": ManualCalwithFluid}
+              "source_calwith_fluid": ManualCalwithFluid,
+              "diagnostic_pipette": ManualDiagnosticPipette}
     try:
         model = models[params["operation"]]
     except (KeyError, TypeError):
         raise ValueError("unknown manual physical operation") from None
     step = model.model_validate(dict(params))
-    operation = ("diagnostic_detect_fluid" if isinstance(step, DiagnosticDetectFluid) else
+    operation = ("diagnostic_pipette" if isinstance(step, ManualDiagnosticPipette) else
+                 "diagnostic_detect_fluid" if isinstance(step, DiagnosticDetectFluid) else
                  "source_calwith_fluid" if isinstance(step, ManualCalwithFluid) else
                  "manual_load_tip" if isinstance(step, ManualLoadTip) else
                  "source_fluid_offset" if isinstance(step, ManualFluidOffset) else "measure_fluid_height")

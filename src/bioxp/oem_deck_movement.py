@@ -1095,9 +1095,9 @@ def _wp8_plan(operation: str, children: list[dict[str, Any]], **metadata: Any) -
             "terminal_source_point" if child["operation"] == "updatePlateLocation"
             else "immediate_after_source_call" if mutation else "none"
         )
-    if operation == "manual_source_pipette":
-        # These typed source options contain floats. Match the existing queue's
-        # RFC8785 persistence digest (20.0 and 20 have one canonical encoding).
+    if operation in {"manual_source_pipette", "diagnostic_pipette"}:
+        # Typed source calls carry fractional values. Match the existing
+        # SQLite owner's RFC8785 digest (10.0 and 10 are the same JSON number).
         import rfc8785
         plan["plan_digest"] = hashlib.sha256(rfc8785.dumps(plan)).hexdigest()
     else:
@@ -1109,6 +1109,7 @@ def _wp8_plan(operation: str, children: list[dict[str, Any]], **metadata: Any) -
 # operations, never a public arbitrary-method dispatch surface.
 OEM_PIPETTE_LEAVES = {
     "manual_source_pipette": ("sourceManualPipette", ("request",)),
+    "diagnostic_pipette": ("sourceDiagnosticPipette", ("diagnostic",)),
     "pipette_load_tips": ("sourceLoadTips", ("tip_type", "force_new_tip")),
     "manual_load_tip": ("sourceManualLoadTip", ("tray", "well", "overpress", "lift_z")),
     "measure_fluid_height": ("sourceMeasureFluidHeight", ("speed",)),

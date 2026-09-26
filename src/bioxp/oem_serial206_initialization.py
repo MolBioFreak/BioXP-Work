@@ -4428,6 +4428,7 @@ class Serial206OemInitializationProvider:
 
     _WP8_CHILD_BINDINGS: Mapping[str, str] = {
         "sourceDiagnosticDetectFluid": "wp8_diagnostic_detect_fluid",
+        "sourceDiagnosticPipette": "wp8_diagnostic_pipette",
         "sourceForceToHighHome": "wp8_preparation_force_high_home",
         "sourceMoveTo": "wp8_source_move_to",
         "sourceImageGantryLoad": "wp8_source_image_gantry_load",
@@ -12791,6 +12792,12 @@ class Serial206OemInitializationProvider:
             owner_identity=owner_identity, state=self._manual_pipette_source_state,
             pipette_settings=self._manual_pipette_source_settings,
             calibration_settings=self._manual_calibration_settings)
+
+    def wp8_diagnostic_pipette(self, operation: str, arguments: Mapping[str, Any], *,
+            command_id: str, owner_identity: Mapping[str, Any], **_: Any) -> dict[str, Any]:
+        from .pipette.oem_diagnostics import run_diagnostic_inline
+        return run_diagnostic_inline(self, arguments["diagnostic"], command_id=command_id,
+                                     owner_identity=owner_identity)
 
     def wp8_manual_pipette_physical(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
