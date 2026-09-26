@@ -1,7 +1,8 @@
 """Pure caller ordering for ControlLib Detect Fluid:1440-1469 and calwithFluid:2782-2850.
 
-Callbacks execute under the finite owner's existing claim. This module never binds
-saved PositionTable geometry to a running machine or commands hardware itself.
+Callbacks execute under the finite owner's existing claim. Settings application
+belongs to the calibration owner; this module never acquires hardware or changes
+worker ownership.
 """
 from __future__ import annotations
 
@@ -80,6 +81,8 @@ def calwith_fluid(bindings: FluidCallerBindings, settings: CalibrationSettingsSe
     resultComparison() returns true without opening a comparison dialog.
     `restore` must atomically reinstate the prior saved revision, including None.
     """
+    from ..oem_calibration_settings import comparison_values
+    run = settings.begin_run(machine_calibrated=machine_calibrated)
     before = settings.read()
     measurements: list[dict[str, Any]] = []
     result: dict[str, Any] = {"source": "ControlLib.calwithFluid:2782-2850",
@@ -87,7 +90,8 @@ def calwith_fluid(bindings: FluidCallerBindings, settings: CalibrationSettingsSe
         "fluid_reference_revision": str(fluid_reference["REVISION"]),
         "previous_saved_revision_id": before["saved_revision_id"],
         "active_revision_id": before["active_revision_id"], "measurements": measurements,
-        "body_completed": False, "outcome": "incomplete"}
+        "body_completed": False, "outcome": "incomplete", "run_id": run["run_id"],
+        "decision": None, "decision_status": "running"}
 
     def required(name: str) -> Callable[..., Any]:
         fn = getattr(bindings, name)
@@ -108,7 +112,10 @@ def calwith_fluid(bindings: FluidCallerBindings, settings: CalibrationSettingsSe
         patch = CalibrationSettingsPatch(positions=tuple(
             PositionCalibrationPatch(name=cast(PositionName, id_names[idx]), zLow=low) for idx, low in updates.items()))
         # Source adjustZ then saveConfig, including each intermediate saved revision.
-        saved = settings.save(patch, liquid_reference_revision=str(fluid_reference["REVISION"]))
+        saved = settings.save(patch, liquid_reference_revision=str(fluid_reference["REVISION"]),
+            run_id=run["run_id"], measurement={"plate": plate, "measured_raw_z": z,
+                "calculated_z_lows": {id_names[idx]: low for idx, low in updates.items()},
+                "settings_updates": derived["settings_updates"]})
         measurements.append({"plate": plate, "measured_raw_z": z,
             "calculated_z_lows": {id_names[idx]: low for idx, low in updates.items()},
             "settings_updates": derived["settings_updates"],
@@ -146,30 +153,35 @@ def calwith_fluid(bindings: FluidCallerBindings, settings: CalibrationSettingsSe
             required("completed")()
             # OEM compares even after a body failure. Backup exists only when
             # m_calibrated==1; absent backup yields OEM's true, not user consent.
-            if not machine_calibrated:
-                result["comparison_choice"] = True
-                result["comparison_source"] = "no_previous_values"
-                if result["body_completed"]:
-                    result["outcome"] = "accepted_no_previous_values"
-            elif bindings.compare is not None:
-                choice = bindings.compare(before, settings.read())
-                result["comparison_choice"] = choice
-                if choice is True and result["body_completed"]:
-                    if bindings.save_history is not None:
-                        bindings.save_history()
-                        result["outcome"] = "accepted"
-                elif choice is False:
-                    if bindings.restore is not None:
-                        bindings.restore(before["saved_revision"])
-                        restored = settings.read()
-                        if restored["saved_revision"] == before["saved_revision"]:
-                            result["outcome"] = "rejected_restored"
-                        else:
-                            result["restore_error"] = "saved revision readback differs"
-            result["saved_revision_id"] = settings.read()["saved_revision_id"]
-            result["pending_restart"] = settings.read()["pending_restart"]
+            try:
+                settings.update_run(run["run_id"], after=comparison_values(settings.read()),
+                    body_completed=result["body_completed"], error=result.get("error"),
+                    decision_status="pending" if machine_calibrated else "no_previous_values")
+                if not machine_calibrated:
+                    result.update(comparison_choice=True, comparison_source="no_previous_values",
+                                  outcome="accepted_no_previous_values", decision_status="no_previous_values")
+                else:
+                    result["decision_status"] = "pending"
+                    choice = None if bindings.compare is None else bindings.compare(before, settings.read())
+                    result["comparison_choice"] = choice
+                    if choice is not None:
+                        decided = settings.decide_run(run["run_id"], "accept" if choice else "restore",
+                            save_history=bindings.save_history, restore=bindings.restore)
+                        for key in ("decision", "decision_status", "comparison_error"):
+                            if decided.get(key) is not None:
+                                result[key] = decided[key]
+                        if not decided.get("comparison_error"):
+                            result["outcome"] = "accepted" if choice else "rejected_restored"
+            except Exception as exc:
+                # Settings.resultComparison:6518-6539 catches dialog/history/restore.
+                result["comparison_error"] = str(exc)
             required("finish_ui")()
             required("set_z_acceleration")(576)
     except Exception as exc:
         result["finalization_error"] = str(exc)
+    current = settings.read()
+    result.update(saved_revision_id=current["saved_revision_id"],
+                  active_revision_id=current["active_revision_id"], pending_restart=current["pending_restart"])
+    settings.update_run(run["run_id"], **{k: v for k, v in result.items()
+        if k not in ("run_id", "measurements")})
     return result

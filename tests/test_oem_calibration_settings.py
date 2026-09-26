@@ -48,9 +48,9 @@ def test_save_reload_consumes_calibration_and_preserves_baseline(baseline, store
     original_bytes = (baseline.bundle_root / config_record.bundle_relative_path).read_bytes()
     service = CalibrationSettingsService(store, baseline)
     result = service.save(patch(x=12345, y=23456, zLow=34000, zDelta=1000, inc_factor=2))
-    assert result["pending_restart"] and result["active_revision_id"] is None
+    assert not result["pending_restart"] and result["active_revision_id"] == result["saved_revision_id"]
     assert not result["motion_commanded"]
-    assert next(row for row in result["active_positions"] if row["name"] == "TECANRACK1")["x"] == original["x"]
+    assert next(row for row in result["active_positions"] if row["name"] == "TECANRACK1")["x"] == 12345
     assert bundle.get_active_oem_machine_snapshot() is baseline
     effective = load_saved_calibration(baseline, store)
     assert effective.records is baseline.records
@@ -125,7 +125,7 @@ def test_failed_save_does_not_promote_or_replace_saved_revision(baseline, store)
         service.save(patch(x=999))
     after = service.read()
     assert before["saved_revision"] == after["saved_revision"]
-    assert service.active_snapshot is baseline
+    assert service.active_snapshot.calibration_revision["revision_id"] == before["active_revision_id"]
 
 
 @pytest.mark.parametrize("values", [{"x": True}, {"x": 1.5}, {"x": "1"}, {"x": None}, {"x": 2147483648}, {"x": -2147483649}, {"zHigh": 1}, {}])
@@ -136,7 +136,7 @@ def test_source_types_not_coercion_or_arbitrary_fields(values):
 
 def test_no_invented_travel_or_increment_bounds(baseline, store):
     result = CalibrationSettingsService(store, baseline).save(patch(x=-2147483648, inc_factor=-2))
-    assert result["pending_restart"]
+    assert not result["pending_restart"]
 
 
 def test_unknown_or_absent_rows_and_duplicates_do_not_save(baseline, store):

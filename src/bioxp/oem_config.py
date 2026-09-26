@@ -347,7 +347,7 @@ def _snapshot_legacy_bundle(snapshot: OemMachineSnapshot) -> dict[str, Any]:
         from .runtime_state import get_active_oem_runtime_state_store
 
         store = get_active_oem_runtime_state_store()
-        if store.snapshot is snapshot:
+        if store.snapshot.lock_sha256 == snapshot.lock_sha256:
             operation_parameters = store.operation_parameters_projection()
     except Exception:
         pass
@@ -384,7 +384,7 @@ def _snapshot_legacy_bundle(snapshot: OemMachineSnapshot) -> dict[str, Any]:
         "machine_calibrated": snapshot.machine_calibrated,
         "source_type": "immutable_oem_machine_snapshot" if snapshot.calibration_revision is None else "sealed_baseline_plus_user_calibration",
         "root_dir": str(snapshot.bundle_root),
-        "runtime_binding": "read_only_immutable_evidence" if snapshot.calibration_revision is None else "startup_bound_user_calibration",
+        "runtime_binding": "read_only_immutable_evidence" if snapshot.calibration_revision is None else "owner_applied_user_calibration",
         "files": files,
         "config": active,
         "diff_vs_source_defaults": machine_config_diff(active),
@@ -606,7 +606,7 @@ def find_oem_config(roots: Iterable[str | Path] | None = None) -> dict:
             from .runtime_state import get_active_oem_runtime_state_store
 
             store = get_active_oem_runtime_state_store()
-            if store.snapshot is snapshot:
+            if store.snapshot.lock_sha256 == snapshot.lock_sha256:
                 operation = store.operation_parameters_projection()
                 fields["StartMode"] = str(operation["Mode"])
                 fields["CheckCamera"] = str(operation["CheckCamera"])

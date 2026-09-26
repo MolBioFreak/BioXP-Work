@@ -202,6 +202,7 @@ class OemMachineSnapshot:
     validation_conflicts: tuple[str, ...] = ()
     # Separate user-authored configuration; records/fields remain sealed evidence.
     calibration_revision: Mapping[str, Any] | None = None
+    calibration_baseline: OemMachineSnapshot | None = None
 
     @property
     def machine_calibrated(self) -> bool:
@@ -275,6 +276,17 @@ def set_active_oem_machine_snapshot(snapshot: OemMachineSnapshot) -> OemMachineS
             raise OemMachineBundleError("OEM machine snapshot is already bound and cannot be replaced in-process")
         _active_snapshot = snapshot
     return snapshot
+
+
+def apply_owned_calibration_snapshot(snapshot: OemMachineSnapshot) -> None:
+    """CalibrationSettingsService publication, not machine/transport rebinding.
+
+    Only the separately projected calibration changes; sealed records are retained.
+    Existing finite execution/exclusion ownership is unchanged.
+    """
+    global _active_snapshot
+    with _snapshot_lock:
+        _active_snapshot = snapshot
 
 
 def get_active_oem_machine_snapshot() -> OemMachineSnapshot:

@@ -913,6 +913,7 @@ _LATCH_CAPABLE_INITIALIZATION_PATHS = {
 _NO_MOTION_PREPARATION_PATHS = {
     "/liquid/manual/compile",
     "/motion/oem/calibration_settings",
+    "/motion/oem/calibration_settings/runs/{run_id}/decision",
     "/motion/oem/pipette/tip_tray_set",
     "/liquid/pipette/settings",
     "/liquid/pipette/tip-type",

@@ -4962,6 +4962,7 @@ class OEMRuntimeStore:
         self,
         baseline_lock_sha256: str,
         update: Callable[[dict[str, Any] | None], dict[str, Any]],
+        after_update: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Merge and persist under the existing SQLite writer owner atomically."""
         key = "machine_calibration_v1:" + baseline_lock_sha256
@@ -4979,6 +4980,8 @@ class OEMRuntimeStore:
                 readback = self._db.execute("SELECT value FROM runtime_metadata WHERE key=?", (key,)).fetchone()[0]
                 if readback != encoded:
                     raise RuntimeError("machine calibration save readback mismatch")
+                if after_update is not None:
+                    after_update(payload)
                 self._db.execute("COMMIT")
             except Exception:
                 self._db.execute("ROLLBACK")
@@ -5006,6 +5009,20 @@ class OEMRuntimeStore:
             except Exception:
                 self._db.execute("ROLLBACK")
                 raise
+
+    def read_calibration_run(self, run_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.execute("SELECT value FROM runtime_metadata WHERE key=?",
+                                   ("calibration_run_v1:" + run_id,)).fetchone()
+            return None if row is None else json.loads(row[0])
+
+    def write_calibration_run(self, payload: dict[str, Any]) -> None:
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO runtime_metadata(key,value,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                ("calibration_run_v1:" + payload["run_id"], encoded, time.time()))
 
     def next_seq(self) -> int:
         with self._lock:

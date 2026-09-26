@@ -68,7 +68,7 @@ def test_diagnostic_order_and_early_catch():
     assert ("park", None) not in events
 
 
-def test_calibration_saves_each_adjustment_and_next_startup_only(settings):
+def test_calibration_saves_each_adjustment_and_applies_in_process(settings):
     b, events = setup(settings)
     original = {r["name"]: r["zLow"] for r in settings.read()["active_positions"]}
     r = calwith_fluid(b, settings, REF, machine_calibrated=True)
@@ -79,15 +79,15 @@ def test_calibration_saves_each_adjustment_and_next_startup_only(settings):
     assert r["fluid_reference_revision"] == "17"
     assert settings.read()["saved_liquid_calibration"]["m_liquid_cal_reversion"] == "17"
     assert settings.read()["saved_liquid_calibration"]["m_Liquid_Cal"] is True
-    assert settings.read()["active_liquid_calibration"]["m_liquid_cal_reversion"] != "17"
+    assert settings.read()["active_liquid_calibration"]["m_liquid_cal_reversion"] == "17"
     at_next_startup = load_saved_calibration(settings.active_snapshot, settings.store)
     assert at_next_startup.config_sections["calibration"]["m_liquid_cal_reversion"] == "17"
     assert at_next_startup.config_sections["calibration"]["m_Liquid_Cal"] is True
     assert CalibrationSettingsService(settings.store, at_next_startup).read()["pending_restart"] is False
-    assert r["pending_restart"] and r["active_revision_id"] is None
+    assert not r["pending_restart"] and r["active_revision_id"] == r["saved_revision_id"]
     state = settings.read()
     saved = {p["name"]: p["zLow"] for p in state["saved_positions"]}
-    assert {p["name"]: p["zLow"] for p in state["active_positions"]} == original
+    assert {p["name"]: p["zLow"] for p in state["active_positions"]} == saved
     assert [saved[n] for n in ("LOC_TC", "LOC_MS", "LOC_OC", "LOC_RC")] == [2100, 2200, 2300, 2500]
     assert saved["LOC_STRIP1"] - original["LOC_STRIP1"] == 1200 - original["LOC_STRIP2"]
     assert events[:5] == [("log", None), ("reset", None), ("press", (0,)), ("scan", ("TC", 300, True, 4)), ("catch", 0)]
@@ -106,14 +106,14 @@ def test_reject_restores_prior_revision_and_failure_still_finalizes(settings):
     assert ("history", None) not in events and ("restore", prior["saved_revision_id"]) in events
     b, events = setup(settings, failure="scan")
     r = calwith_fluid(b, settings, REF, machine_calibrated=True)
-    assert r["outcome"] == "incomplete" and not r["body_completed"]
-    assert events[-3:] == [("compare", None), ("ui", None), ("acc", 576)]
+    assert r["outcome"] == "accepted" and not r["body_completed"]
+    assert events[-4:] == [("compare", None), ("history", None), ("ui", None), ("acc", 576)]
 
 
 def test_no_explicit_acceptance_is_incomplete(settings):
     b, events = setup(settings, choice=None)
     r = calwith_fluid(b, settings, REF, machine_calibrated=True)
-    assert r["outcome"] == "incomplete" and r["pending_restart"]
+    assert r["outcome"] == "incomplete" and not r["pending_restart"]
     assert ("history", None) not in events
 
 

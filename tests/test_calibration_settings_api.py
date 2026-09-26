@@ -17,7 +17,7 @@ PATH = "/motion/oem/calibration_settings"
 def calibration(monkeypatch, tmp_path):
     snapshot = bind_serial206_oem_snapshot(monkeypatch)
     store = OEMRuntimeStore(tmp_path)
-    service = CalibrationSettingsService(store, snapshot)
+    service = CalibrationSettingsService(store, snapshot, publish=oem_machine_bundle.apply_owned_calibration_snapshot)
     monkeypatch.setattr(api.app.state, "calibration_settings", service, raising=False)
 
     def no_hardware(*args, **kwargs):
@@ -31,7 +31,7 @@ def calibration(monkeypatch, tmp_path):
     store.close()
 
 
-def test_settings_http_save_readback_keeps_active_consumers_unchanged(calibration):
+def test_settings_http_save_readback_applies_to_active_consumers(calibration):
     client, snapshot, store, service = calibration
     response = client.get(PATH)
     assert response.status_code == 200
@@ -43,16 +43,16 @@ def test_settings_http_save_readback_keeps_active_consumers_unchanged(calibratio
     saved = response.json()
     readback = client.get(PATH).json()
     assert saved["committed_revision_id"] == readback["saved_revision_id"]
-    assert readback["application_status"] == "pending_restart"
-    assert readback["active_positions"] == before["active_positions"]
+    assert readback["application_status"] == "bound_configuration"
+    assert readback["active_positions"] == readback["saved_positions"]
     row = next(row for row in readback["saved_positions"] if row["name"] == "LOC_RC")
     assert all(row[key] == value for key, value in values.items())
     assert row["zHigh"] == 59000
     assert not readback["motion_commanded"]
     assert not readback["physical_calibration_verified"]
-    assert oem_machine_bundle.get_active_oem_machine_snapshot() is snapshot
-    # The caller did not replace the live snapshot, compiled provider or baseline bytes.
-    assert service.active_snapshot is snapshot
+    assert oem_machine_bundle.get_active_oem_machine_snapshot() is service.active_snapshot
+    assert service.active_snapshot.records is snapshot.records
+    assert load_bound_oem_position_table().resolve(location_id="LOC_RC").z_low == 78000
 
 
 @pytest.mark.parametrize("positions", [

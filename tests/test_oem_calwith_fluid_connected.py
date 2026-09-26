@@ -43,12 +43,11 @@ def test_native_calibration_five_saves_and_partial_failure(rig, monkeypatch, tmp
     snapshot = bind_serial206_oem_snapshot(monkeypatch)
     snapshot = replace(snapshot, fields={**snapshot.fields, "machine.calibrated":
         replace(snapshot.fields["machine.calibrated"], value=machine_calibrated)})
-    # The motion fixture's zero-argument PositionTable shortcut is not the
-    # calibration service's snapshot projection. Preserve both callers.
-    from bioxp.oem_compat import position_table
-    motion_table = position_table.load_bound_oem_position_table()
-    monkeypatch.setattr(position_table, "load_bound_oem_position_table",
-                        lambda bound=None: original_table(bound) if bound is not None else motion_table)
+    # Exercise the actual active geometry through every provider consumer.
+    from bioxp import oem_machine_bundle as bundle
+    bundle.apply_owned_calibration_snapshot(snapshot)
+    monkeypatch.setattr("bioxp.oem_compat.position_table.load_bound_oem_position_table", original_table)
+    monkeypatch.setattr("bioxp.oem_serial206_initialization.load_bound_oem_position_table", original_table)
     monkeypatch.setattr("bioxp.oem_serial206_initialization.load_oem_parity_config",
                         lambda _: SimpleNamespace(blockers=[], values={}))
     p = rig.provider
@@ -70,7 +69,11 @@ def test_native_calibration_five_saves_and_partial_failure(rig, monkeypatch, tmp
     monkeypatch.setattr(rig.native, "motor_wait_stopped", lambda *a, **kw: {"ok": True, "stopped": True}, raising=False)
     p._manual_pipette_source_state = SimpleNamespace(source_model=construct_new_machine_source_model())
     p._manual_pipette_source_settings = {"LogPressure": False, "CheckForStaticTipLoss": False}
-    p._manual_calibration_settings = CalibrationSettingsService(OEMRuntimeStore(tmp_path), snapshot)
+    p._manual_calibration_settings = CalibrationSettingsService(OEMRuntimeStore(tmp_path), snapshot,
+        publish=bundle.apply_owned_calibration_snapshot)
+    for tray in p._manual_pipette_source_state.source_model.tip_trays:
+        tray.tip_type = 201
+        tray.location = 6
     from bioxp.serial206_y_provider import Serial206YProvider
     p.primitives.bind_y_provider(Serial206YProvider(rig.native,
         state_store=p._manual_calibration_settings.store, generation_provider=lambda: 1))
@@ -222,10 +225,10 @@ def test_native_calibration_five_saves_and_partial_failure(rig, monkeypatch, tmp
     assert [m["plate"] for m in body["measurements"]] == (
         ["TC", "MS"] if inject_failure is True else ["TC", "MS", "OC", "RC", "STRIP"])
     if inject_failure is True:
-        assert body["error"] and body["outcome"] == "incomplete"
+        assert body["error"] and body["outcome"] == ("incomplete" if machine_calibrated else "accepted_no_previous_values")
     else:
         assert body["body_completed"] and not body.get("error")
-        assert body["pending_restart"]
+        assert not body["pending_restart"]
         assert p._manual_pipette_source_state.source_model.strips[1].strip_color == "X"
     assert len({m["saved_revision_id"] for m in body["measurements"]}) == len(body["measurements"])
     assert body["measurements"][0]["measured_raw_z"] == 88000
@@ -238,7 +241,7 @@ def test_native_calibration_five_saves_and_partial_failure(rig, monkeypatch, tmp
         if not inject_failure:
             assert body["outcome"] == "accepted_no_previous_values"
     assert p._manual_calibration_settings.read()["saved_revision_id"] == body["saved_revision_id"]
-    assert p._manual_calibration_settings.read()["pending_restart"]
+    assert not p._manual_calibration_settings.read()["pending_restart"]
     if inject_failure == "finalization":
         assert body["finalization_error"] == "transport final acceleration failure"
         assert body["body_completed"] is True
@@ -248,5 +251,14 @@ def test_native_calibration_five_saves_and_partial_failure(rig, monkeypatch, tmp
     assert len(keys) == len(set(keys)) and len(keys) > 4
     assert rig.store.connection.execute("SELECT count(*) FROM operator_commands WHERE command_id=?",
         ("cal-parent",)).fetchone()[0] == 1
+    model = p._manual_pipette_source_state.source_model
+    assert [tray.tip_type for tray in model.tip_trays] == [50, 50, 50, 200, 50]
+    assert [tray.location for tray in model.tip_trays] == [7, 8, 9, 10, 15]
+    persisted = p._manual_calibration_settings.read_run(body["run_id"])
+    assert persisted["body_completed"] is body["body_completed"]
+    assert persisted["active_revision_id"] == body["saved_revision_id"]
+    for measurement in body["measurements"]:
+        for name, low in measurement["calculated_z_lows"].items():
+            assert original_table().resolve(location_id=name).z_low == low
     p._manual_calibration_settings.store.close()
     receipts.connection.close()

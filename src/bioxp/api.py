@@ -1078,7 +1078,8 @@ def _configure_machine_calibration(runtime_root):
     except Exception:
         store.close()
         raise
-    return snapshot, store, CalibrationSettingsService(store, snapshot)
+    from .oem_machine_bundle import apply_owned_calibration_snapshot
+    return snapshot, store, CalibrationSettingsService(store, snapshot, publish=apply_owned_calibration_snapshot)
 
 
 @asynccontextmanager
@@ -12059,16 +12060,35 @@ async def calibration_settings_read():
 
 @app.patch("/motion/oem/calibration_settings")
 async def calibration_settings_save(req: CalibrationSettingsPatch):
-    """Save final PositionTable values for next ordinary startup; no motion."""
+    """Save and apply final PositionTable values in-process; no motion."""
     try:
         return await run_in_threadpool(_calibration_settings_service().save, req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+from .oem_calibration_settings import CalibrationDecisionRequest, CalibrationRunResponse
+
+
+@app.get("/motion/oem/calibration_settings/runs/{run_id}", response_model=CalibrationRunResponse)
+async def calibration_run_read(run_id: str):
+    try:
+        return await run_in_threadpool(_calibration_settings_service().read_run, run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Calibration run not found") from exc
+
+
+@app.post("/motion/oem/calibration_settings/runs/{run_id}/decision", response_model=CalibrationRunResponse)
+async def calibration_run_decision(run_id: str, req: CalibrationDecisionRequest):
+    try:
+        return await run_in_threadpool(_calibration_settings_service().decide_run, run_id, req.decision)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Calibration run not found") from exc
+
+
 @app.post("/motion/oem/pipette/tip_tray_set")
 async def pipette_tip_tray_set(req: ManualTipTraySet):
-    """Capture controller Z once, save both OEM tray rows for next startup."""
+    """Capture controller Z once, save/apply both OEM tray rows in-process."""
     service = _calibration_settings_service()
     provider = _require_serial206_oem_initialization_provider("initialize_motors")
     try:

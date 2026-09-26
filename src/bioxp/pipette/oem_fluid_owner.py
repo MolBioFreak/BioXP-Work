@@ -228,8 +228,9 @@ def run_calwith_fluid_inline(provider: Any, *, command_id: str,
         from ..oem_job_preparation import (construct_new_machine_source_model,
                                            reset_loaded_job_tip_inventory)
         from ..oem_deck_movement import OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS
-        reset_loaded_job_tip_inventory(state, execute_native=lambda name, inputs, _: finite(name, **inputs))
         defaults = construct_new_machine_source_model()
+        reset_loaded_job_tip_inventory(state, selected_trays=defaults.tip_trays,
+            execute_native=lambda name, inputs, _: finite(name, **inputs))
         state.source_model.trays = defaults.trays
         state.source_model.strips = defaults.strips
         state.source_model.fluid_name = None
@@ -264,7 +265,8 @@ def run_calwith_fluid_inline(provider: Any, *, command_id: str,
         finish_ui=lambda: record("finish_ui", {"ui_not_bound": True}),
         set_z_acceleration=lambda value: controller("setMaxAcc(z)",
             lambda: provider.primitives.z_set_max_acc(value)),
-        # No WPF comparison dialog is connected to a running finite claim.
+        # The source comparison is durable; the typed run decision endpoint
+        # replaces the WPF dialog without holding/replacing the finite worker.
         compare=lambda before, after: record("comparison_pending", {
             "before_revision_id": before["saved_revision_id"],
             "after_revision_id": after["saved_revision_id"]}) and None,
@@ -282,7 +284,7 @@ def run_calwith_fluid_inline(provider: Any, *, command_id: str,
     result.setdefault("comparison_choice", None)
     return {**result, "ok": result["body_completed"] and "finalization_error" not in result,
             "delivery_attempted": True, "source_events": events,
-            "comparison_gap": "OEM resultComparison requires an operator choice; no dialog is bound"
+            "comparison_gap": f"Operator choice pending at /motion/oem/calibration_settings/runs/{result['run_id']}/decision"
                               if result.get("comparison_choice") is None else None,
             "physical_effect_verified": False}
 

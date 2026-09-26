@@ -1,7 +1,7 @@
 """OEM manual tray Set and consumed pipette operation settings; no motion.
 
 ControlLib.cs:1370-1415,1471-1477. A Set reads controller Z once,
-then writes one atomic paired revision; configuration binds at next startup.
+then writes one atomic paired revision; configuration applies through the existing in-process owner.
 """
 from __future__ import annotations
 

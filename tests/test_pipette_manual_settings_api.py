@@ -21,7 +21,7 @@ SETTINGS = "/liquid/pipette/settings"
 def mounted(monkeypatch, tmp_path):
     snapshot = bind_serial206_oem_snapshot(monkeypatch)
     store = OEMRuntimeStore(tmp_path / "calibration")
-    service = CalibrationSettingsService(store, snapshot)
+    service = CalibrationSettingsService(store, snapshot, publish=oem_machine_bundle.apply_owned_calibration_snapshot)
     monkeypatch.setattr(api.app.state, "calibration_settings", service, raising=False)
     runtime = OemRuntimeStateStore(tmp_path / "mutable", replace(snapshot, operator_label_matched=True))
     monkeypatch.setattr(api, "get_active_oem_runtime_state_store", lambda: runtime)
@@ -37,7 +37,7 @@ def mounted(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("tray,pair", [(1, ("TECANRACK1", "TECANRACK2")), (2, ("TECANRACK1", "TECANRACK2")),
                                         (3, ("TECANRACK3", "TECANRACK4")), (4, ("TECANRACK3", "TECANRACK4"))])
-def test_manual_set_paired_saved_readback_not_active(mounted, tray, pair):
+def test_manual_set_paired_saved_readback_and_active_geometry(mounted, tray, pair):
     client, store, snapshot, _, _, positions = mounted
     before = client.get("/motion/oem/calibration_settings").json()
     response = client.post(SET, json={"tray": tray})
@@ -46,12 +46,13 @@ def test_manual_set_paired_saved_readback_not_active(mounted, tray, pair):
     assert positions == ["z"]
     assert data["measured_z_steps"] == 32123
     assert data["paired_positions"] == list(pair)
-    assert data["pending_restart"] and not data["motion_commanded"]
+    assert not data["pending_restart"] and not data["motion_commanded"]
     assert {r["name"]: r["zLow"] for r in data["saved_positions"]} == dict.fromkeys(pair, 32123)
     readback = client.get("/motion/oem/calibration_settings").json()
     assert readback["saved_revision_id"] == data["committed_revision_id"]
-    assert readback["active_positions"] == before["active_positions"]
-    assert oem_machine_bundle.get_active_oem_machine_snapshot() is snapshot
+    assert readback["active_positions"] == readback["saved_positions"]
+    assert all(load_bound_oem_position_table().resolve(location_id=name).z_low == 32123 for name in pair)
+    assert oem_machine_bundle.get_active_oem_machine_snapshot().records is snapshot.records
 
 
 def test_manual_set_failures_do_not_commit(mounted):

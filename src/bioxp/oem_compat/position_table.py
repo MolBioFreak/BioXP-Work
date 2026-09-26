@@ -229,7 +229,7 @@ class PositionTable:
             return cls.from_rows(
                 root_dir.position_table,
                 source=("immutable_oem_machine_snapshot.PositionTable" if root_dir.calibration_revision is None
-                        else "startup_bound_user_calibration.PositionTable"),
+                        else "owner_applied_user_calibration.PositionTable"),
                 source_sha256=str(source_sha256) if source_sha256 else None,
             )
         if root_dir is None:
