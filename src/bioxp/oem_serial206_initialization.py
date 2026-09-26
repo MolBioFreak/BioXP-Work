@@ -12661,13 +12661,11 @@ class Serial206OemInitializationProvider:
                 get_active_oem_machine_snapshot().fields["machine.camera_installed"].value is True
                 and get_active_oem_machine_snapshot().camera_calibrated),
         )
-        try:
-            result = load_tips(arguments["tip_type"], bindings,
-                               force_new_tip=arguments["force_new_tip"])
-        except Exception as exc:
-            evidence = getattr(exc, "evidence", None)
-            return {"ok": False, "delivery_attempted": True,
-                    "error": str(exc), "partial_evidence": evidence}
+        # zOffset discards this method's Boolean, not its exceptions. Keep
+        # thrown failures (and their existing cause/evidence) on the exception
+        # path instead of disguising them as an ordinary false source return.
+        result = load_tips(arguments["tip_type"], bindings,
+                           force_new_tip=arguments["force_new_tip"])
         return {**result, "ok": result.get("source_return") is True,
                 "delivery_attempted": True}
 
@@ -12710,13 +12708,19 @@ class Serial206OemInitializationProvider:
                 result = call(nested)
                 events.append({"operation": name, "source_identity": nested["source_identity"],
                                "result": result})
-                if not ignored_result and isinstance(result, Mapping) and result.get("ok") is not True:
+                # catchPlate/releasePlate have already applied their OEM
+                # log-and-suppress policy. Their failed receipt is evidence,
+                # not a new exception at this composing caller.
+                if (not ignored_result and isinstance(result, Mapping)
+                        and result.get("ok") is not True
+                        and result.get("exception_suppressed") is not True):
                     raise RuntimeError(f"diagnostic_source_failure:{name}")
                 return result
             except Exception as exc:
                 if not events or events[-1].get("source_identity") != nested["source_identity"]:
                     events.append({"operation": name, "source_identity": nested["source_identity"],
-                                   "error": str(exc), "evidence": getattr(exc, "evidence", None)})
+                                   "exception_type": type(exc).__name__, "error": str(exc),
+                                   "evidence": getattr(exc, "evidence", None)})
                 raise
 
         def finite(name: str, **inputs: Any) -> Any:
@@ -12729,7 +12733,11 @@ class Serial206OemInitializationProvider:
                     transfer_fluid=transfer, skip_steps=skip, command_id=command_id,
                     owner_identity=nested, state=state, settings=settings)
                 if result.get("error"):
-                    return {**result, "ok": False}
+                    # run_z_offset_inline exposes its caught sequence exception
+                    # with partial evidence. Restore that exception boundary,
+                    # not a generic diagnostic_source_failure identity.
+                    from .pipette.oem_calibration import CalibrationExecutionError
+                    raise CalibrationExecutionError(result["error"], result)
                 return {**result, "ok": True}
             return record(f"zOffset:{plate}", run)
 

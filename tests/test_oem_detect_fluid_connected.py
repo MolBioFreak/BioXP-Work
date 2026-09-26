@@ -43,7 +43,7 @@ def test_diagnostic_void_initiate_continues_pressure_sequence_after_wait_false(r
     assert streams == [(channel, True) for channel in range(4)] + [(channel, False) for channel in range(4)]
 
 
-@pytest.mark.parametrize("failure", [None, "initiate_boolean_false", "second_catch", "third_scan"])
+@pytest.mark.parametrize("failure", [None, "initiate_boolean_false", "second_catch", "first_release", "third_scan", "outer_exception"])
 def test_diagnostic_real_provider_sqlite_and_transport_seams(rig, monkeypatch, tmp_path, failure):
     from tests.test_deck_tip_query_publication import bind_collection_test_identity
     bind_collection_test_identity(monkeypatch)
@@ -82,7 +82,7 @@ def test_diagnostic_real_provider_sqlite_and_transport_seams(rig, monkeypatch, t
     p._oem_pipette_rgb_writer = lambda *a: {"ok": True}
     p._manual_pipette_source_state = SimpleNamespace(source_model=construct_new_machine_source_model())
     p._manual_pipette_source_settings = {"LogPressure": False, "CheckForStaticTipLoss": False}
-    p._read_constructed_tip_tray = lambda i: {"tip_type": "T50" if i == 0 else "T200",
+    p._read_constructed_tip_tray = lambda i: {"tip_type": "T50" if i in (0, 1) or (i == 2 and failure == "third_scan") else "T200",
         "location": 7 + i, "construction_id": "fixture", "tip_available": True,
         "occupancy": [True] * 96}
     p.bind_tip_tray_state_reader(rig.store.tip_tray_state)
@@ -97,6 +97,9 @@ def test_diagnostic_real_provider_sqlite_and_transport_seams(rig, monkeypatch, t
     assert rig.store._renew_owner(lease_seconds=120.0)
     p.publish_tip_tray_transition(tray_id=0, transition="construct",
         operation_id="detect-parent:construct", command_id="detect-parent",
+        provenance={"source_operation": "ClassMachineStatus.constructor"})
+    p.publish_tip_tray_transition(tray_id=1, transition="construct",
+        operation_id="detect-parent:construct:1", command_id="detect-parent",
         provenance={"source_operation": "ClassMachineStatus.constructor"})
     for t in rig.group._transports:
         t._tip_loaded = False
@@ -131,7 +134,34 @@ def test_diagnostic_real_provider_sqlite_and_transport_seams(rig, monkeypatch, t
                 raise RuntimeError("injected_second_catch_native_failure")
             return original_move(board, target, motor=motor, **kwargs)
         rig.native.motor_oem_move_absolute = fail_during_second_catch
+    if failure == "first_release":
+        # Observe the composing adapter, replacing only the native IO beneath
+        # its first release. The compiler/suppression policy remains real.
+        active = []
+        compile_execute = p._wp8_compile_and_execute
+        def observed_finite(**kwargs):
+            active.append(kwargs["operation"])
+            try:
+                return compile_execute(**kwargs)
+            finally:
+                active.pop()
+        monkeypatch.setattr(p, "_wp8_compile_and_execute", observed_finite)
+        native_move = rig.native.motor_oem_move_absolute
+        injected = []
+        def release_failure(*args, **kwargs):
+            if active == ["release_plate"] and not injected:
+                injected.append(True)
+                raise LookupError("injected_first_release_native_failure")
+            return native_move(*args, **kwargs)
+        monkeypatch.setattr(rig.native, "motor_oem_move_absolute", release_failure)
+    if failure == "outer_exception":
+        def failed_initiate():
+            raise LookupError("injected_initiate_outer_exception")
+        monkeypatch.setattr(rig.drivers[0], "pipette_initiate_group", failed_initiate)
     if failure == "third_scan":
+        p.publish_tip_tray_transition(tray_id=2, transition="construct",
+            operation_id="detect-parent:construct:2", command_id="detect-parent",
+            provenance={"source_operation": "ClassMachineStatus.constructor"})
         driver = rig.drivers[2]
         original_wait = driver.wait_pipette_command_completion
         press_waits = []
@@ -182,48 +212,44 @@ def test_diagnostic_real_provider_sqlite_and_transport_seams(rig, monkeypatch, t
         else:
             rows = (getattr(exc, "evidence", {}).get("failure_evidence") or [{}])
             body = rows[0].get("result") or {}
-        if failure in {"second_catch", "third_scan"}:
-            assert not body["completed"]
-            assert not any(e["operation"] == "park_gantry" for e in body["events"])
-            if failure == "second_catch":
-                assert "injected_second_catch_native_failure" in str(body["events"])
-                assert [s["plate"] for s in body["scans"]] == ["TC"]
+        assert not body["completed"]
+        assert not any(e["operation"] == "park_gantry" for e in body["events"])
+        operations = [e["operation"] for e in body["events"]]
+        if failure == "outer_exception":
+            assert "injected_initiate_outer_exception" in body["error"]
+            assert not body["scans"]
+            assert not any(op.startswith("zOffset:") for op in operations)
+        else:
+            assert [s["plate"] for s in body["scans"]] == ["TC", "MS"]
+            assert operations[-1] == "zOffset:OC"
+            if failure == "third_scan":
+                assert body["error"] != "The required tip is not loaded!"
+                assert "scrFluidDetection" in str(body["events"][-1]["evidence"])
             else:
-                assert [s["plate"] for s in body["scans"]] == ["TC", "MS"]
-                assert any(e["operation"] == "zOffset:OC" for e in body["events"])
-            assert rig.store.deck_semantic_state()["movable_plate_locations"]["POOL_PLATE"] == (
-                "LOC_TC" if failure == "second_catch" else "LOC_MS")
-            assert receipts.read(limit=1000)
-            assert rig.store.wp8_operation_evidence(child_ids[0])["children"][0]["operation"] == "sourceDiagnosticDetectFluid"
-            return
-        pytest.fail(str({"error": body.get("error"), "events": [(e["operation"], e.get("error"),
-            (e.get("result") or {}).get("failed_child"), (e.get("result") or {}).get("error"),
-            str((e.get("result") or {}).get("failure_evidence"))[:600],
-            str(e.get("evidence"))[:400]) for e in body.get("events", [])]}))
-    assert failure in {None, "initiate_boolean_false"}, f"injected transport failure was not observed: BR={sum(e[0] == 'BR' for e in rig.events)}, moves={rig.native.moves[:12]}"
-    assert body["completed"], [(e["operation"], e.get("error"),
-        (e.get("result") or {}).get("failed_child")) for e in body["events"]]
-    assert result["calibration_persisted"] is False
-    assert runtime.source_model.strips[1].strip_color == "X"
-    assert [s["plate"] for s in body["scans"]] == ["TC", "MS", "OC", "RC", "STRIP"]
-    assert all(s["scan"]["source_return"] == 88000 for s in body["scans"])
-    assert all(s["scan"]["transfer_fluid"] is False and s["scan"]["skip_steps"] == 1
-               and s["scan"]["speed"] == 300 for s in body["scans"])
-    ids = [e["source_identity"] for e in body["events"] if "source_identity" in e]
-    assert len(ids) == len(set(ids))
-    assert [e["result"]["cycle"] for e in body["events"] if e["operation"] == "initiateGroup"] == [
-        "detectFluid.initiateGroup"]
-    if failure == "initiate_boolean_false":
-        assert [e["result"]["ok"] for e in body["events"] if e["operation"] == "initiateGroup"] == [False]
-    assert p._manual_pipette_source_state.source_model.strips[1].strip_color == "X"
-    assert len(receipts.read(limit=1000)) > 20
-    keys = [row[0] for row in receipts.connection.execute("SELECT command_id FROM pipette_operations")]
-    assert len(keys) == len(set(keys))
-    assert rig.store.wp8_operation_evidence(child_ids[0])["children"][0]["operation"] == "sourceDiagnosticDetectFluid"
-    assert rig.store.get_command(child_ids[0])["status"] == "completed"
-    assert rig.store.connection.execute("SELECT count(*) FROM operator_commands WHERE command_id=?",
-        ("detect-parent",)).fetchone()[0] == 1
-    assert [e["operation"] for e in body["events"] if e["operation"] in {
-        "catch_plate", "release_plate", "press_plates", "park_gantry", "initiateGroup", "markStripX"}] == [
-        "catch_plate", "release_plate", "initiateGroup", "catch_plate", "release_plate",
-        "press_plates", "press_plates", "markStripX", "park_gantry"]
+                # The old fixture falsely completed all scans by swallowing
+                # loadTips's stock-exhaustion throw. Two declared T50 trays
+                # are consumed by TC/MS; OC must unwind, not scan.
+                assert body["error"] == "The required tip is not loaded!"
+                assert body["events"][-1]["evidence"]["samples"] == []
+                assert [s["operation"] for s in body["events"][-1]["evidence"]["steps"]] == [
+                    "updatePlateLocation", "loadTips"]
+            if failure in {"second_catch", "first_release"}:
+                failed_name = "catch_plate" if failure == "second_catch" else "release_plate"
+                suppressed = [e for e in body["events"] if e["operation"] == failed_name
+                              and e.get("result", {}).get("exception_suppressed")]
+                assert len(suppressed) == 1
+                evidence = suppressed[0]["result"]
+                assert evidence["ok"] is False
+                assert f"injected_{failure}_native_failure" in str(evidence["failure_evidence"])
+                assert body["scans"][1]["plate"] == "MS"
+            if failure == "initiate_boolean_false":
+                assert [e["result"]["ok"] for e in body["events"]
+                        if e["operation"] == "initiateGroup"] == [False]
+        assert receipts.read(limit=1000)
+        keys = [row[0] for row in receipts.connection.execute("SELECT command_id FROM pipette_operations")]
+        assert len(keys) == len(set(keys))
+        ids = [e["source_identity"] for e in body["events"] if "source_identity" in e]
+        assert len(ids) == len(set(ids))
+        assert rig.store.wp8_operation_evidence(child_ids[0])["children"][0]["operation"] == "sourceDiagnosticDetectFluid"
+        return
+    pytest.fail("diagnostic swallowed a genuine source exception")

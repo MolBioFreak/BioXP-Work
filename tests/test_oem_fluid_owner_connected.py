@@ -61,9 +61,12 @@ def test_manual_scan_handler_supplies_oem_constructor_logical_wells(monkeypatch)
     assert handle(action, state)["source_return"] == 88000
 
 
-@pytest.mark.parametrize("plate,transfer_fluid", [("STRIP", False), ("RC", True)])
+@pytest.mark.parametrize("plate,transfer_fluid,load_case", [
+    ("STRIP", False, "normal"), ("RC", True, "normal"),
+    ("RC", True, "no_tips"), ("STRIP", False, "native_throw"),
+    ("STRIP", False, "camera_false")])
 def test_inline_scan_under_one_owner_with_distinct_source_occurrences(rig, monkeypatch, tmp_path,
-                                                                      plate, transfer_fluid):
+                                                                      plate, transfer_fluid, load_case):
     from tests.test_deck_tip_query_publication import bind_collection_test_identity
     bind_collection_test_identity(monkeypatch)
     monkeypatch.setattr(socket, "socket", lambda family=socket.AF_INET, *a, **kw:
@@ -71,7 +74,8 @@ def test_inline_scan_under_one_owner_with_distinct_source_occurrences(rig, monke
     monkeypatch.setattr("bioxp.oem_machine_bundle.get_active_oem_machine_snapshot", lambda:
         SimpleNamespace(operation_parameters={"Mode": "WebMode"}, config_sections={"offsets": {
             "m_Z_MOTOR_MAX_CURRENT_DOWN": 17}},
-            fields={"machine.camera_installed": SimpleNamespace(value=False)}, camera_calibrated=False))
+            fields={"machine.camera_installed": SimpleNamespace(value=load_case == "camera_false")},
+            camera_calibrated=load_case == "camera_false"))
     monkeypatch.setattr("bioxp.oem_serial206_initialization.load_oem_parity_config",
                         lambda _: SimpleNamespace(blockers=[], values={}))
     p = rig.provider
@@ -84,7 +88,7 @@ def test_inline_scan_under_one_owner_with_distinct_source_occurrences(rig, monke
             [SourceWell(None, 0.0, 200.0) for _ in range(96)])
     p._manual_pipette_source_state = SimpleNamespace(source_model=model)
     p._manual_pipette_source_settings = {"LogPressure": False, "CheckForStaticTipLoss": False}
-    p._read_constructed_tip_tray = lambda i: {"tip_type": "T50" if i == 0 else "T200",
+    p._read_constructed_tip_tray = lambda i: {"tip_type": "T50" if i == 0 and load_case != "no_tips" else "T200",
         "location": 7 + i, "construction_id": "fixture", "tip_available": True,
         "occupancy": [True] * 96}
     p.bind_tip_tray_state_reader(rig.store.tip_tray_state)
@@ -128,6 +132,25 @@ def test_inline_scan_under_one_owner_with_distinct_source_occurrences(rig, monke
             d.issue("aspirate", volume=volume, **kw), raising=False)
         monkeypatch.setattr(driver, "dispense", lambda volume, d=driver, **kw:
             d.issue("dispense_liquid", volume=volume, **kw), raising=False)
+    frames = []
+    if load_case == "native_throw":
+        def failed_home(*args, **kwargs):
+            raise LookupError("injected_load_home_exception")
+        monkeypatch.setattr(rig.native, "motor_oem_move_z_home", failed_home)
+    if load_case == "camera_false":
+        from tests.test_pipette_check_tips_connected import image
+        frames = [image(1), image(), image(1), image()]
+        camera_settings = {"CheckForStaticTipLoss": True, "CameraXOffset": 0,
+            "CameraYOffset": 0, "InspectionSettings": {"ClungTips": {
+                "Exposure": 1000, "Gain": 1000, "LED1": False, "LED2": True,
+                "LED3": False, "Parameters": {"threshold": 100}}}}
+        p.bind_oem_cover_inspection_callbacks(settings=lambda: camera_settings,
+            capture=lambda **_: {"frame": frames.pop(0), "capture_evidence": {"fixture": True}},
+            save=lambda **_: {"artifact_saved": True, "fixture": True},
+            led=lambda **_: None, rgb=lambda *_: None, barcode=lambda _: "")
+        p.primitives.tester.motor_x_move_relative_strict = lambda steps: {"ok": True, "steps": steps}
+        p.primitives.tester.motor_y_move_relative_strict = lambda steps: {"ok": True, "steps": steps}
+        p.sleep = lambda _: None
     plan = compile_finite_plate_operation("source_fluid_offset", source_leaf_available=True,
         plate=plate, speed=300, transfer_fluid=transfer_fluid, skip_steps=12)
     try:
@@ -136,6 +159,17 @@ def test_inline_scan_under_one_owner_with_distinct_source_occurrences(rig, monke
     except Exception as exc:
         evidence = getattr(exc, "evidence", {})
         body = (evidence.get("failure_evidence") or [{}])[0].get("result") or {}
+        if load_case in {"no_tips", "native_throw"}:
+            expected = ("Tips are not available" if load_case == "no_tips"
+                        else "injected_load_home_exception")
+            assert body["error"] == expected
+            assert [s["operation"] for s in body["steps"]] == ["updatePlateLocation", "loadTips"]
+            assert body["samples"] == []
+            assert not any(e[0] in {"BR", "aspirate", "dispense_liquid"} for e in rig.events)
+            assert receipts.read(limit=100)
+            if load_case == "native_throw":
+                assert "LookupError" in str(body["steps"][-1]["evidence"])
+            return
         pytest.fail(str({"tip_type": rig.group._tip_type, "queries": len(calls), "ejected_at": ejected_at,
             "loads": [(s.get("result") or {}).get("source_return") for s in body.get("steps", []) if s["operation"] == "loadTips"],
             "load_failures": [(s.get("result") or {}).get("error") for s in body.get("steps", []) if s["operation"] == "loadTips"],
@@ -143,12 +177,19 @@ def test_inline_scan_under_one_owner_with_distinct_source_occurrences(rig, monke
             "failures": [(step["operation"], step.get("error"),
                 str(step.get("evidence"))[:500]) for step in body.get("steps", [])
                          if step.get("error")]}))
+    assert load_case not in {"no_tips", "native_throw"}, "source load exception was ignored"
     assert result["ok"], result
     body = result["source_children"][0]["result"]
     assert [s["well"] for s in body["samples"]] == ["A1", "B1"]
     assert [s["operation"] for s in body["steps"]].count("loadTips") == (3 if transfer_fluid else 2)
     assert [s["operation"] for s in body["steps"]].count("ejectAllTips") == (3 if transfer_fluid else 2)
     assert body["source_return"] == 88000
+    if load_case == "camera_false":
+        loads = [s["result"] for s in body["steps"] if s["operation"] == "loadTips"]
+        assert len(loads) == 2
+        assert all(row["source_return"] is False and row["ok"] is False for row in loads)
+        assert not frames
+        assert all(any(step["operation"] == "checkTips" for step in row["steps"]) for row in loads)
     assert len(receipts.read(limit=100)) > 4
     keys = [row[0] for row in receipts.connection.execute(
         "SELECT command_id FROM pipette_operations")]
