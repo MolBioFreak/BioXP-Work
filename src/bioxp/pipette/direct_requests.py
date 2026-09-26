@@ -40,8 +40,36 @@ class PipetteReadbackChannel(BaseModel):
     data: dict[str, JsonValue] | None
 
 
+class PipetteCollectionChannelSource(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    tip_loaded: StrictBool | None
+    verified: StrictBool
+
+
+class PipetteCollectionChannelIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    actor: str | None
+    revision: StrictInt | None
+    reader: StrictInt
+    reader_generation: StrictInt | None
+
+
+class PipetteCollectionSourceIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    owner: str
+    interrupt_epoch: StrictInt
+    channels: list[PipetteCollectionChannelIdentity] = Field(min_length=4, max_length=4)
+
+
+class PipetteCollectionSource(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    identity: PipetteCollectionSourceIdentity
+    channels: list[PipetteCollectionChannelSource] = Field(min_length=4, max_length=4)
+
+
 class PipetteReadbackResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
+    collection_source: PipetteCollectionSource | None = None
     ok: StrictBool
     semantic_ok: StrictBool
     available: StrictBool
