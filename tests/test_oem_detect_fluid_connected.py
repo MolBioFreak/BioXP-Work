@@ -188,6 +188,15 @@ def test_diagnostic_real_provider_sqlite_and_transport_seams(rig, monkeypatch, t
     admission = {"ownership_generation": 1, "serial206_initialization_provider": {
         "x_authority": {"current_board_lifecycle_generation": 1},
         "board4_authority": {"active_board_epoch": 1}}}
+    from bioxp.operator_command_plane import OperatorCommandPlane
+    from bioxp.operator_controls import _workflow_terminal_result
+    from fastapi import FastAPI
+    plane = OperatorCommandPlane.__new__(OperatorCommandPlane)
+    plane.app = FastAPI()
+    plane.store = rig.store
+    plane.machine_state_provider = lambda: admission
+    plane.app.state.oem_deck_provider = p
+    plane.app.state.oem_wp8_operation_executor = execute_wp8
     child_ids = []
     def execute(compiled, action, state):
         admitted = rig.store.admit_internal_wp8_operation(compiled["operation"], inputs={},
@@ -196,60 +205,61 @@ def test_diagnostic_real_provider_sqlite_and_transport_seams(rig, monkeypatch, t
         child_ids.append(child_id)
         claimed = rig.store.claim_next()
         assert claimed["command_id"] == child_id
-        response = execute_wp8(command_id=child_id, plan=compiled)
-        rig.store.finish(child_id, status="completed", payload={"response": response}, claimed=claimed)
-        return response
+        plane._dispatch_one(claimed)
+        terminal = rig.store.get_command(child_id)
+        import json
+        assert len(json.dumps(terminal["terminal_evidence"])) < 131072
+        return _workflow_terminal_result(terminal)
     handler = bind_manual_physical_handler(command_store=rig.store,
         execute_plan=execute,
         require_motion_ready=lambda: None, provider_getter=lambda: p,
         receipt_store_getter=lambda: receipts)
-    try:
-        result = handler(doc.stages[0].actions[0], runtime)
-        body = result["completed_children"][0]["result"]
-    except Exception as exc:
-        if hasattr(exc, "provider_results"):
-            body = getattr(exc, "provider_results")[0]
+    from bioxp.protocols.executor import ProtocolExecutor
+    from bioxp.protocols.models import ProtocolActionKind
+    def publish(state):
+        rig.store.publish_workflow("detect-parent", payload={"execution": {"runtime_state": state.to_payload()}})
+    runtime = ProtocolExecutor(dry_run=False, job_id="detect-parent",
+        before_native_entry=lambda identity, state: rig.store.assert_workflow_current("detect-parent"),
+        on_state_change=publish,
+        handlers={ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL: handler}).execute(doc, state=runtime)
+    result = next(row for row in runtime.action_results if row.get("action_id") == doc.stages[0].actions[0].action_id)
+    retained = rig.store.get_workflow("detect-parent")["execution"]["runtime_state"]["action_results"]
+    assert next(row for row in retained if "pipette_result" in row)["pipette_result"] == result["pipette_result"]
+    body = result["pipette_result"]
+    assert body["kind"] == "diagnostic_detect_fluid"
+    assert body == result["receipt"]["terminal_evidence"]["pipette_result"]
+    # This fixture deliberately declares two T50 trays; a genuine source
+    # stock-exhaustion exception must survive dispatcher and workflow storage.
+    assert not body["completed"]
+    assert result["calibration_persisted"] is False
+    assert not any(e["operation"] == "park_gantry" for e in body["events"])
+    operations = [e["operation"] for e in body["events"]]
+    if failure == "outer_exception":
+        assert "injected_initiate_outer_exception" in body["error"]
+        assert not body["scans"]
+        assert not any(op.startswith("zOffset:") for op in operations)
+    else:
+        assert [s["plate"] for s in body["scans"]] == ["TC", "MS"]
+        assert operations[-1] == "zOffset:OC"
+        if failure == "third_scan":
+            assert body["error"] != "The required tip is not loaded!"
+            assert "scrFluidDetection" in str(body["events"][-1])
         else:
-            rows = (getattr(exc, "evidence", {}).get("failure_evidence") or [{}])
-            body = rows[0].get("result") or {}
-        assert not body["completed"]
-        assert not any(e["operation"] == "park_gantry" for e in body["events"])
-        operations = [e["operation"] for e in body["events"]]
-        if failure == "outer_exception":
-            assert "injected_initiate_outer_exception" in body["error"]
-            assert not body["scans"]
-            assert not any(op.startswith("zOffset:") for op in operations)
-        else:
-            assert [s["plate"] for s in body["scans"]] == ["TC", "MS"]
-            assert operations[-1] == "zOffset:OC"
-            if failure == "third_scan":
-                assert body["error"] != "The required tip is not loaded!"
-                assert "scrFluidDetection" in str(body["events"][-1]["evidence"])
-            else:
-                # The old fixture falsely completed all scans by swallowing
-                # loadTips's stock-exhaustion throw. Two declared T50 trays
-                # are consumed by TC/MS; OC must unwind, not scan.
-                assert body["error"] == "The required tip is not loaded!"
-                assert body["events"][-1]["evidence"]["samples"] == []
-                assert [s["operation"] for s in body["events"][-1]["evidence"]["steps"]] == [
-                    "updatePlateLocation", "loadTips"]
-            if failure in {"second_catch", "first_release"}:
-                failed_name = "catch_plate" if failure == "second_catch" else "release_plate"
-                suppressed = [e for e in body["events"] if e["operation"] == failed_name
-                              and e.get("result", {}).get("exception_suppressed")]
-                assert len(suppressed) == 1
-                evidence = suppressed[0]["result"]
-                assert evidence["ok"] is False
-                assert f"injected_{failure}_native_failure" in str(evidence["failure_evidence"])
-                assert body["scans"][1]["plate"] == "MS"
-            if failure == "initiate_boolean_false":
-                assert [e["result"]["ok"] for e in body["events"]
-                        if e["operation"] == "initiateGroup"] == [False]
-        assert receipts.read(limit=1000)
-        keys = [row[0] for row in receipts.connection.execute("SELECT command_id FROM pipette_operations")]
-        assert len(keys) == len(set(keys))
-        ids = [e["source_identity"] for e in body["events"] if "source_identity" in e]
-        assert len(ids) == len(set(ids))
-        assert rig.store.wp8_operation_evidence(child_ids[0])["children"][0]["operation"] == "sourceDiagnosticDetectFluid"
-        return
-    pytest.fail("diagnostic swallowed a genuine source exception")
+            assert body["error"] == "The required tip is not loaded!"
+        if failure in {"second_catch", "first_release"}:
+            failed_name = "catch_plate" if failure == "second_catch" else "release_plate"
+            suppressed = [e for e in body["events"] if e["operation"] == failed_name
+                          and e.get("result", {}).get("exception_suppressed")]
+            assert len(suppressed) == 1
+            assert suppressed[0]["result"]["ok"] is False
+            assert f"injected_{failure}_native_failure" in str(suppressed[0]["errors"])
+            assert body["scans"][1]["plate"] == "MS"
+        if failure == "initiate_boolean_false":
+            assert [e["result"]["ok"] for e in body["events"]
+                    if e["operation"] == "initiateGroup"] == [False]
+    assert receipts.read(limit=1000)
+    keys = [row[0] for row in receipts.connection.execute("SELECT command_id FROM pipette_operations")]
+    assert len(keys) == len(set(keys))
+    ids = [e["source_identity"] for e in body["events"] if "source_identity" in e]
+    assert len(ids) == len(set(ids))
+    assert rig.store.wp8_operation_evidence(child_ids[0])["children"][0]["operation"] == "sourceDiagnosticDetectFluid"

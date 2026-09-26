@@ -334,9 +334,14 @@ def bind_manual_physical_handler(*, command_store: Any, execute_plan: Callable,
                         raise RuntimeError("calibration settings service not bound")
                     provider._manual_calibration_settings = calibration_settings_getter()
             result = execute_plan(plan, action, state)
-        children = result.get("completed_children") or result.get("source_children") or []
-        saved_revision_id = (children[0].get("result") or {}).get("saved_revision_id") if children else None
+        from .operator_controls import _compact_pipette_response
+        result = _compact_pipette_response(result)
+        critical = result.get("pipette_result") or {}
+        # An older saved revision can survive a failure before the first save.
+        # Per-station revisions are appended by the source only after settings.save.
+        saved_stations = any(row.get("saved_revision_id") is not None
+                             for row in critical.get("measurements", []))
         return {**dict(result), "physical_effect_verified": False,
                 "calibration_persisted": plan["operation"] == "source_calwith_fluid" and
-                saved_revision_id is not None}
+                saved_stations}
     return handle

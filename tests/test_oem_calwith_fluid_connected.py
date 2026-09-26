@@ -33,7 +33,7 @@ def test_calibration_compiles_one_owner_and_rejects_untyped_arguments():
         manual_physical_plan({"operation": "source_calwith_fluid", "comparison_choice": True})
 
 
-@pytest.mark.parametrize("inject_failure", [False, True])
+@pytest.mark.parametrize("inject_failure", [False, True, "finalization"])
 @pytest.mark.parametrize("machine_calibrated", [True, False])
 def test_native_calibration_five_saves_and_partial_failure(rig, monkeypatch, tmp_path, inject_failure, machine_calibrated):
     from tests.test_deck_tip_query_publication import bind_collection_test_identity
@@ -133,7 +133,14 @@ def test_native_calibration_five_saves_and_partial_failure(rig, monkeypatch, tmp
             d.issue("aspirate", volume=volume, **kw), raising=False)
         monkeypatch.setattr(driver, "dispense", lambda volume, d=driver, **kw:
             d.issue("dispense_liquid", volume=volume, **kw), raising=False)
-    if inject_failure:
+    if inject_failure == "finalization":
+        original_acc = p.primitives.z_set_max_acc
+        def fail_final_acc(value):
+            if value == 576:
+                raise RuntimeError("transport final acceleration failure")
+            return original_acc(value)
+        monkeypatch.setattr(p.primitives, "z_set_max_acc", fail_final_acc)
+    if inject_failure is True:
         saved = []
         service = p._manual_calibration_settings
         original_save = service.save
@@ -147,43 +154,74 @@ def test_native_calibration_five_saves_and_partial_failure(rig, monkeypatch, tmp
             result = original_wait(timeout, owner_token=owner_token)
             return {**result, "ok": False} if owner_token.startswith("BR") and len(saved) >= 2 else result
         monkeypatch.setattr(rig.drivers[2], "wait_pipette_command_completion", fail_third_scan)
-    if inject_failure:
-        plan = compile_finite_plate_operation("source_calwith_fluid", source_leaf_available=True)
-        child = {**plan["children"][0], "_delivery_identity": {"source_identity": "cal-parent:source"}}
-        body = p.execute_wp8_child(child, command_id="cal-parent", child_order=0,
-                                   plan_digest=plan["plan_digest"])
-    else:
-        doc = compile_manual_pipetting({"protocol_id": "cal", "steps": [
-            {"operation": "source_calwith_fluid"}]})
-        runtime = ProtocolRuntimeState.from_document(doc, dry_run=False, job_id="cal-parent")
-        monkeypatch.setattr("bioxp.runtime_state.get_active_oem_runtime_state_store", lambda: object())
-        monkeypatch.setattr("bioxp.pipette.manual_settings.read_pipette_operation_settings",
-            lambda _: {"runtime_values": {"LogPressure": False,
-                                          "CheckForStaticTipLoss": False}})
-        execute_wp8 = make_wp8_operation_executor(provider_getter=lambda: p, command_store=rig.store)
-        admission = {"ownership_generation": 1, "serial206_initialization_provider": {
-            "x_authority": {"current_board_lifecycle_generation": 1},
-            "board4_authority": {"active_board_epoch": 1}}}
-        def execute(compiled, action, state):
-            admitted = rig.store.admit_internal_wp8_operation(compiled["operation"], inputs={},
-                state=admission, idempotency_key=action.action_id, prepared_plan=compiled)
-            claimed = rig.store.claim_next()
-            assert claimed["command_id"] == admitted["command_id"]
-            response = execute_wp8(command_id=claimed["command_id"], plan=compiled)
-            rig.store.finish(claimed["command_id"], status="completed",
-                payload={"response": response}, claimed=claimed)
-            return response
-        handler = bind_manual_physical_handler(command_store=rig.store, execute_plan=execute,
-            require_motion_ready=lambda: None, provider_getter=lambda: p,
-            receipt_store_getter=lambda: receipts,
-            calibration_settings_getter=lambda: p._manual_calibration_settings)
-        result = handler(doc.stages[0].actions[0], runtime)
-        assert result["calibration_persisted"] is True
-        body = result["completed_children"][0]["result"]
-    assert body["ok"] is not inject_failure, body
+    doc = compile_manual_pipetting({"protocol_id": "cal", "steps": [
+        {"operation": "source_calwith_fluid"}]})
+    runtime = ProtocolRuntimeState.from_document(doc, dry_run=False, job_id="cal-parent")
+    monkeypatch.setattr("bioxp.runtime_state.get_active_oem_runtime_state_store", lambda: object())
+    monkeypatch.setattr("bioxp.pipette.manual_settings.read_pipette_operation_settings",
+        lambda _: {"runtime_values": {"LogPressure": False,
+                                      "CheckForStaticTipLoss": False}})
+    execute_wp8 = make_wp8_operation_executor(provider_getter=lambda: p, command_store=rig.store)
+    admission = {"ownership_generation": 1, "serial206_initialization_provider": {
+        "x_authority": {"current_board_lifecycle_generation": 1},
+        "board4_authority": {"active_board_epoch": 1}}}
+    from bioxp.operator_command_plane import OperatorCommandPlane
+    from bioxp.operator_controls import _workflow_terminal_result
+    from fastapi import FastAPI
+    plane = OperatorCommandPlane.__new__(OperatorCommandPlane)
+    plane.app = FastAPI()
+    plane.store = rig.store
+    plane.machine_state_provider = lambda: admission
+    plane.app.state.oem_deck_provider = p
+    plane.app.state.oem_wp8_operation_executor = execute_wp8
+    def execute(compiled, action, state):
+        admitted = rig.store.admit_internal_wp8_operation(compiled["operation"], inputs={},
+            state=admission, idempotency_key=action.action_id, prepared_plan=compiled)
+        claimed = rig.store.claim_next()
+        assert claimed["command_id"] == admitted["command_id"]
+        plane._dispatch_one(claimed)
+        terminal = rig.store.get_command(claimed["command_id"])
+        response = _workflow_terminal_result(terminal)
+        assert response["pipette_result"] == terminal["terminal_evidence"]["response"]["pipette_result"]
+        assert response["status"] == ("ambiguous" if inject_failure else "completed")
+        import json
+        assert len(json.dumps(terminal["terminal_evidence"])) < 131072
+        canonical = rig.store.wp8_operation_evidence(claimed["command_id"])
+        child = canonical["children"][0]
+        child_result = json.loads(child["terminal_evidence_json"])["result"]
+        assert child_result["measurements"] == response["pipette_result"]["measurements"]
+        assert "source_events" not in child_result
+        if not inject_failure:
+            operation_result = json.loads(canonical["operation"]["terminal_result_json"])
+            assert operation_result["pipette_result"] == response["pipette_result"]
+            assert len(canonical["operation"]["terminal_result_json"]) < 131072
+        outbox = rig.store.connection.execute(
+            "SELECT payload_json FROM operator_plane_outbox WHERE command_id=? ORDER BY transition_sequence DESC LIMIT 1",
+            (claimed["command_id"],)).fetchone()
+        assert json.loads(outbox[0])["pipette_result"] == response["pipette_result"]
+        return response
+    handler = bind_manual_physical_handler(command_store=rig.store, execute_plan=execute,
+        require_motion_ready=lambda: None, provider_getter=lambda: p,
+        receipt_store_getter=lambda: receipts,
+        calibration_settings_getter=lambda: p._manual_calibration_settings)
+    from bioxp.protocols.executor import ProtocolExecutor
+    from bioxp.protocols.models import ProtocolActionKind
+    def publish(state):
+        rig.store.publish_workflow("cal-parent", payload={"execution": {"runtime_state": state.to_payload()}})
+    runtime = ProtocolExecutor(dry_run=False, job_id="cal-parent",
+        before_native_entry=lambda identity, state: rig.store.assert_workflow_current("cal-parent"),
+        on_state_change=publish,
+        handlers={ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL: handler}).execute(doc, state=runtime)
+    result = next(row for row in runtime.action_results if row.get("action_id") == doc.stages[0].actions[0].action_id)
+    retained = rig.store.get_workflow("cal-parent")["execution"]["runtime_state"]["action_results"]
+    assert next(row for row in retained if "pipette_result" in row)["pipette_result"] == result["pipette_result"]
+    assert result["calibration_persisted"] is True
+    body = result["pipette_result"]
+    assert body["kind"] == "source_calwith_fluid"
+    assert body["ok"] is (not inject_failure), body
     assert [m["plate"] for m in body["measurements"]] == (
-        ["TC", "MS"] if inject_failure else ["TC", "MS", "OC", "RC", "STRIP"])
-    if inject_failure:
+        ["TC", "MS"] if inject_failure is True else ["TC", "MS", "OC", "RC", "STRIP"])
+    if inject_failure is True:
         assert body["error"] and body["outcome"] == "incomplete"
     else:
         assert body["body_completed"] and not body.get("error")
@@ -201,9 +239,11 @@ def test_native_calibration_five_saves_and_partial_failure(rig, monkeypatch, tmp
             assert body["outcome"] == "accepted_no_previous_values"
     assert p._manual_calibration_settings.read()["saved_revision_id"] == body["saved_revision_id"]
     assert p._manual_calibration_settings.read()["pending_restart"]
-    assert [e["operation"] for e in body["source_events"]][:9] == [
-        "setMaxAcc(z):outer", "setFileName", *(["pipette_tip_transition"] * 5),
-        "resetStatus", "press_plates"]
+    if inject_failure == "finalization":
+        assert body["finalization_error"] == "transport final acceleration failure"
+        assert body["body_completed"] is True
+    assert "source_events" not in body
+    assert all("steps" not in m["scan"] for m in body["measurements"])
     keys = [row[0] for row in receipts.connection.execute("SELECT command_id FROM pipette_operations")]
     assert len(keys) == len(set(keys)) and len(keys) > 4
     assert rig.store.connection.execute("SELECT count(*) FROM operator_commands WHERE command_id=?",

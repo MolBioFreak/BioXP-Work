@@ -29,6 +29,7 @@ from .operator_controls import (
     _DISPATCH_CONTEXT,
     _assess_action,
     _bounded_json,
+    _compact_pipette_response,
     _controller_acknowledged,
     _MAX_INPUT_BYTES,
 )
@@ -4855,7 +4856,7 @@ class OperatorCommandStore:
         with self._transaction() as conn:
             changed = conn.execute(
                 "UPDATE operator_plane_wp8_operations SET terminal_result_json=?,finished_at=? WHERE command_id=? AND terminal_result_json IS NULL",
-                (_canonical(dict(result)), _now(), str(command_id)),
+                (_canonical(_compact_pipette_response(result)), _now(), str(command_id)),
             ).rowcount
             if changed != 1:
                 raise RuntimeError("wp8 operation already terminal or absent")
@@ -6211,7 +6212,7 @@ class OperatorCommandStore:
                     int(controller_completion_verified),
                     int(hardware_postcondition_verified),
                     int(semantic_state_committed),
-                    _canonical(provider_results) if provider_results else None,
+                    _canonical([_compact_pipette_response(row) for row in provider_results]) if provider_results else None,
                     str(command_id),
                 ),
             )
@@ -7196,6 +7197,7 @@ class OperatorCommandStore:
     def finish(self, command_id: str, *, status: str, payload: Mapping[str, Any], source_noop: bool = False, source_noop_reason: str | None = None, remote_acknowledged: bool = False, controller_acknowledged: bool = False, physical_effect_verified: bool = False, claimed: Mapping[str, Any] | None = None, full_response: Any = None) -> dict[str, Any]:
         if status not in COMMAND_TERMINAL:
             raise ValueError(status)
+        payload = _compact_pipette_response(payload)
         with self._transaction() as conn:
             row = conn.execute("SELECT * FROM operator_plane_commands WHERE command_id=?", (command_id,)).fetchone()
             if row is None:
@@ -8449,7 +8451,7 @@ class OperatorCommandPlane:
                         "error": f"wp8_operation_exception:{type(exc).__name__}",
                         "detail": str(exc)[:500],
                         "delivery_attempted": delivery_attempted,
-                        **({"response": response} if failure is not None else {}),
+                        **({"response": _bounded_json(response, 131072)} if failure is not None else {}),
                         **({"outcome_unknown": True} if delivery_attempted else {}),
                     },
                     controller_acknowledged=bool(response.get("controller_command_acknowledged")),

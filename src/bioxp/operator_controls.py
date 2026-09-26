@@ -707,13 +707,125 @@ def _controller_acknowledged(value: Any) -> bool:
     return False
 
 
+def _pipette_source_errors(value: Any) -> list[Any]:
+    """Retain literal nested failure messages when deleting transport nesting."""
+    if isinstance(value, Mapping):
+        errors = []
+        for key, child in value.items():
+            if key in {"error", "finalization_error", "exception_message", "errors"} and child:
+                errors.extend(child if isinstance(child, list) else [child])
+            elif isinstance(child, (Mapping, list)):
+                errors.extend(_pipette_source_errors(child))
+        return [error for index, error in enumerate(errors) if error not in errors[:index]]
+    if isinstance(value, list):
+        return [error for child in value for error in _pipette_source_errors(child)]
+    return []
+
+
+def _compact_pipette_response(value: Any) -> Any:
+    """Keep operational data, not repeated transport/step trees, in receipts.
+
+    Primitive transport evidence already lives in the canonical child/pipette
+    stores. Source outcomes are copied verbatim; this is not outcome evaluation.
+    The discriminator is source-owned, never guessed from a saved revision.
+    """
+    if not isinstance(value, Mapping):
+        return value
+    source = str(value.get("source") or value.get("source_anchor") or "")
+    kinds = {"ControlLib.calwithFluid:": "source_calwith_fluid",
+             "ControlLib.btnDetectFluid_Click:": "diagnostic_detect_fluid",
+             "ControlLib.zOffset:": "source_fluid_offset",
+             "ControlLib.scrFluidDetection:": "measure_fluid_height"}
+    kind = next((kind for prefix, kind in kinds.items() if source.startswith(prefix)), None)
+    if kind:
+        result = {k: v for k, v in value.items() if k not in {"steps", "source_events"}}
+        errors = _pipette_source_errors([value.get("steps", []), value.get("source_events", [])])
+        if errors:
+            result["source_errors"] = errors
+        if "events" in result:
+            # Keep source occurrence/outcome evidence once, not each event's
+            # recursively repeated controller/scan transport tree.
+            events = []
+            for event in result["events"]:
+                row = {k: v for k, v in event.items() if k not in {"result", "evidence"}}
+                raw = event.get("result")
+                if isinstance(raw, Mapping):
+                    row["result"] = {k: v for k, v in raw.items()
+                        if not isinstance(v, (Mapping, list, tuple))}
+                    if raw.get("ok") is False and "samples" in raw:
+                        row["result"]["samples"] = raw["samples"]
+                errors = _pipette_source_errors(event)
+                if errors:
+                    row["errors"] = errors
+                events.append(row)
+            result["events"] = events
+        # Failed station samples can exist only in the calibration event stream;
+        # retain that source result without the repeated successful scan copies.
+        failed_scans = [event["result"] for event in value.get("source_events", [])
+            if isinstance(event.get("result"), Mapping)
+            and event["result"].get("ok") is False
+            and "samples" in event["result"]]
+        if failed_scans:
+            result["failed_scans"] = [_compact_pipette_response(scan) for scan in failed_scans]
+        for key in ("measurements", "scans"):
+            if key in result:
+                result[key] = [{**row, **({"scan": _compact_pipette_response(row["scan"])}
+                    if isinstance(row.get("scan"), Mapping) else {})} for row in result[key]]
+        return {"kind": kind, **result}
+    result = dict(value)
+    critical = result.get("pipette_result")
+    for key in ("result", "response", "completed_children", "source_children", "provider_results"):
+        child = result.get(key)
+        if isinstance(child, Mapping):
+            result[key] = _compact_pipette_response(child)
+            candidates = [result[key]]
+        elif isinstance(child, list):
+            result[key] = [_compact_pipette_response(row) for row in child]
+            candidates = result[key]
+        else:
+            continue
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            if isinstance(candidate.get("pipette_result"), Mapping):
+                critical = candidate["pipette_result"]
+            anchor = str(candidate.get("source") or candidate.get("source_anchor") or "")
+            child_kind = next((k for prefix, k in kinds.items() if anchor.startswith(prefix)), None)
+            if child_kind:
+                critical = {"kind": child_kind, **candidate}
+    if critical is not None:
+        result["pipette_result"] = critical
+    return result
+
+
+def _workflow_terminal_result(receipt: Mapping[str, Any]) -> dict[str, Any]:
+    """One native consumer for persisted terminal success and partial failure."""
+    evidence = receipt.get("terminal_evidence") or {}
+    response = dict(evidence.get("response") or {})
+    for key in ("error", "detail", "pipette_result"):
+        if key in evidence:
+            response[key] = evidence[key]
+    return {**response, "ok": receipt["status"] == "completed",
+            "command_id": receipt["command_id"], "status": receipt["status"], "receipt": receipt}
+
+
 def _bounded_json(value: Any, limit: int) -> Any:
+    value = _compact_pipette_response(value)
     try:
         raw = json.dumps(value, default=str, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     except Exception:
         return {"bounded": True, "detail": "unserializable response"}
     if len(raw) <= limit:
         return json.loads(raw)
+    if isinstance(value, Mapping) and isinstance(value.get("kind"), str) and value["kind"] in {
+            "source_calwith_fluid", "diagnostic_detect_fluid",
+            "source_fluid_offset", "measure_fluid_height"}:
+        return json.loads(raw)
+    if isinstance(value, Mapping) and isinstance(value.get("pipette_result"), Mapping):
+        # Critical source data is not diagnostic preview data. Drop the redundant
+        # envelope rather than hashing it or losing samples to the diagnostic cap.
+        return {key: value[key] for key in ("pipette_result", "ok", "error", "detail",
+            "delivery_attempted", "outcome_unknown") if key in value}
     digest = hashlib.sha256(raw).hexdigest()
     return {"bounded": True, "original_bytes": len(raw), "sha256": digest, "preview": raw[: min(limit // 2, 4096)].decode("utf-8", "replace")}
 
@@ -3202,10 +3314,7 @@ def install_operator_control_plane(
                                 command_plane.store.workflow_child_completion(command_id),
                                 domains=("Gripper",), command_id=command_id),)}
                 if status in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"}:
-                    evidence = receipt.get("terminal_evidence") or {}
-                    response = dict(evidence.get("response") or {})
-                    return {**response, "ok": status == "completed", "command_id": command_id,
-                            "status": status, "receipt": receipt}
+                    return _workflow_terminal_result(receipt)
                 if command_plane.store._stop.is_set():
                     raise RuntimeError("workflow_child_owner_lost")
                 # The existing dispatcher renews/executes; this is only the
