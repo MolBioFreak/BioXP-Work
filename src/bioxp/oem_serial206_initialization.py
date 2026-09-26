@@ -4503,6 +4503,7 @@ class Serial206OemInitializationProvider:
         "sourceLoadTips": "wp8_load_tips",
         "sourceMeasureFluidHeight": "wp8_manual_pipette_physical",
         "sourceFluidOffset": "wp8_source_fluid_offset",
+        "sourceManualPipette": "wp8_manual_source_pipette",
         "sourceCalwithFluid": "wp8_source_calwith_fluid",
         "sourceWellPierced": "wp8_pipette_source_leaf",
         "sourceLiftTo": "wp8_pipette_source_leaf",
@@ -12668,6 +12669,15 @@ class Serial206OemInitializationProvider:
                            force_new_tip=arguments["force_new_tip"])
         return {**result, "ok": result.get("source_return") is True,
                 "delivery_attempted": True}
+
+    def wp8_manual_source_pipette(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        from .pipette.manual_source import run_manual_source_inline
+        return run_manual_source_inline(self, arguments["request"], command_id=command_id,
+            owner_identity=owner_identity, state=self._manual_pipette_source_state,
+            settings=self._manual_pipette_source_settings)
 
     def wp8_source_fluid_offset(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,

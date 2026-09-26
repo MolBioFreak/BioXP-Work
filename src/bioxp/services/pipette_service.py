@@ -1217,7 +1217,11 @@ class _OemPipetteBody:
         return result["source_return"]
 
     def eject(self, check=True):
-        return self.pipette("eject_all_tips", lambda t: t.eject_all_tips(check_missing_tip=check, wait=True))
+        # Collection.ejectAllTips:1179-1186 selects MachineStatus.TipLocation.
+        # The generic transport's omitted channels means all four, not that
+        # source selection (notably after KeepTip on a consecutive request).
+        return self.pipette("eject_all_tips", lambda t: t.eject_all_tips(
+            check_missing_tip=check, wait=True, channels=t._tip_location_channels()))
 
     def move(self, location, column=0, row=0):
         return self.native("scriptmoveTo", self.n.script_move, location, column, row)

@@ -1095,13 +1095,20 @@ def _wp8_plan(operation: str, children: list[dict[str, Any]], **metadata: Any) -
             "terminal_source_point" if child["operation"] == "updatePlateLocation"
             else "immediate_after_source_call" if mutation else "none"
         )
-    plan["plan_digest"] = _digest(plan)
+    if operation == "manual_source_pipette":
+        # These typed source options contain floats. Match the existing queue's
+        # RFC8785 persistence digest (20.0 and 20 have one canonical encoding).
+        import rfc8785
+        plan["plan_digest"] = hashlib.sha256(rfc8785.dumps(plan)).hexdigest()
+    else:
+        plan["plan_digest"] = _digest(plan)
     return plan
 
 
 # Finite ControlLib pipette/lifecycle leaves. These are internal compiler
 # operations, never a public arbitrary-method dispatch surface.
 OEM_PIPETTE_LEAVES = {
+    "manual_source_pipette": ("sourceManualPipette", ("request",)),
     "pipette_load_tips": ("sourceLoadTips", ("tip_type", "force_new_tip")),
     "manual_load_tip": ("sourceManualLoadTip", ("tray", "well", "overpress", "lift_z")),
     "measure_fluid_height": ("sourceMeasureFluidHeight", ("speed",)),

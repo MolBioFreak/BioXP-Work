@@ -42,7 +42,7 @@ def test_run_job_query_nonscript_eject_requery_and_hold(remain):
     n.eject_all_tips=eject
     result=helpers(args)['run_job_tip_prefix'](state,source_occurrence_id='lifecycle:run_job:tips')
     assert [row[0] for row in n.calls]==['tips','eject','tips']
-    assert n.calls[1][1]=={'check_missing_tip':False,'wait':True}
+    assert n.calls[1][1]=={'check_missing_tip':False,'wait':True,'channels':[2]}
     assert ('waste',) in fx
     assert ('sleep',.5) in fx and ('sleep',.1) in fx
     if remain:

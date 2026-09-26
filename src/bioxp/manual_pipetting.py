@@ -88,6 +88,49 @@ class ManualLoadTip(_Request):
     lift_z: bool = False
 
 
+class SourceLoadTips(_Request):
+    """newloadTips, not calibration loadTips or manual tray/well pickup.
+
+    A matching tip type with force_new_tip=False returns without realignment.
+    Pipette is the OEM zero-based index; -1 is the fixed four-head group.
+    """
+    operation: Literal["source_load_tips"]
+    tip_type: Literal[50, 200]
+    pipette: int = Field(ge=-1, le=3)
+    force_new_tip: bool
+
+
+class SourceMix(_Request):
+    """ControlLib.mmix scientific procedure, not repeated manual strokes."""
+    operation: Literal["source_mix"]
+    volume_ul: float
+    air_ul: float = 15.0
+    aspirate_speed: float = 100.0
+    dispense_speed: float = 20.0
+    aspirate_delay_ms: int | None = None
+    dispense_delay_ms: int | None = None
+    cycles: int = Field(default=2, ge=0)
+    mix_type: Literal["N", "H", "C"] = "N"
+    tip_dip: bool = True
+
+
+class SourceAir(_Request):
+    operation: Literal["source_aspirate_air", "source_dispense_air"]
+    volume_ul: float
+
+
+class SourcePurge(_Request):
+    operation: Literal["source_purge"]
+    speed: float = 30.0
+    amp: bool = False
+    ntd: bool = False
+
+
+SOURCE_MANUAL_MODELS = {"source_load_tips": SourceLoadTips, "source_mix": SourceMix,
+    "source_aspirate_air": SourceAir, "source_dispense_air": SourceAir,
+    "source_purge": SourcePurge}
+
+
 class ManualMeasureFluidHeight(_Request):
     operation: Literal["measure_fluid_height"]
     speed: int = 300
@@ -111,7 +154,7 @@ class ManualCalwithFluid(_Request):
 
 ManualStep = Annotated[Union[ManualMove, ManualLower, ManualLift, ManualLiquid, ManualMix,
     ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset, DiagnosticDetectFluid,
-    ManualCalwithFluid], Field(discriminator="operation")]
+    ManualCalwithFluid, SourceLoadTips, SourceMix, SourceAir, SourcePurge], Field(discriminator="operation")]
 
 
 class ManualPipettingRequest(_Request):
@@ -145,7 +188,8 @@ def compile_manual_pipetting(request: ManualPipettingRequest | Mapping[str, Any]
         if isinstance(step, (ManualMove, ManualLower, ManualLift)):
             add(ProtocolActionKind.PIPETTE_POSITION, step.model_dump(), index)
         elif isinstance(step, (ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset,
-                               DiagnosticDetectFluid, ManualCalwithFluid)):
+                               DiagnosticDetectFluid, ManualCalwithFluid,
+                               SourceLoadTips, SourceMix, SourceAir, SourcePurge)):
             add(ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL, step.model_dump(), index)
         elif isinstance(step, ManualLiquid):
             liquid(step.operation, step.channels, step.volume_ul, step.speed, index)
@@ -200,6 +244,10 @@ def bind_manual_position_handler(*, command_store: Any, execute_plan: Callable,
 
 
 def manual_physical_plan(params: Mapping[str, Any]) -> dict[str, Any]:
+    if params.get("operation") in SOURCE_MANUAL_MODELS:
+        step = SOURCE_MANUAL_MODELS[params["operation"]].model_validate(dict(params))
+        return compile_finite_plate_operation("manual_source_pipette", source_leaf_available=True,
+                                             request=step.model_dump())
     models = {"load_tip": ManualLoadTip, "measure_fluid_height": ManualMeasureFluidHeight,
               "source_fluid_offset": ManualFluidOffset,
               "diagnostic_detect_fluid": DiagnosticDetectFluid,
@@ -249,7 +297,7 @@ def bind_manual_physical_handler(*, command_store: Any, execute_plan: Callable,
             command_store.assert_workflow_current(state.job_id)
             provider = provider_getter()
             provider._manual_pipette_receipt_runner = receipt
-            if plan["operation"] in {"source_fluid_offset", "diagnostic_detect_fluid", "source_calwith_fluid"}:
+            if plan["operation"] in {"source_fluid_offset", "diagnostic_detect_fluid", "source_calwith_fluid", "manual_source_pipette"}:
                 from .runtime_state import get_active_oem_runtime_state_store
                 from .pipette.manual_settings import read_pipette_operation_settings
                 from .oem_job_preparation import construct_new_machine_source_model

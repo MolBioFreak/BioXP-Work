@@ -1,0 +1,1280 @@
+{
+  "schema_version": "bioxp.manual_source_pipetting.v1",
+  "authoring_routes": {
+    "compile": "POST /liquid/manual/compile",
+    "execute": "POST /liquid/manual/execute",
+    "native_submit": "POST /protocol/execute",
+    "request_model": "bioxp.manual_pipetting.ManualPipettingRequest",
+    "execute_model": "bioxp.api.ManualPipettingExecuteRequest"
+  },
+  "existing_surfaces_not_duplicated": {
+    "POST /liquid/keep-tip": "PipetteKeepTipRequest -> FourPipetteTransport.KeepTip",
+    "POST /liquid/aspirate-air": "PipetteAirRequest -> aspirate_air (primitive, no source LiftForAir)",
+    "POST /liquid/dispense-air": "PipetteAirRequest -> dispense_air (primitive, distinct from source da)",
+    "POST /liquid/mix-all": "PipetteMixAllRequest -> mix_all; unchanged collection tip-type-as-volume behavior",
+    "POST /liquid/dispense-all": "PipetteDispenseAllRequest -> dispense_all",
+    "POST /liquid/terminate": "PipetteTerminateRequest -> terminate; addressed device stop, not HTTP cancellation",
+    "POST /liquid/heartbeat": "PipetteHeartbeatRequest -> heartbeat",
+    "POST /liquid/pipette/tip-type": "PipetteTipTypeRequest -> loadTip; host metadata only"
+  },
+  "step_schema": {
+    "$defs": {
+      "SourceAir": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "enum": [
+              "source_aspirate_air",
+              "source_dispense_air"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "volume_ul": {
+            "title": "Volume Ul",
+            "type": "number"
+          }
+        },
+        "required": [
+          "operation",
+          "volume_ul"
+        ],
+        "title": "SourceAir",
+        "type": "object"
+      },
+      "SourceLoadTips": {
+        "additionalProperties": false,
+        "description": "newloadTips, not calibration loadTips or manual tray/well pickup.\n\nA matching tip type with force_new_tip=False returns without realignment.\nPipette is the OEM zero-based index; -1 is the fixed four-head group.",
+        "properties": {
+          "operation": {
+            "const": "source_load_tips",
+            "title": "Operation",
+            "type": "string"
+          },
+          "tip_type": {
+            "enum": [
+              50,
+              200
+            ],
+            "title": "Tip Type",
+            "type": "integer"
+          },
+          "pipette": {
+            "maximum": 3,
+            "minimum": -1,
+            "title": "Pipette",
+            "type": "integer"
+          },
+          "force_new_tip": {
+            "title": "Force New Tip",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "operation",
+          "tip_type",
+          "pipette",
+          "force_new_tip"
+        ],
+        "title": "SourceLoadTips",
+        "type": "object"
+      },
+      "SourceMix": {
+        "additionalProperties": false,
+        "description": "ControlLib.mmix scientific procedure, not repeated manual strokes.",
+        "properties": {
+          "operation": {
+            "const": "source_mix",
+            "title": "Operation",
+            "type": "string"
+          },
+          "volume_ul": {
+            "title": "Volume Ul",
+            "type": "number"
+          },
+          "air_ul": {
+            "default": 15.0,
+            "title": "Air Ul",
+            "type": "number"
+          },
+          "aspirate_speed": {
+            "default": 100.0,
+            "title": "Aspirate Speed",
+            "type": "number"
+          },
+          "dispense_speed": {
+            "default": 20.0,
+            "title": "Dispense Speed",
+            "type": "number"
+          },
+          "aspirate_delay_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Aspirate Delay Ms"
+          },
+          "dispense_delay_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Dispense Delay Ms"
+          },
+          "cycles": {
+            "default": 2,
+            "minimum": 0,
+            "title": "Cycles",
+            "type": "integer"
+          },
+          "mix_type": {
+            "default": "N",
+            "enum": [
+              "N",
+              "H",
+              "C"
+            ],
+            "title": "Mix Type",
+            "type": "string"
+          },
+          "tip_dip": {
+            "default": true,
+            "title": "Tip Dip",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "operation",
+          "volume_ul"
+        ],
+        "title": "SourceMix",
+        "type": "object"
+      },
+      "SourcePurge": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "const": "source_purge",
+            "title": "Operation",
+            "type": "string"
+          },
+          "speed": {
+            "default": 30.0,
+            "title": "Speed",
+            "type": "number"
+          },
+          "amp": {
+            "default": false,
+            "title": "Amp",
+            "type": "boolean"
+          },
+          "ntd": {
+            "default": false,
+            "title": "Ntd",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "title": "SourcePurge",
+        "type": "object"
+      }
+    },
+    "discriminator": {
+      "mapping": {
+        "source_aspirate_air": "#/$defs/SourceAir",
+        "source_dispense_air": "#/$defs/SourceAir",
+        "source_load_tips": "#/$defs/SourceLoadTips",
+        "source_mix": "#/$defs/SourceMix",
+        "source_purge": "#/$defs/SourcePurge"
+      },
+      "propertyName": "operation"
+    },
+    "oneOf": [
+      {
+        "$ref": "#/$defs/SourceLoadTips"
+      },
+      {
+        "$ref": "#/$defs/SourceMix"
+      },
+      {
+        "$ref": "#/$defs/SourceAir"
+      },
+      {
+        "$ref": "#/$defs/SourcePurge"
+      }
+    ]
+  },
+  "examples": [
+    {
+      "request": {
+        "protocol_id": "source-selected--1",
+        "steps": [
+          {
+            "operation": "source_load_tips",
+            "tip_type": 50,
+            "pipette": -1,
+            "force_new_tip": true
+          },
+          {
+            "operation": "move",
+            "location_id": 3,
+            "well": "G2",
+            "position_flag": 1
+          },
+          {
+            "operation": "aspirate",
+            "channels": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "volume_ul": 10.0,
+            "speed": 20.0
+          },
+          {
+            "operation": "move",
+            "location_id": 1,
+            "well": "H3",
+            "position_flag": 1
+          },
+          {
+            "operation": "dispense",
+            "channels": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "volume_ul": 10.0,
+            "speed": 20.0
+          }
+        ]
+      },
+      "document": {
+        "protocol_id": "source-selected--1",
+        "version": 1,
+        "stages": [
+          {
+            "stage_id": "manual",
+            "title": "Manual pipetting",
+            "review_required": false,
+            "actions": [
+              {
+                "action_id": "manual-0-0",
+                "stage_id": "manual",
+                "kind": "pipette_manual_physical",
+                "params": {
+                  "operation": "source_load_tips",
+                  "tip_type": 50,
+                  "pipette": -1,
+                  "force_new_tip": true
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 0
+                }
+              },
+              {
+                "action_id": "manual-1-1",
+                "stage_id": "manual",
+                "kind": "pipette_position",
+                "params": {
+                  "location_id": 3,
+                  "operation": "move",
+                  "well": "G2",
+                  "position_flag": 1
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 1
+                }
+              },
+              {
+                "action_id": "manual-2-2",
+                "stage_id": "manual",
+                "kind": "pipette_aspirate",
+                "params": {
+                  "volume_ul": 10.0,
+                  "pressure_profile": "1R",
+                  "source": null,
+                  "liquid_class": null,
+                  "tip_id": null,
+                  "air_gap_ul": null,
+                  "operator": null,
+                  "channels": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ],
+                  "speed": 20.0,
+                  "metadata": {}
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 2
+                }
+              },
+              {
+                "action_id": "manual-3-3",
+                "stage_id": "manual",
+                "kind": "pipette_position",
+                "params": {
+                  "location_id": 1,
+                  "operation": "move",
+                  "well": "H3",
+                  "position_flag": 1
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 3
+                }
+              },
+              {
+                "action_id": "manual-4-4",
+                "stage_id": "manual",
+                "kind": "pipette_dispense",
+                "params": {
+                  "volume_ul": 10.0,
+                  "pressure_profile": "1R",
+                  "blow_out": false,
+                  "destination": null,
+                  "liquid_class": null,
+                  "tip_id": null,
+                  "air_gap_ul": null,
+                  "operator": null,
+                  "dispense_type": 0,
+                  "channels": [
+                    0,
+                    1,
+                    2,
+                    3
+                  ],
+                  "speed": 20.0,
+                  "metadata": {}
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 4
+                }
+              }
+            ],
+            "metadata": {}
+          }
+        ],
+        "metadata": {
+          "manual_scope": "explicit_steps_only",
+          "well_alignment": "source_machine_tip_location"
+        }
+      }
+    },
+    {
+      "request": {
+        "protocol_id": "source-selected-0",
+        "steps": [
+          {
+            "operation": "source_load_tips",
+            "tip_type": 50,
+            "pipette": 0,
+            "force_new_tip": true
+          },
+          {
+            "operation": "move",
+            "location_id": 3,
+            "well": "G2",
+            "position_flag": 1
+          },
+          {
+            "operation": "aspirate",
+            "channels": [
+              0
+            ],
+            "volume_ul": 10.0,
+            "speed": 20.0
+          },
+          {
+            "operation": "move",
+            "location_id": 1,
+            "well": "H3",
+            "position_flag": 1
+          },
+          {
+            "operation": "dispense",
+            "channels": [
+              0
+            ],
+            "volume_ul": 10.0,
+            "speed": 20.0
+          }
+        ]
+      },
+      "document": {
+        "protocol_id": "source-selected-0",
+        "version": 1,
+        "stages": [
+          {
+            "stage_id": "manual",
+            "title": "Manual pipetting",
+            "review_required": false,
+            "actions": [
+              {
+                "action_id": "manual-0-0",
+                "stage_id": "manual",
+                "kind": "pipette_manual_physical",
+                "params": {
+                  "operation": "source_load_tips",
+                  "tip_type": 50,
+                  "pipette": 0,
+                  "force_new_tip": true
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 0
+                }
+              },
+              {
+                "action_id": "manual-1-1",
+                "stage_id": "manual",
+                "kind": "pipette_position",
+                "params": {
+                  "location_id": 3,
+                  "operation": "move",
+                  "well": "G2",
+                  "position_flag": 1
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 1
+                }
+              },
+              {
+                "action_id": "manual-2-2",
+                "stage_id": "manual",
+                "kind": "pipette_aspirate",
+                "params": {
+                  "volume_ul": 10.0,
+                  "pressure_profile": "1R",
+                  "source": null,
+                  "liquid_class": null,
+                  "tip_id": null,
+                  "air_gap_ul": null,
+                  "operator": null,
+                  "channels": [
+                    0
+                  ],
+                  "speed": 20.0,
+                  "metadata": {}
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 2
+                }
+              },
+              {
+                "action_id": "manual-3-3",
+                "stage_id": "manual",
+                "kind": "pipette_position",
+                "params": {
+                  "location_id": 1,
+                  "operation": "move",
+                  "well": "H3",
+                  "position_flag": 1
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 3
+                }
+              },
+              {
+                "action_id": "manual-4-4",
+                "stage_id": "manual",
+                "kind": "pipette_dispense",
+                "params": {
+                  "volume_ul": 10.0,
+                  "pressure_profile": "1R",
+                  "blow_out": false,
+                  "destination": null,
+                  "liquid_class": null,
+                  "tip_id": null,
+                  "air_gap_ul": null,
+                  "operator": null,
+                  "dispense_type": 0,
+                  "channels": [
+                    0
+                  ],
+                  "speed": 20.0,
+                  "metadata": {}
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 4
+                }
+              }
+            ],
+            "metadata": {}
+          }
+        ],
+        "metadata": {
+          "manual_scope": "explicit_steps_only",
+          "well_alignment": "source_machine_tip_location"
+        }
+      }
+    },
+    {
+      "request": {
+        "protocol_id": "source-selected-1",
+        "steps": [
+          {
+            "operation": "source_load_tips",
+            "tip_type": 50,
+            "pipette": 1,
+            "force_new_tip": true
+          },
+          {
+            "operation": "move",
+            "location_id": 3,
+            "well": "G2",
+            "position_flag": 1
+          },
+          {
+            "operation": "aspirate",
+            "channels": [
+              1
+            ],
+            "volume_ul": 10.0,
+            "speed": 20.0
+          },
+          {
+            "operation": "move",
+            "location_id": 1,
+            "well": "H3",
+            "position_flag": 1
+          },
+          {
+            "operation": "dispense",
+            "channels": [
+              1
+            ],
+            "volume_ul": 10.0,
+            "speed": 20.0
+          }
+        ]
+      },
+      "document": {
+        "protocol_id": "source-selected-1",
+        "version": 1,
+        "stages": [
+          {
+            "stage_id": "manual",
+            "title": "Manual pipetting",
+            "review_required": false,
+            "actions": [
+              {
+                "action_id": "manual-0-0",
+                "stage_id": "manual",
+                "kind": "pipette_manual_physical",
+                "params": {
+                  "operation": "source_load_tips",
+                  "tip_type": 50,
+                  "pipette": 1,
+                  "force_new_tip": true
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 0
+                }
+              },
+              {
+                "action_id": "manual-1-1",
+                "stage_id": "manual",
+                "kind": "pipette_position",
+                "params": {
+                  "location_id": 3,
+                  "operation": "move",
+                  "well": "G2",
+                  "position_flag": 1
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 1
+                }
+              },
+              {
+                "action_id": "manual-2-2",
+                "stage_id": "manual",
+                "kind": "pipette_aspirate",
+                "params": {
+                  "volume_ul": 10.0,
+                  "pressure_profile": "1R",
+                  "source": null,
+                  "liquid_class": null,
+                  "tip_id": null,
+                  "air_gap_ul": null,
+                  "operator": null,
+                  "channels": [
+                    1
+                  ],
+                  "speed": 20.0,
+                  "metadata": {}
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 2
+                }
+              },
+              {
+                "action_id": "manual-3-3",
+                "stage_id": "manual",
+                "kind": "pipette_position",
+                "params": {
+                  "location_id": 1,
+                  "operation": "move",
+                  "well": "H3",
+                  "position_flag": 1
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 3
+                }
+              },
+              {
+                "action_id": "manual-4-4",
+                "stage_id": "manual",
+                "kind": "pipette_dispense",
+                "params": {
+                  "volume_ul": 10.0,
+                  "pressure_profile": "1R",
+                  "blow_out": false,
+                  "destination": null,
+                  "liquid_class": null,
+                  "tip_id": null,
+                  "air_gap_ul": null,
+                  "operator": null,
+                  "dispense_type": 0,
+                  "channels": [
+                    1
+                  ],
+                  "speed": 20.0,
+                  "metadata": {}
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 4
+                }
+              }
+            ],
+            "metadata": {}
+          }
+        ],
+        "metadata": {
+          "manual_scope": "explicit_steps_only",
+          "well_alignment": "source_machine_tip_location"
+        }
+      }
+    },
+    {
+      "request": {
+        "protocol_id": "source-selected-2",
+        "steps": [
+          {
+            "operation": "source_load_tips",
+            "tip_type": 50,
+            "pipette": 2,
+            "force_new_tip": true
+          },
+          {
+            "operation": "move",
+            "location_id": 3,
+            "well": "G2",
+            "position_flag": 1
+          },
+          {
+            "operation": "aspirate",
+            "channels": [
+              2
+            ],
+            "volume_ul": 10.0,
+            "speed": 20.0
+          },
+          {
+            "operation": "move",
+            "location_id": 1,
+            "well": "H3",
+            "position_flag": 1
+          },
+          {
+            "operation": "dispense",
+            "channels": [
+              2
+            ],
+            "volume_ul": 10.0,
+            "speed": 20.0
+          }
+        ]
+      },
+      "document": {
+        "protocol_id": "source-selected-2",
+        "version": 1,
+        "stages": [
+          {
+            "stage_id": "manual",
+            "title": "Manual pipetting",
+            "review_required": false,
+            "actions": [
+              {
+                "action_id": "manual-0-0",
+                "stage_id": "manual",
+                "kind": "pipette_manual_physical",
+                "params": {
+                  "operation": "source_load_tips",
+                  "tip_type": 50,
+                  "pipette": 2,
+                  "force_new_tip": true
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 0
+                }
+              },
+              {
+                "action_id": "manual-1-1",
+                "stage_id": "manual",
+                "kind": "pipette_position",
+                "params": {
+                  "location_id": 3,
+                  "operation": "move",
+                  "well": "G2",
+                  "position_flag": 1
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 1
+                }
+              },
+              {
+                "action_id": "manual-2-2",
+                "stage_id": "manual",
+                "kind": "pipette_aspirate",
+                "params": {
+                  "volume_ul": 10.0,
+                  "pressure_profile": "1R",
+                  "source": null,
+                  "liquid_class": null,
+                  "tip_id": null,
+                  "air_gap_ul": null,
+                  "operator": null,
+                  "channels": [
+                    2
+                  ],
+                  "speed": 20.0,
+                  "metadata": {}
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 2
+                }
+              },
+              {
+                "action_id": "manual-3-3",
+                "stage_id": "manual",
+                "kind": "pipette_position",
+                "params": {
+                  "location_id": 1,
+                  "operation": "move",
+                  "well": "H3",
+                  "position_flag": 1
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 3
+                }
+              },
+              {
+                "action_id": "manual-4-4",
+                "stage_id": "manual",
+                "kind": "pipette_dispense",
+                "params": {
+                  "volume_ul": 10.0,
+                  "pressure_profile": "1R",
+                  "blow_out": false,
+                  "destination": null,
+                  "liquid_class": null,
+                  "tip_id": null,
+                  "air_gap_ul": null,
+                  "operator": null,
+                  "dispense_type": 0,
+                  "channels": [
+                    2
+                  ],
+                  "speed": 20.0,
+                  "metadata": {}
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 4
+                }
+              }
+            ],
+            "metadata": {}
+          }
+        ],
+        "metadata": {
+          "manual_scope": "explicit_steps_only",
+          "well_alignment": "source_machine_tip_location"
+        }
+      }
+    },
+    {
+      "request": {
+        "protocol_id": "source-selected-3",
+        "steps": [
+          {
+            "operation": "source_load_tips",
+            "tip_type": 50,
+            "pipette": 3,
+            "force_new_tip": true
+          },
+          {
+            "operation": "move",
+            "location_id": 3,
+            "well": "G2",
+            "position_flag": 1
+          },
+          {
+            "operation": "aspirate",
+            "channels": [
+              3
+            ],
+            "volume_ul": 10.0,
+            "speed": 20.0
+          },
+          {
+            "operation": "move",
+            "location_id": 1,
+            "well": "H3",
+            "position_flag": 1
+          },
+          {
+            "operation": "dispense",
+            "channels": [
+              3
+            ],
+            "volume_ul": 10.0,
+            "speed": 20.0
+          }
+        ]
+      },
+      "document": {
+        "protocol_id": "source-selected-3",
+        "version": 1,
+        "stages": [
+          {
+            "stage_id": "manual",
+            "title": "Manual pipetting",
+            "review_required": false,
+            "actions": [
+              {
+                "action_id": "manual-0-0",
+                "stage_id": "manual",
+                "kind": "pipette_manual_physical",
+                "params": {
+                  "operation": "source_load_tips",
+                  "tip_type": 50,
+                  "pipette": 3,
+                  "force_new_tip": true
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 0
+                }
+              },
+              {
+                "action_id": "manual-1-1",
+                "stage_id": "manual",
+                "kind": "pipette_position",
+                "params": {
+                  "location_id": 3,
+                  "operation": "move",
+                  "well": "G2",
+                  "position_flag": 1
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 1
+                }
+              },
+              {
+                "action_id": "manual-2-2",
+                "stage_id": "manual",
+                "kind": "pipette_aspirate",
+                "params": {
+                  "volume_ul": 10.0,
+                  "pressure_profile": "1R",
+                  "source": null,
+                  "liquid_class": null,
+                  "tip_id": null,
+                  "air_gap_ul": null,
+                  "operator": null,
+                  "channels": [
+                    3
+                  ],
+                  "speed": 20.0,
+                  "metadata": {}
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 2
+                }
+              },
+              {
+                "action_id": "manual-3-3",
+                "stage_id": "manual",
+                "kind": "pipette_position",
+                "params": {
+                  "location_id": 1,
+                  "operation": "move",
+                  "well": "H3",
+                  "position_flag": 1
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 3
+                }
+              },
+              {
+                "action_id": "manual-4-4",
+                "stage_id": "manual",
+                "kind": "pipette_dispense",
+                "params": {
+                  "volume_ul": 10.0,
+                  "pressure_profile": "1R",
+                  "blow_out": false,
+                  "destination": null,
+                  "liquid_class": null,
+                  "tip_id": null,
+                  "air_gap_ul": null,
+                  "operator": null,
+                  "dispense_type": 0,
+                  "channels": [
+                    3
+                  ],
+                  "speed": 20.0,
+                  "metadata": {}
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 4
+                }
+              }
+            ],
+            "metadata": {}
+          }
+        ],
+        "metadata": {
+          "manual_scope": "explicit_steps_only",
+          "well_alignment": "source_machine_tip_location"
+        }
+      }
+    },
+    {
+      "request": {
+        "protocol_id": "source-scientific",
+        "steps": [
+          {
+            "operation": "source_mix",
+            "volume_ul": 20.0
+          },
+          {
+            "operation": "source_aspirate_air",
+            "volume_ul": 5.0
+          },
+          {
+            "operation": "source_dispense_air",
+            "volume_ul": 5.0
+          },
+          {
+            "operation": "source_purge",
+            "speed": 30.0,
+            "amp": false,
+            "ntd": false
+          }
+        ]
+      },
+      "document": {
+        "protocol_id": "source-scientific",
+        "version": 1,
+        "stages": [
+          {
+            "stage_id": "manual",
+            "title": "Manual pipetting",
+            "review_required": false,
+            "actions": [
+              {
+                "action_id": "manual-0-0",
+                "stage_id": "manual",
+                "kind": "pipette_manual_physical",
+                "params": {
+                  "operation": "source_mix",
+                  "volume_ul": 20.0,
+                  "air_ul": 15.0,
+                  "aspirate_speed": 100.0,
+                  "dispense_speed": 20.0,
+                  "aspirate_delay_ms": null,
+                  "dispense_delay_ms": null,
+                  "cycles": 2,
+                  "mix_type": "N",
+                  "tip_dip": true
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 0
+                }
+              },
+              {
+                "action_id": "manual-1-1",
+                "stage_id": "manual",
+                "kind": "pipette_manual_physical",
+                "params": {
+                  "operation": "source_aspirate_air",
+                  "volume_ul": 5.0
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 1
+                }
+              },
+              {
+                "action_id": "manual-2-2",
+                "stage_id": "manual",
+                "kind": "pipette_manual_physical",
+                "params": {
+                  "operation": "source_dispense_air",
+                  "volume_ul": 5.0
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 2
+                }
+              },
+              {
+                "action_id": "manual-3-3",
+                "stage_id": "manual",
+                "kind": "pipette_manual_physical",
+                "params": {
+                  "operation": "source_purge",
+                  "speed": 30.0,
+                  "amp": false,
+                  "ntd": false
+                },
+                "description": null,
+                "required_capability": null,
+                "review_required": false,
+                "pause_message": null,
+                "oem_opcode": null,
+                "source_occurrence_id": null,
+                "source_key": null,
+                "metadata": {
+                  "manual_step": 3
+                }
+              }
+            ],
+            "metadata": {}
+          }
+        ],
+        "metadata": {
+          "manual_scope": "explicit_steps_only",
+          "well_alignment": "source_machine_tip_location"
+        }
+      }
+    }
+  ],
+  "notes": {
+    "channel_numbering": "pipette -1 = fixed four-head group; 0..3 = source single pipette; no arbitrary XY subsets",
+    "early_return": "Matching tip type plus force_new_tip=false keeps existing TipLocation even when a different pipette was requested",
+    "load_distinctions": "source_load_tips = newloadTips; load_tip = manual tray/well; pipette_load_tips = calibration loadTips; /liquid/pipette/tip-type = software-only",
+    "mix_distinctions": "source_mix = mmix; mix = repeated strokes; /liquid/mix-all = collection mixAll (unchanged tip-type-as-volume quirk)",
+    "execution": "Compile to ordinary native document; submit through existing /protocol/execute; no full job/lifecycle",
+    "source_result": "completed_children[0].result: source_return, native_results; source_load_tips additionally requested_pipette, tip_location, already_matching_tip_type, alignment_published; physical_effect_verified=false"
+  }
+}
