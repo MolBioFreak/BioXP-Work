@@ -309,4 +309,3 @@ def test_source_press_retry_is_not_an_outer_retry(connected, monkeypatch):
     names = [row["operation"] for row in body["native_results"]]
     assert names.count("lowerPipette") == 2
     assert names.count("loadTip") == 1
-
