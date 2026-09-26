@@ -98,19 +98,23 @@ def run_manual_source_inline(provider: Any, request: Mapping[str, Any], *,
                              params={"arguments": ()})
     body = _OemPipetteBody(action, state, callbacks["source_bindings"], receipt, fence, settings)
     callbacks["lift_for_air"] = lambda action, runtime: body.lift_air()
+    def outcome(result):
+        return {"kind": step.operation, **result}
+
+    before = None
     try:
         if isinstance(step, SourceLoadTips):
             before = body.facts()
             returned = body.newload(step.tip_type, step.force_new_tip, step.pipette)
             after = body.facts()
-            return {**body.result(), "source_return": returned,
+            return outcome({**body.result(), "source_return": returned,
                 "requested_pipette": step.pipette, "tip_location": after["tip_location"],
                 "already_matching_tip_type": before["tip_type"] == step.tip_type and not step.force_new_tip,
                 "alignment_published": any(row["operation"] == "loadTip" for row in body.steps)
-                    and after["tip_location"] == step.pipette}
+                    and after["tip_location"] == step.pipette})
         if isinstance(step, SourcePurge):
             body.purge(step.speed, amp=step.amp, ntd=step.ntd)
-            return {**body.result(), "source_return": None}
+            return outcome({**body.result(), "source_return": None})
         if isinstance(step, SourceMix):
             opcode = "mmix"
             action.params["arguments"] = {
@@ -125,8 +129,21 @@ def run_manual_source_inline(provider: Any, request: Mapping[str, Any], *,
             action.params["arguments"] = (str(step.volume_ul),)
         handlers = build_oem_pipette_handlers(before_native_entry=fence,
                                               pipette_call=receipt, **callbacks)
-        return handlers[opcode](action, state)
+        return outcome(handlers[opcode](action, state))
     except Exception as exc:
         if not hasattr(exc, "oem_partial_results"):
             setattr(exc, "oem_partial_results", list(body.steps))
-        raise
+        # Keep the thrown boundary and original cause, carrying the partial
+        # source account through the finite executor's existing failure path.
+        from ..oem_deck_movement import DeckExecutionFailure
+        partial = outcome({"ok": False, "source_return_completed": False,
+            "error": str(exc), "exception_type": type(exc).__name__,
+            "native_results": getattr(exc, "oem_partial_results")})
+        if isinstance(step, SourceLoadTips):
+            partial.update(requested_pipette=step.pipette,
+                tip_location=provider._deck_semantic_state_reader()["tip_location"],
+                **({"already_matching_tip_type": before["tip_type"] == step.tip_type and not step.force_new_tip} if before else {}),
+                alignment_published=any(row["operation"] == "loadTip" for row in body.steps)
+                    and provider._deck_semantic_state_reader()["tip_location"] == step.pipette)
+        raise DeckExecutionFailure(str(exc), delivery_attempted=True,
+            provider_results=[partial]) from exc

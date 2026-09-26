@@ -41,3 +41,40 @@ def test_large_sample_set_and_partial_scan_remain_lossless():
     assert bounded["pipette_result"]["failed_scans"][0]["samples"] == samples
     assert "steps" not in bounded["pipette_result"]["failed_scans"][0]
     assert _bounded_json(scan, 131072)["samples"] == samples
+
+
+@pytest.mark.parametrize("kind", ["source_load_tips", "source_mix", "source_aspirate_air",
+    "source_dispense_air", "source_purge", "diagnostic_pipette"])
+@pytest.mark.parametrize("container", ["completed_children", "source_children", "provider_results"])
+def test_additional_typed_outcome_is_idempotent_and_not_transport_bulk(kind, container):
+    source = {"kind": kind, "ok": False, "source_return": None,
+        "error": "partial source failure", "tip_location": -1,
+        "native_results": [{"operation": "sent", "result": {"ok": False,
+            "driver_result": {"bulk": "x" * 200000, "error": "wire failure"}}}],
+        "tests": [{"number": 0, "channels": [{"channel": 0, "diagnosis": None,
+            "display": "No data returned"}]}]}
+    body = {container: [{"result": source}], "bulk": "x" * 200000}
+    result = _bounded_json(body, 131072)["pipette_result"]
+    assert result['kind'] == kind and result['source_return'] is None
+    assert result['tip_location'] == -1 and not result['ok']
+    assert result['tests'][0]['channels'][0]['diagnosis'] is None
+    assert 'wire failure' in result['source_errors']
+    assert 'driver_result' not in json.dumps(result)
+    assert _bounded_json(result, 1) == result
+    assert len(json.dumps(result)) < 2000
+
+
+def test_exported_additional_results_are_complete_native_action_rows():
+    from pathlib import Path
+    data = json.loads((Path(__file__).parents[1] /
+        'testdata/pipette_completion/additional-results.json').read_text())
+    names = [row['name'] for row in data['cases']]
+    assert len(names) == len(set(names)) == 21
+    for case in data['cases']:
+        action = case['action_result']
+        assert action['command_id'] and action['action_id']
+        assert case['request']['steps']
+        assert _bounded_json(action, 1)['pipette_result'] == action['pipette_result']
+    assert {'selected_load', 'matching_load', 'failed_reload', 'partial_diagnosis',
+        'aspirate', 'dispense', 'dispense_all', 'diagnoses', 'initialize', 'eject',
+        'get_data', 'last_error', 'plunger_up', 'plunger_down'} <= set(names)

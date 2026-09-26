@@ -722,6 +722,58 @@ def _pipette_source_errors(value: Any) -> list[Any]:
     return []
 
 
+_ADDITIONAL_PIPETTE_KINDS = frozenset({"source_load_tips", "source_mix",
+    "source_aspirate_air", "source_dispense_air", "source_purge", "diagnostic_pipette"})
+
+
+def _compact_pipette_observation(value: Any) -> Any:
+    """Project actual outcomes, dropping redundant wire/receipt trees."""
+    if isinstance(value, (list, tuple)):
+        return [_compact_pipette_observation(row) for row in value]
+    if not isinstance(value, Mapping):
+        return value
+    fields = {"ok", "completed", "source_return", "source_return_completed",
+        "controller_outcome_ok", "interrupted_by_terminate", "channel", "channels",
+        "result", "completion", "status", "group", "attempt", "number", "label",
+        "diagnosis", "display", "part_number", "revision", "firmware", "data",
+        "query", "queries", "results", "value", "value_ascii", "value_bytes", "unit",
+        "error", "errors", "oem_error_code", "oem_error_free",
+        "semantic_ok", "reply_received", "timeout_ms", "operation", "step_id",
+        "source_identity", "source_occurrence_id", "source_noop", "outcome",
+        "delivery_attempted", "exception_type", "failure", "steps", "current",
+        "current_max", "requested_current", "signed_steps", "requested_steps", "position_steps",
+        "command_issued", "physical_motion_commanded", "physical_effect_verified",
+        "command_id", "parent_command_id", "plan_digest", "child_order",
+        "tip_loaded", "source_tip_loaded", "tip_type", "tip_location", "volume_ul", "speed"}
+    return {k: _compact_pipette_observation(v) for k, v in value.items() if k in fields}
+
+
+def _compact_additional_pipette(value: Mapping[str, Any]) -> dict[str, Any]:
+    fields = {"kind", "action", "source_anchor", "source_occurrence_id", "ok",
+        "completed", "source_return", "source_return_completed", "source_noop",
+        "physical_effect_verified", "controller_outcome_ok", "delivery_attempted",
+        "interrupted_by_terminate", "error", "exception_type", "failure",
+        "requested_pipette", "tip_location", "already_matching_tip_type", "alignment_published",
+        "selected_channels", "lost_tip_channels", "cached_tip_channels", "ejected_channels"}
+    result = {k: v for k, v in value.items() if k in fields}
+    for key in ("tests", "attempts", "channels", "stroke", "dispense_all", "events", "native_results"):
+        if key in value:
+            result[key] = _compact_pipette_observation(value[key])
+    # Event trees duplicate the structured tests/data/status above. Keep the
+    # occurrence and scalar outcome once; plunger value/steps are scalars too.
+    for event in result.get("events", []):
+        if isinstance(event.get("result"), Mapping):
+            event["result"] = {k: v for k, v in event["result"].items()
+                if not isinstance(v, (Mapping, list, tuple))}
+    errors = list(value.get("source_errors", []))
+    for error in _pipette_source_errors(value):
+        if error not in errors:
+            errors.append(error)
+    if errors or "source_errors" in value:
+        result["source_errors"] = errors
+    return result
+
+
 def _compact_pipette_response(value: Any) -> Any:
     """Keep operational data, not repeated transport/step trees, in receipts.
 
@@ -731,6 +783,8 @@ def _compact_pipette_response(value: Any) -> Any:
     """
     if not isinstance(value, Mapping):
         return value
+    if value.get("kind") in _ADDITIONAL_PIPETTE_KINDS:
+        return _compact_additional_pipette(value)
     source = str(value.get("source") or value.get("source_anchor") or "")
     kinds = {"ControlLib.calwithFluid:": "source_calwith_fluid",
              "ControlLib.btnDetectFluid_Click:": "diagnostic_detect_fluid",
@@ -791,6 +845,7 @@ def _compact_pipette_response(value: Any) -> Any:
                 critical = candidate["pipette_result"]
             anchor = str(candidate.get("source") or candidate.get("source_anchor") or "")
             child_kind = next((k for prefix, k in kinds.items() if anchor.startswith(prefix)), None)
+            child_kind = candidate.get("kind") if candidate.get("kind") in _ADDITIONAL_PIPETTE_KINDS else child_kind
             if child_kind:
                 critical = {"kind": child_kind, **candidate}
     if critical is not None:
@@ -819,7 +874,7 @@ def _bounded_json(value: Any, limit: int) -> Any:
         return json.loads(raw)
     if isinstance(value, Mapping) and isinstance(value.get("kind"), str) and value["kind"] in {
             "source_calwith_fluid", "diagnostic_detect_fluid",
-            "source_fluid_offset", "measure_fluid_height"}:
+            "source_fluid_offset", "measure_fluid_height", *_ADDITIONAL_PIPETTE_KINDS}:
         return json.loads(raw)
     if isinstance(value, Mapping) and isinstance(value.get("pipette_result"), Mapping):
         # Critical source data is not diagnostic preview data. Drop the redundant

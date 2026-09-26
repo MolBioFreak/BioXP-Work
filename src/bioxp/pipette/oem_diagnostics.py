@@ -234,7 +234,7 @@ def run_diagnostic_inline(provider, diagnostic, *, command_id, owner_identity):
         "get_data": "ClassPipetteCollection:302-309,640-659",
         "last_error": "ClassPipetteCollection:557-569",
         "plunger_up": "ControlLib:1426-1433", "plunger_down": "ControlLib:1417-1424"}
-    result = {"action": request.action, "events": events, "physical_effect_verified": False,
+    result = {"kind": "diagnostic_pipette", "action": request.action, "events": events, "physical_effect_verified": False,
               "source_anchor": anchors[request.action]}
 
     def record(name, call):
