@@ -1,4 +1,12 @@
-"""Native calibration worker under one claimed command; hardware transport replaced."""
+"""Native calibration worker under one claimed command; hardware transport replaced.
+
+Reproduce BMS producer exports (run sequentially, not with pytest-xdist):
+    PIPETTE_COMPLETION_EXPORT=testdata/pipette_completion/calibration-results.json \
+        PYTHONPATH=src:tests:. python -m pytest -q tests/test_oem_calwith_fluid_connected.py
+
+The opt-in artifact contains actual SQLite action envelopes and REST run replies;
+ordinary test runs do not modify repository fixtures. UUIDs/times remain untouched.
+"""
 import asyncio
 import socket
 from contextlib import nullcontext
@@ -77,8 +85,9 @@ def test_native_calibration_five_saves_and_partial_failure(rig, monkeypatch, tmp
     from bioxp.serial206_y_provider import Serial206YProvider
     p.primitives.bind_y_provider(Serial206YProvider(rig.native,
         state_store=p._manual_calibration_settings.store, generation_provider=lambda: 1))
-    p._read_constructed_tip_tray = lambda i: {"tip_type": "T50" if i == 0 else "T200",
-        "location": 7 + i, "construction_id": "fixture", "tip_available": True,
+    # Match the source resetStatus inventory, including the hotel location.
+    p._read_constructed_tip_tray = lambda i: {"tip_type": "T200" if i == 3 else "T50",
+        "location": [7, 8, 9, 10, 15][i], "construction_id": "fixture", "tip_available": True,
         "occupancy": [True] * 96}
     p.bind_tip_tray_state_reader(rig.store.tip_tray_state)
     p.bind_tip_tray_state_publisher(rig.store.publish_tip_tray_transition)
@@ -260,5 +269,49 @@ def test_native_calibration_five_saves_and_partial_failure(rig, monkeypatch, tmp
     for measurement in body["measurements"]:
         for name, low in measurement["calculated_z_lows"].items():
             assert original_table().resolve(location_id=name).z_low == low
+    # Opt-in real-producer contract export. No fixture-shaped response synthesis:
+    # action_results come from SQLite workflow storage, runs from actual REST.
+    import os
+    export_path = os.environ.get("PIPETTE_COMPLETION_EXPORT")
+    if export_path and (machine_calibrated or not inject_failure):
+        import json
+        from pathlib import Path
+        from fastapi.testclient import TestClient
+        from bioxp import api
+        service = p._manual_calibration_settings
+        monkeypatch.setattr(api.app.state, "calibration_settings", service, raising=False)
+        path = "/motion/oem/calibration_settings/runs/" + body["run_id"]
+        from contextlib import closing
+        with closing(TestClient(api.app)) as client:
+            response = client.get(path)
+            assert response.status_code == 200
+            run = response.json()  # Detached predecision snapshot.
+            assert run == json.loads(json.dumps(persisted))
+            case = {"name": ("no_backup" if not machine_calibrated else
+                    "partial" if inject_failure is True else
+                    "finalization" if inject_failure else "success"),
+                "action_result": next(row for row in retained
+                    if row.get("action_id") == result["action_id"]),
+                "run": run, "robot_document": doc.to_payload()}
+            for decision, key in (("accept", "accept_run"), ("restore", "restore_run")):
+                response = client.post(path + "/decision", json={"decision": decision})
+                assert response.status_code == 200, response.text
+                case[key] = response.json()
+                assert client.get(path).json() == case[key]
+            if machine_calibrated:
+                assert case["accept_run"]["decision"] == "accept"
+                assert case["restore_run"]["decision"] == "restore"
+                active = service.read()["active_positions"]
+                assert [{key: row[key] for key in run["before"]["positions"][0]}
+                        for row in active] == run["before"]["positions"]
+            else:
+                assert case["accept_run"]["decision"] is None
+                assert case["restore_run"]["decision"] is None
+            assert case["run"] == run and run["decision"] is None
+        target = Path(export_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        exported = json.loads(target.read_text()) if target.exists() else {"cases": []}
+        exported["cases"] = [row for row in exported["cases"] if row["name"] != case["name"]] + [case]
+        target.write_text(json.dumps(exported, indent=2, allow_nan=False) + "\n")
     p._manual_calibration_settings.store.close()
     receipts.connection.close()

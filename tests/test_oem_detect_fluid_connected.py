@@ -43,7 +43,7 @@ def test_diagnostic_void_initiate_continues_pressure_sequence_after_wait_false(r
     assert streams == [(channel, True) for channel in range(4)] + [(channel, False) for channel in range(4)]
 
 
-@pytest.mark.parametrize("failure", [None, "initiate_boolean_false", "second_catch", "first_release", "third_scan", "outer_exception"])
+@pytest.mark.parametrize("failure", [None, "full_inventory", "initiate_boolean_false", "second_catch", "first_release", "third_scan", "outer_exception"])
 def test_diagnostic_real_provider_sqlite_and_transport_seams(rig, monkeypatch, tmp_path, failure):
     from tests.test_deck_tip_query_publication import bind_collection_test_identity
     bind_collection_test_identity(monkeypatch)
@@ -82,8 +82,8 @@ def test_diagnostic_real_provider_sqlite_and_transport_seams(rig, monkeypatch, t
     p._oem_pipette_rgb_writer = lambda *a: {"ok": True}
     p._manual_pipette_source_state = SimpleNamespace(source_model=construct_new_machine_source_model())
     p._manual_pipette_source_settings = {"LogPressure": False, "CheckForStaticTipLoss": False}
-    p._read_constructed_tip_tray = lambda i: {"tip_type": "T50" if i in (0, 1) or (i == 2 and failure == "third_scan") else "T200",
-        "location": 7 + i, "construction_id": "fixture", "tip_available": True,
+    p._read_constructed_tip_tray = lambda i: {"tip_type": "T50" if i in (0, 1) or (i == 2 and failure == "third_scan") or failure == "full_inventory" else "T200",
+        "location": [7, 8, 9, 10, 15][i], "construction_id": "fixture", "tip_available": True,
         "occupancy": [True] * 96}
     p.bind_tip_tray_state_reader(rig.store.tip_tray_state)
     p.bind_tip_tray_state_publisher(rig.store.publish_tip_tray_transition)
@@ -101,6 +101,17 @@ def test_diagnostic_real_provider_sqlite_and_transport_seams(rig, monkeypatch, t
     p.publish_tip_tray_transition(tray_id=1, transition="construct",
         operation_id="detect-parent:construct:1", command_id="detect-parent",
         provenance={"source_operation": "ClassMachineStatus.constructor"})
+    if failure == "full_inventory":
+        # Diagnostic inventory is declared separately from calibration reset:
+        # all four source-addressable trays contain T50 tips.
+        for tray in p._manual_pipette_source_state.source_model.tip_trays:
+            tray.tip_type = 50
+            for well in tray.wells:
+                well.empty = False
+        for tray_id in (2, 3, 4):
+            p.publish_tip_tray_transition(tray_id=tray_id, transition="construct",
+                operation_id=f"detect-parent:construct:{tray_id}", command_id="detect-parent",
+                provenance={"source_operation": "ClassMachineStatus.constructor"})
     for t in rig.group._transports:
         t._tip_loaded = False
     rig.group._tip_type = 201
@@ -228,13 +239,20 @@ def test_diagnostic_real_provider_sqlite_and_transport_seams(rig, monkeypatch, t
     body = result["pipette_result"]
     assert body["kind"] == "diagnostic_detect_fluid"
     assert body == result["receipt"]["terminal_evidence"]["pipette_result"]
-    # This fixture deliberately declares two T50 trays; a genuine source
-    # stock-exhaustion exception must survive dispatcher and workflow storage.
-    assert not body["completed"]
+    # Default inventory deliberately has only two T50 trays. Even the fully
+    # stocked case must retain true source exhaustion through SQLite/workflow.
+    assert body["completed"] is False
     assert result["calibration_persisted"] is False
     assert not any(e["operation"] == "park_gantry" for e in body["events"])
     operations = [e["operation"] for e in body["events"]]
-    if failure == "outer_exception":
+    if failure == "full_inventory":
+        # Source loadTips searches four trays, not the hotel. TC/MS/OC/RC
+        # consume their 96 four-tip groups; STRIP needs six more. Do not turn
+        # true stock exhaustion into an ignored Boolean or invent replenishment.
+        assert [s["plate"] for s in body["scans"]] == ["TC", "MS", "OC", "RC"]
+        assert operations[-1] == "zOffset:STRIP"
+        assert body["error"] == "Tips are not available"
+    elif failure == "outer_exception":
         assert "injected_initiate_outer_exception" in body["error"]
         assert not body["scans"]
         assert not any(op.startswith("zOffset:") for op in operations)
@@ -243,7 +261,7 @@ def test_diagnostic_real_provider_sqlite_and_transport_seams(rig, monkeypatch, t
         assert operations[-1] == "zOffset:OC"
         if failure == "third_scan":
             assert body["error"] != "The required tip is not loaded!"
-            assert "scrFluidDetection" in str(body["events"][-1])
+            assert "sourceMeasureFluidHeight" in str(body["events"][-1])
         else:
             assert body["error"] == "The required tip is not loaded!"
         if failure in {"second_catch", "first_release"}:
