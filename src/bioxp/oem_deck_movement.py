@@ -1095,17 +1095,31 @@ def _wp8_plan(operation: str, children: list[dict[str, Any]], **metadata: Any) -
             "terminal_source_point" if child["operation"] == "updatePlateLocation"
             else "immediate_after_source_call" if mutation else "none"
         )
-    plan["plan_digest"] = _digest(plan)
+    if operation in {"manual_source_pipette", "diagnostic_pipette"}:
+        # Typed source calls carry fractional values. Match the existing
+        # SQLite owner's RFC8785 digest (10.0 and 10 are the same JSON number).
+        import rfc8785
+        plan["plan_digest"] = hashlib.sha256(rfc8785.dumps(plan)).hexdigest()
+    else:
+        plan["plan_digest"] = _digest(plan)
     return plan
 
 
 # Finite ControlLib pipette/lifecycle leaves. These are internal compiler
 # operations, never a public arbitrary-method dispatch surface.
 OEM_PIPETTE_LEAVES = {
+    "manual_source_pipette": ("sourceManualPipette", ("request",)),
+    "diagnostic_pipette": ("sourceDiagnosticPipette", ("diagnostic",)),
+    "pipette_load_tips": ("sourceLoadTips", ("tip_type", "force_new_tip")),
+    "manual_load_tip": ("sourceManualLoadTip", ("tray", "well", "overpress", "lift_z")),
+    "measure_fluid_height": ("sourceMeasureFluidHeight", ("speed",)),
+    "source_fluid_offset": ("sourceFluidOffset", ("plate", "speed", "transfer_fluid", "skip_steps")),
+    "source_calwith_fluid": ("sourceCalwithFluid", ()),
     "pipette_script_move": ("scriptmoveTo", ("destination", "column", "row", "position_flag", "run_in_parallel")),
     "pipette_location": ("updateLocation", ("destination", "well")),
     "pipette_tip_state": ("sourceTipState", ("changes",)),
     "pipette_tip_transition": ("sourceTipTransition", ("tray_id", "well_ids", "transition")),
+    "pipette_check_tips": ("sourceCheckTips", ("tray_id", "tip_location", "tip_type", "check_for_static_tip_loss")),
     "pipette_pierce": ("sourceWellPierced", ("plate", "well", "single")),
     "pipette_lift": ("sourceLiftTo", ("location", "height")),
     "pipette_lower": ("sourceLowerTo", ("location",)),
@@ -1132,6 +1146,7 @@ OEM_PIPETTE_LEAVES = {
 }
 
 FINITE_PLATE_OPERATIONS = frozenset({
+    "manual_pipette_move", "diagnostic_detect_fluid",
     "catch_plate", "release_plate", "park_gantry", "waste_sequence",
     "press_plate", "press_plates", "send_z_and_gripper_home", "thermal_door", "cleanup",
     "move_plate", "script_snapshot", "cut_seal", "shakeoff", "ordinary_pause_prepare", "critical_item_images",
@@ -1139,6 +1154,8 @@ FINITE_PLATE_OPERATIONS = frozenset({
 })
 
 WP8_OPERATION_INTENT_KEYS: Mapping[str, frozenset[str]] = {
+    "diagnostic_detect_fluid": frozenset(),
+    "manual_pipette_move": frozenset({"location", "well", "position_flag"}),
     "move_plate": frozenset({"plate", "destination", "press_plate"}),
     "catch_plate": frozenset({"plate", "run_in_parallel"}),
     "release_plate": frozenset({"destination", "press_plate", "run_in_parallel"}),
@@ -1157,6 +1174,7 @@ WP8_OPERATION_INTENT_KEYS: Mapping[str, frozenset[str]] = {
 }
 
 WP8_COMPILED_CHILD_OPERATIONS = frozenset({
+    "sourceDiagnosticDetectFluid",
     "CloseGripper", "HomeAxisD", "LoadGantry", "LoadGantryNull", "LockGripperOperation",
     "MoveZHome", "OpenGripper", "OpenGripperWide", "ReleaseLockGripperOperation", "Sleep",
     "SnapshotImage", "StopCloseGripper", "backgroundGripperHomeAndUnlock", "catchPlate",
@@ -1196,6 +1214,21 @@ def _compile_finite_plate_operation_unchecked(
         raise RuntimeError(f"source_authority_missing:{operation}")
     children: list[dict[str, Any]] = []
 
+    if operation == "diagnostic_detect_fluid":
+        _wp8_child(children, "sourceDiagnosticDetectFluid")
+        return _wp8_plan(operation, children, source_caller="ControlLib.btnDetectFluid_Click:1440-1469")
+
+    if operation == "manual_pipette_move":
+        # ControlLib.movExecution: scriptmoveTo then updateLocation, without
+        # piercing, job preparation, sweep, lid or Park. Geometry/custody remain
+        # owned by the existing scriptmoveTo provider and live PositionTable.
+        location, well = inputs["location"], well_id_from_label(inputs["well"])
+        _wp8_child(children, "scriptmoveTo", arguments={
+            "destination": location, "column": well % 12, "row": well // 12,
+            "position_flag": inputs["position_flag"], "run_in_parallel": True,
+        })
+        _wp8_child(children, "updateLocation", arguments={"destination": location, "well": well})
+        return _wp8_plan(operation, children)
     if operation == "preparation_force_high_home":
         _wp8_child(children, "sourceForceToHighHome", state_mutation={"pseudo_z_home": 500})
         return _wp8_plan(operation, children, source_caller="ControlLib.DefaultParameters.ForceToHighHome")
@@ -1370,7 +1403,7 @@ def _compile_finite_plate_operation_unchecked(
 
     if operation == "catch_plate":
         plate = int(inputs.get("plate", 0))
-        location = int(inputs.get("plate_location", inputs.get("location", 0)))
+        location = int(inputs.get("plate_location") if inputs.get("plate_location") is not None else inputs.get("location", 0))
         destination = {1: 21, 2: 23, 0: 25}.get(location, location)
         door_open = inputs.get("thermal_door_open")
         if type(door_open) is not bool:
@@ -1392,12 +1425,16 @@ def _compile_finite_plate_operation_unchecked(
             _wp8_child(children, "StopCloseGripper", arguments={"reset_speed": False})
         wide = destination in {0, 1, 2, 21, 23, 25}
         _wp8_child(children, "OpenGripperWide" if wide else "OpenGripper", arguments={"recover": True})
+        led_order = len(children)
         _wp8_child(children, "led2On", ignored_return=True)
-        _wp8_child(children, "Sleep", arguments={"milliseconds": 1000})
+        # ControlLib's one-second settle is inside m_ledControl != null.
+        _wp8_child(children, "Sleep", arguments={"milliseconds": 1000},
+                   source_condition={"child_order": led_order, "result_field": "led_owner_present", "equals": True})
         _wp8_child(children, "SnapshotImage", arguments={"name": "CatchPlate"}, ignored_return=True)
         _wp8_child(children, "Sleep", arguments={"milliseconds": 100})
         _wp8_child(children, "led2Off", ignored_return=True)
-        offset = -30236 if destination == 25 and int(inputs.get("output_plate_location", -1)) in {25, 0} else 0
+        output_location = inputs.get("output_plate_location")
+        offset = -30236 if destination == 25 and output_location in {25, 0} else 0
         _wp8_child(children, "moveZ", arguments={"location": destination, "z_low_offset": offset})
         _wp8_child(children, "Sleep", arguments={"milliseconds": 100})
         if plate == 0:
@@ -1421,7 +1458,8 @@ def _compile_finite_plate_operation_unchecked(
     if operation == "release_plate":
         destination = int(inputs["destination"])
         parallel = bool(inputs.get("run_in_parallel", True))
-        offset = -30236 if destination == 25 and int(inputs.get("plate_on_gantry", -1)) == 1 and int(inputs.get("output_plate_location", -1)) in {25, 29} else 0
+        offset = (-30236 if destination == 25 and inputs.get("plate_on_gantry") == 1
+                  and inputs.get("output_plate_location") in {25, 29} else 0)
         _wp8_child(children, "scriptmoveTo", arguments={"destination": destination, "well": 0, "position_flag": 0}, ignored_return=True)
         _wp8_child(children, "moveZLow", arguments={"location": destination, "z_low_offset": offset})
         _wp8_child(children, "Sleep", arguments={"milliseconds": 5})
@@ -1444,8 +1482,11 @@ def _compile_finite_plate_operation_unchecked(
         plate = inputs.get("current_tray")
         _wp8_child(children, "updatePlateLocation", arguments={"plate": plate, "location": destination}, state_mutation={"plate": plate, "location": destination})
         _wp8_child(children, "updateLocation", arguments={"destination": destination, "well": 0}, state_mutation={"current_location": destination, "current_well": 0})
+        led_order = len(children)
         _wp8_child(children, "led2On", ignored_return=True)
-        _wp8_child(children, "Sleep", arguments={"milliseconds": 1000})
+        # ControlLib's one-second settle is inside m_ledControl != null.
+        _wp8_child(children, "Sleep", arguments={"milliseconds": 1000},
+                   source_condition={"child_order": led_order, "result_field": "led_owner_present", "equals": True})
         _wp8_child(children, "SnapshotImage", arguments={"name": "ReleasePlate"}, ignored_return=True)
         _wp8_child(children, "Sleep", arguments={"milliseconds": 100})
         _wp8_child(children, "led2Off", ignored_return=True)
@@ -1721,6 +1762,15 @@ def execute_finite_plate_operation(
         leaf_result = completed[-1]["result"]
         if isinstance(leaf_result, Mapping):
             source_return.update({key: leaf_result[key] for key in ("source_return", "x", "y", "z", "door_ok") if key in leaf_result})
+            if plan.get("operation") in {"manual_load_tip", "measure_fluid_height"}:
+                source_return.update({key: leaf_result[key] for key in (
+                    "position_steps", "fluid_timestamps", "timing", "location", "well_id",
+                    "lost_steps", "lost_steps_warning", "calibration_persisted", "physical_effect_verified")
+                    if key in leaf_result})
+            if plan.get("operation") == "pipette_check_tips":
+                source_return.update({key: leaf_result[key] for key in (
+                    "removed_wells", "inspection_completed", "source_exception", "skip_reason")
+                    if key in leaf_result})
     if plan.get("source_stop_scripts"):
         source_return["source_stop_scripts"] = True
     return {

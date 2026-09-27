@@ -217,11 +217,15 @@ class CameraProvider:
         self._led_fd: int | None = None
         self._led_leaf: Any = None
         self._led_binding: Any = None
+        self._led_initialized = False
+        self._led_commands: dict[int, bool | None] = dict.fromkeys((1, 2, 3))
 
     def _close_illumination(self) -> None:
         # Caller holds provider RLock, including stream generation transitions.
         fd, self._led_fd = self._led_fd, None
         self._led_leaf = self._led_binding = None
+        self._led_initialized = False
+        self._led_commands = dict.fromkeys((1, 2, 3))
         if fd is not None:
             os.close(fd)
 
@@ -296,13 +300,20 @@ class CameraProvider:
                     self._led_binding = binding
                 leaf = self._led_leaf
                 if operation == "probe":
+                    self._led_initialized = False
                     length, info = leaf.probe()
                     result = {"control_length": length, "control_info": info}
-                elif operation == "initialize":
+                elif operation == "initialize" or (
+                        operation == "ensure_initialized" and not self._led_initialized):
                     leaf.probe()
                     result = {"dsp_type": leaf.discover_dsp_type()}
+                    self._led_initialized = True
+                elif operation == "ensure_initialized":
+                    result = {}
                 else:
                     leaf.set_led(channel, on)
+                    assert type(channel) is int and type(on) is bool
+                    self._led_commands[channel] = on
                     result = {"channel": channel, "on": on}
                 return {"ok": True, **result, "provider_generation": self._generation,
                         "delivery_attempted": operation != "probe",
@@ -316,7 +327,7 @@ class CameraProvider:
         return self._illumination("probe")
 
     def initialize_illumination(self) -> dict[str, Any]:
-        """Physical source discovery: invoke only inside canonical camera child."""
+        """Explicit source discovery for inspection or operator illumination."""
         return self._illumination("initialize")
 
     def set_illumination(self, *, channel: int, on: bool) -> dict[str, Any]:
@@ -324,6 +335,32 @@ class CameraProvider:
         if type(channel) is not int or channel not in (1, 2, 3) or type(on) is not bool:
             raise ValueError("source_preparation_led_arguments_invalid")
         return self._illumination("set", channel=channel, on=on)
+
+    def illumination_state(self) -> dict[str, Any]:
+        """Cached last successful requests only; no discovery or hardware I/O."""
+        with self._lock:
+            # A generation mismatch invalidates observations without touching fd
+            # or hardware. Normal lifecycle transitions clear these eagerly.
+            if self._led_binding is not None and self._led_binding[1] != self._generation:
+                self._led_commands = dict.fromkeys((1, 2, 3))
+            return {
+                "schema_version": "bioxp.camera_illumination.v1",
+                "provider_generation": self._generation,
+                "channels": [{"channel": channel, "on": on}
+                             for channel, on in self._led_commands.items()],
+                "state_source": "last_successful_command",
+                "physical_effect_verified": False,
+            }
+
+    def command_illumination(self, *, channel: int, on: bool) -> dict[str, Any]:
+        """Operator request: initialize this binding if needed, then set once."""
+        if type(channel) is not int or channel not in (1, 2, 3) or type(on) is not bool:
+            raise ValueError("source_preparation_led_arguments_invalid")
+        with self._lock:
+            self._illumination("ensure_initialized")
+            self.set_illumination(channel=channel, on=on)
+            return {**self.illumination_state(), "ok": True, "channel": channel,
+                    "on": on, "delivery_attempted": True}
 
     def begin_stream(self, owner: str) -> CameraIdentity:
         """Reserve the device under the same lock as still capture/discovery."""

@@ -1268,13 +1268,15 @@ class Serial206ProductionPrimitiveAdapter:
         return result
 
     def _move_xy_y_issue_absolute(self, requested: int, *, event_window: Any) -> dict[str, Any]:
-        before = self.tester.motor_get_position(4, motor=0)
-        before_value = self._x_value(before)
         target = max(0, int(requested))
-        if type(before_value) is not int:
-            return {"ok": False, "failure": "y_position_before_unavailable", "command_issued": False}
-        assert type(before_value) is int
         move = self.tester.motor_oem_move_absolute(4, target, motor=0, wait_for_stop=False, max_position=102956)
+        # The board primitive owns the fresh pre-TX position check, including
+        # exact-target and high-limit branches. Reuse that actual observation.
+        before = move.get("before") if isinstance(move, Mapping) else None
+        before_value = self._x_value(before)
+        if isinstance(move, Mapping) and move.get("failure") == "current_position_unavailable":
+            return {"ok": False, "failure": "y_position_before_unavailable", "command_issued": False,
+                    "move": _json_safe(move)}
         acknowledged = bool(
             isinstance(move, Mapping)
             and move.get("ok") is True
@@ -1323,7 +1325,11 @@ class Serial206ProductionPrimitiveAdapter:
 
     def _finalize_move_xy_receipt(self, receipt: dict[str, Any], *, commands: Mapping[str, Any], waits: Mapping[str, Any], after: Mapping[str, int], restore: Mapping[str, Any], required_axes: tuple[str, ...]) -> dict[str, Any]:
         axis_address = {"x": (5, 0), "y": (4, 0)}
-        events = self.tester.collect_bus_events(duration_s=0.30, timeout_ms=12, max_events=128) if required_axes else []
+        # Axis waits have already consumed their terminal notifications. The
+        # receive owner continuously buffers events; take its current snapshot
+        # without adding a non-OEM post-completion dwell. Keep every existing
+        # freshness/error/position/speed check below.
+        events = self.tester.collect_bus_events(duration_s=0.0, timeout_ms=12, max_events=128) if required_axes else []
         evidence: dict[str, Any] = {}
         fresh_after: dict[str, int] = dict(after)
         # Board lower clamps precede their exact-position return. Keep the
@@ -1335,8 +1341,10 @@ class Serial206ProductionPrimitiveAdapter:
             moved = isinstance(command, Mapping) and command.get("command_issued") is True
             board, motor = axis_address[axis]
             position = self.tester.motor_get_position(board, motor=motor)
+            # Reuse this final observation for the receipt and terminal checks.
+            # Preserve the former outer _read_axis_position failure semantics.
+            position_value = self._position_value(position)
             speed = self.tester.motor_get_speed(board, motor=motor)
-            position_value = self._x_value(position)
             speed_value = speed.get("speed") if isinstance(speed, Mapping) else None
             if type(position_value) is int:
                 fresh_after[axis] = position_value
@@ -3001,7 +3009,9 @@ class Serial206ProductionPrimitiveAdapter:
         target = result.get("motor_effective_target")
         source_noop_wrapper = (result.get("schema") == "bioxp.serial206_y_provider.v2"
             and result.get("completion_class") == "oem_source_noop")
-        if result.get("source_mode") == "moveXY.near_axis.moveX":
+        # Both callers retain the same x_move_absolute native no-op receipt.
+        if result.get("source_mode") in {
+                "moveXY.near_axis.moveX", "ClassControlInterface.moveTo.moveX"}:
             native = result.get("move")
             target = result.get("target_position_steps")
             source_noop_wrapper = result.get("source_noop") is True
@@ -3469,7 +3479,23 @@ class Serial206ProductionPrimitiveAdapter:
             interruption = interrupted("complete", branch)
             if interruption is not None:
                 return {**interruption, "restore_acc": _json_safe(restore)}
-            child_evidence = [self._oem_controller_child_evidence(row) for row in results]
+            # move_axis(Y) already verified the native exact-target no-op and
+            # projected its typed command/ACK/terminal evidence above. Its
+            # diagnostic `move` may be bounded; re-normalizing this wrapper
+            # treats the absent no-op ACK as a missing commanded ACK.
+            child_evidence = [
+                {
+                    "command_required": row["controller_command_required"],
+                    "acknowledged": row["controller_command_acknowledged"],
+                    "terminal": row["controller_terminal_state_verified"],
+                } if (isinstance(row, Mapping) and row.get("axis") == "y"
+                      and isinstance(row.get("move"), Mapping)
+                      and all(type(row.get(field)) is bool for field in (
+                          "controller_command_required", "controller_command_acknowledged",
+                          "controller_terminal_state_verified")))
+                else self._oem_controller_child_evidence(row)
+                for row in results
+            ]
             commanded = [row for row in child_evidence if row["command_required"]]
             controller_acknowledged = bool(commanded) and all(row["acknowledged"] for row in commanded)
             controller_completion_verified = bool(child_evidence) and all(
@@ -3785,8 +3811,6 @@ class Serial206ProductionPrimitiveAdapter:
                 for axis, board in (("x", 5), ("y", 4)):
                     waits[axis] = wait_fn(board, motor=0, timeout_s=5.0, event_window=shared_event_window)
             restore = {"x": self.tester.motor_set_axis_param(5, 5, 350, motor=0), "y": self.tester.motor_set_axis_param(4, 5, 400, motor=0)}
-            for axis in ("x", "y"):
-                after[axis] = self._read_axis_position(axis)
             receipt.update({"branch": "parallel", "acceleration_selected": {"x": x_acc, "y": y_acc}, "acceleration_set": _json_safe(acceleration_set), "acceleration_setup_verified": setup_ok, "event_window": _json_safe(shared_event_window), "launch_order": launch_order, "stagger_ms": stagger_ms, "pre_wait_sleep_ms": 5, "pair_wait": _json_safe(pair_wait) if "pair_wait" in locals() else None})
             return self._finalize_move_xy_receipt(receipt, commands=commands, waits=waits, after=after, restore=restore, required_axes=("x", "y"))
         except Exception as exc:
@@ -4403,6 +4427,8 @@ class Serial206OemInitializationProvider:
     """One durable expected-next stage per generation-bound approval."""
 
     _WP8_CHILD_BINDINGS: Mapping[str, str] = {
+        "sourceDiagnosticDetectFluid": "wp8_diagnostic_detect_fluid",
+        "sourceDiagnosticPipette": "wp8_diagnostic_pipette",
         "sourceForceToHighHome": "wp8_preparation_force_high_home",
         "sourceMoveTo": "wp8_source_move_to",
         "sourceImageGantryLoad": "wp8_source_image_gantry_load",
@@ -4473,6 +4499,13 @@ class Serial206OemInitializationProvider:
         "waitZ": "wp8_wait_z",
         "sourceTipState": "wp8_pipette_source_leaf",
         "sourceTipTransition": "wp8_pipette_source_leaf",
+        "sourceCheckTips": "wp8_check_tips",
+        "sourceManualLoadTip": "wp8_manual_pipette_physical",
+        "sourceLoadTips": "wp8_load_tips",
+        "sourceMeasureFluidHeight": "wp8_manual_pipette_physical",
+        "sourceFluidOffset": "wp8_source_fluid_offset",
+        "sourceManualPipette": "wp8_manual_source_pipette",
+        "sourceCalwithFluid": "wp8_source_calwith_fluid",
         "sourceWellPierced": "wp8_pipette_source_leaf",
         "sourceLiftTo": "wp8_pipette_source_leaf",
         "sourceLowerTo": "wp8_pipette_source_leaf",
@@ -5165,7 +5198,8 @@ class Serial206OemInitializationProvider:
             dict(provenance), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         return semantic
 
-    def _canonical_deck_semantic_state(self, *, allow_recovery: bool = False, no_tip_park: bool = False) -> dict[str, Any]:
+    def _canonical_deck_semantic_state(self, *, allow_recovery: bool = False, no_tip_park: bool = False,
+                                       require_latch_observation: bool = True) -> dict[str, Any]:
         reader = self._deck_semantic_state_reader
         if not callable(reader):
             raise RuntimeError("deck_semantic_state_reader_not_bound")
@@ -5213,6 +5247,12 @@ class Serial206OemInitializationProvider:
             "machine_latch_closed": bool,
             "latch_observation_id": str,
         }
+        if not require_latch_observation:
+            # Native movExecution/scriptmoveTo do not consume manual-button
+            # latch provenance. A location publication can replace that record;
+            # absent observations must not become a native compile prerequisite.
+            for key in ("latch_status", "machine_latch_closed", "latch_observation_id"):
+                branch_types.pop(key)
         # ControlLib.parkGantry(false) -> scriptmoveTo(...,28,...,2):
         # verified absence skips tip cleanup and never consults tray CleanPath.
         # Keep absence explicit and all other full-state/owner fences intact.
@@ -5224,7 +5264,7 @@ class Serial206OemInitializationProvider:
         for key, expected_type in branch_types.items():
             if type(semantic.get(key)) is not expected_type:
                 raise RuntimeError(f"deck_semantic_state_not_authoritative:{key}")
-        if not semantic["latch_observation_id"].strip():
+        if require_latch_observation and not semantic["latch_observation_id"].strip():
             raise RuntimeError("deck_semantic_state_not_authoritative:latch_observation_id")
         tip_location = int(semantic["tip_location"])
         if tip_location not in {-1, 0, 1, 2, 3}:
@@ -5262,9 +5302,9 @@ class Serial206OemInitializationProvider:
             "ownership_generation": int(semantic["ownership_generation"]),
             "board_epoch_4": int(semantic["board_epoch_4"]),
             "board_epoch_5": int(semantic["board_epoch_5"]),
-            "latch_status": bool(semantic["latch_status"]),
-            "machine_latch_closed": bool(semantic["machine_latch_closed"]),
-            "latch_observation_id": str(semantic["latch_observation_id"]),
+            "latch_status": semantic.get("latch_status"),
+            "machine_latch_closed": semantic.get("machine_latch_closed"),
+            "latch_observation_id": semantic.get("latch_observation_id"),
             "ambiguity_state": str(ambiguity_state),
         }
 
@@ -11582,7 +11622,7 @@ class Serial206OemInitializationProvider:
         from .oem_deck_movement import OEM_PLATE_NAME_ORDINALS
         from .oem_compat.pathing import LOCATION_ID_TO_NAME
 
-        semantic = self._canonical_deck_semantic_state()
+        semantic = self._canonical_deck_semantic_state(require_latch_observation=False)
         name_to_location = {name: ordinal for ordinal, name in LOCATION_ID_TO_NAME.items()}
         current_name = str(semantic["current_location"])
         if current_name not in name_to_location:
@@ -11656,10 +11696,17 @@ class Serial206OemInitializationProvider:
         if operation not in WP8_OPERATION_INTENT_KEYS:
             raise RuntimeError(f"source_authority_missing:{operation}")
         from .oem_deck_movement import OEM_PIPETTE_LEAVES
-        if operation in OEM_PIPETTE_LEAVES or operation in {"pipette_shift_camera", "pipette_script_waste", "pipette_unlock", "park_gantry", "critical_item_images"}:
+        if operation in OEM_PIPETTE_LEAVES or operation in {"manual_pipette_move", "pipette_shift_camera", "pipette_script_waste", "pipette_unlock", "park_gantry", "critical_item_images"}:
             # These literal leaves resolve only their selected source facts at
             # native entry. Do not introduce a gripper GAP into every leaf.
             return {}
+        if operation == "move_plate":
+            # The outer wrapper consumes only the cached source door flag.
+            # Catch/release resolve live routing and custody at native entry;
+            # neither this plan nor admission uses a gripper GAP or table copy.
+            with self._lock:
+                machine = dict(self._load_state().get("machine_status") or {})
+            return {"thermal_door_open": machine.get("thermal_door_open")}
         if operation == "thermal_door":
             # Door planning consumes the source door flag and board-test mode.
             # Its Park child performs its own scoped custody/collection reads.
@@ -12380,6 +12427,8 @@ class Serial206OemInitializationProvider:
         from .oem_deck_movement import _pierced
 
         captured = copy.deepcopy(dict(settings or {}))
+        self._oem_pipette_load_tips_settings = captured
+        self._oem_pipette_source_error_event = source_error_event
         if rgb_writer is not None:
             self._oem_pipette_rgb_writer = rgb_writer
 
@@ -12437,7 +12486,19 @@ class Serial206OemInitializationProvider:
             return run("pipette_hotel", action, state, location=15, column=0, row=1,
                        high_pos=True, run_in_parallel=False)
 
+        def check_tips(tray, well, action, state):
+            result = run("pipette_check_tips", action, state, tray_id=tray, tip_location=well,
+                         tip_type=state.source_model.tip_trays[tray].tip_type,
+                         check_for_static_tip_loss=captured.get("CheckForStaticTipLoss"))
+            # As with normal pickup, update the source model only for removals
+            # already committed by the canonical occupancy publisher.
+            for index in result.get("removed_wells", ()):
+                item = state.source_model.tip_trays[tray].wells[index]
+                item.empty, item.content = True, None
+            return result
+
         native = OemPipetteSourceBindings(
+            check_tips=check_tips,
             facts=facts, lift_to=leaf("pipette_lift", ("location", "height")),
             lower_to=leaf("pipette_lower", ("location",)), move_xy=leaf("pipette_move_xy", ("x", "y")),
             position=leaf("pipette_position", ()), home=leaf("pipette_home", ("rehome",)),
@@ -12471,6 +12532,410 @@ class Serial206OemInitializationProvider:
             tip_load_move=lambda location, column, row, action, state: script_move(location, column, row, action, state, flag=2, parallel=False),
             move_z_home=native.home, set_z_current_max=lambda action, state: native.set_z_current_max(None, action, state),
             remove_tip=remove_tip, script_move_to_waste=leaf("pipette_script_waste", ()), source_error_event=source_error_event)
+
+    def wp8_load_tips(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        """ControlLib.loadTips(T50, true) inline under the owning WP8 child.
+
+        The finite compiler executes every nested deck leaf in this owner, and
+        the existing pipette receipt runner executes repeated CAN calls inline.
+        No second worker or request-selected method dispatch is introduced.
+        """
+        from .pipette.oem_load_tips import LoadTipsBindings, load_tips
+        from .oem_compat.position_table import tip_group_well_ids
+        from .oem_machine_bundle import get_active_oem_machine_snapshot
+
+        runner = getattr(self, "_manual_pipette_receipt_runner", None)
+        if not callable(runner):
+            raise RuntimeError("source_authority_missing:loadTips:pipette_receipt_runner")
+        occurrence = 0
+
+        def identity(name):
+            nonlocal occurrence
+            occurrence += 1
+            return {**owner_identity, "source_identity":
+                f"{owner_identity['source_identity']}:loadTips:{occurrence}:{name}"}
+
+        def finite(name, **inputs):
+            plan = compile_finite_plate_operation(name, source_leaf_available=True, **inputs)
+            try:
+                return self._wp8_execute_nested_plan(plan=plan, command_id=command_id,
+                                                     owner_identity=identity(name))
+            except RuntimeError as exc:
+                # loadTips ignores primitive false returns, but not exceptions.
+                # Keep the failed child receipt without converting a false into
+                # an extra source admission gate.
+                failures = getattr(exc, "evidence", {}).get("failure_evidence", [])
+                if (len(failures) == 1 and failures[0]["exception_message"] ==
+                        f"wp8_nested_child_failed:{plan['children'][0]['operation']}"
+                        and isinstance(failures[0].get("result"), Mapping)):
+                    return {"ok": False, "source_children": [
+                        {"result": failures[0]["result"]}], "failure_evidence": failures}
+                raise
+
+        def pipette(name, call):
+            child_identity = identity(name)
+            self._wp8_execution_fence_checker(command_id, boundary=child_identity["source_identity"])
+            operation_name = ("query_all_pipette_tip_states"
+                              if name == "query_tip_status_for_oem_load_tips" else name)
+            return runner(operation_name, call, command_id, child_identity, arguments)
+
+        def query():
+            raw = pipette("query_tip_status_for_oem_load_tips",
+                lambda transport: transport.query_tip_status_for_oem_load_tips())
+            return {**raw, "tip_exists": raw["source_tip_exists"],
+                    "tip_missing": raw["source_tip_missing"]}
+
+        def tray(index):
+            constructed = self._read_constructed_tip_tray(index)
+            reader = getattr(self, "_tip_tray_state_reader", None)
+            if constructed is None or not callable(reader):
+                raise RuntimeError("source_authority_missing:loadTips:tip_tray")
+            state = reader(index)
+            occupancy = state["occupancy"]
+            tip_type = {"T50": 50, "T200": 200, "T201": 201}[constructed["tip_type"]]
+            return {"tip_type": tip_type,
+                    "tip_available": state["tip_available"], "location": constructed["location"],
+                    "next_group": next((group for group in range(24)
+                        if all(occupancy[well] for well in tip_group_well_ids(group))), 24)}
+
+        def remove(index, group):
+            return finite("pipette_tip_transition", tray_id=index,
+                well_ids=list(tip_group_well_ids(group)), transition="remove")
+
+        def inspect(index, group):
+            well = f"{'AB'[group % 2]}{group // 2 + 1}"
+            result = finite("pipette_check_tips", tray_id=index, tip_location=well,
+                tip_type=arguments["tip_type"], check_for_static_tip_loss=None)
+            # The plan wrapper preserves the source return in its first child.
+            child = result["source_children"][0]["result"]
+            return {**result, "source_return": child["source_return"]}
+
+        def light():
+            color = finite("pipette_color", r=255, g=255, b=255)
+            led = finite("pipette_led2")
+            stall = finite("pipette_stall", value=10)
+            return {"ok": True, "source_children": [color, led, stall]}
+
+        def load_type(value):
+            return pipette("load_tip_metadata", lambda transport: transport.loadTip(value, -1))
+
+        def eject(check_missing):
+            return pipette("eject_all_tips_for_oem_load_tips", lambda transport:
+                transport.eject_all_tips(check_missing_tip=check_missing, wait=True, channels=None))
+
+        def home():
+            result = finite("pipette_home", rehome=False)
+            child = result["source_children"][0]["result"]
+            return {**result, "source_return": child["source_return"]}
+
+        def event(message):
+            callback = getattr(self, "_oem_pipette_source_error_event", None)
+            if callable(callback):
+                return {"ok": True, "source_return": callback(message), "delivery_attempted": False}
+            return {"ok": True, "source_noop": "errorEvent_null", "delivery_attempted": False}
+
+        bindings = LoadTipsBindings(
+            facts=self.mov_execution_machine_state, query=query, light=light,
+            stall_default=lambda: finite("pipette_stall", value=None), tray=tray,
+            move=lambda location, column, row: finite("pipette_script_move",
+                destination=location, column=column, row=row, position_flag=0,
+                run_in_parallel=True),
+            publish=lambda location, well: finite("pipette_location", destination=location, well=well),
+            home=home,
+            lower=lambda location: finite("pipette_lower_pipette", location=location),
+            lift=lambda location: finite("pipette_lift_pipette", location=location),
+            eject=eject,
+            tip_state=lambda changes: finite("pipette_tip_state", changes=dict(changes)),
+            remove=remove, load_type=load_type, inspect=inspect,
+            current_max=lambda: finite("pipette_current", value=None),
+            log_missing=lambda: {"ok": True, "source_log": "loadTips:tip_missing"},
+            error_event=event,
+            unlock_door=lambda: finite("pipette_unlock"),
+            start_mode=lambda: {"DevMode": 0, "WebMode": 1, "LocalMode": 2, "TradeShowMode": 3}[
+                get_active_oem_machine_snapshot().operation_parameters["Mode"]],
+            # The installed WPF checkbox is two-state, so IsChecked.HasValue
+            # is true even when unchecked. No synthetic null/unlock branch.
+            overpress_checked_has_value=lambda: True,
+            camera_ready=lambda: (
+                get_active_oem_machine_snapshot().fields["machine.camera_installed"].value is True
+                and get_active_oem_machine_snapshot().camera_calibrated),
+        )
+        # zOffset discards this method's Boolean, not its exceptions. Keep
+        # thrown failures (and their existing cause/evidence) on the exception
+        # path instead of disguising them as an ordinary false source return.
+        result = load_tips(arguments["tip_type"], bindings,
+                           force_new_tip=arguments["force_new_tip"])
+        return {**result, "ok": result.get("source_return") is True,
+                "delivery_attempted": True}
+
+    def wp8_manual_source_pipette(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        from .pipette.manual_source import run_manual_source_inline
+        return run_manual_source_inline(self, arguments["request"], command_id=command_id,
+            owner_identity=owner_identity, state=self._manual_pipette_source_state,
+            settings=self._manual_pipette_source_settings)
+
+    def wp8_source_fluid_offset(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        """One source zOffset body inline under the existing finite child."""
+        from .pipette.oem_fluid_owner import run_z_offset_inline
+        return {**run_z_offset_inline(
+            self, plate=arguments["plate"], speed=arguments["speed"],
+            transfer_fluid=arguments["transfer_fluid"], skip_steps=arguments["skip_steps"],
+            command_id=command_id, owner_identity=owner_identity,
+            state=self._manual_pipette_source_state,
+            settings=self._manual_pipette_source_settings), "delivery_attempted": True}
+
+    def wp8_diagnostic_detect_fluid(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        """ControlLib diagnostic button, including all five scans, inside one owner."""
+        from .pipette.oem_fluid_callers import FluidCallerBindings, detect_fluid
+        from .pipette.oem_fluid_owner import run_z_offset_inline
+
+        state = self._manual_pipette_source_state
+        settings = self._manual_pipette_source_settings
+        events: list[dict[str, Any]] = []
+        serial = 0
+
+        def identity(name: str) -> dict[str, Any]:
+            nonlocal serial
+            serial += 1
+            return {**owner_identity, "source_identity":
+                    f"{owner_identity['source_identity']}:detect:{serial}:{name}"}
+
+        def record(name: str, call: Any, *, ignored_result: bool = False) -> Any:
+            nested = identity(name)
+            self._wp8_execution_fence_checker(command_id, boundary=nested["source_identity"])
+            try:
+                result = call(nested)
+                events.append({"operation": name, "source_identity": nested["source_identity"],
+                               "result": result})
+                # catchPlate/releasePlate have already applied their OEM
+                # log-and-suppress policy. Their failed receipt is evidence,
+                # not a new exception at this composing caller.
+                if (not ignored_result and isinstance(result, Mapping)
+                        and result.get("ok") is not True
+                        and result.get("exception_suppressed") is not True):
+                    raise RuntimeError(f"diagnostic_source_failure:{name}")
+                return result
+            except Exception as exc:
+                if not events or events[-1].get("source_identity") != nested["source_identity"]:
+                    events.append({"operation": name, "source_identity": nested["source_identity"],
+                                   "exception_type": type(exc).__name__, "error": str(exc),
+                                   "evidence": getattr(exc, "evidence", None)})
+                raise
+
+        def finite(name: str, **inputs: Any) -> Any:
+            return record(name, lambda nested: self._wp8_compile_and_execute(
+                operation=name, inputs=inputs, command_id=command_id, owner_identity=nested))
+
+        def scan(plate: str, speed: int, transfer: bool, skip: int) -> Any:
+            def run(nested: Mapping[str, Any]) -> Any:
+                result = run_z_offset_inline(self, plate=plate, speed=speed,
+                    transfer_fluid=transfer, skip_steps=skip, command_id=command_id,
+                    owner_identity=nested, state=state, settings=settings)
+                if result.get("error"):
+                    # run_z_offset_inline exposes its caught sequence exception
+                    # with partial evidence. Restore that exception boundary,
+                    # not a generic diagnostic_source_failure identity.
+                    from .pipette.oem_calibration import CalibrationExecutionError
+                    raise CalibrationExecutionError(result["error"], result)
+                return {**result, "ok": True}
+            return record(f"zOffset:{plate}", run)
+
+        def initiate() -> None:
+            record("initiateGroup", lambda nested: self._manual_pipette_receipt_runner(
+                "initiate_group_once_for_oem_detect_fluid",
+                lambda transport: transport.initiate_group_once_for_oem_detect_fluid(),
+                command_id, nested, {"diagnostic": "detect_fluid"}), ignored_result=True)
+
+        def mark_strip() -> None:
+            # The source changes m_strip[1] in memory before the STRIP scan.
+            def mark(_nested: Mapping[str, Any]) -> dict[str, Any]:
+                strip = state.source_model.strips[1]
+                strip.strip_color = "X"
+                return {"ok": True, "strip_index": 1, "strip_color": strip.strip_color,
+                        "delivery_attempted": False}
+            record("markStripX", mark)
+
+        result = detect_fluid(FluidCallerBindings(
+            log_file=lambda: events.append({"operation": "setLogFileName",
+                "source_path": r"c:\logfile\fluid-level.txt", "effect": "source_diagnostic_log_path_recorded"}),
+            initiate_group=initiate,
+            catch_plate=lambda plate: finite("catch_plate", plate=plate, run_in_parallel=False),
+            release_plate=lambda destination, press: finite("release_plate", destination=destination,
+                press_plate=press, run_in_parallel=False),
+            press_plates=lambda plates: finite("press_plates", plates=list(plates), run_in_parallel=False),
+            scan=scan, mark_strip=mark_strip,
+            park=lambda: finite("park_gantry"),
+            error=lambda source, exc: None,
+        ))
+        return {**result, "ok": result["completed"], "events": events,
+                "delivery_attempted": True}
+
+    def wp8_source_calwith_fluid(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        """Run the source worker and its nested operations inside this claim."""
+        from .pipette.oem_fluid_owner import run_calwith_fluid_inline
+        return run_calwith_fluid_inline(self, command_id=command_id,
+            owner_identity=owner_identity, state=self._manual_pipette_source_state,
+            pipette_settings=self._manual_pipette_source_settings,
+            calibration_settings=self._manual_calibration_settings)
+
+    def wp8_diagnostic_pipette(self, operation: str, arguments: Mapping[str, Any], *,
+            command_id: str, owner_identity: Mapping[str, Any], **_: Any) -> dict[str, Any]:
+        from .pipette.oem_diagnostics import run_diagnostic_inline
+        return run_diagnostic_inline(self, arguments["diagnostic"], command_id=command_id,
+                                     owner_identity=owner_identity)
+
+    def wp8_manual_pipette_physical(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, owner_identity: Mapping[str, Any], **_: Any,
+    ) -> dict[str, Any]:
+        """One finite owner; nested source calls never submit another queue item."""
+        from .pipette.oem_calibration import (bind_calibration_provider, manual_load_tip,
+            measure_fluid_height, ManualTipLoadRequest, FluidHeightRequest, CalibrationExecutionError)
+        from .oem_machine_bundle import get_active_oem_machine_snapshot
+
+        runner = getattr(self, "_manual_pipette_receipt_runner")
+        occurrence = 0
+
+        def identity(name):
+            nonlocal occurrence
+            occurrence += 1
+            return {**owner_identity, "source_identity":
+                f"{owner_identity['source_identity']}:manual:{occurrence}:{name}"}
+
+        def finite(name, inputs):
+            plan = compile_finite_plate_operation(name, source_leaf_available=True, **inputs)
+            return self._wp8_execute_nested_plan(plan=plan, command_id=command_id,
+                                                 owner_identity=identity(name))
+
+        def native(name, call, inputs):
+            child_identity = identity(name)
+            self._wp8_execution_fence_checker(command_id, boundary=child_identity["source_identity"])
+            result = call()
+            return {**result, "source_identity": child_identity["source_identity"], "inputs": dict(inputs)}
+
+        def pipette(name, call):
+            child_identity = identity(name)
+            self._wp8_execution_fence_checker(command_id, boundary=child_identity["source_identity"])
+            return runner(name, call, command_id, child_identity, arguments)
+
+        def tray_location(index):
+            # Read only location from the actual persisted source machine object.
+            # Occupancy/history is neither synthesized nor an admission condition.
+            with self._lock:
+                return self._load_state()["machine_status"]["constructed_tip_trays"][index]["location"]
+
+        # Pickup does not consume motor-current settings. Detection does.
+        current = (get_active_oem_machine_snapshot().config_sections["offsets"]["m_Z_MOTOR_MAX_CURRENT_DOWN"]
+                   if operation == "sourceMeasureFluidHeight" else None)
+        bindings = bind_calibration_provider(self, finite=finite, native=native, pipette=pipette,
+            tray_location=tray_location, z_current_down=current, sleep=self.sleep)
+        try:
+            result = (manual_load_tip(ManualTipLoadRequest(**arguments), bindings)
+                      if operation == "sourceManualLoadTip" else
+                      measure_fluid_height(FluidHeightRequest(**arguments), bindings))
+        except CalibrationExecutionError as exc:
+            # Return partial source receipts for canonical terminalization, not
+            # an exception string that loses already-completed physical children.
+            result = {**exc.evidence, "error": str(exc)}
+        return {**result, "delivery_attempted": True}
+
+    def wp8_check_tips(
+        self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
+        child_order: int, plan_digest: str, **_: Any,
+    ) -> dict[str, Any]:
+        """ControlLib.checkTips:9918-10222 under the existing finite owner.
+
+        This is static loss beside the pickup, not whole-rack missingTps.
+        OEM exceptions retain the current flag; inspection evidence is separate
+        from that source boolean. No additional success/admission criterion.
+        """
+        from .vision.oem_tips import clung_tips, clung_tip_wells
+
+        flag = True
+        receipt: dict[str, Any] = {"ok": True, "source_return": True,
+            "inspection_completed": False, "delivery_attempted": False,
+            "captures": [], "moves": [], "removed_wells": []}
+        identity = self._wp8_identity(command_id, child_order, plan_digest)
+        try:
+            settings = self._cover_inspection_settings()
+            enabled = arguments["check_for_static_tip_loss"]
+            if enabled is None:
+                # ClassBioXPSettings.cs:1650 constructor, captured policy wins.
+                enabled = settings.get("CheckForStaticTipLoss", False)
+            text = arguments["tip_location"]
+            column = int(text[1:])
+            ordinal = (column - 1) * 2 + (text[0] == "B")
+            if not enabled or arguments["tip_type"] == 200 or ordinal >= 23:
+                self._cover_inspection_callbacks()["led"](channel=2, on=False)
+                receipt["source_noop"] = True
+                receipt["skip_reason"] = ("static_tip_loss_disabled" if not enabled else
+                    "200ul_tip" if arguments["tip_type"] == 200 else "tip_location_ge_23")
+            else:
+                profile = self._cover_inspection_profile("ClungTips")
+                threshold = int(profile["Parameters"]["threshold"])
+
+                def move(axis, steps):
+                    # CI.moveSteps (not direct board.moveSteps): retain the
+                    # public wrapper's final getCurrentPosition and null-board
+                    # semantics through the existing source-native driver.
+                    method = (self.primitives.tester.motor_x_move_relative_strict if axis == "x"
+                              else self.primitives.tester.motor_y_move_relative_strict)
+                    receipt["delivery_attempted"] = True
+                    result = method(steps)
+                    receipt["moves"].append({"axis": axis, "steps": steps, "result": result})
+                    # Source moveSteps return is ignored; controller exceptions
+                    # reach the original checkTips catch below.
+
+                move("y", 3198 + settings["CameraYOffset"] - (2132 if "B" in text else 0))
+                move("x", -1066 + settings["CameraXOffset"])
+                for half in (0, 1):
+                    if half:
+                        move("y", 8528)
+                    self.sleep(0.2)
+                    artifact = f"{identity}:checkTips:{half}"
+                    capture = self._cover_inspection_capture(condition="ClungTips", artifact_id=artifact)
+                    status = clung_tips(capture["frame"], threshold, "12" in text)
+                    wells = clung_tip_wells(status, text, half)
+                    evidence = {"half": half, "tipstatus": status,
+                                "capture_evidence": capture.get("capture_evidence"),
+                                "missing_wells": list(wells)}
+                    receipt["captures"].append(evidence)
+                    for well in wells:
+                        tray = self._tip_tray_state_reader(arguments["tray_id"])
+                        if tray["occupancy"][well]:
+                            flag = False
+                        self.publish_tip_tray_transition(
+                            tray_id=arguments["tray_id"], transition="remove", well_ids=[well],
+                            operation_id=f"{artifact}:remove:{well}", command_id=command_id,
+                            provenance={"source_operation": "checkTips", "source_child": identity})
+                        receipt["removed_wells"].append(well)
+                    if not flag:
+                        evidence["artifact"] = self._cover_inspection_callbacks()["save"](
+                            frame=capture["frame"], condition="ClungTips", artifact_id=artifact)
+                receipt["inspection_completed"] = True
+        except Exception as exc:
+            # Deliberately preserve OEM's fail-open/current-flag catch. Never
+            # describe this source return as a successful physical inspection.
+            receipt["source_exception"] = str(exc)
+        finally:
+            self._cover_inspection_all_leds_off()
+        receipt["source_return"] = flag
+        return receipt
 
     def wp8_pipette_source_leaf(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
@@ -13141,7 +13606,8 @@ class Serial206OemInitializationProvider:
         result = self.primitives.motor_wait_stopped(
             4, motor=1, timeout_s=float(arguments["timeout_ms"]) / 1000.0,
         )
-        stopped = bool(isinstance(result, Mapping) and (result.get("stopped") is True or result.get("ok") is True))
+        observed = result.get("wait") if isinstance(result, Mapping) and isinstance(result.get("wait"), Mapping) else result
+        stopped = bool(isinstance(observed, Mapping) and (observed.get("stopped") is True or observed.get("ok") is True))
         return {
             "ok": stopped, "delivery_attempted": False,
             "controller_command_acknowledged": False,
@@ -13819,13 +14285,14 @@ class Serial206OemInitializationProvider:
         if not callable(owner):
             return {
                 "ok": True, "delivery_attempted": False,
-                "source_noop": "m_ledControl_null",
+                "source_noop": "m_ledControl_null", "led_owner_present": False,
                 "source_anchor": "CVisionLib.ClassLEDControl.led2On/led2Off",
             }
         result = owner(operation == "led2On")
         row = dict(result) if isinstance(result, Mapping) else {}
         return {
             **row, "ok": row.get("ok") is True, "delivery_attempted": True,
+            "led_owner_present": True,
             "source_anchor": "CVisionLib.ClassLEDControl.led2On/led2Off",
         }
 
@@ -13983,6 +14450,7 @@ class Serial206OemInitializationProvider:
             raise RuntimeError("wp8_execution_fence_checker_missing")
 
         failures: list[dict[str, Any]] = []
+        completed: list[dict[str, Any]] = []
 
         def invoke(child: Mapping[str, Any]) -> Any:
             result = None
@@ -13998,6 +14466,7 @@ class Serial206OemInitializationProvider:
                 )
                 if isinstance(result, Mapping) and result.get("ok") is not True:
                     raise RuntimeError(f"wp8_nested_child_failed:{child['operation']}")
+                completed.append({"operation": child["operation"], "order": child["order"], "result": result})
                 return result
             except Exception as exc:
                 # The source catch/release executor suppresses exceptions;
@@ -14011,7 +14480,12 @@ class Serial206OemInitializationProvider:
                 })
                 raise
 
-        result = execute_finite_plate_operation(plan, invoke)
+        try:
+            result = execute_finite_plate_operation(plan, invoke)
+        except Exception as exc:
+            setattr(exc, "evidence", {"ok": False, "completed_children": completed,
+                                     "failure_evidence": failures, "source_plan_digest": digest})
+            raise
         return {
             **dict(result),
             "failure_evidence": failures,
@@ -14163,7 +14637,8 @@ class Serial206OemInitializationProvider:
             # Keep canonical owner authorization unchanged for every handler.
             plan_digest=(source_plan_identity if operation in {
                 "updateLocation", "updatePlateLocation", "updateThermalDoorOpen",
-                "clearTipLoaded", "inspectCoverAt", "SnapshotImage",
+                "clearTipLoaded", "sourceTipState", "sourceTipTransition",
+                "sourceWellPierced", "inspectCoverAt", "SnapshotImage",
                 "startMoveZPseudoHome", "startGripperHomeAndUnlock",
                 "backgroundGripperHomeAndUnlock", "waitMoveZOnly",
             } else owner_plan_digest),

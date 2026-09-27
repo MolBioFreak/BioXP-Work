@@ -201,6 +201,96 @@ def test_occupied_target_never_commands_transfer_or_final_storage_write(connecte
     assert connected.store.deck_semantic_state()['movable_plate_locations'] == before
 
 
+def test_reagent_return_exact_target_y_noop_still_lowers_and_releases(connected, monkeypatch):
+    """OEM loaded-cover Y clearance equals reagent destination Y.
+
+    Exercise both finite catch/release plans through the real provider,
+    production adapter and SQLite publisher; replace only native transport.
+    """
+    rig = connected
+    provider = rig.provider
+    first = provider._wp8_compile_and_execute(
+        operation='move_plate',
+        inputs={'plate': 5, 'destination': 20, 'press_plate': False, 'run_in_parallel': True},
+        command_id='offline-reagent-to-storage', owner_identity=rig.owner,
+    )
+    assert first['ok'] is True
+    for row in provider._wp8_tasks.values():
+        row['thread'].join(timeout=2)
+        assert row['state'] == 'completed'
+    assert rig.store.deck_semantic_state()['movable_plate_locations']['REAGENT_COVER'] == 'LOC_RC_COVER_STORAGE'
+    rig.native.events.clear()
+
+    original = rig.native.motor_oem_move_absolute
+    exact_noops = []
+    def native_exact_target_noop(board, target, *, motor, wait_for_stop, max_position=None):
+        if (board, motor) == (4, 0) and target == 44972 and rig.native.positions[board, motor] == target:
+            before = rig.native.motor_get_position(board, motor=motor)
+            exact_noops.append((target, before['position']))
+            return {'ok': True, 'source_noop': True,
+                    'short_circuit': 'current_position_equals_target',
+                    'requested_position': target, 'command_sent': False,
+                    'ack': None, 'before': before}
+        return original(board, target, motor=motor, wait_for_stop=wait_for_stop,
+                        max_position=max_position)
+    monkeypatch.setattr(rig.native, 'motor_oem_move_absolute', native_exact_target_noop)
+
+    result = provider._wp8_compile_and_execute(
+        operation='move_plate',
+        inputs={'plate': 5, 'destination': 19, 'press_plate': False, 'run_in_parallel': True},
+        command_id='offline-reagent-to-chiller', owner_identity=rig.owner,
+    )
+    assert exact_noops == [(44972, 44972)]
+    assert result['ok'] is True, result.get('failure_evidence')
+    release = result['source_children'][1]['result']
+    assert release['ok'] is True
+    assert release['source_children'][0]['result']['controller_command_acknowledged'] is True
+    assert release['source_children'][0]['result']['controller_completion_verified'] is True
+    assert rig.store.deck_semantic_state()['movable_plate_locations']['REAGENT_COVER'] == 'LOC_RC_COVER'
+    assert rig.store.deck_semantic_state()['plate_on_gantry'] is None
+    assert ('move', 'z', 107496, 42788, 44972) in rig.native.events
+    _, positions = provider._wp8_calibration()
+    assert any(event[:3] == ('move', 'g', positions['open']) and event[3:] == (42788, 44972)
+               for event in rig.native.events)
+
+
+def test_reagent_return_missing_command_ack_does_not_lower_or_publish(connected, monkeypatch):
+    rig = connected
+    provider = rig.provider
+    first = provider._wp8_compile_and_execute(
+        operation='move_plate',
+        inputs={'plate': 5, 'destination': 20, 'press_plate': False, 'run_in_parallel': True},
+        command_id='offline-reagent-before-lost-ack', owner_identity=rig.owner,
+    )
+    assert first['ok'] is True
+    for row in provider._wp8_tasks.values():
+        row['thread'].join(timeout=2)
+        assert row['state'] == 'completed'
+    rig.native.events.clear()
+    original = rig.native.motor_oem_move_absolute
+    lost_ack = []
+    def native_missing_ack(board, target, *, motor, wait_for_stop, max_position=None):
+        if (board, motor) == (4, 0) and target == 44972 and not lost_ack:
+            lost_ack.append(target)
+            before = rig.native.motor_get_position(board, motor=motor)
+            return {'ok': True, 'source_noop': False,
+                    'requested_position': target, 'command_sent': True,
+                    'ack': None, 'before': before}
+        return original(board, target, motor=motor, wait_for_stop=wait_for_stop,
+                        max_position=max_position)
+    monkeypatch.setattr(rig.native, 'motor_oem_move_absolute', native_missing_ack)
+    with pytest.raises(RuntimeError, match='wp8_nested_child_failed:releasePlate'):
+        provider._wp8_compile_and_execute(
+            operation='move_plate',
+            inputs={'plate': 5, 'destination': 19, 'press_plate': False, 'run_in_parallel': True},
+            command_id='offline-reagent-lost-ack', owner_identity=rig.owner,
+        )
+    assert lost_ack == [44972]
+    assert ('move', 'z', 107496, 42788, 44972) not in rig.native.events
+    assert rig.store.deck_semantic_state()['plate_on_gantry'] == 5
+    assert rig.store.deck_semantic_state()['movable_plate_locations']['REAGENT_COVER'] == 'LOC_GANTRY'
+
+
 @pytest.mark.parametrize('phase', ['catch', 'release'])
 def test_failed_transfer_never_finalizes_or_parks(connected, phase):
     _, positions = connected.provider._wp8_calibration()

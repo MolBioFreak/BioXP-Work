@@ -1,0 +1,568 @@
+[
+  {
+    "action": "aspirate",
+    "manual_request": {
+      "protocol_id": "diagnostic-aspirate",
+      "steps": [
+        {
+          "operation": "diagnostic_pipette",
+          "diagnostic": {
+            "action": "aspirate",
+            "channels": [
+              0,
+              2
+            ],
+            "volume_ul": 10.25,
+            "speed": 100
+          }
+        }
+      ]
+    },
+    "native_document": {
+      "protocol_id": "diagnostic-aspirate",
+      "version": 1,
+      "stages": [
+        {
+          "stage_id": "manual",
+          "title": "Manual pipetting",
+          "review_required": false,
+          "actions": [
+            {
+              "action_id": "manual-0-0",
+              "stage_id": "manual",
+              "kind": "pipette_manual_physical",
+              "params": {
+                "operation": "diagnostic_pipette",
+                "diagnostic": {
+                  "channels": [
+                    0,
+                    2
+                  ],
+                  "action": "aspirate",
+                  "volume_ul": 10.25,
+                  "speed": 100
+                }
+              },
+              "description": null,
+              "required_capability": null,
+              "review_required": false,
+              "pause_message": null,
+              "oem_opcode": null,
+              "source_occurrence_id": null,
+              "source_key": null,
+              "metadata": {
+                "manual_step": 0
+              }
+            }
+          ],
+          "metadata": {}
+        }
+      ],
+      "metadata": {
+        "manual_scope": "explicit_steps_only",
+        "well_alignment": "source_machine_tip_location"
+      }
+    }
+  },
+  {
+    "action": "dispense",
+    "manual_request": {
+      "protocol_id": "diagnostic-dispense",
+      "steps": [
+        {
+          "operation": "diagnostic_pipette",
+          "diagnostic": {
+            "action": "dispense",
+            "channels": [
+              0,
+              2
+            ],
+            "volume_ul": 10.25,
+            "speed": 100
+          }
+        }
+      ]
+    },
+    "native_document": {
+      "protocol_id": "diagnostic-dispense",
+      "version": 1,
+      "stages": [
+        {
+          "stage_id": "manual",
+          "title": "Manual pipetting",
+          "review_required": false,
+          "actions": [
+            {
+              "action_id": "manual-0-0",
+              "stage_id": "manual",
+              "kind": "pipette_manual_physical",
+              "params": {
+                "operation": "diagnostic_pipette",
+                "diagnostic": {
+                  "channels": [
+                    0,
+                    2
+                  ],
+                  "action": "dispense",
+                  "volume_ul": 10.25,
+                  "speed": 100
+                }
+              },
+              "description": null,
+              "required_capability": null,
+              "review_required": false,
+              "pause_message": null,
+              "oem_opcode": null,
+              "source_occurrence_id": null,
+              "source_key": null,
+              "metadata": {
+                "manual_step": 0
+              }
+            }
+          ],
+          "metadata": {}
+        }
+      ],
+      "metadata": {
+        "manual_scope": "explicit_steps_only",
+        "well_alignment": "source_machine_tip_location"
+      }
+    }
+  },
+  {
+    "action": "dispense_all",
+    "manual_request": {
+      "protocol_id": "diagnostic-dispense_all",
+      "steps": [
+        {
+          "operation": "diagnostic_pipette",
+          "diagnostic": {
+            "action": "dispense_all"
+          }
+        }
+      ]
+    },
+    "native_document": {
+      "protocol_id": "diagnostic-dispense_all",
+      "version": 1,
+      "stages": [
+        {
+          "stage_id": "manual",
+          "title": "Manual pipetting",
+          "review_required": false,
+          "actions": [
+            {
+              "action_id": "manual-0-0",
+              "stage_id": "manual",
+              "kind": "pipette_manual_physical",
+              "params": {
+                "operation": "diagnostic_pipette",
+                "diagnostic": {
+                  "action": "dispense_all"
+                }
+              },
+              "description": null,
+              "required_capability": null,
+              "review_required": false,
+              "pause_message": null,
+              "oem_opcode": null,
+              "source_occurrence_id": null,
+              "source_key": null,
+              "metadata": {
+                "manual_step": 0
+              }
+            }
+          ],
+          "metadata": {}
+        }
+      ],
+      "metadata": {
+        "manual_scope": "explicit_steps_only",
+        "well_alignment": "source_machine_tip_location"
+      }
+    }
+  },
+  {
+    "action": "diagnoses",
+    "manual_request": {
+      "protocol_id": "diagnostic-diagnoses",
+      "steps": [
+        {
+          "operation": "diagnostic_pipette",
+          "diagnostic": {
+            "action": "diagnoses"
+          }
+        }
+      ]
+    },
+    "native_document": {
+      "protocol_id": "diagnostic-diagnoses",
+      "version": 1,
+      "stages": [
+        {
+          "stage_id": "manual",
+          "title": "Manual pipetting",
+          "review_required": false,
+          "actions": [
+            {
+              "action_id": "manual-0-0",
+              "stage_id": "manual",
+              "kind": "pipette_manual_physical",
+              "params": {
+                "operation": "diagnostic_pipette",
+                "diagnostic": {
+                  "action": "diagnoses"
+                }
+              },
+              "description": null,
+              "required_capability": null,
+              "review_required": false,
+              "pause_message": null,
+              "oem_opcode": null,
+              "source_occurrence_id": null,
+              "source_key": null,
+              "metadata": {
+                "manual_step": 0
+              }
+            }
+          ],
+          "metadata": {}
+        }
+      ],
+      "metadata": {
+        "manual_scope": "explicit_steps_only",
+        "well_alignment": "source_machine_tip_location"
+      }
+    }
+  },
+  {
+    "action": "initialize",
+    "manual_request": {
+      "protocol_id": "diagnostic-initialize",
+      "steps": [
+        {
+          "operation": "diagnostic_pipette",
+          "diagnostic": {
+            "action": "initialize"
+          }
+        }
+      ]
+    },
+    "native_document": {
+      "protocol_id": "diagnostic-initialize",
+      "version": 1,
+      "stages": [
+        {
+          "stage_id": "manual",
+          "title": "Manual pipetting",
+          "review_required": false,
+          "actions": [
+            {
+              "action_id": "manual-0-0",
+              "stage_id": "manual",
+              "kind": "pipette_manual_physical",
+              "params": {
+                "operation": "diagnostic_pipette",
+                "diagnostic": {
+                  "action": "initialize"
+                }
+              },
+              "description": null,
+              "required_capability": null,
+              "review_required": false,
+              "pause_message": null,
+              "oem_opcode": null,
+              "source_occurrence_id": null,
+              "source_key": null,
+              "metadata": {
+                "manual_step": 0
+              }
+            }
+          ],
+          "metadata": {}
+        }
+      ],
+      "metadata": {
+        "manual_scope": "explicit_steps_only",
+        "well_alignment": "source_machine_tip_location"
+      }
+    }
+  },
+  {
+    "action": "eject",
+    "manual_request": {
+      "protocol_id": "diagnostic-eject",
+      "steps": [
+        {
+          "operation": "diagnostic_pipette",
+          "diagnostic": {
+            "action": "eject",
+            "channels": [
+              1,
+              3
+            ]
+          }
+        }
+      ]
+    },
+    "native_document": {
+      "protocol_id": "diagnostic-eject",
+      "version": 1,
+      "stages": [
+        {
+          "stage_id": "manual",
+          "title": "Manual pipetting",
+          "review_required": false,
+          "actions": [
+            {
+              "action_id": "manual-0-0",
+              "stage_id": "manual",
+              "kind": "pipette_manual_physical",
+              "params": {
+                "operation": "diagnostic_pipette",
+                "diagnostic": {
+                  "channels": [
+                    1,
+                    3
+                  ],
+                  "action": "eject"
+                }
+              },
+              "description": null,
+              "required_capability": null,
+              "review_required": false,
+              "pause_message": null,
+              "oem_opcode": null,
+              "source_occurrence_id": null,
+              "source_key": null,
+              "metadata": {
+                "manual_step": 0
+              }
+            }
+          ],
+          "metadata": {}
+        }
+      ],
+      "metadata": {
+        "manual_scope": "explicit_steps_only",
+        "well_alignment": "source_machine_tip_location"
+      }
+    }
+  },
+  {
+    "action": "get_data",
+    "manual_request": {
+      "protocol_id": "diagnostic-get_data",
+      "steps": [
+        {
+          "operation": "diagnostic_pipette",
+          "diagnostic": {
+            "action": "get_data"
+          }
+        }
+      ]
+    },
+    "native_document": {
+      "protocol_id": "diagnostic-get_data",
+      "version": 1,
+      "stages": [
+        {
+          "stage_id": "manual",
+          "title": "Manual pipetting",
+          "review_required": false,
+          "actions": [
+            {
+              "action_id": "manual-0-0",
+              "stage_id": "manual",
+              "kind": "pipette_manual_physical",
+              "params": {
+                "operation": "diagnostic_pipette",
+                "diagnostic": {
+                  "action": "get_data"
+                }
+              },
+              "description": null,
+              "required_capability": null,
+              "review_required": false,
+              "pause_message": null,
+              "oem_opcode": null,
+              "source_occurrence_id": null,
+              "source_key": null,
+              "metadata": {
+                "manual_step": 0
+              }
+            }
+          ],
+          "metadata": {}
+        }
+      ],
+      "metadata": {
+        "manual_scope": "explicit_steps_only",
+        "well_alignment": "source_machine_tip_location"
+      }
+    }
+  },
+  {
+    "action": "last_error",
+    "manual_request": {
+      "protocol_id": "diagnostic-last_error",
+      "steps": [
+        {
+          "operation": "diagnostic_pipette",
+          "diagnostic": {
+            "action": "last_error"
+          }
+        }
+      ]
+    },
+    "native_document": {
+      "protocol_id": "diagnostic-last_error",
+      "version": 1,
+      "stages": [
+        {
+          "stage_id": "manual",
+          "title": "Manual pipetting",
+          "review_required": false,
+          "actions": [
+            {
+              "action_id": "manual-0-0",
+              "stage_id": "manual",
+              "kind": "pipette_manual_physical",
+              "params": {
+                "operation": "diagnostic_pipette",
+                "diagnostic": {
+                  "action": "last_error"
+                }
+              },
+              "description": null,
+              "required_capability": null,
+              "review_required": false,
+              "pause_message": null,
+              "oem_opcode": null,
+              "source_occurrence_id": null,
+              "source_key": null,
+              "metadata": {
+                "manual_step": 0
+              }
+            }
+          ],
+          "metadata": {}
+        }
+      ],
+      "metadata": {
+        "manual_scope": "explicit_steps_only",
+        "well_alignment": "source_machine_tip_location"
+      }
+    }
+  },
+  {
+    "action": "plunger_up",
+    "manual_request": {
+      "protocol_id": "diagnostic-plunger_up",
+      "steps": [
+        {
+          "operation": "diagnostic_pipette",
+          "diagnostic": {
+            "action": "plunger_up",
+            "steps": 100
+          }
+        }
+      ]
+    },
+    "native_document": {
+      "protocol_id": "diagnostic-plunger_up",
+      "version": 1,
+      "stages": [
+        {
+          "stage_id": "manual",
+          "title": "Manual pipetting",
+          "review_required": false,
+          "actions": [
+            {
+              "action_id": "manual-0-0",
+              "stage_id": "manual",
+              "kind": "pipette_manual_physical",
+              "params": {
+                "operation": "diagnostic_pipette",
+                "diagnostic": {
+                  "action": "plunger_up",
+                  "steps": 100
+                }
+              },
+              "description": null,
+              "required_capability": null,
+              "review_required": false,
+              "pause_message": null,
+              "oem_opcode": null,
+              "source_occurrence_id": null,
+              "source_key": null,
+              "metadata": {
+                "manual_step": 0
+              }
+            }
+          ],
+          "metadata": {}
+        }
+      ],
+      "metadata": {
+        "manual_scope": "explicit_steps_only",
+        "well_alignment": "source_machine_tip_location"
+      }
+    }
+  },
+  {
+    "action": "plunger_down",
+    "manual_request": {
+      "protocol_id": "diagnostic-plunger_down",
+      "steps": [
+        {
+          "operation": "diagnostic_pipette",
+          "diagnostic": {
+            "action": "plunger_down",
+            "steps": 100
+          }
+        }
+      ]
+    },
+    "native_document": {
+      "protocol_id": "diagnostic-plunger_down",
+      "version": 1,
+      "stages": [
+        {
+          "stage_id": "manual",
+          "title": "Manual pipetting",
+          "review_required": false,
+          "actions": [
+            {
+              "action_id": "manual-0-0",
+              "stage_id": "manual",
+              "kind": "pipette_manual_physical",
+              "params": {
+                "operation": "diagnostic_pipette",
+                "diagnostic": {
+                  "action": "plunger_down",
+                  "steps": 100
+                }
+              },
+              "description": null,
+              "required_capability": null,
+              "review_required": false,
+              "pause_message": null,
+              "oem_opcode": null,
+              "source_occurrence_id": null,
+              "source_key": null,
+              "metadata": {
+                "manual_step": 0
+              }
+            }
+          ],
+          "metadata": {}
+        }
+      ],
+      "metadata": {
+        "manual_scope": "explicit_steps_only",
+        "well_alignment": "source_machine_tip_location"
+      }
+    }
+  }
+]

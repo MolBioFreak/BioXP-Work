@@ -200,8 +200,10 @@ def evaluate_inspect_cover_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
             "camera_session_disposition": "not_released_by_inspectCover",
         }
 
-    if not door_closed:
-        raise OemVisionReceiptError("enabled inspectCover requires verified doorOpen(false)")
+    # OEM doorOpen(false) may return successfully from its retained-state
+    # no-op without reading the physical switches. Preserve the observed
+    # evidence bit, but do not reject completed inspection solely for its
+    # absence or pretend that the no-op proves physical closure.
     expected_all_methods = (
         {17: "InspectOutputLocation(1)", 19: "checkRCCover", 20: "checkCoverStorage", 18: "checkCoverStorage"}
         if high_resolution

@@ -120,6 +120,46 @@ def missing_tips(image: bytes | np.ndarray, threshold: int, tiptype: int,
     return result << 8
 
 
+def clung_tips(image: bytes | np.ndarray, threshold: int, reduce_size: bool = False,
+               *, file_mode: bool = False) -> int:
+    """ClassFrameGrabber.clungTps:3792-4197, NOT missingTps/rack scan.
+
+    Return the source encoding: nearest-center mask *256 + blob-vector size
+    (including its one value-initialized entry). No minimum blob-count gate.
+    """
+    gray = _gray(image, file_mode=file_mode)
+    cropped = _roi(gray, 20, 120, gray.shape[1] - 40,
+                   gray.shape[0] // (4 if reduce_size else 2))
+    blobs = get_blobs(cv2.inRange(cropped, 0, threshold))
+    centers = tuple((x, y) for y in ((60,) if reduce_size else (57, 183))
+                    for x in (111, 237, 363, 489))
+    bits = 0
+    for blob in blobs:
+        if 3001 <= blob.area <= 9499:
+            distances = [np.sqrt(np.float32(np.float32((x - blob.x) ** 2)
+                                           + np.float32((y - blob.y) ** 2)))
+                         for x, y in centers]
+            bits |= 1 << int(np.argmin(distances))
+    return bits * 256 + len(blobs) + 1
+
+
+def clung_tip_wells(tipstatus: int, tip_location: str, half: int) -> tuple[int, ...]:
+    """ControlLib.checkTips mapping, including the literal source 0x28 mask."""
+    row, column = tip_location[0], int(tip_location[1:])
+    bits = (tipstatus >> 8) & (0xFFFFF0 if row == "B" else 0xFFFFF5)
+    base = half * 4
+    wells = []
+    if row != "B":
+        for mask, offset in ((1, 3), (4, 1)):
+            if bits & mask:
+                wells.append((base + offset) * 12 + column - 1)
+    if column != 12:
+        for mask, offset in ((0x10, 3), (0x28, 2), (0x40, 1), (0x80, 0)):
+            if bits & mask:
+                wells.append((base + offset) * 12 + column)
+    return tuple(wells)
+
+
 def missing_tip_wells(tipstatus: int, region: int) -> tuple[int, ...]:
     """Pure setTipInfo mapping: bit0 D1, bit1 C1,... region0; IDs 0..95.
 

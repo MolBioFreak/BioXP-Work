@@ -18,7 +18,7 @@ from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .critical_logging import critical_receipt
 from .oem_runtime_types import OEMRuntimeSnapshot, utc_ts
@@ -4950,6 +4950,79 @@ class OEMRuntimeStore:
             "SELECT value FROM runtime_metadata WHERE key='runtime_sequence'"
         ).fetchone()
         return int(row[0]) if row is not None else 0
+
+    def read_machine_calibration_revision(self, baseline_lock_sha256: str) -> dict[str, Any] | None:
+        """User-authored config, never a serial206 hardware-authority record."""
+        key = "machine_calibration_v1:" + baseline_lock_sha256
+        with self._lock:
+            row = self._db.execute("SELECT value FROM runtime_metadata WHERE key=?", (key,)).fetchone()
+            return None if row is None else json.loads(row[0])
+
+    def update_machine_calibration_revision(
+        self,
+        baseline_lock_sha256: str,
+        update: Callable[[dict[str, Any] | None], dict[str, Any]],
+        after_update: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Merge and persist under the existing SQLite writer owner atomically."""
+        key = "machine_calibration_v1:" + baseline_lock_sha256
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute("SELECT value FROM runtime_metadata WHERE key=?", (key,)).fetchone()
+                payload = update(None if row is None else json.loads(row[0]))
+                encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                self._db.execute(
+                    "INSERT INTO runtime_metadata(key,value,updated_at) VALUES(?,?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                    (key, encoded, time.time()),
+                )
+                readback = self._db.execute("SELECT value FROM runtime_metadata WHERE key=?", (key,)).fetchone()[0]
+                if readback != encoded:
+                    raise RuntimeError("machine calibration save readback mismatch")
+                if after_update is not None:
+                    after_update(payload)
+                self._db.execute("COMMIT")
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
+            return json.loads(readback)
+
+    def restore_machine_calibration_revision(
+        self, baseline_lock_sha256: str, previous: dict[str, Any] | None,
+    ) -> None:
+        """Restore an OEM comparison backup, including an absent prior revision."""
+        key = "machine_calibration_v1:" + baseline_lock_sha256
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                if previous is None:
+                    self._db.execute("DELETE FROM runtime_metadata WHERE key=?", (key,))
+                else:
+                    encoded = json.dumps(previous, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                    self._db.execute(
+                        "INSERT INTO runtime_metadata(key,value,updated_at) VALUES(?,?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                        (key, encoded, time.time()),
+                    )
+                self._db.execute("COMMIT")
+            except Exception:
+                self._db.execute("ROLLBACK")
+                raise
+
+    def read_calibration_run(self, run_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.execute("SELECT value FROM runtime_metadata WHERE key=?",
+                                   ("calibration_run_v1:" + run_id,)).fetchone()
+            return None if row is None else json.loads(row[0])
+
+    def write_calibration_run(self, payload: dict[str, Any]) -> None:
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO runtime_metadata(key,value,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                ("calibration_run_v1:" + payload["run_id"], encoded, time.time()))
 
     def next_seq(self) -> int:
         with self._lock:

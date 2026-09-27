@@ -1,0 +1,716 @@
+{
+  "success": {
+    "active_revision_id": null,
+    "adjustment_source": "ClassBioXPSettings.adjustZ:6039-6138",
+    "body_completed": true,
+    "comparison_choice": null,
+    "comparison_gap": "OEM resultComparison requires an operator choice; no dialog is bound",
+    "delivery_attempted": true,
+    "fluid_reference_revision": "0",
+    "kind": "source_calwith_fluid",
+    "measurements": [
+      {
+        "calculated_z_lows": {
+          "LOC_TC": 93178
+        },
+        "measured_raw_z": 88000,
+        "pending_restart": true,
+        "plate": "TC",
+        "saved_revision_id": "5084a28be7534637beaa00376e323496",
+        "scan": {
+          "calibration_persisted": false,
+          "kind": "source_fluid_offset",
+          "location": 2,
+          "ok": true,
+          "physical_effect_verified": false,
+          "plate": "TC",
+          "samples": [
+            {
+              "position_steps": 88000,
+              "well": "A1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A9"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B9"
+            }
+          ],
+          "skip_steps": 4,
+          "source_anchor": "ControlLib.zOffset:3387-3627",
+          "source_return": 88000,
+          "speed": 300,
+          "transfer_fluid": true
+        },
+        "settings_updates": {
+          "m_current_tool": "FluidReference",
+          "m_liquid_cal_revision": "0"
+        }
+      },
+      {
+        "calculated_z_lows": {
+          "LOC_MS": 93178
+        },
+        "measured_raw_z": 88000,
+        "pending_restart": true,
+        "plate": "MS",
+        "saved_revision_id": "0951c44e2f6b4d3084186a576745655c",
+        "scan": {
+          "calibration_persisted": false,
+          "kind": "source_fluid_offset",
+          "location": 0,
+          "ok": true,
+          "physical_effect_verified": false,
+          "plate": "MS",
+          "samples": [
+            {
+              "position_steps": 88000,
+              "well": "A1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A9"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B9"
+            }
+          ],
+          "skip_steps": 4,
+          "source_anchor": "ControlLib.zOffset:3387-3627",
+          "source_return": 88000,
+          "speed": 300,
+          "transfer_fluid": true
+        },
+        "settings_updates": {
+          "m_PLLow": 93178,
+          "m_current_tool": "FluidReference",
+          "m_liquid_cal_revision": "0"
+        }
+      },
+      {
+        "calculated_z_lows": {
+          "LOC_OC": 93178
+        },
+        "measured_raw_z": 88000,
+        "pending_restart": true,
+        "plate": "OC",
+        "saved_revision_id": "aff0a1205f98438a87197c55c14f13cb",
+        "scan": {
+          "calibration_persisted": false,
+          "kind": "source_fluid_offset",
+          "location": 1,
+          "ok": true,
+          "physical_effect_verified": false,
+          "plate": "OC",
+          "samples": [
+            {
+              "position_steps": 88000,
+              "well": "A1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A9"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B9"
+            }
+          ],
+          "skip_steps": 4,
+          "source_anchor": "ControlLib.zOffset:3387-3627",
+          "source_return": 88000,
+          "speed": 300,
+          "transfer_fluid": true
+        },
+        "settings_updates": {
+          "m_current_tool": "FluidReference",
+          "m_liquid_cal_revision": "0"
+        }
+      },
+      {
+        "calculated_z_lows": {
+          "LOC_RC": 93300
+        },
+        "measured_raw_z": 88000,
+        "pending_restart": true,
+        "plate": "RC",
+        "saved_revision_id": "195a56e7d96e4a0fb2946c528cab352f",
+        "scan": {
+          "calibration_persisted": false,
+          "kind": "source_fluid_offset",
+          "location": 3,
+          "ok": true,
+          "physical_effect_verified": false,
+          "plate": "RC",
+          "samples": [
+            {
+              "position_steps": 88000,
+              "well": "A1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A9"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B9"
+            }
+          ],
+          "skip_steps": 4,
+          "source_anchor": "ControlLib.zOffset:3387-3627",
+          "source_errors": [
+            "Tips are not available",
+            "Tips are not available",
+            "Tips are not available"
+          ],
+          "source_return": 88000,
+          "speed": 300,
+          "transfer_fluid": true
+        },
+        "settings_updates": {
+          "m_current_tool": "FluidReference",
+          "m_liquid_cal_revision": "0"
+        }
+      },
+      {
+        "calculated_z_lows": {
+          "LOC_STRIP1": 95700,
+          "LOC_STRIP2": 95700,
+          "LOC_STRIP3": 95700,
+          "LOC_STRIP4": 95700
+        },
+        "measured_raw_z": 88000,
+        "pending_restart": true,
+        "plate": "STRIP",
+        "saved_revision_id": "87682f09cbf5498da321b2ba989e4aef",
+        "scan": {
+          "calibration_persisted": false,
+          "kind": "source_fluid_offset",
+          "location": 12,
+          "ok": true,
+          "physical_effect_verified": false,
+          "plate": "STRIP",
+          "samples": [
+            {
+              "position_steps": 88000,
+              "well": "A1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B1"
+            }
+          ],
+          "skip_steps": 4,
+          "source_anchor": "ControlLib.zOffset:3387-3627",
+          "source_errors": [
+            "Tips are not available",
+            "Tips are not available",
+            "Tips are not available"
+          ],
+          "source_return": 88000,
+          "speed": 300,
+          "transfer_fluid": true
+        },
+        "settings_updates": {
+          "m_current_tool": "FluidReference",
+          "m_liquid_cal_revision": "0"
+        }
+      }
+    ],
+    "ok": true,
+    "outcome": "incomplete",
+    "pending_restart": true,
+    "physical_effect_verified": false,
+    "previous_saved_revision_id": null,
+    "saved_revision_id": "87682f09cbf5498da321b2ba989e4aef",
+    "source": "ControlLib.calwithFluid:2782-2850",
+    "source_errors": [
+      "Tips are not available",
+      "Tips are not available"
+    ]
+  },
+  "partial_failure": {
+    "active_revision_id": null,
+    "adjustment_source": "ClassBioXPSettings.adjustZ:6039-6138",
+    "body_completed": false,
+    "comparison_choice": null,
+    "comparison_gap": "OEM resultComparison requires an operator choice; no dialog is bound",
+    "delivery_attempted": true,
+    "error": "calwithFluid:zOffset:OC:failed:wp8_nested_child_failed:sourceMeasureFluidHeight",
+    "failed_scans": [
+      {
+        "calibration_persisted": false,
+        "error": "wp8_nested_child_failed:sourceMeasureFluidHeight",
+        "kind": "source_fluid_offset",
+        "location": 1,
+        "ok": false,
+        "physical_effect_verified": false,
+        "plate": "OC",
+        "samples": [],
+        "skip_steps": 4,
+        "source_anchor": "ControlLib.zOffset:3387-3627",
+        "source_errors": [
+          "RuntimeError('wp8_nested_child_failed:sourceMeasureFluidHeight')",
+          "wp8_nested_child_failed:sourceMeasureFluidHeight",
+          "Detect fluid level timeout"
+        ],
+        "speed": 300,
+        "transfer_fluid": true
+      }
+    ],
+    "fluid_reference_revision": "0",
+    "kind": "source_calwith_fluid",
+    "measurements": [
+      {
+        "calculated_z_lows": {
+          "LOC_TC": 93178
+        },
+        "measured_raw_z": 88000,
+        "pending_restart": true,
+        "plate": "TC",
+        "saved_revision_id": "1883a42e491744848bdd4633a967f437",
+        "scan": {
+          "calibration_persisted": false,
+          "kind": "source_fluid_offset",
+          "location": 2,
+          "ok": true,
+          "physical_effect_verified": false,
+          "plate": "TC",
+          "samples": [
+            {
+              "position_steps": 88000,
+              "well": "A1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A9"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B9"
+            }
+          ],
+          "skip_steps": 4,
+          "source_anchor": "ControlLib.zOffset:3387-3627",
+          "source_return": 88000,
+          "speed": 300,
+          "transfer_fluid": true
+        },
+        "settings_updates": {
+          "m_current_tool": "FluidReference",
+          "m_liquid_cal_revision": "0"
+        }
+      },
+      {
+        "calculated_z_lows": {
+          "LOC_MS": 93178
+        },
+        "measured_raw_z": 88000,
+        "pending_restart": true,
+        "plate": "MS",
+        "saved_revision_id": "da223c4a05fd461fbaeaa14d2144f27a",
+        "scan": {
+          "calibration_persisted": false,
+          "kind": "source_fluid_offset",
+          "location": 0,
+          "ok": true,
+          "physical_effect_verified": false,
+          "plate": "MS",
+          "samples": [
+            {
+              "position_steps": 88000,
+              "well": "A1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A9"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B9"
+            }
+          ],
+          "skip_steps": 4,
+          "source_anchor": "ControlLib.zOffset:3387-3627",
+          "source_return": 88000,
+          "speed": 300,
+          "transfer_fluid": true
+        },
+        "settings_updates": {
+          "m_PLLow": 93178,
+          "m_current_tool": "FluidReference",
+          "m_liquid_cal_revision": "0"
+        }
+      }
+    ],
+    "ok": false,
+    "outcome": "incomplete",
+    "pending_restart": true,
+    "physical_effect_verified": false,
+    "previous_saved_revision_id": null,
+    "saved_revision_id": "da223c4a05fd461fbaeaa14d2144f27a",
+    "source": "ControlLib.calwithFluid:2782-2850",
+    "source_errors": [
+      "RuntimeError('wp8_nested_child_failed:sourceMeasureFluidHeight')",
+      "wp8_nested_child_failed:sourceMeasureFluidHeight",
+      "Detect fluid level timeout"
+    ]
+  },
+  "finalization_failure": {
+    "active_revision_id": null,
+    "adjustment_source": "ClassBioXPSettings.adjustZ:6039-6138",
+    "body_completed": true,
+    "comparison_choice": null,
+    "comparison_gap": "OEM resultComparison requires an operator choice; no dialog is bound",
+    "delivery_attempted": true,
+    "finalization_error": "transport final acceleration failure",
+    "fluid_reference_revision": "0",
+    "kind": "source_calwith_fluid",
+    "measurements": [
+      {
+        "calculated_z_lows": {
+          "LOC_TC": 93178
+        },
+        "measured_raw_z": 88000,
+        "pending_restart": true,
+        "plate": "TC",
+        "saved_revision_id": "1f4f06c2796749c4a5f7a10269c3ce1e",
+        "scan": {
+          "calibration_persisted": false,
+          "kind": "source_fluid_offset",
+          "location": 2,
+          "ok": true,
+          "physical_effect_verified": false,
+          "plate": "TC",
+          "samples": [
+            {
+              "position_steps": 88000,
+              "well": "A1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A9"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B9"
+            }
+          ],
+          "skip_steps": 4,
+          "source_anchor": "ControlLib.zOffset:3387-3627",
+          "source_return": 88000,
+          "speed": 300,
+          "transfer_fluid": true
+        },
+        "settings_updates": {
+          "m_current_tool": "FluidReference",
+          "m_liquid_cal_revision": "0"
+        }
+      },
+      {
+        "calculated_z_lows": {
+          "LOC_MS": 93178
+        },
+        "measured_raw_z": 88000,
+        "pending_restart": true,
+        "plate": "MS",
+        "saved_revision_id": "e700bcc156ca446ca561f8617d9d3288",
+        "scan": {
+          "calibration_persisted": false,
+          "kind": "source_fluid_offset",
+          "location": 0,
+          "ok": true,
+          "physical_effect_verified": false,
+          "plate": "MS",
+          "samples": [
+            {
+              "position_steps": 88000,
+              "well": "A1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A9"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B9"
+            }
+          ],
+          "skip_steps": 4,
+          "source_anchor": "ControlLib.zOffset:3387-3627",
+          "source_return": 88000,
+          "speed": 300,
+          "transfer_fluid": true
+        },
+        "settings_updates": {
+          "m_PLLow": 93178,
+          "m_current_tool": "FluidReference",
+          "m_liquid_cal_revision": "0"
+        }
+      },
+      {
+        "calculated_z_lows": {
+          "LOC_OC": 93178
+        },
+        "measured_raw_z": 88000,
+        "pending_restart": true,
+        "plate": "OC",
+        "saved_revision_id": "425852b6140a4484a8c0e34697a18c3b",
+        "scan": {
+          "calibration_persisted": false,
+          "kind": "source_fluid_offset",
+          "location": 1,
+          "ok": true,
+          "physical_effect_verified": false,
+          "plate": "OC",
+          "samples": [
+            {
+              "position_steps": 88000,
+              "well": "A1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A9"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B9"
+            }
+          ],
+          "skip_steps": 4,
+          "source_anchor": "ControlLib.zOffset:3387-3627",
+          "source_return": 88000,
+          "speed": 300,
+          "transfer_fluid": true
+        },
+        "settings_updates": {
+          "m_current_tool": "FluidReference",
+          "m_liquid_cal_revision": "0"
+        }
+      },
+      {
+        "calculated_z_lows": {
+          "LOC_RC": 93300
+        },
+        "measured_raw_z": 88000,
+        "pending_restart": true,
+        "plate": "RC",
+        "saved_revision_id": "aaf1a2983192474cb3531e3c2dd91704",
+        "scan": {
+          "calibration_persisted": false,
+          "kind": "source_fluid_offset",
+          "location": 3,
+          "ok": true,
+          "physical_effect_verified": false,
+          "plate": "RC",
+          "samples": [
+            {
+              "position_steps": 88000,
+              "well": "A1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B5"
+            },
+            {
+              "position_steps": 88000,
+              "well": "A9"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B9"
+            }
+          ],
+          "skip_steps": 4,
+          "source_anchor": "ControlLib.zOffset:3387-3627",
+          "source_errors": [
+            "Tips are not available",
+            "Tips are not available",
+            "Tips are not available"
+          ],
+          "source_return": 88000,
+          "speed": 300,
+          "transfer_fluid": true
+        },
+        "settings_updates": {
+          "m_current_tool": "FluidReference",
+          "m_liquid_cal_revision": "0"
+        }
+      },
+      {
+        "calculated_z_lows": {
+          "LOC_STRIP1": 95700,
+          "LOC_STRIP2": 95700,
+          "LOC_STRIP3": 95700,
+          "LOC_STRIP4": 95700
+        },
+        "measured_raw_z": 88000,
+        "pending_restart": true,
+        "plate": "STRIP",
+        "saved_revision_id": "284f32043ce440bfb74a3bd39c085e88",
+        "scan": {
+          "calibration_persisted": false,
+          "kind": "source_fluid_offset",
+          "location": 12,
+          "ok": true,
+          "physical_effect_verified": false,
+          "plate": "STRIP",
+          "samples": [
+            {
+              "position_steps": 88000,
+              "well": "A1"
+            },
+            {
+              "position_steps": 88000,
+              "well": "B1"
+            }
+          ],
+          "skip_steps": 4,
+          "source_anchor": "ControlLib.zOffset:3387-3627",
+          "source_errors": [
+            "Tips are not available",
+            "Tips are not available",
+            "Tips are not available"
+          ],
+          "source_return": 88000,
+          "speed": 300,
+          "transfer_fluid": true
+        },
+        "settings_updates": {
+          "m_current_tool": "FluidReference",
+          "m_liquid_cal_revision": "0"
+        }
+      }
+    ],
+    "ok": false,
+    "outcome": "incomplete",
+    "pending_restart": true,
+    "physical_effect_verified": false,
+    "previous_saved_revision_id": null,
+    "saved_revision_id": "284f32043ce440bfb74a3bd39c085e88",
+    "source": "ControlLib.calwithFluid:2782-2850",
+    "source_errors": [
+      "Tips are not available",
+      "Tips are not available"
+    ]
+  }
+}

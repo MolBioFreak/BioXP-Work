@@ -707,13 +707,180 @@ def _controller_acknowledged(value: Any) -> bool:
     return False
 
 
+def _pipette_source_errors(value: Any) -> list[Any]:
+    """Retain literal nested failure messages when deleting transport nesting."""
+    if isinstance(value, Mapping):
+        errors = []
+        for key, child in value.items():
+            if key in {"error", "finalization_error", "exception_message", "errors"} and child:
+                errors.extend(child if isinstance(child, list) else [child])
+            elif isinstance(child, (Mapping, list)):
+                errors.extend(_pipette_source_errors(child))
+        return [error for index, error in enumerate(errors) if error not in errors[:index]]
+    if isinstance(value, list):
+        return [error for child in value for error in _pipette_source_errors(child)]
+    return []
+
+
+_ADDITIONAL_PIPETTE_KINDS = frozenset({"source_load_tips", "source_mix",
+    "source_aspirate_air", "source_dispense_air", "source_purge", "diagnostic_pipette"})
+
+
+def _compact_pipette_observation(value: Any) -> Any:
+    """Project actual outcomes, dropping redundant wire/receipt trees."""
+    if isinstance(value, (list, tuple)):
+        return [_compact_pipette_observation(row) for row in value]
+    if not isinstance(value, Mapping):
+        return value
+    fields = {"ok", "completed", "source_return", "source_return_completed",
+        "controller_outcome_ok", "interrupted_by_terminate", "channel", "channels",
+        "result", "completion", "status", "group", "attempt", "number", "label",
+        "diagnosis", "display", "part_number", "revision", "firmware", "data",
+        "query", "queries", "results", "value", "value_ascii", "value_bytes", "unit",
+        "error", "errors", "oem_error_code", "oem_error_free",
+        "semantic_ok", "reply_received", "timeout_ms", "operation", "step_id",
+        "source_identity", "source_occurrence_id", "source_noop", "outcome",
+        "delivery_attempted", "exception_type", "failure", "steps", "current",
+        "current_max", "requested_current", "signed_steps", "requested_steps", "position_steps",
+        "command_issued", "physical_motion_commanded", "physical_effect_verified",
+        "command_id", "parent_command_id", "plan_digest", "child_order",
+        "tip_loaded", "source_tip_loaded", "tip_type", "tip_location", "volume_ul", "speed"}
+    return {k: _compact_pipette_observation(v) for k, v in value.items() if k in fields}
+
+
+def _compact_additional_pipette(value: Mapping[str, Any]) -> dict[str, Any]:
+    fields = {"kind", "action", "source_anchor", "source_occurrence_id", "ok",
+        "completed", "source_return", "source_return_completed", "source_noop",
+        "physical_effect_verified", "controller_outcome_ok", "delivery_attempted",
+        "interrupted_by_terminate", "error", "exception_type", "failure",
+        "requested_pipette", "tip_location", "already_matching_tip_type", "alignment_published",
+        "selected_channels", "lost_tip_channels", "cached_tip_channels", "ejected_channels"}
+    result = {k: v for k, v in value.items() if k in fields}
+    for key in ("tests", "attempts", "channels", "stroke", "dispense_all", "events", "native_results"):
+        if key in value:
+            result[key] = _compact_pipette_observation(value[key])
+    # Event trees duplicate the structured tests/data/status above. Keep the
+    # occurrence and scalar outcome once; plunger value/steps are scalars too.
+    for event in result.get("events", []):
+        if isinstance(event.get("result"), Mapping):
+            event["result"] = {k: v for k, v in event["result"].items()
+                if not isinstance(v, (Mapping, list, tuple))}
+    errors = list(value.get("source_errors", []))
+    for error in _pipette_source_errors(value):
+        if error not in errors:
+            errors.append(error)
+    if errors or "source_errors" in value:
+        result["source_errors"] = errors
+    return result
+
+
+def _compact_pipette_response(value: Any) -> Any:
+    """Keep operational data, not repeated transport/step trees, in receipts.
+
+    Primitive transport evidence already lives in the canonical child/pipette
+    stores. Source outcomes are copied verbatim; this is not outcome evaluation.
+    The discriminator is source-owned, never guessed from a saved revision.
+    """
+    if not isinstance(value, Mapping):
+        return value
+    if value.get("kind") in _ADDITIONAL_PIPETTE_KINDS:
+        return _compact_additional_pipette(value)
+    source = str(value.get("source") or value.get("source_anchor") or "")
+    kinds = {"ControlLib.calwithFluid:": "source_calwith_fluid",
+             "ControlLib.btnDetectFluid_Click:": "diagnostic_detect_fluid",
+             "ControlLib.zOffset:": "source_fluid_offset",
+             "ControlLib.scrFluidDetection:": "measure_fluid_height"}
+    kind = next((kind for prefix, kind in kinds.items() if source.startswith(prefix)), None)
+    if kind:
+        result = {k: v for k, v in value.items() if k not in {"steps", "source_events"}}
+        errors = _pipette_source_errors([value.get("steps", []), value.get("source_events", [])])
+        if errors:
+            result["source_errors"] = errors
+        if "events" in result:
+            # Keep source occurrence/outcome evidence once, not each event's
+            # recursively repeated controller/scan transport tree.
+            events = []
+            for event in result["events"]:
+                row = {k: v for k, v in event.items() if k not in {"result", "evidence"}}
+                raw = event.get("result")
+                if isinstance(raw, Mapping):
+                    row["result"] = {k: v for k, v in raw.items()
+                        if not isinstance(v, (Mapping, list, tuple))}
+                    if raw.get("ok") is False and "samples" in raw:
+                        row["result"]["samples"] = raw["samples"]
+                errors = _pipette_source_errors(event)
+                if errors:
+                    row["errors"] = errors
+                events.append(row)
+            result["events"] = events
+        # Failed station samples can exist only in the calibration event stream;
+        # retain that source result without the repeated successful scan copies.
+        failed_scans = [event["result"] for event in value.get("source_events", [])
+            if isinstance(event.get("result"), Mapping)
+            and event["result"].get("ok") is False
+            and "samples" in event["result"]]
+        if failed_scans:
+            result["failed_scans"] = [_compact_pipette_response(scan) for scan in failed_scans]
+        for key in ("measurements", "scans"):
+            if key in result:
+                result[key] = [{**row, **({"scan": _compact_pipette_response(row["scan"])}
+                    if isinstance(row.get("scan"), Mapping) else {})} for row in result[key]]
+        return {"kind": kind, **result}
+    result = dict(value)
+    critical = result.get("pipette_result")
+    for key in ("result", "response", "completed_children", "source_children", "provider_results"):
+        child = result.get(key)
+        if isinstance(child, Mapping):
+            result[key] = _compact_pipette_response(child)
+            candidates = [result[key]]
+        elif isinstance(child, list):
+            result[key] = [_compact_pipette_response(row) for row in child]
+            candidates = result[key]
+        else:
+            continue
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            if isinstance(candidate.get("pipette_result"), Mapping):
+                critical = candidate["pipette_result"]
+            anchor = str(candidate.get("source") or candidate.get("source_anchor") or "")
+            child_kind = next((k for prefix, k in kinds.items() if anchor.startswith(prefix)), None)
+            child_kind = candidate.get("kind") if candidate.get("kind") in _ADDITIONAL_PIPETTE_KINDS else child_kind
+            if child_kind:
+                critical = {"kind": child_kind, **candidate}
+    if critical is not None:
+        result["pipette_result"] = critical
+    return result
+
+
+def _workflow_terminal_result(receipt: Mapping[str, Any]) -> dict[str, Any]:
+    """One native consumer for persisted terminal success and partial failure."""
+    evidence = receipt.get("terminal_evidence") or {}
+    response = dict(evidence.get("response") or {})
+    for key in ("error", "detail", "pipette_result"):
+        if key in evidence:
+            response[key] = evidence[key]
+    return {**response, "ok": receipt["status"] == "completed",
+            "command_id": receipt["command_id"], "status": receipt["status"], "receipt": receipt}
+
+
 def _bounded_json(value: Any, limit: int) -> Any:
+    value = _compact_pipette_response(value)
     try:
         raw = json.dumps(value, default=str, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     except Exception:
         return {"bounded": True, "detail": "unserializable response"}
     if len(raw) <= limit:
         return json.loads(raw)
+    if isinstance(value, Mapping) and isinstance(value.get("kind"), str) and value["kind"] in {
+            "source_calwith_fluid", "diagnostic_detect_fluid",
+            "source_fluid_offset", "measure_fluid_height", *_ADDITIONAL_PIPETTE_KINDS}:
+        return json.loads(raw)
+    if isinstance(value, Mapping) and isinstance(value.get("pipette_result"), Mapping):
+        # Critical source data is not diagnostic preview data. Drop the redundant
+        # envelope rather than hashing it or losing samples to the diagnostic cap.
+        return {key: value[key] for key in ("pipette_result", "ok", "error", "detail",
+            "delivery_attempted", "outcome_unknown") if key in value}
     digest = hashlib.sha256(raw).hexdigest()
     return {"bounded": True, "original_bytes": len(raw), "sha256": digest, "preview": raw[: min(limit // 2, 4096)].decode("utf-8", "replace")}
 
@@ -734,7 +901,7 @@ def _resolve_schema(schema: Mapping[str, Any], document: Mapping[str, Any]) -> d
     return selected
 
 
-def _input_spec(name: str, schema: Mapping[str, Any], *, required: bool, location: str, description: str = "") -> dict[str, Any]:
+def _input_spec(name: str, schema: Mapping[str, Any], *, required: bool, location: str, description: str = "", form_schema: Mapping[str, Any] | None = None) -> dict[str, Any]:
     enum_values = schema.get("enum") if isinstance(schema.get("enum"), list) else []
     raw_type = schema.get("type")
     value_type = "enum" if enum_values else raw_type if raw_type in {"string", "integer", "number", "boolean"} else "json"
@@ -753,7 +920,9 @@ def _input_spec(name: str, schema: Mapping[str, Any], *, required: bool, locatio
         "maximum": schema.get("maximum") if isinstance(schema.get("maximum"), (int, float)) else None,
         "exclusive_minimum": schema.get("exclusiveMinimum") if isinstance(schema.get("exclusiveMinimum"), (int, float)) else None,
         "exclusive_maximum": schema.get("exclusiveMaximum") if isinstance(schema.get("exclusiveMaximum"), (int, float)) else None,
-        "default": _bounded_json(default, 4096) if default is not None else None,
+        "default": default,
+        # Native request shape is presentation metadata, never a new gate.
+        "json_schema": dict(form_schema if form_schema is not None else schema),
     }
 
 
@@ -797,6 +966,12 @@ _LATCH_CAPABLE_INITIALIZATION_PATHS = {
 }
 
 _NO_MOTION_PREPARATION_PATHS = {
+    "/liquid/manual/compile",
+    "/motion/oem/calibration_settings",
+    "/motion/oem/calibration_settings/runs/{run_id}/decision",
+    "/motion/oem/pipette/tip_tray_set",
+    "/liquid/pipette/settings",
+    "/liquid/pipette/tip-type",
     "/motion/oem/prepare_without_motion",
     "/motion/arm/strict_startup",
     # ClassMotor.setHome is a controller-coordinate write (SAP1=0), not a
@@ -826,7 +1001,7 @@ def _safety(method: str, path: str) -> str:
     if any(token in lower for token in ("/stop", "/abort", "/cancel")) or lower == "/oem/runtime/events/pause":
         return "stop"
     if lower in _NO_MOTION_PREPARATION_PATHS:
-        return "service"
+        return "read_only" if method == "GET" else "service"
     if "constructor_pipettes" in lower:
         return "service" if method != "GET" else "read_only"
     if lower in _PIPETTE_QUERY_PATHS:
@@ -1621,6 +1796,7 @@ def _path_action_id(method: str, path: str, operation_id: str | None) -> str:
 
 
 def _extract_inputs(operation: Mapping[str, Any], document: Mapping[str, Any]) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    from .operator_input_schema import native_form_schema
     specs: list[dict[str, Any]] = []
     locations: dict[str, dict[str, Any]] = {}
     for parameter in operation.get("parameters", []):
@@ -1631,7 +1807,7 @@ def _extract_inputs(operation: Mapping[str, Any], document: Mapping[str, Any]) -
             continue
         location = str(parameter["in"])
         schema = _resolve_schema(parameter.get("schema", {}), document)
-        spec = _input_spec(name, schema, required=bool(parameter.get("required")), location=location, description=str(parameter.get("description") or ""))
+        spec = _input_spec(name, schema, required=bool(parameter.get("required")), location=location, description=str(parameter.get("description") or ""), form_schema=native_form_schema(parameter.get("schema", {}), document))
         specs.append(spec)
         locations[spec["name"]] = {"location": location, "wire_name": name}
     request_body = operation.get("requestBody")
@@ -1651,12 +1827,12 @@ def _extract_inputs(operation: Mapping[str, Any], document: Mapping[str, Any]) -
                         "implicit_operator_control": True,
                     }
                     continue
-                spec = _input_spec(name, schema, required=raw_name in required_names, location="body")
+                spec = _input_spec(name, schema, required=raw_name in required_names, location="body", form_schema=native_form_schema(raw_schema, document))
                 spec["wire_name"] = str(raw_name)
                 specs.append(spec)
                 locations[name] = {"location": "body", "wire_name": str(raw_name)}
         else:
-            specs.append(_input_spec("body", body_schema, required=bool(request_body.get("required")), location="body", description=str(request_body.get("description") or "Request JSON body")))
+            specs.append(_input_spec("body", body_schema, required=bool(request_body.get("required")), location="body", description=str(request_body.get("description") or "Request JSON body"), form_schema=native_form_schema(request_body.get("content", {}).get("application/json", {}).get("schema", {}), document)))
             locations["body"] = {"location": "body", "wire_name": "body"}
     return specs, locations
 
@@ -3194,10 +3370,7 @@ def install_operator_control_plane(
                                 command_plane.store.workflow_child_completion(command_id),
                                 domains=("Gripper",), command_id=command_id),)}
                 if status in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"}:
-                    evidence = receipt.get("terminal_evidence") or {}
-                    response = dict(evidence.get("response") or {})
-                    return {**response, "ok": status == "completed", "command_id": command_id,
-                            "status": status, "receipt": receipt}
+                    return _workflow_terminal_result(receipt)
                 if command_plane.store._stop.is_set():
                     raise RuntimeError("workflow_child_owner_lost")
                 # The existing dispatcher renews/executes; this is only the

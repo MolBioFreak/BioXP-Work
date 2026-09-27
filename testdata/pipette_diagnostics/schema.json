@@ -1,0 +1,163 @@
+{
+  "$defs": {
+    "DiagnosticEject": {
+      "additionalProperties": false,
+      "properties": {
+        "channels": {
+          "items": {
+            "maximum": 3,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 4,
+          "title": "Channels",
+          "type": "array"
+        },
+        "action": {
+          "const": "eject",
+          "title": "Action",
+          "type": "string"
+        }
+      },
+      "required": [
+        "channels",
+        "action"
+      ],
+      "title": "DiagnosticEject",
+      "type": "object"
+    },
+    "DiagnosticLiquid": {
+      "additionalProperties": false,
+      "properties": {
+        "channels": {
+          "items": {
+            "maximum": 3,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 4,
+          "title": "Channels",
+          "type": "array"
+        },
+        "action": {
+          "enum": [
+            "aspirate",
+            "dispense"
+          ],
+          "title": "Action",
+          "type": "string"
+        },
+        "volume_ul": {
+          "minimum": 0,
+          "title": "Volume Ul",
+          "type": "number"
+        },
+        "speed": {
+          "exclusiveMinimum": 0,
+          "title": "Speed",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "channels",
+        "action",
+        "volume_ul",
+        "speed"
+      ],
+      "title": "DiagnosticLiquid",
+      "type": "object"
+    },
+    "DiagnosticPlunger": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "plunger_up",
+            "plunger_down"
+          ],
+          "title": "Action",
+          "type": "string"
+        },
+        "steps": {
+          "maximum": 2147483647,
+          "minimum": 0,
+          "title": "Steps",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "action",
+        "steps"
+      ],
+      "title": "DiagnosticPlunger",
+      "type": "object"
+    },
+    "DiagnosticSimple": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "dispense_all",
+            "diagnoses",
+            "initialize",
+            "get_data",
+            "last_error"
+          ],
+          "title": "Action",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "DiagnosticSimple",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "operation": {
+      "const": "diagnostic_pipette",
+      "title": "Operation",
+      "type": "string"
+    },
+    "diagnostic": {
+      "discriminator": {
+        "mapping": {
+          "aspirate": "#/$defs/DiagnosticLiquid",
+          "diagnoses": "#/$defs/DiagnosticSimple",
+          "dispense": "#/$defs/DiagnosticLiquid",
+          "dispense_all": "#/$defs/DiagnosticSimple",
+          "eject": "#/$defs/DiagnosticEject",
+          "get_data": "#/$defs/DiagnosticSimple",
+          "initialize": "#/$defs/DiagnosticSimple",
+          "last_error": "#/$defs/DiagnosticSimple",
+          "plunger_down": "#/$defs/DiagnosticPlunger",
+          "plunger_up": "#/$defs/DiagnosticPlunger"
+        },
+        "propertyName": "action"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/DiagnosticLiquid"
+        },
+        {
+          "$ref": "#/$defs/DiagnosticEject"
+        },
+        {
+          "$ref": "#/$defs/DiagnosticSimple"
+        },
+        {
+          "$ref": "#/$defs/DiagnosticPlunger"
+        }
+      ],
+      "title": "Diagnostic"
+    }
+  },
+  "required": [
+    "operation",
+    "diagnostic"
+  ],
+  "title": "ManualDiagnosticPipette",
+  "type": "object"
+}

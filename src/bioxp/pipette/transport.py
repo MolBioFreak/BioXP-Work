@@ -1178,7 +1178,8 @@ class FourPipetteTransport:
             "oem_source_anchor": "ClassPipetteCollection constructor/readback; ClassPipette QueryFirmware/Q1/?31/?57/getData",
         }
 
-    def _run_group_cycle(self, command: PipetteInitCommand, *, cycle: str) -> dict[str, Any]:
+    def _run_group_cycle(self, command: PipetteInitCommand, *, cycle: str,
+                         continue_after_completion_failure: bool = False) -> dict[str, Any]:
         sends: list[dict[str, Any]] = []
         for channel, transport in enumerate(self._transports):
             driver = transport._get_driver()
@@ -1222,7 +1223,8 @@ class FourPipetteTransport:
             result = transport._get_driver().wait_pipette_initialization_completion(remaining)
             completions.append({"channel": channel, "result": result})
             transport._initialized = bool(result.get("ok"))
-        if not all(row["result"].get("ok") for row in completions):
+        completion_ok = all(row["result"].get("ok") for row in completions)
+        if not completion_ok and not continue_after_completion_failure:
             return {
                 "ok": False,
                 "cycle": cycle,
@@ -1268,9 +1270,10 @@ class FourPipetteTransport:
             for row in completions
         )
         return {
-            "ok": bool(stream_ok),
+            "ok": bool(stream_ok and completion_ok),
             "cycle": cycle,
-            "outcome": "completion" if stream_ok else "pressure_stream_command_failed",
+            "outcome": ("group_completion_timeout_or_error" if not completion_ok else
+                        "completion" if stream_ok else "pressure_stream_command_failed"),
             "sends": sends,
             "delayed_completions": completions,
             "completion_timeout_ms": 10_000,
@@ -1327,6 +1330,14 @@ class FourPipetteTransport:
                 "single_group_cycle": True,
                 "retry_selected_by_transport": False,
             }
+
+    def initiate_group_once_for_oem_detect_fluid(self) -> dict[str, Any]:
+        """Diagnostic button's one initiateGroup call; no initialization retry."""
+        with self._transaction_lock:
+            return {**dict(self._run_group_cycle(PipetteInitCommand(), cycle="detectFluid.initiateGroup",
+                    continue_after_completion_failure=True)),
+                    "oem_source_anchor": "ControlLib.btnDetectFluid_Click:1449; ClassPipetteCollection.initiateGroup:677-693",
+                    "single_group_cycle": True}
 
     def checked_pipette_status_for_oem_initialize_motion(self, *, attempt: str) -> dict[str, Any]:
         """Exact four-channel `checkedPipetteStatus()` query and error gate."""
@@ -1838,8 +1849,11 @@ class FourPipetteTransport:
         post_send_delay_s: float = 0.0,
         timeout_failure_sleep_s: float = 0.0,
         check_forceabort_after_wait: bool = False,
+        after_sends: Callable[[], None] | None = None,
+        set_allow_to_stop: bool = True,
     ) -> dict[str, Any]:
-        self._allow_to_stop = False
+        if set_allow_to_stop:
+            self._allow_to_stop = False
         rows: list[dict[str, Any]] = []
         operation_interrupt_epoch = self._interrupt_epoch
         try:
@@ -1861,6 +1875,12 @@ class FourPipetteTransport:
         except Exception as exc:
             self._last_error = {"operation": operation, "error": repr(exc), "channels": rows}
             raise
+
+        # ControlLib.detectFluidLevel starts Z only after all four BR owners
+        # are captured, before waiting. Keep motion outside the send lock so
+        # terminatecommands can interrupt it; the epoch below preserves Stop.
+        if after_sends is not None:
+            after_sends()
 
         completion_rows: list[dict[str, Any]] = []
         if defer_completion:
@@ -2185,6 +2205,43 @@ class FourPipetteTransport:
                 details.update(partial)
             setattr(exc, "oem_partial_results", partial)
             raise
+
+    def query_tip_status_for_oem_load_tips(self) -> dict[str, Any]:
+        """Source queryTipStatus(-1): query all four in order, count only 1s."""
+        with self._transaction_lock:
+            channels: list[dict[str, Any]] = []
+            for channel, transport in enumerate(self._transports):
+                try:
+                    result = transport._safe_query_tip_status(
+                        transport._get_driver(), required=True, source_continue=True,
+                    )
+                except Exception as exc:
+                    partial = {"observed_channels": channels, "failed_channel": channel,
+                               "source_return_completed": False, "source_exception": True}
+                    if isinstance(exc, PipetteCommandError):
+                        exc.details.update(partial)
+                        raise
+                    raise PipetteCommandError(
+                        str(exc), details={**partial, "exception": repr(exc)},
+                    ) from exc
+                channels.append({"channel": channel, "result": result})
+            return {
+                "ok": True,
+                "source_return_completed": True,
+                "source_return": sum(row["result"].get("source_return") == 1 for row in channels),
+                "source_tip_exists": any(t._tip_loaded for t in self._transports),
+                "source_tip_missing": any(t._tip_loaded != 1 for t in self._transports),
+                "tip_type": self._tip_type,
+                "channels": channels,
+                "hardware_postcondition_verified": all(
+                    row["result"].get("ok") is True
+                    and row["result"].get("semantic_ok") is True
+                    and row["result"].get("hardware_truth_level") == "hardware_query"
+                    for row in channels
+                ),
+                "physical_effect_verified": False,
+                "oem_source_anchor": "ClassPipetteCollection.queryTipStatus:1336-1357",
+            }
 
     def query_tip_status_for_oem_script(self, pipette: int) -> dict[str, Any]:
         """Source single-channel queryTipStatus:1349–1357; no group query."""

@@ -691,3 +691,41 @@ class TestReceiptAssembly:
         evaluation = evaluate_inspect_cover_receipt(receipt)
         assert evaluation["receipt_validation_pass"] is False
         assert evaluation["error_status"] == "SHORT_CHILLER_COVER"
+
+
+class TestOemDoorNoopReceipt:
+    def test_successful_cached_close_noop_keeps_unknown_sensor_evidence(self):
+        evidence = TestReceiptAssembly()._evidence(
+            {17: True, 19: True, 20: False, 18: False},
+            relocations=[{"cover": "output", "from": 17, "to": 18},
+                         {"cover": "reagent", "from": 19, "to": 20}],
+            final={"output": 18, "reagent": 20}, door_open=True,
+        )
+        evidence["children"][1]["terminal_evidence_json"] = json.dumps({
+            "result": {"ok": True, "source_noop": True, "completed_children": []},
+        })
+        receipt = assemble_inspect_cover_receipt(
+            evidence, settings={"deck_inspection": True, "screen_resolution_high": False,
+                                "inspection_log_only": False},
+        )
+        assert receipt["door_closed_verified"] is False
+        assert receipt["door_open_verified"] is True
+        evaluation = evaluate_inspect_cover_receipt(receipt)
+        assert evaluation["receipt_validation_pass"] is True
+        assert evaluation["outcome"] == "covers_canonicalized"
+
+    def test_door_provider_does_not_add_sensor_reads_or_new_gates(self):
+        calls = []
+        def execute(**kwargs):
+            calls.append(kwargs)
+            return {"ok": True, "source_noop": True, "completed_children": []}
+        provider = types.SimpleNamespace(
+            _wp8_compile_and_execute=execute,
+            wp8_read_door_sensors=lambda *_args: (_ for _ in ()).throw(AssertionError("unexpected read")),
+        )
+        result = Serial206OemInitializationProvider.wp8_door_open(
+            provider, "doorOpen", {"open": False},
+            command_id="inspect-1", owner_identity={"work_identity": "inspect-1"},
+        )
+        assert result == {"ok": True, "source_noop": True, "completed_children": []}
+        assert len(calls) == 1 and calls[0]["inputs"] == {"open": False}

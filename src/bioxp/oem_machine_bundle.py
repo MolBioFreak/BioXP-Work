@@ -195,10 +195,14 @@ class OemMachineSnapshot:
     inspection_profile_name: str
     inspection_profile: Mapping[str, Any]
     calibration_comparison: Mapping[str, Any]
+    fluid_reference: Mapping[str, int]
     process_times: Mapping[str, float]
     mutable_seeds: Mapping[str, OemRecordProvenance]
     operator_label_matched: bool
     validation_conflicts: tuple[str, ...] = ()
+    # Separate user-authored configuration; records/fields remain sealed evidence.
+    calibration_revision: Mapping[str, Any] | None = None
+    calibration_baseline: OemMachineSnapshot | None = None
 
     @property
     def machine_calibrated(self) -> bool:
@@ -253,6 +257,11 @@ class OemMachineSnapshot:
             "motion_commanded": False,
             "current_mutation_commanded": False,
             "switch_mask_mutation_commanded": False,
+            **({
+                "configuration_source": "sealed_baseline_plus_user_calibration",
+                "active_calibration_revision": _thaw(self.calibration_revision),
+                "field_provenance_scope": "sealed_baseline_only",
+            } if self.calibration_revision is not None else {}),
         }
 
 
@@ -269,6 +278,17 @@ def set_active_oem_machine_snapshot(snapshot: OemMachineSnapshot) -> OemMachineS
     return snapshot
 
 
+def apply_owned_calibration_snapshot(snapshot: OemMachineSnapshot) -> None:
+    """CalibrationSettingsService publication, not machine/transport rebinding.
+
+    Only the separately projected calibration changes; sealed records are retained.
+    Existing finite execution/exclusion ownership is unchanged.
+    """
+    global _active_snapshot
+    with _snapshot_lock:
+        _active_snapshot = snapshot
+
+
 def get_active_oem_machine_snapshot() -> OemMachineSnapshot:
     with _snapshot_lock:
         snapshot = _active_snapshot
@@ -277,7 +297,7 @@ def get_active_oem_machine_snapshot() -> OemMachineSnapshot:
     return snapshot
 
 
-def configure_oem_machine_snapshot_from_env(*, require_operator_label: bool = True) -> OemMachineSnapshot:
+def configure_oem_machine_snapshot_from_env(*, require_operator_label: bool = True, runtime_store=None) -> OemMachineSnapshot:
     lock_path = os.environ.get(OEM_MACHINE_BUNDLE_LOCK_ENV)
     if not lock_path:
         raise OemMachineBundleError(f"{OEM_MACHINE_BUNDLE_LOCK_ENV} is required")
@@ -287,6 +307,10 @@ def configure_oem_machine_snapshot_from_env(*, require_operator_label: bool = Tr
         operator_label_serial=label,
         require_operator_label=require_operator_label,
     )
+    if runtime_store is not None:
+        from .oem_calibration_settings import load_saved_calibration
+
+        snapshot = load_saved_calibration(snapshot, runtime_store)
     return set_active_oem_machine_snapshot(snapshot)
 
 
@@ -912,6 +936,11 @@ def load_oem_machine_snapshot(
         inspection_profile_name="Settings3200",
         inspection_profile=inspection,
         calibration_comparison=comparison,
+        # ClassCalibrationReference reads m_appDir/calreference.xml for the
+        # in-process FluidReference; the newer current-directory copy is only
+        # a possible update, not the reference used by adjustZ.
+        fluid_reference=_freeze({"REVISION": installed_cal["fluid"]["revision"],
+                                 **installed_cal["fluid"]["parameters"]}),
         process_times=process_times,
         mutable_seeds=MappingProxyType(mutable),
         operator_label_matched=label_matched,

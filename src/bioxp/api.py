@@ -34,7 +34,12 @@ from .hardware_status import CANONICAL_DOMAINS, CollectionContext, hardware_stat
 from .reference_recovery import ReferenceRecoveryMonitor
 from .lifecycle_state import LifecycleStateError, lifecycle_state
 from .oem_machine_bundle import configure_oem_machine_snapshot_from_env
-from .runtime_state import configure_oem_runtime_state_from_env
+from .oem_calibration_settings import CalibrationSettingsPatch, CalibrationSettingsService
+from .runtime_state import configure_oem_runtime_state_from_env, get_active_oem_runtime_state_store
+from .pipette.manual_settings import (
+    ManualTipTraySet, PipetteOperationSettingsPatch, manual_tip_tray_set,
+    read_pipette_operation_settings, save_pipette_operation_settings,
+)
 from .oem_axis_diagnostics import AxisDiagnosticContractError, diagnostic_catalog, resolve_axis_diagnostic
 from .oem_gripper import (
     gripper_clear,
@@ -1062,6 +1067,21 @@ def _require_motion_not_blocked_by_maintenance() -> None:
     )
 
 
+def _configure_machine_calibration(runtime_root):
+    """Bind saved configuration once, before ordinary provider construction."""
+    store = OEMRuntimeStore(runtime_root)
+    try:
+        snapshot = configure_oem_machine_snapshot_from_env(
+            require_operator_label=True, runtime_store=store,
+        )
+        configure_oem_runtime_state_from_env(snapshot)
+    except Exception:
+        store.close()
+        raise
+    from .oem_machine_bundle import apply_owned_calibration_snapshot
+    return snapshot, store, CalibrationSettingsService(store, snapshot, publish=apply_owned_calibration_snapshot)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _tester, _tester_quarantine, _startup_error, _pipette_transport, _pipette_receipts
@@ -1110,6 +1130,8 @@ async def lifespan(app: FastAPI):
         )
         _operator_reports_installed = True
     app.state.report_export_reconciliation = reconcile_operator_report_exports(_pipette_receipts)
+    calibration_runtime_store = None
+    app.state.calibration_settings = None
     try:
         _pipette_receipts.attest_first_install_absence()
         app.state.pipette_migration = _pipette_receipts.migrate_legacy_jsonl()
@@ -1119,8 +1141,8 @@ async def lifespan(app: FastAPI):
         app.state.pipette_migration = {"status": "failed", "error": str(exc)}
         raise RuntimeError(_startup_error) from exc
     try:
-        machine_snapshot = configure_oem_machine_snapshot_from_env(require_operator_label=True)
-        configure_oem_runtime_state_from_env(machine_snapshot)
+        machine_snapshot, calibration_runtime_store, settings_service = _configure_machine_calibration(runtime_root)
+        app.state.calibration_settings = settings_service
         # OEM BioXPMainWindow sets BoardTestMode only when the process command
         # line contains the separate token "boardtest".  It is not StartMode.
         board_test_mode = os.environ.get("BIOXP_BOARD_TEST_MODE", "").strip().lower() in {"1", "true", "yes", "boardtest"}
@@ -1219,6 +1241,12 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        calibration_close_error = None
+        if calibration_runtime_store is not None:
+            try:
+                await asyncio.to_thread(calibration_runtime_store.close)
+            except Exception as exc:
+                calibration_close_error = f"calibration store close: {exc}"
         if reference_recovery_task is not None and not reference_recovery_task.done():
             reference_recovery_task.cancel()
             await asyncio.gather(reference_recovery_task, return_exceptions=True)
@@ -1230,7 +1258,7 @@ async def lifespan(app: FastAPI):
         # waiter, but it cannot publish an owner after this shutdown completes.
         async with _tester_lock:
             async with _tester_transition_lock:
-                shutdown_errors = []
+                shutdown_errors = [calibration_close_error] if calibration_close_error else []
                 try:
                     await _stop_owned_camera_session(reason="lifespan shutdown")
                 except Exception as exc:
@@ -1340,7 +1368,8 @@ app.include_router(oem_homing_router)
 
 @app.middleware("http")
 async def bind_direct_pipette_idempotency(request: Request, call_next):
-    if request.method == "POST" and request.url.path.startswith("/liquid/"):
+    if (request.method == "POST" and request.url.path.startswith("/liquid/")
+            and request.url.path != "/liquid/manual/compile"):
         dispatch_context = current_operator_dispatch_context() or {}
         trusted_key = dispatch_context.get("idempotency_key")
         key = str(trusted_key or request.headers.get("idempotency-key", "")).strip()
@@ -2741,6 +2770,11 @@ class PipetteTipRequest(BaseModel):
     operator: Optional[str] = Field(None, max_length=120)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+class PipetteTipTypeRequest(BaseModel):
+    """OEM combo selection: software type only, never physical pickup."""
+    model_config = ConfigDict(extra="forbid")
+    tip_type: Literal[50, 200, 201]
+
 
 class PipetteEjectAllRequest(BaseModel):
     channels: Optional[list[int]] = None
@@ -2981,6 +3015,10 @@ class BarcodeReadRequest(BaseModel):
     include_image_data: bool = False
 
 
+from .manual_pipetting import (ManualPipettingRequest, bind_manual_position_handler,
+                              bind_manual_physical_handler, compile_manual_pipetting)
+
+
 class ProtocolCompileRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     source_type: str = Field("native", pattern=r"^(native|oem_xml)$")
@@ -2998,7 +3036,7 @@ class ProtocolExecuteRequest(ProtocolCompileRequest):
     )
     live_execution: Optional[dict[str, Any]] = Field(
         None,
-        description="Required contract block for dry_run=false live execution: operator ack, deck manifest, preflight, and artifact refs.",
+        description="Live execution click intent and optional operator observation records.",
     )
     live_execution_ack: bool = Field(False, description="Explicit operator acknowledgement for dry_run=false live protocol execution.")
     operator_id: Optional[str] = Field(None, max_length=120)
@@ -3007,6 +3045,15 @@ class ProtocolExecuteRequest(ProtocolCompileRequest):
     preflight: Optional[dict[str, Any]] = None
     artifact_refs: list[str] = Field(default_factory=list)
     snapshot_refs: list[str] = Field(default_factory=list)
+
+
+class ManualPipettingExecuteRequest(ManualPipettingRequest):
+    """Typed manual steps with the existing native execution intent contract."""
+
+    dry_run: bool = True
+    idempotency_key: StrictStr | None = Field(default=None, min_length=1, max_length=256)
+    live_execution: dict[str, Any] | None = None
+    live_execution_ack: bool = False
 
 
 class ProtocolControlTarget(BaseModel):
@@ -3066,6 +3113,7 @@ class LedRgbRequest(BaseModel):
     g: int = Field(..., ge=0, le=255)
     b: int = Field(..., ge=0, le=255)
     reconnect_first: bool = True
+    activate_first: bool = True
 
 
 class LedIntensityRequest(BaseModel):
@@ -7974,6 +8022,7 @@ async def led_rgb(req: LedRgbRequest):
             req.g,
             req.b,
             reconnect_first=bool(req.reconnect_first),
+            activate_first=bool(req.activate_first),
         ),
         timeout_s=20.0,
     )
@@ -10181,6 +10230,39 @@ def _camera_jpeg_response(frame: CameraFrame) -> Response:
     )
 
 
+class CameraIlluminationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    channel: StrictInt = Field(ge=1, le=3)
+    on: StrictBool
+
+
+@app.get("/camera/illumination/state")
+async def camera_illumination_state(request: Request):
+    if request.query_params or await request.body():
+        raise HTTPException(status_code=422, detail="Camera illumination state accepts no fields")
+    provider = _camera_provider
+    result = await run_in_threadpool(provider.illumination_state)
+    if provider is not _camera_provider or provider.generation != result["provider_generation"]:
+        raise HTTPException(status_code=503, detail="camera owner changed during illumination state read")
+    return result
+
+
+@app.post("/camera/illumination")
+async def camera_illumination(request: Request, req: CameraIlluminationRequest):
+    if request.query_params:
+        raise HTTPException(status_code=422, detail="Camera illumination accepts no query fields")
+    provider = _camera_provider
+    try:
+        result = await run_in_threadpool(provider.command_illumination, channel=req.channel, on=req.on)
+        if provider is not _camera_provider or provider.generation != result["provider_generation"]:
+            raise CameraError("camera owner changed during illumination command")
+    except (CameraError, OSError, RuntimeError, ValueError) as exc:
+        # Never replay an uncertain native write or turn it into success.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return result
+
+
 @app.get("/camera/status", response_model=CameraStatusResponse)
 async def camera_status():
     provider = _camera_provider
@@ -10531,6 +10613,18 @@ async def liquid_tip(req: PipetteTipRequest):
         receipt_store=_pipette_receipts,
     )
 
+
+@app.post("/liquid/pipette/tip-type")
+async def liquid_pipette_tip_type(req: PipetteTipTypeRequest):
+    return await run_pipette_operation(
+        "select_tip_type",
+        lambda transport: transport.loadTip(req.tip_type),
+        get_transport=_get_pipette_transport,
+        run_blocking=_run_blocking,
+        timeout_s=10.0,
+        receipt_store=_pipette_receipts,
+        requested_inputs={"tip_type": req.tip_type},
+    )
 
 @app.post("/liquid/eject-all")
 async def liquid_eject_all(req: PipetteEjectAllRequest):
@@ -11139,7 +11233,7 @@ def _protocol_live_move_handler(action, state):
     command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
     if not isinstance(command_id, str) or not command_id:
         raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
-    return _wait_protocol_deck_command(command_id)
+    return _protocol_deck_action_result(command_id)
 
 
 def _protocol_live_pipette_handler(action, state):
@@ -11248,22 +11342,37 @@ def _wait_protocol_deck_command(command_id: str, *, timeout_s: float = 180.0) ->
     if not callable(getter):
         raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        row = getter(command_id)
-        if isinstance(row, Mapping):
-            status = str(row.get("status") or "")
-            if status == "completed":
-                return dict(row)
-            if status in COMMAND_TERMINAL:
-                raise HTTPException(
-                    status_code=409,
-                    detail={"error": "canonical_deck_command_failed", "command": dict(row)},
-                )
-        time.sleep(0.05)
+    row = getter(command_id) if timeout_s > 0 else None
+    if timeout_s > 0 and (not isinstance(row, Mapping) or row.get("status") not in COMMAND_TERMINAL):
+        # The existing dispatcher settles this future from SQLite after a
+        # completion/control wake. No per-action receipt polling or retry.
+        from concurrent.futures import TimeoutError as FutureTimeoutError
+        try:
+            row = store.workflow_child_completion(command_id).result(
+                timeout=max(0.0, deadline - time.monotonic()),
+            )["receipt"]
+        except FutureTimeoutError:
+            row = None
+    if isinstance(row, Mapping):
+        if row.get("status") == "completed":
+            return dict(row)
+        if row.get("status") in COMMAND_TERMINAL:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "canonical_deck_command_failed", "command": dict(row)},
+            )
     raise HTTPException(
         status_code=504,
         detail={"error": "canonical_deck_command_timeout", "command_id": command_id},
     )
+
+
+def _protocol_deck_action_result(command_id: str) -> dict[str, Any]:
+    # Terminal queue status is a command outcome, not physical placement proof.
+    # Preserve the complete command row and its nested terminal/child evidence.
+    command = _wait_protocol_deck_command(command_id)
+    return {"ok": command.get("status") == "completed", "command_id": command_id,
+            "command": command}
 
 
 def _protocol_live_plate_move_handler(action, state):
@@ -11290,7 +11399,7 @@ def _protocol_live_plate_move_handler(action, state):
     command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
     if not isinstance(command_id, str) or not command_id:
         raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
-    return _wait_protocol_deck_command(command_id)
+    return _protocol_deck_action_result(command_id)
 
 
 def _protocol_live_plate_prepare_handler(action, state):
@@ -11310,7 +11419,7 @@ def _protocol_live_plate_prepare_handler(action, state):
     command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
     if not isinstance(command_id, str) or not command_id:
         raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
-    return _wait_protocol_deck_command(command_id)
+    return _protocol_deck_action_result(command_id)
 
 
 def _protocol_live_thermal_door_handler(action, state):
@@ -11354,6 +11463,29 @@ def _protocol_live_thermal_door_handler(action, state):
     }
 
 
+def _protocol_live_manual_position_handler(action, state):
+    # Resolve only when invoked. Building a dry-run handler map is motionless
+    # and must not acquire a live owner or demand initialized hardware.
+    handler = bind_manual_position_handler(
+        command_store=_protocol_command_store(),
+        execute_plan=app.state.oem_workflow_plan_executor,
+        require_motion_ready=_require_motion_route_ready,
+    )
+    return handler(action, state)
+
+
+def _protocol_live_manual_physical_handler(action, state):
+    handler = bind_manual_physical_handler(
+        command_store=_protocol_command_store(),
+        execute_plan=app.state.oem_workflow_plan_executor,
+        require_motion_ready=_require_motion_route_ready,
+        provider_getter=lambda: _serial206_oem_initialization_provider,
+        receipt_store_getter=lambda: _pipette_receipts,
+        calibration_settings_getter=_calibration_settings_service,
+    )
+    return handler(action, state)
+
+
 def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
     return {
         ProtocolActionKind.MOVE: _protocol_live_move_handler,
@@ -11363,6 +11495,8 @@ def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
         ProtocolActionKind.THERMAL_DOOR: _protocol_live_thermal_door_handler,
         ProtocolActionKind.INSPECT: _protocol_live_inspect_cover_handler,
         ProtocolActionKind.PIPETTE_INIT: _protocol_live_pipette_handler,
+        ProtocolActionKind.PIPETTE_POSITION: _protocol_live_manual_position_handler,
+        ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL: _protocol_live_manual_physical_handler,
         ProtocolActionKind.PIPETTE_TIP: _protocol_live_pipette_handler,
         ProtocolActionKind.TIP_EJECT: _protocol_live_pipette_handler,
         ProtocolActionKind.PIPETTE_ASPIRATE: _protocol_live_pipette_handler,
@@ -11726,6 +11860,9 @@ def _protocol_bindings(bundle, *, source_executor=None):
             )
         return result
     if provider is not None and canonical_plan is not None:
+        # checkTips shares the same camera/illumination owner as inspection.
+        # Binding callbacks does not acquire the camera or command any motion.
+        _bind_deck_cover_inspection(provider)
         callbacks = provider.build_oem_pipette_source_callbacks(
             execute_plan=pipette_plan, start_child=start_child,
             stopped=lambda: executor().source_stopped(), settings=settings,
@@ -11895,7 +12032,7 @@ async def protocol_execute(req: ProtocolExecuteRequest):
             bind_protocol_dispatcher(command_store, binding_factory=_protocol_bindings)
         result = await run_in_threadpool(
             create_protocol_job,
-            req.model_dump(exclude_none=True),
+            req.model_dump(exclude_none=True, exclude_unset=True),
             dry_run=bool(req.dry_run), command_store=command_store,
             binding_factory=None if req.dry_run else _protocol_bindings,
             authority_factory=None if req.dry_run else _protocol_authority,
@@ -11906,6 +12043,99 @@ async def protocol_execute(req: ProtocolExecuteRequest):
         raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _calibration_settings_service() -> CalibrationSettingsService:
+    service = getattr(app.state, "calibration_settings", None)
+    if service is None:
+        raise HTTPException(status_code=503, detail="Machine calibration configuration is unavailable")
+    return service
+
+
+@app.get("/motion/oem/calibration_settings")
+async def calibration_settings_read():
+    """Read active and saved settings. No hardware read, motion or rebind."""
+    return await run_in_threadpool(_calibration_settings_service().read)
+
+
+@app.patch("/motion/oem/calibration_settings")
+async def calibration_settings_save(req: CalibrationSettingsPatch):
+    """Save and apply final PositionTable values in-process; no motion."""
+    try:
+        return await run_in_threadpool(_calibration_settings_service().save, req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+from .oem_calibration_settings import CalibrationDecisionRequest, CalibrationRunResponse
+
+
+@app.get("/motion/oem/calibration_settings/runs/{run_id}", response_model=CalibrationRunResponse)
+async def calibration_run_read(run_id: str):
+    try:
+        return await run_in_threadpool(_calibration_settings_service().read_run, run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Calibration run not found") from exc
+
+
+@app.post("/motion/oem/calibration_settings/runs/{run_id}/decision", response_model=CalibrationRunResponse)
+async def calibration_run_decision(run_id: str, req: CalibrationDecisionRequest):
+    try:
+        return await run_in_threadpool(_calibration_settings_service().decide_run, run_id, req.decision)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Calibration run not found") from exc
+
+
+@app.post("/motion/oem/pipette/tip_tray_set")
+async def pipette_tip_tray_set(req: ManualTipTraySet):
+    """Capture controller Z once, save/apply both OEM tray rows in-process."""
+    service = _calibration_settings_service()
+    provider = _require_serial206_oem_initialization_provider("initialize_motors")
+    try:
+        return await run_in_threadpool(
+            manual_tip_tray_set, req, service,
+            lambda: provider.primitives._read_axis_position("z"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/liquid/pipette/settings")
+async def pipette_operation_settings_read():
+    return await run_in_threadpool(read_pipette_operation_settings, get_active_oem_runtime_state_store())
+
+
+@app.patch("/liquid/pipette/settings")
+async def pipette_operation_settings_save(req: PipetteOperationSettingsPatch):
+    try:
+        return await run_in_threadpool(save_pipette_operation_settings, get_active_oem_runtime_state_store(), req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/liquid/manual/compile")
+async def liquid_manual_compile(req: ManualPipettingRequest):
+    """Compile explicit manual steps; no hardware connection or motion."""
+    try:
+        document = compile_manual_pipetting(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await protocol_compile(ProtocolCompileRequest(source_type="native", document=document.to_payload()))
+
+
+@app.post("/liquid/manual/execute")
+async def liquid_manual_execute(req: ManualPipettingExecuteRequest):
+    """Use the one native workflow owner; append no preparation or cleanup."""
+    try:
+        authored = ManualPipettingRequest(protocol_id=req.protocol_id, steps=req.steps)
+        document = compile_manual_pipetting(authored)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await protocol_execute(ProtocolExecuteRequest(
+        source_type="native", document=document.to_payload(), dry_run=req.dry_run,
+        idempotency_key=req.idempotency_key, live_execution=req.live_execution,
+        live_execution_ack=req.live_execution_ack,
+    ))
 
 
 @app.get("/protocol/jobs")

@@ -29,6 +29,7 @@ from .operator_controls import (
     _DISPATCH_CONTEXT,
     _assess_action,
     _bounded_json,
+    _compact_pipette_response,
     _controller_acknowledged,
     _MAX_INPUT_BYTES,
 )
@@ -1077,6 +1078,7 @@ class OperatorCommandStore:
         self._workflow_controls: dict[str, Callable] = {}
         self._workflow_interrupt_notified: set[str] = set()
         self._workflow_child_waiters: dict[str, Any] = {}
+        self._workflow_verified_snapshot: tuple[tuple[Any, ...], int] | None = None
         self._interrupt_spool_write_depth = 0
         self._deck_owner_authority_reader: Callable[[], Mapping[str, Any]] | None = None
         self._deck_owner_authority_scope: Callable[[], AbstractContextManager[Any]] = nullcontext
@@ -3445,13 +3447,24 @@ class OperatorCommandStore:
                 # not the legacy board-5 projection. Read on this transaction's
                 # connection: never acquire the provider lock beneath a writer.
                 snapshot = conn.execute(
-                    "SELECT state_json,state_sha256 FROM serial206_authority_snapshots "
+                    "SELECT state_json,state_sha256,sequence FROM serial206_authority_snapshots "
                     "ORDER BY sequence DESC LIMIT 1").fetchone()
-                state = _json_load(snapshot[0], {}) if snapshot else {}
-                if snapshot and (snapshot[0] != json.dumps(state, sort_keys=True, separators=(",", ":"), allow_nan=False)
-                        or hashlib.sha256(snapshot[0].encode("utf-8")).hexdigest() != snapshot[1]):
-                    raise ValueError("workflow_board_epoch_changed")
-                actual = (state.get("x_lifecycle") or {}).get("board_lifecycle_generation")
+                # Like OEMRuntimeStore's exact-byte verification memo, this is
+                # one bounded entry, never a substitute for the live SQLite read.
+                # Retain only verified bytes/hash and an immutable generation;
+                # reused sequence/digest cannot hide changed snapshot bytes.
+                key = tuple(snapshot) if snapshot else None
+                memo = self._workflow_verified_snapshot
+                if key is not None and memo is not None and memo[0] == key:
+                    actual = memo[1]
+                else:
+                    state = _json_load(snapshot[0], {}) if snapshot else {}
+                    if snapshot and (snapshot[0] != json.dumps(state, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                            or hashlib.sha256(snapshot[0].encode("utf-8")).hexdigest() != snapshot[1]):
+                        raise ValueError("workflow_board_epoch_changed")
+                    actual = (state.get("x_lifecycle") or {}).get("board_lifecycle_generation")
+                    if key is not None and type(actual) is int:
+                        self._workflow_verified_snapshot = (key, actual)
             else:
                 table = "serial206_board_authority" if str(board) == "4" else "operator_plane_board_authority"
                 selected = conn.execute(f"SELECT active_board_epoch FROM {table} WHERE board_id=?", (int(board),)).fetchone()
@@ -3714,8 +3727,15 @@ class OperatorCommandStore:
         ready = []
         with self._lock:
             for command_id, future in list(self._workflow_child_waiters.items()):
-                receipt = self.get_command(command_id)
-                if receipt is not None and receipt["status"] in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"}:
+                # Pending children need only a durable status check. Building
+                # the full receipt here repeatedly defeats completion wakeups.
+                row = self.connection.execute(
+                    "SELECT COALESCE(m.state,p.status) AS status FROM operator_plane_commands p "
+                    "LEFT JOIN serial206_movement_commands m ON m.command_id=p.command_id "
+                    "WHERE p.command_id=?", (command_id,),
+                ).fetchone()
+                if row is not None and row["status"] in COMMAND_TERMINAL | {"rejected"}:
+                    receipt = self.get_command(command_id)
                     ready.append((future, {"ok": receipt["status"] == "completed", "command_id": command_id,
                                            "status": receipt["status"], "receipt": receipt}))
                     del self._workflow_child_waiters[command_id]
@@ -4836,7 +4856,7 @@ class OperatorCommandStore:
         with self._transaction() as conn:
             changed = conn.execute(
                 "UPDATE operator_plane_wp8_operations SET terminal_result_json=?,finished_at=? WHERE command_id=? AND terminal_result_json IS NULL",
-                (_canonical(dict(result)), _now(), str(command_id)),
+                (_canonical(_compact_pipette_response(result)), _now(), str(command_id)),
             ).rowcount
             if changed != 1:
                 raise RuntimeError("wp8 operation already terminal or absent")
@@ -6192,7 +6212,7 @@ class OperatorCommandStore:
                     int(controller_completion_verified),
                     int(hardware_postcondition_verified),
                     int(semantic_state_committed),
-                    _canonical(provider_results) if provider_results else None,
+                    _canonical([_compact_pipette_response(row) for row in provider_results]) if provider_results else None,
                     str(command_id),
                 ),
             )
@@ -7177,6 +7197,7 @@ class OperatorCommandStore:
     def finish(self, command_id: str, *, status: str, payload: Mapping[str, Any], source_noop: bool = False, source_noop_reason: str | None = None, remote_acknowledged: bool = False, controller_acknowledged: bool = False, physical_effect_verified: bool = False, claimed: Mapping[str, Any] | None = None, full_response: Any = None) -> dict[str, Any]:
         if status not in COMMAND_TERMINAL:
             raise ValueError(status)
+        payload = _compact_pipette_response(payload)
         with self._transaction() as conn:
             row = conn.execute("SELECT * FROM operator_plane_commands WHERE command_id=?", (command_id,)).fetchone()
             if row is None:
@@ -8430,7 +8451,7 @@ class OperatorCommandPlane:
                         "error": f"wp8_operation_exception:{type(exc).__name__}",
                         "detail": str(exc)[:500],
                         "delivery_attempted": delivery_attempted,
-                        **({"response": response} if failure is not None else {}),
+                        **({"response": _bounded_json(response, 131072)} if failure is not None else {}),
                         **({"outcome_unknown": True} if delivery_attempted else {}),
                     },
                     controller_acknowledged=bool(response.get("controller_command_acknowledged")),
