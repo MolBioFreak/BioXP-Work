@@ -7715,7 +7715,8 @@ async def motion_oem_prepare_without_motion():
             _maintenance_state.get("motion_blocked") is True
             and _maintenance_state.get("recovery_required") is True
         )
-    hardware_state.invalidate(reason="source_grounded_motion_preparation_started")
+    # OEM preparation does not erase prior query results. Keep their original
+    # observation times so they age normally until the next collection.
     tester = _get_tester()
 
     def prepare_operator_motion_state() -> dict[str, Any]:
