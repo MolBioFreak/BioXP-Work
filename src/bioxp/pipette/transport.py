@@ -1196,6 +1196,7 @@ class FourPipetteTransport:
                         command="initialize",
                         driver_result=driver_result,
                         requested=command.to_payload(),
+                        **transport._driver_evidence(driver_result),
                         hardware_truth_level="acknowledged_command",
                     ),
                     "driver_result": driver_result,
@@ -1428,9 +1429,18 @@ class FourPipetteTransport:
             )
             else initial_group
         )
+        # The group cycle owns the correlated sends and delayed completions.
+        # Surface those facts on the completed constructor command itself:
+        # the receipt store reads top-level truth, not nested diagnostics.
+        completed_groups = [initial_group] + ([retry_group] if retry_group is not None else [])
         self._last_group_transaction = {
             "ok": ok,
             "outcome": "completion" if ok else "condition_or_status_failed",
+            **({
+                "delivery_verified": all(group.get("delivery_verified") is True for group in completed_groups),
+                "controller_acknowledged": all(group.get("controller_acknowledged") is True for group in completed_groups),
+                "completion_verified": all(group.get("completion_verified") is True for group in completed_groups),
+            } if ok else {}),
             "channels": [
                 {"channel": row["channel"], "result": row}
                 for row in self.get_status()["channels"]
