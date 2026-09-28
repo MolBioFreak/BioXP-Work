@@ -126,7 +126,10 @@ def test_real_encoder_does_not_invent_capture_progress(rig, monkeypatch, tmp_pat
                    "delivered_parts": len(delivered), "output_args": list(argv_seen[0][argv_seen[0].index("-i")+2:])})
             assert len(encoded) == capture_fps * 2, "fps filter invented fresh capture frames"
             assert status["frame_sequence"] == len(encoded)
-            assert provider.latest().source_captured_at is not None
+            # This finite MJPEG fixture starts PTS at zero. It proves packet
+            # cadence/preview delivery, not a recognizable kernel clock.
+            # Native-clock snapshot evidence is covered by test_camera_native_pts.
+            assert provider.latest().source_captured_at is None
             expected_decodes = 1 + sum(a != b for a, b in zip(encoded, encoded[1:]))
             print({"scene": scene, "published": len(encoded), "full_decodes": validation.call_count,
                    "expected_decodes": expected_decodes})

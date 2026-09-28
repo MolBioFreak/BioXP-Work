@@ -103,7 +103,7 @@ def test_connected_real_ffmpeg_owner_snapshot_and_preview(rig, monkeypatch, tmp_
 
     async def spawn(*argv, **kwargs):
         assert argv[argv.index("-i") + 1] == "/synthetic/video7"
-        assert "-copyts" in argv and argv[argv.index("-timestamps") + 1] == "abs"
+        assert "-copyts" in argv and argv[argv.index("-timestamps") + 1] == "default"
         output = list(argv[argv.index("-i") + 2:])
         assert output[output.index("-c:v") + 1] == "copy"
         # Replace ONLY the camera input. Actual subprocess/pipes, sideband,
