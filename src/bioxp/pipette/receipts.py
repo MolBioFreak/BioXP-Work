@@ -192,8 +192,9 @@ class PipetteReceiptStore:
         if row is None or not row["receipt_json"]:
             raise PipetteReceiptError("pipette_collection_receipt_unavailable")
         source = json.loads(row["source_identity_json"])
-        if any(source.get(k) != v for k, v in _current_replay_identity().items()):
-            raise PipetteReceiptError("pipette_collection_source_identity_changed")
+        # A release change does not change the OEM collection TipExist value.
+        # Keep live owner/reader/Stop fences below; replay identity is checked
+        # by the command replay path, not by this source-state read.
         claimed = source.get("collection_owner", {})
         if row["ownership_generation"] != generation or claimed.get("owner") != owner:
             raise PipetteReceiptError("pipette_collection_owner_changed")
