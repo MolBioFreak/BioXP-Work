@@ -4,6 +4,9 @@ Real ASGI/queue/provider/production adapter/SQLite; native transport is replaced
 No hardware calls, re-homing, reference repair or fabricated owner epochs.
 """
 import copy
+import json
+import os
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -67,6 +70,16 @@ def test_queued_named_move_dispatches_without_reference_or_display_epochs(
     replay = client.post('/operator/v2/actions/oem.deck.move_to_location', json=body)
     assert replay.status_code == 200 and replay.json()['command_id'] == cid
     assert leaf.moves == moves
+
+    if output := os.environ.get('NON_OEM_NATIVE_EXPORT_DIR'):
+        catalog = client.get('/operator/v2/control-catalog')
+        assert catalog.status_code == 200, catalog.text
+        path = Path(output)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / f'{reference_mode}-{len(caller_epochs)}.json').write_text(json.dumps({
+            'catalog': catalog.json(), 'receipt': receipt,
+            'reference_mode': reference_mode, 'caller_epochs': caller_epochs,
+        }))
     conflict = client.post('/operator/v2/actions/oem.deck.move_to_location',
                            json={**body, 'inputs': {'target': 'LOC_OC', 'camera_offset': False}})
     assert conflict.status_code == 409
