@@ -40,15 +40,17 @@ def test_actual_retained_normal_v12_migration(tmp_path):
         objects = dict(ro.execute("SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL"))
     store = OEMRuntimeStore(target)
     connection = store.connection if hasattr(store, 'connection') else store._db
-    assert connection.execute('PRAGMA user_version').fetchone()[0] == 13
-    assert connection.execute('SELECT count(*) FROM runtime_schema_migrations WHERE version=13').fetchone()[0] == 1
+    assert connection.execute('PRAGMA user_version').fetchone()[0] == 14
+    assert connection.execute('SELECT count(*) FROM runtime_schema_migrations WHERE version=14').fetchone()[0] == 1
     verify_canonical_runtime_database(connection, full_data_check=True)
     assert records(connection) == before
     assert [tuple(r) for r in connection.execute('SELECT * FROM runtime_schema_migrations WHERE version<=11 ORDER BY version')] == prefix
     after_objects = dict(connection.execute("SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL"))
     changed = [name for name in objects if objects[name] != after_objects[name]]
     assert set(objects) == set(after_objects)
-    assert changed == ['operator_plane_deck_recovery_decisions_authorized_insert_v1']
+    assert set(changed) == {'operator_plane_deck_recovery_decisions_authorized_insert_v1',
+        'operator_plane_delivery_attempts_lineage_insert',
+        'operator_plane_wp8_background_tasks_terminal_authority'}
     migration = dict(connection.execute('SELECT * FROM runtime_schema_migrations WHERE version=12').fetchone())
     store.close()
     reopened = OEMRuntimeStore(target)
@@ -58,6 +60,6 @@ def test_actual_retained_normal_v12_migration(tmp_path):
     assert file_digest(source) == original
     Path(os.environ['BIOXP_WORKFLOW_EXPORT']+'.retained-v12.json').write_text(json.dumps({
         'source': str(source), 'source_sha256': original, 'source_unchanged': True,
-        'from_version': 11, 'to_version': 13, 'changed_schema_objects': changed,
+        'from_version': 11, 'to_version': 14, 'changed_schema_objects': changed,
         'all_operational_tables_unchanged': before, 'migration': migration,
         'normal_reopen_verified': True}, indent=2))

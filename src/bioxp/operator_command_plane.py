@@ -4548,11 +4548,9 @@ class OperatorCommandStore:
     ) -> dict[str, Any]:
         with self._deck_owner_authority_scope(), self._transaction() as conn:
             command = conn.execute(
-                "SELECT c.dispatch_attempt_id,c.ownership_generation,m.state,m.expected_board_epochs_json,"
-                "s.board_epoch_4,s.board_epoch_5 "
+                "SELECT c.dispatch_attempt_id,c.ownership_generation,m.state,m.expected_board_epochs_json "
                 "FROM operator_plane_commands AS c "
                 "JOIN serial206_movement_commands AS m ON m.command_id=c.command_id "
-                "JOIN operator_plane_deck_semantic_state AS s ON s.singleton=1 "
                 "WHERE c.command_id=? AND c.status='dispatched' AND m.state='dispatched'",
                 (str(command_id),),
             ).fetchone()
@@ -4591,40 +4589,7 @@ class OperatorCommandStore:
 
     def create_wp8_background_task(self, command_id: str, child_order: int, *, task_id: str, task_kind: str, plan_digest: str, authority_stamps: Mapping[str, Any]) -> dict[str, Any]:
         with self._deck_owner_authority_scope(), self._transaction() as conn:
-            command = conn.execute(
-                """
-                SELECT c.dispatch_attempt_id,c.ownership_generation,m.state,m.expected_board_epochs_json,
-                       lane.owner_id,lane.owner_lease_until,
-                       semantic.ownership_generation AS current_ownership,
-                       semantic.board_epoch_4,semantic.board_epoch_5
-                FROM operator_plane_commands AS c
-                JOIN serial206_movement_commands AS m ON m.command_id=c.command_id
-                JOIN operator_plane_lane AS lane ON lane.singleton=1
-                JOIN operator_plane_deck_semantic_state AS semantic ON semantic.singleton=1
-                WHERE c.command_id=? AND c.status='dispatched'
-                """,
-                (str(command_id),),
-            ).fetchone()
             supplied = dict(authority_stamps)
-            expected_epochs = _json_load(
-                command["expected_board_epochs_json"], {},
-            ) if command is not None else {}
-            if (
-                command is None
-                or not command["dispatch_attempt_id"]
-                or str(command["state"]) != "dispatched"
-                or str(command["owner_id"] or "") != self.owner_id
-                or float(command["owner_lease_until"] or 0.0) <= _now()
-                or int(command["ownership_generation"]) != int(command["current_ownership"])
-                or int(supplied.get("ownership_generation", -1)) != int(command["current_ownership"])
-                or int(supplied.get("board_epoch_4", -1)) != int(command["board_epoch_4"])
-                or int(supplied.get("board_epoch_5", -1)) != int(command["board_epoch_5"])
-                or expected_epochs != {
-                    "4": int(command["board_epoch_4"]),
-                    "5": int(command["board_epoch_5"]),
-                }
-            ):
-                raise RuntimeError("wp8 background task dispatch authority is stale")
             marker = self.record_delivery_attempt(
                 str(command_id),
                 work_kind="wp8_background_task",
@@ -4639,7 +4604,7 @@ class OperatorCommandStore:
                 "VALUES(?,?,?,?,?,?,?,?,'created','{}',?,?)",
                 (
                     str(command_id), int(child_order), str(task_id), str(task_kind),
-                    str(plan_digest), str(command["dispatch_attempt_id"]),
+                    str(plan_digest), str(marker["dispatch_attempt_id"]),
                     int(marker["attempt_sequence"]), _canonical(supplied), now, now,
                 ),
             )
@@ -4661,7 +4626,7 @@ class OperatorCommandStore:
     def settle_wp8_background_task(self, task_id: str, *, state: str, evidence: Mapping[str, Any]) -> None:
         if state not in {"completed", "failed", "ambiguous"}:
             raise ValueError("invalid WP8 background terminal state")
-        with self._transaction() as conn:
+        with self._deck_owner_authority_scope(), self._transaction() as conn:
             now = _now()
             changed = conn.execute(
                 """
@@ -4673,7 +4638,6 @@ class OperatorCommandStore:
                     JOIN operator_plane_commands AS command ON command.command_id=attempt.command_id
                     JOIN serial206_movement_commands AS movement ON movement.command_id=command.command_id
                     JOIN operator_plane_lane AS lane ON lane.singleton=1
-                    JOIN operator_plane_deck_semantic_state AS semantic ON semantic.singleton=1
                     WHERE attempt.attempt_sequence=operator_plane_wp8_background_tasks.delivery_attempt_sequence
                       AND attempt.command_id=operator_plane_wp8_background_tasks.command_id
                       AND attempt.dispatch_attempt_id=operator_plane_wp8_background_tasks.dispatch_attempt_id
@@ -4684,9 +4648,7 @@ class OperatorCommandStore:
                       AND movement.state IN ('dispatched','issued_pending')
                       AND command.dispatch_attempt_id=attempt.dispatch_attempt_id
                       AND command.ownership_generation=attempt.ownership_generation
-                      AND semantic.ownership_generation=attempt.ownership_generation
-                      AND semantic.board_epoch_4=attempt.board_epoch_4
-                      AND semantic.board_epoch_5=attempt.board_epoch_5
+                      AND deck_owner_authority_current(attempt.ownership_generation,attempt.board_epoch_4,attempt.board_epoch_5)=1
                       AND CAST(json_extract(movement.expected_board_epochs_json,'$.4') AS INTEGER)=attempt.board_epoch_4
                       AND CAST(json_extract(movement.expected_board_epochs_json,'$.5') AS INTEGER)=attempt.board_epoch_5
                   )
@@ -4796,35 +4758,28 @@ class OperatorCommandStore:
         if state not in {"completed", "failed", "ambiguous"}:
             raise ValueError("invalid WP8 terminal state")
         evidence = {"result": _bounded_json(result, 131072), "terminalized_at": _now()}
-        with self._transaction() as conn:
+        with self._deck_owner_authority_scope(), self._transaction() as conn:
             active = conn.execute(
                 """
                 SELECT c.dispatch_attempt_id,c.ownership_generation,
                        m.state,m.expected_board_epochs_json,
                        lane.owner_id,lane.owner_lease_until,
-                       semantic.ownership_generation AS current_ownership,
-                       semantic.board_epoch_4,semantic.board_epoch_5
+                       deck_owner_authority_current(c.ownership_generation,
+                           CAST(json_extract(m.expected_board_epochs_json,'$.4') AS INTEGER),
+                           CAST(json_extract(m.expected_board_epochs_json,'$.5') AS INTEGER)) AS owner_current
                 FROM operator_plane_commands AS c
                 JOIN serial206_movement_commands AS m ON m.command_id=c.command_id
                 JOIN operator_plane_lane AS lane ON lane.singleton=1
-                JOIN operator_plane_deck_semantic_state AS semantic ON semantic.singleton=1
                 WHERE c.command_id=? AND c.status='dispatched'
                 """,
                 (str(command_id),),
             ).fetchone()
-            expected_epochs = _json_load(
-                active["expected_board_epochs_json"], {},
-            ) if active is not None else {}
             if (
                 active is None
                 or str(active["state"]) != "dispatched"
                 or str(active["owner_id"] or "") != self.owner_id
                 or float(active["owner_lease_until"] or 0.0) <= _now()
-                or int(active["ownership_generation"]) != int(active["current_ownership"])
-                or expected_epochs != {
-                    "4": int(active["board_epoch_4"]),
-                    "5": int(active["board_epoch_5"]),
-                }
+                or active["owner_current"] != 1
                 or (
                     dispatch_attempt_id is not None
                     and str(active["dispatch_attempt_id"] or "") != str(dispatch_attempt_id)
@@ -4845,7 +4800,7 @@ class OperatorCommandStore:
         dispatch_attempt_id: str | None = None,
     ) -> None:
         """CAS-complete one WP8 child and publish its mutation in one transaction."""
-        with self._transaction():
+        with self._deck_owner_authority_scope(), self._transaction():
             self.terminalize_wp8_child(
                 command_id, child_order, state="completed", result=result,
                 dispatch_attempt_id=dispatch_attempt_id,
@@ -4956,35 +4911,28 @@ class OperatorCommandStore:
             ]
             evidence["join"] = getattr(step, "join", None)
         stage_evidence = self._deck_stage_evidence(step, evidence, reason=reason)
-        with self._transaction() as conn:
+        with self._deck_owner_authority_scope(), self._transaction() as conn:
             active = conn.execute(
                 """
                 SELECT c.dispatch_attempt_id,c.ownership_generation,
                        m.state,m.expected_board_epochs_json,
                        lane.owner_id,lane.owner_lease_until,
-                       semantic.ownership_generation AS current_ownership,
-                       semantic.board_epoch_4,semantic.board_epoch_5
+                       deck_owner_authority_current(c.ownership_generation,
+                           CAST(json_extract(m.expected_board_epochs_json,'$.4') AS INTEGER),
+                           CAST(json_extract(m.expected_board_epochs_json,'$.5') AS INTEGER)) AS owner_current
                 FROM operator_plane_commands AS c
                 JOIN serial206_movement_commands AS m ON m.command_id=c.command_id
                 JOIN operator_plane_lane AS lane ON lane.singleton=1
-                JOIN operator_plane_deck_semantic_state AS semantic ON semantic.singleton=1
                 WHERE c.command_id=? AND c.status='dispatched'
                 """,
                 (str(command_id),),
             ).fetchone()
-            expected_epochs = _json_load(
-                active["expected_board_epochs_json"], {},
-            ) if active is not None else {}
             if (
                 active is None
                 or str(active["state"]) != "dispatched"
                 or str(active["owner_id"] or "") != self.owner_id
                 or float(active["owner_lease_until"] or 0.0) <= _now()
-                or int(active["ownership_generation"]) != int(active["current_ownership"])
-                or expected_epochs != {
-                    "4": int(active["board_epoch_4"]),
-                    "5": int(active["board_epoch_5"]),
-                }
+                or active["owner_current"] != 1
                 or (
                     dispatch_attempt_id is not None
                     and str(active["dispatch_attempt_id"] or "") != str(dispatch_attempt_id)
@@ -5018,7 +4966,7 @@ class OperatorCommandStore:
         dispatch_attempt_id: str | None = None,
     ) -> int:
         """CAS-complete one WP7 stage and publish semantics in one transaction."""
-        with self._transaction():
+        with self._deck_owner_authority_scope(), self._transaction():
             self.terminalize_mov_execution_stage(
                 command_id, step, state="completed", result=result,
                 source_return_disposition=source_return_disposition,
@@ -7802,12 +7750,9 @@ class OperatorCommandStore:
         with self._lock:
             row = self.connection.execute(
                 """
-                SELECT o.status,o.action_id,c.state,c.ownership_generation,c.expected_board_epochs_json,
-                       s.ownership_generation AS current_ownership,
-                       s.board_epoch_4,s.board_epoch_5
+                SELECT o.status,o.action_id,c.state,c.ownership_generation,c.expected_board_epochs_json
                 FROM operator_plane_commands AS o
                 JOIN serial206_movement_commands AS c ON c.command_id=o.command_id
-                JOIN operator_plane_deck_semantic_state AS s ON s.singleton=1
                 WHERE o.command_id=? AND o.action_id IN (
                     'oem.deck.move_to_location','oem.deck._mov_execution','oem.deck._finite_operation'
                 )

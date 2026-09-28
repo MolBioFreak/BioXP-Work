@@ -145,8 +145,7 @@ def test_three_native_moves_after_real_publication_need_no_latch_record(connecte
         assert semantic['movable_plate_locations'] == initial_inventory
         assert semantic['current_location'] == ('LOC_OC_COVER' if plate == 4 else 'LOC_RC_COVER')
         assert semantic['producer_operation'] == 'updatePlateLocation'
-        with pytest.raises(RuntimeError, match='deck_semantic_state_not_authoritative:latch_status'):
-            provider._canonical_deck_semantic_state()  # full/manual consumer unchanged
+        assert provider._canonical_deck_semantic_state()['latch_status'] is None  # evidence, not admission
     assert any(event[:2] == ('move', 'x') for event in r.native.events)
 
 

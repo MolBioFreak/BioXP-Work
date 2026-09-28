@@ -86,6 +86,41 @@ def test_queued_named_move_dispatches_without_reference_or_display_epochs(
     assert leaf.moves == moves
 
 
+@pytest.mark.parametrize('historical_ambiguity', ['ambiguous', 'recovery_required'])
+def test_named_source_noop_keeps_historical_uncertainty_record_only(
+        installed_retained, retained_rig, monkeypatch, historical_ambiguity):
+    from tests.test_deck_complete_noop import submit
+    app, provider, observations, references, root = installed_retained
+    leaf, waits, raw = setup_native(installed_retained, retained_rig, monkeypatch)
+    plane = app.state.operator_command_plane
+    client = TestClient(app)
+    plane.start()
+    first, _ = submit(app, client, 'LOC_P_TC', provider)
+    assert terminal(client, first)['status'] == 'completed'
+    assert plane.store.wait_for_command_workers([first], timeout=2)
+    with plane.store._transaction() as db:
+        db.execute('UPDATE operator_plane_deck_semantic_state SET ambiguity_state=?, '
+                   'ownership_generation=NULL,board_epoch_4=NULL,board_epoch_5=NULL, '
+                   'semantic_state_revision=semantic_state_revision+1', (historical_ambiguity,))
+    moves = copy.deepcopy(leaf.moves)
+    cid, _ = submit(app, client, 'LOC_BSC', provider)
+    receipt = terminal(client, cid)
+    assert plane.store.wait_for_command_workers([cid], timeout=2)
+    assert receipt['status'] == 'completed', receipt
+    assert receipt['completion_class'] == 'source_noop'
+    assert leaf.moves == moves
+    assert receipt['deck_movement']['ambiguity_state'] == 'none'  # current command, not history
+    assert plane.store.deck_semantic_state()['ambiguity_state'] == historical_ambiguity
+    if output := os.environ.get('NON_OEM_NATIVE_EXPORT_DIR'):
+        catalog = client.get('/operator/v2/control-catalog')
+        assert catalog.status_code == 200, catalog.text
+        path = Path(output) / 'history-noop'
+        path.mkdir(parents=True, exist_ok=True)
+        (path / f'noop-history-{historical_ambiguity}.json').write_text(json.dumps({
+            'catalog': catalog.json(), 'receipt': receipt,
+            'historical_ambiguity': historical_ambiguity}))
+
+
 @pytest.mark.parametrize('refusal', ['no_24v', 'uninitialized', 'latch', 'stop'])
 def test_stale_reference_does_not_hide_real_refusal(
         installed_retained, retained_rig, monkeypatch, refusal):
