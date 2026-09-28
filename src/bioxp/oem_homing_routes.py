@@ -368,6 +368,7 @@ def _execute_oem_step_live(
     acc: int | None,
     path: str,
     pseudo_z_home_steps: int | None = None,
+    source_context: str | None = None,
 ) -> dict[str, Any]:
     op = str(step.get("op") or "")
     result: dict[str, Any] = {"ok": True, "path": path, "op": op, "source_step": dict(step), "results": []}
@@ -431,6 +432,7 @@ def _execute_oem_step_live(
                         tip_loaded=authority["tip_loaded"],
                         plate_on_gantry=authority.get("plate_on_gantry"),
                         location19_y=authority.get("location19_y"),
+                        source_context=source_context,
                     )
                     result["results"].append({"command": "moveTo", "result": sub})
                     if _step_result_failed(sub):
@@ -445,7 +447,8 @@ def _execute_oem_step_live(
             if x is None or y is None:
                 result.update({"ok": False, "error": "moveXY missing x/y target"})
             else:
-                sub = move_xy(int(x), int(y), wait_timeout_s=wait_timeout_s)
+                sub = move_xy(int(x), int(y), wait_timeout_s=wait_timeout_s,
+                              source_context=source_context)
                 result["results"].append({"command": "moveXY", "result": sub})
                 if _step_result_failed(sub):
                     result.update({"ok": False, "error": "moveXY step failed"})
@@ -499,6 +502,7 @@ def _execute_oem_step_live(
                         acc=acc,
                         path=f"{path}.parallel[{index}]",
                         pseudo_z_home_steps=pseudo_z_home_steps,
+                        source_context=source_context,
                     )
                 except Exception as exc:
                     child_errors.append(f"{index}:{type(exc).__name__}:{exc}")
@@ -538,6 +542,7 @@ def _execute_oem_steps_live(
     speed: int | None,
     acc: int | None,
     pseudo_z_home_steps: int | None = None,
+    source_context: str | None = None,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     motion_commanded = False
@@ -551,6 +556,7 @@ def _execute_oem_steps_live(
             acc=acc,
             path=str(idx),
             pseudo_z_home_steps=pseudo_z_home_steps,
+            source_context=source_context,
         )
         results.append(step_result)
         if op != "sleep":

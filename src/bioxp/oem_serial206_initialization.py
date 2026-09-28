@@ -4265,6 +4265,7 @@ class Serial206ProductionPrimitiveAdapter:
         gripper_confirmed: bool = False,
         plate_on_gantry: int | str | None = None,
         location19_y: int | None = None,
+        source_context: str | None = None,
     ) -> dict[str, Any]:
         table = load_bound_oem_position_table()
         parity = load_oem_parity_config(None)
@@ -4312,6 +4313,7 @@ class Serial206ProductionPrimitiveAdapter:
             speed=None,
             acc=None,
             pseudo_z_home_steps=int(pseudo_home_steps),
+            source_context=source_context,
         )
         controller_evidence = _aggregate_executed_controller_evidence(execution)
         acknowledged = controller_evidence["controller_command_acknowledged"]
@@ -11951,9 +11953,10 @@ class Serial206OemInitializationProvider:
             command_id = context["command_id"]
             def before_entry(boundary: str) -> None:
                 checker(command_id, boundary=boundary)
-            result = self.parkGantry(rehome=True, before_native_entry=before_entry)
+            result = self.parkGantry(rehome=True, before_native_entry=before_entry, source_context=None)
         else:
-            result = self.parkGantry(rehome=False)
+            # Native workflow callers are not the synchronous WPF manual button.
+            result = self.parkGantry(rehome=False, source_context=None)
         update = result.get("source_location_update")
         if (result.get("ok") is True
                 and not result.get("source_pause_scripts")
@@ -14597,8 +14600,9 @@ class Serial206OemInitializationProvider:
         rehome: bool = False,
         authority_snapshot: Mapping[str, Any] | None = None,
         before_native_entry: Callable[[str], None] | None = None,
+        source_context: str | None = "ClassControlInterface.btnLOC1_Click",
     ) -> dict[str, Any]:
-        """Source Park variants; manual false and governed early return retained."""
+        """Manual btnLOC Park; native callers explicitly retain their context."""
         from .oem_compat.pathing import LOCATION_ID_TO_NAME
 
         if authority_snapshot is not None and authority_snapshot.get("dependency_scope", "full") != "full":
@@ -14673,6 +14677,7 @@ class Serial206OemInitializationProvider:
                     tip_loaded=True,
                     plate_on_gantry=semantics.get("plate_on_gantry"),
                     location19_y=int(table.resolve(location_id="LOC_RC_COVER").base_coordinates["y"]),
+                    source_context=source_context,
                 ),
                 discarded_return=True,
             )
@@ -14769,6 +14774,7 @@ class Serial206OemInitializationProvider:
                     pseudo_home_steps=pseudo_home,
                     plate_on_gantry=semantics.get("plate_on_gantry"),
                     location19_y=int(table.resolve(location_id="LOC_RC_COVER").base_coordinates["y"]),
+                    source_context=source_context,
                 ),
                 discarded_return=True,
             )
@@ -14810,6 +14816,7 @@ class Serial206OemInitializationProvider:
                 pseudo_home_steps=pseudo_home,
                 plate_on_gantry=semantics.get("plate_on_gantry"),
                 location19_y=int(table.resolve(location_id="LOC_RC_COVER").base_coordinates["y"]),
+                source_context=source_context,
             ),
             discarded_return=True,
         )
