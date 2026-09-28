@@ -5313,7 +5313,7 @@ class OperatorCommandStore:
                         and child_receipt.get("result", {}).get("hardware_query_verified") is True
                         and child_receipt.get("truth", {}).get("semantic_query_response_verified") is True
                     )
-                if semantic["ambiguity_state"] != "none" or (changed and not owned_tip_child):
+                if changed and not owned_tip_child:
                     raise RuntimeError("deck_semantic_authority_changed_before_commit")
             result_index = 0
             for step in plan.steps:
@@ -5362,7 +5362,7 @@ class OperatorCommandStore:
                 "latch_observation_id": str(plan.semantic_transition["latch_observation_id"]),
             }
             conn.execute(
-                "UPDATE operator_plane_deck_semantic_state SET current_location=?,current_well=?,current_tray=?,semantic_state_revision=?,producer_operation='updateLocation',producer_command_id=?,ownership_generation=?,board_epoch_4=?,board_epoch_5=?,transition_provenance_json=?,ambiguity_state='none',updated_at=? WHERE singleton=1",
+                "UPDATE operator_plane_deck_semantic_state SET current_location=?,current_well=?,current_tray=?,semantic_state_revision=?,producer_operation='updateLocation',producer_command_id=?,ownership_generation=?,board_epoch_4=?,board_epoch_5=?,transition_provenance_json=?,updated_at=? WHERE singleton=1",
                 (
                     canonical_location, int(plan.semantic_transition["current_well_id"]), current_tray,
                     after, str(command_id),

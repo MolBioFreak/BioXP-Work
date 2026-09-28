@@ -28,8 +28,11 @@ def export(name, row):
             json.dumps(row, indent=2))
 
 
-@pytest.mark.parametrize('target', ['LOC_OC', 'LOC_TC_BARCODE', 'LOC_RC_BARCODE', 'LOC_PARK', 'source_noop'])
-def test_native_terminal_automatic_refresh_matrix(query_rig, retained_rig, monkeypatch, target):
+@pytest.mark.parametrize('target,history', [(target, 'intact') for target in
+    ('LOC_OC', 'LOC_TC_BARCODE', 'LOC_RC_BARCODE', 'LOC_PARK', 'source_noop')] +
+    [(target, history) for target in ('WASTE_BIN', 'LOC_PARK')
+     for history in ('ambiguous', 'missing_metadata', 'stale_metadata')])
+def test_native_terminal_automatic_refresh_matrix(query_rig, retained_rig, monkeypatch, target, history):
     from bioxp import api, oem_machine_bundle
     from bioxp.oem_serial206_initialization import Serial206ProductionPrimitiveAdapter
     from bioxp.serial206_y_provider import Serial206YProvider
@@ -40,6 +43,10 @@ def test_native_terminal_automatic_refresh_matrix(query_rig, retained_rig, monke
     runtime = retained_rig[2]
     store = app.state.operator_command_plane.store
     observations.calls.clear()
+    # This matrix models a retained predecessor, not constructor bootstrap.
+    state = provider._load_state()
+    state['machine_status'].pop('construction_id', None)
+    provider._save_state(state)
     qualify_full_predecessor((provider, observations, runtime, references, store, root))
     snapshot = oem_machine_bundle.get_active_oem_machine_snapshot()
     monkeypatch.setattr(oem_machine_bundle, '_active_snapshot',
@@ -93,6 +100,20 @@ def test_native_terminal_automatic_refresh_matrix(query_rig, retained_rig, monke
         assert store.wait_for_command_workers([accepted.json()['command_id']], timeout=3)
         leaf.moves.clear()
         leaf.expected_sta = False
+    if history != 'intact':
+        # Change real retained history, not current command ownership or OEM inputs.
+        with store._lock, store._authority_write():
+            if history == 'ambiguous':
+                store.connection.execute("UPDATE operator_plane_deck_semantic_state SET "
+                    "ambiguity_state='ambiguous',semantic_state_revision=semantic_state_revision+1")
+            else:
+                stamp = 'NULL' if history == 'missing_metadata' else '1'
+                store.connection.execute("UPDATE operator_plane_deck_semantic_state SET "
+                    f"ownership_generation={stamp},board_epoch_4={stamp},board_epoch_5={stamp},"
+                    "transition_provenance_json='{}',semantic_state_revision=semantic_state_revision+1")
+        prior_history = store.deck_semantic_state()
+        assert prior_history['ambiguity_state'] == ('ambiguous' if history == 'ambiguous' else 'none')
+        provider.invalidate_deck_authority_cache(reason='offline historical evidence change')
     warm_before = catalog_payload(app)
     body = request(provider, 'matrix-' + target)
     body['inputs']['target'] = 'LOC_PARK' if target == 'source_noop' else target
@@ -104,6 +125,10 @@ def test_native_terminal_automatic_refresh_matrix(query_rig, retained_rig, monke
     export(target + '-terminal', {'detail': detail, 'moves': leaf.moves})
     assert detail['status'] == 'completed', detail
     assert detail['deck_movement']['semantic_state_committed'] is True
+    assert detail['physical_effect_verified'] is False
+    if history != 'intact':
+        assert store.deck_semantic_state()['semantic_state_revision'] > prior_history['semantic_state_revision']
+        assert store.deck_semantic_state()['ambiguity_state'] == prior_history['ambiguity_state']
     assert store.wait_for_command_workers([command_id], timeout=3)
     before_refresh = provider.deck_observation_freshness(expected_generation=generation)
     assert before_refresh['available'] is False, before_refresh

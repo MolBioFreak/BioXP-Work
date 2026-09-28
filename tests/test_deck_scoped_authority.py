@@ -98,8 +98,8 @@ def test_ordered_tray_unknown_is_not_stale_verified_association():
     assert OperatorCommandStore._oem_update_location_current_tray('LOC_OC', {}, 'OUTPUT_PLATE') is None
 
 
-@pytest.mark.parametrize('field,value', [('tip_loaded', None), ('tip_loaded', 0), ('ambiguity_state', 'ambiguous')])
-def test_consumed_unknowns_and_ambiguity_remain_blocked(rig, field, value):
+@pytest.mark.parametrize('field,value', [('tip_loaded', None), ('tip_loaded', 0)])
+def test_consumed_unknowns_remain_blocked(rig, field, value):
     provider, primitive, semantic, state = rig
     if field == 'tip_loaded':
         state['machine_status'][field] = value
