@@ -6899,10 +6899,15 @@ async def _reap_camera_session(session: dict[str, Any]) -> None:
                 while await pipe.read(16384):
                     pass
 
+        # Stop metadata backpressure before reaping: after the frame reader
+        # exits there is no consumer for its bounded packet queue.
+        stderr_task = session.get("stderr_task")
+        if stderr_task is not None:
+            stderr_task.cancel()
+            await asyncio.gather(stderr_task, return_exceptions=True)
         # Reap can otherwise hang on paused pipe transports after reader cancel.
         stdout_task = asyncio.create_task(discard(proc.stdout))
-        if session.get("stderr_task") is None:
-            session["stderr_task"] = asyncio.create_task(discard(proc.stderr))
+        session["stderr_task"] = asyncio.create_task(discard(proc.stderr))
         try:
             if proc.returncode is None:
                 try:
@@ -7054,7 +7059,8 @@ async def _start_owned_camera_session(payload: dict[str, Any]) -> dict[str, Any]
 
 
 async def _start_owned_camera_session_locked(payload: dict[str, Any]) -> dict[str, Any]:
-    from .camera_provider import CameraJpegBuffer
+    from fractions import Fraction
+    from .camera_provider import MAX_JPEG_BYTES
 
     del payload
     global _camera_session, _camera_projection_epoch, _camera_probe_cache
@@ -7083,9 +7089,12 @@ async def _start_owned_camera_session_locked(payload: dict[str, Any]) -> dict[st
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     device = identity.device
     fps, quality, width, height = 30, 7, 640, 480
-    # The V4L2 request sets capture cadence. An output fps filter duplicates
-    # delayed captures, falsely advancing provider sequence/freshness with old pixels.
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer", "-flags", "low_delay", "-avioflags", "direct", "-f", "v4l2", "-input_format", "mjpeg", "-framerate", str(fps), "-video_size", f"{width}x{height}", "-i", device, "-an", "-q:v", str(quality), "-vcodec", "mjpeg", "-f", "image2pipe", "pipe:1"]
+    # Copy source MJPEG packets without output synchronization duplication.
+    # Preserve V4L2 acquisition timestamps in a framecrc sideband, converted
+    # to UTC by the demuxer (not host read/publication time or sensor proof).
+    # Metadata MUST be flushed before pixels: otherwise a JPEG larger than
+    # the pipe buffer can deadlock a reader waiting for its packet length.
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-copyts", "-f", "v4l2", "-timestamps", "abs", "-input_format", "mjpeg", "-framerate", str(fps), "-video_size", f"{width}x{height}", "-i", device, "-map", "0:v:0", "-an", "-c:v", "copy", "-vsync", "0", "-f", "tee", "[f=framecrc:flush_packets=1]pipe:2|[f=image2pipe:flush_packets=1]pipe:1"]
     try:
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     except BaseException:
@@ -7109,52 +7118,73 @@ async def _start_owned_camera_session_locked(payload: dict[str, Any]) -> dict[st
         return (_camera_session is session and _camera_projection_epoch == epoch
                 and _camera_provider is provider and provider.generation == session["provider_generation"])
 
+    packets = asyncio.Queue(maxsize=2)
+
     async def drain_stderr():
-        if proc.stderr is not None:
-            while True:
-                chunk = await proc.stderr.read(4096)
-                if not chunk:
-                    break
-                session["stderr_tail"] = (session.get("stderr_tail", "") + chunk.decode("utf-8", errors="replace"))[-4096:]
+        time_base = None
+        try:
+            if proc.stderr is not None:
+                while True:
+                    line = await proc.stderr.readline()
+                    if not line:
+                        break
+                    text = line.decode("utf-8", errors="replace").strip()
+                    if text.startswith("#tb 0: "):
+                        time_base = Fraction(text.removeprefix("#tb 0: "))
+                    elif text.startswith("0,"):
+                        fields = text.split(",")
+                        if time_base is None or len(fields) < 6:
+                            raise CameraError("camera packet timestamp metadata missing")
+                        size = int(fields[4])
+                        if not 0 < size <= MAX_JPEG_BYTES:
+                            raise CameraError("camera JPEG exceeded bounded frame size")
+                        source_at = datetime.fromtimestamp(float(int(fields[2]) * time_base), tz=timezone.utc)
+                        await packets.put((size, source_at))
+                    elif not text.startswith("#"):
+                        session["stderr_tail"] = (session.get("stderr_tail", "") + text + "\n")[-4096:]
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            session["error"] = str(exc)
+        await packets.put(None)
 
     session["stderr_task"] = asyncio.create_task(drain_stderr())
 
     async def reader() -> None:
-        parser = CameraJpegBuffer()
         try:
             while proc.returncode is None and current():
-                chunk = await proc.stdout.read(16384)
-                if not chunk:
-                    session["error"] = "camera stream ended"
+                packet = await packets.get()
+                if packet is None:
+                    session["error"] = session["error"] or "camera stream ended"
                     break
-                for content in parser.feed(chunk):
-                    if not current():
-                        return
-                    try:
-                        frame = await run_in_threadpool(provider.publish_stream_frame, session_id, content)
-                    except CameraError as exc:
-                        session["error"] = str(exc)
-                        if current():
-                            _camera_stream_state.update({"last_error": str(exc), "last_frame_at": None, "dropped_frames": provider.status().dropped_frames})
-                        continue
-                    if not current():
-                        return
-                    part = b"--frame\r\nContent-Type: image/jpeg\r\n" + f"Content-Length: {len(frame.content)}\r\n\r\n".encode("ascii") + frame.content + b"\r\n"
-                    if not queues:
+                size, source_at = packet
+                # Exact packet lengths keep pixels and source PTS paired even
+                # across stdout chunk boundaries, backlog, and UVC zero padding.
+                content = (await proc.stdout.readexactly(size)).rstrip(b"\x00")
+                if not current():
+                    return
+                try:
+                    frame = await run_in_threadpool(
+                        provider.publish_stream_frame, session_id, content,
+                        source_captured_at=source_at)
+                except CameraError as exc:
+                    session["error"] = str(exc)
+                    if current():
+                        _camera_stream_state.update({"last_error": str(exc), "last_frame_at": None, "dropped_frames": provider.status().dropped_frames})
+                    continue
+                if not current():
+                    return
+                part = b"--frame\r\nContent-Type: image/jpeg\r\n" + f"Content-Length: {len(frame.content)}\r\n\r\n".encode("ascii") + frame.content + b"\r\n"
+                if not queues:
+                    provider.drop_stream_frame(session_id)
+                for queue in tuple(queues):
+                    if queue.full():
+                        queue.get_nowait()
                         provider.drop_stream_frame(session_id)
-                    for queue in tuple(queues):
-                        if queue.full():
-                            queue.get_nowait()
-                            provider.drop_stream_frame(session_id)
-                        queue.put_nowait(part)
-                    session["frames_emitted"] += 1
-                    session["error"] = None
-                    _camera_stream_state.update({"frames_emitted": session["frames_emitted"], "last_frame_at": frame.captured_at.timestamp(), "last_error": None, "dropped_frames": provider.status().dropped_frames})
-                if parser.dropped and current():
-                    provider.drop_stream_frame(session_id, invalid=True, count=parser.dropped)
-                    parser.dropped = 0
-                    session["error"] = "camera JPEG exceeded bounded frame size"
-                    _camera_stream_state.update({"last_error": session["error"], "last_frame_at": None, "dropped_frames": provider.status().dropped_frames})
+                    queue.put_nowait(part)
+                session["frames_emitted"] += 1
+                session["error"] = None
+                _camera_stream_state.update({"frames_emitted": session["frames_emitted"], "last_frame_at": frame.captured_at.timestamp(), "last_error": None, "dropped_frames": provider.status().dropped_frames})
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -10226,6 +10256,10 @@ def _camera_jpeg_response(frame: CameraFrame) -> Response:
             "Content-Length": str(len(frame.content)),
             "ETag": f'"{frame.content_sha256}"',
             "X-Content-SHA256": frame.content_sha256,
+            "X-Camera-Frame-Published-At": frame.captured_at.isoformat(),
+            **({"X-Camera-Source-Frame-At": frame.source_captured_at.isoformat(),
+                "X-Camera-Source-Timestamp-Kind": "v4l2_packet_utc"}
+               if frame.source_captured_at is not None else {}),
             "Cache-Control": "no-store",
         },
     )
