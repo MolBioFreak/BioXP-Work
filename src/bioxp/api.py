@@ -7058,6 +7058,33 @@ async def _start_owned_camera_session(payload: dict[str, Any]) -> dict[str, Any]
             raise
 
 
+def _camera_packet_utc(pts, time_base) -> datetime | None:
+    """Map native V4L2 packet time, never arrival time, to UTC.
+
+    FFmpeg's abs/mono2abs modes run a delay-locked loop at dequeue cadence;
+    burst reads and stalls can destabilize it. Keep native PTS instead. Like
+    v4l2.c's autodetection, recognize clocks only within a ten-second window.
+    Unrecognized/future timestamps carry no source evidence, but pixels still
+    publish. This is packet-clock provenance, not optical exposure proof.
+    """
+    source = float(pts * time_base)
+    mono_before = time.clock_gettime(time.CLOCK_MONOTONIC)
+    wall = time.time()
+    mono_after = time.clock_gettime(time.CLOCK_MONOTONIC)
+    if wall - 10 <= source <= wall:
+        utc = source  # Native realtime kernel timestamp: no conversion.
+    elif mono_before - 10 <= source <= mono_before:
+        # Lower-bound clock offset: scheduling during sampling cannot move an
+        # old packet forward to read time or manufacture post-request proof.
+        utc = source + (wall - mono_after)
+    else:
+        return None
+    try:
+        return datetime.fromtimestamp(utc, tz=timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
 async def _start_owned_camera_session_locked(payload: dict[str, Any]) -> dict[str, Any]:
     from fractions import Fraction
     from .camera_provider import MAX_JPEG_BYTES
@@ -7090,11 +7117,11 @@ async def _start_owned_camera_session_locked(payload: dict[str, Any]) -> dict[st
     device = identity.device
     fps, quality, width, height = 30, 7, 640, 480
     # Copy source MJPEG packets without output synchronization duplication.
-    # Preserve V4L2 acquisition timestamps in a framecrc sideband, converted
-    # to UTC by the demuxer (not host read/publication time or sensor proof).
+    # Preserve native kernel PTS: abs/mono2abs use ffmpeg's cadence-sensitive
+    # timefilter. Convert clock domains below, independently of dequeue rate.
     # Metadata MUST be flushed before pixels: otherwise a JPEG larger than
     # the pipe buffer can deadlock a reader waiting for its packet length.
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-copyts", "-f", "v4l2", "-timestamps", "abs", "-input_format", "mjpeg", "-framerate", str(fps), "-video_size", f"{width}x{height}", "-i", device, "-map", "0:v:0", "-an", "-c:v", "copy", "-vsync", "0", "-f", "tee", "[f=framecrc:flush_packets=1]pipe:2|[f=image2pipe:flush_packets=1]pipe:1"]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-copyts", "-f", "v4l2", "-timestamps", "default", "-input_format", "mjpeg", "-framerate", str(fps), "-video_size", f"{width}x{height}", "-i", device, "-map", "0:v:0", "-an", "-c:v", "copy", "-vsync", "0", "-f", "tee", "[f=framecrc:flush_packets=1]pipe:2|[f=image2pipe:flush_packets=1]pipe:1"]
     try:
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     except BaseException:
@@ -7138,7 +7165,7 @@ async def _start_owned_camera_session_locked(payload: dict[str, Any]) -> dict[st
                         size = int(fields[4])
                         if not 0 < size <= MAX_JPEG_BYTES:
                             raise CameraError("camera JPEG exceeded bounded frame size")
-                        source_at = datetime.fromtimestamp(float(int(fields[2]) * time_base), tz=timezone.utc)
+                        source_at = _camera_packet_utc(int(fields[2]), time_base)
                         await packets.put((size, source_at))
                     elif not text.startswith("#"):
                         session["stderr_tail"] = (session.get("stderr_tail", "") + text + "\n")[-4096:]
