@@ -71,6 +71,7 @@ def test_retained_read_does_not_authorize_invalid_current_publication(query_rig,
     assert history(rig) == before
 
 
+@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
 def test_new_runtime_native_cover_document_keeps_retained_collection(integrated_rig, query_rig, monkeypatch):
     rig = integrated_rig
     # The reused manual-button leaf asserts STA; native covers use MTA WaitAll.
