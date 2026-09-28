@@ -52,6 +52,7 @@ def test_script_native_dispatch_and_completion_ignore_history(connected, stamp):
 
 @pytest.mark.parametrize('stamp', [None, 999])
 @pytest.mark.parametrize('parallel', [False, True])
+@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
 def test_finite_native_and_background_completion_ignore_history(connected, stamp, parallel):
     from bioxp.oem_deck_movement import compile_finite_plate_operation, make_wp8_operation_executor
     r = connected

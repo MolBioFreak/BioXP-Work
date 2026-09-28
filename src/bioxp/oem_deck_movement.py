@@ -1854,6 +1854,11 @@ def make_wp8_operation_executor(
                 )
                 try:
                     dispatch_child = dict(child)
+                    # Only this persisted finite child's task has a durable
+                    # background row. Nested source tasks retain their source
+                    # occurrence identity and must not settle that root row.
+                    if not source_publication and not bool(child.get("awaited", True)):
+                        dispatch_child["_background_task_registered"] = True
                     if delivery_marker is not None:
                         dispatch_child["_delivery_identity"] = {
                             "dispatch_attempt_id": child_dispatch_attempt_id,

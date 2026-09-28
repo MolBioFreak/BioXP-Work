@@ -12205,6 +12205,7 @@ class Serial206OemInitializationProvider:
     def _wp8_start_task(
         self, *, task_id: str, target: Callable[[], Any], task_kind: str,
         command_id: str, child_order: int, plan_digest: str,
+        background_task_registered: bool = False,
     ) -> dict[str, Any]:
         worker_starter = getattr(self, "_wp8_background_worker_starter", None)
         if not callable(worker_starter):
@@ -12240,7 +12241,7 @@ class Serial206OemInitializationProvider:
                 row["state"] = "failed"
             finally:
                 settler = getattr(self, "_wp8_background_task_settler", None)
-                if callable(settler):
+                if background_task_registered and callable(settler):
                     settler(
                         task_id,
                         state=str(row["state"]),
@@ -12262,7 +12263,8 @@ class Serial206OemInitializationProvider:
 
     def wp8_start_move_z_pseudo_home(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
-        child_order: int, plan_digest: str, **_: Any,
+        child_order: int, plan_digest: str,
+        background_task_registered: bool = False, **_: Any,
     ) -> dict[str, Any]:
         del arguments
         task_id = self._wp8_identity(command_id, child_order, plan_digest) + ":z-home"
@@ -12271,11 +12273,13 @@ class Serial206OemInitializationProvider:
             task_kind="move_z_pseudo_home",
             target=lambda: self.wp8_move_z_pseudo_home(operation, {}),
             command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+            background_task_registered=background_task_registered,
         )
 
     def wp8_start_gripper_home_and_unlock(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
-        child_order: int, plan_digest: str, **_: Any,
+        child_order: int, plan_digest: str,
+        background_task_registered: bool = False, **_: Any,
     ) -> dict[str, Any]:
         del arguments
         task_id = self._wp8_identity(command_id, child_order, plan_digest) + ":gripper-home"
@@ -12297,6 +12301,7 @@ class Serial206OemInitializationProvider:
         return self._wp8_start_task(
             task_id=task_id, task_kind="gripper_home_and_unlock", target=work,
             command_id=command_id, child_order=child_order, plan_digest=plan_digest,
+            background_task_registered=background_task_registered,
         )
 
     def wp8_wait_move_z_only(
@@ -14547,6 +14552,11 @@ class Serial206OemInitializationProvider:
         }
         handler_identity["acquiring_identity"] = owner_identity["work_identity"]
         handler_identity["owner_identity"] = owner_identity
+        if operation in {"startMoveZPseudoHome", "startGripperHomeAndUnlock",
+                         "backgroundGripperHomeAndUnlock"}:
+            handler_identity["background_task_registered"] = (
+                child.get("_background_task_registered") is True
+            )
         owner_plan_digest = owner_identity["plan_digest"]
         if operation == "ReleaseLockGripperOperation":
             with self._wp8_task_lock:

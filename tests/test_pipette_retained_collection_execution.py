@@ -101,6 +101,14 @@ def test_new_runtime_native_cover_document_keeps_retained_collection(integrated_
     terminal = rig.terminal(job)
     import json
     assert terminal['command']['status'] == 'completed', json.dumps(terminal)
+    # These are nested source tasks, not persisted root-plan background
+    # children. Their real workers still run and retain actual outcomes.
+    tasks = list(rig.provider._wp8_tasks.values())
+    assert len(tasks) == 4
+    for task in tasks:
+        task['thread'].join(3)
+        assert not task['thread'].is_alive()
+        assert task['state'] == 'completed', task
     assert len(rig.children(job)) >= 2
     assert rig.store.deck_semantic_state()['movable_plate_locations']['OUTPUT_COVER'] == 'LOC_OC_COVER'
     assert api._pipette_collection_state() == old
