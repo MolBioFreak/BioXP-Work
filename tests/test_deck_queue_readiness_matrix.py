@@ -66,7 +66,7 @@ def test_native_terminal_automatic_refresh_matrix(query_rig, retained_rig, monke
             return row
 
         def motor_wait_target_reached_many(self, axes, **kwargs):
-            # Source manual ordinary uses STA; native script Park does not.
+            # These are manual named-button callers, including Park.
             assert kwargs['sta_sequential'] is self.expected_sta
             return {'ok': True, 'per_axis': {axis: self.motor_wait_target_reached(board)
                 for axis, board in [('x', 5), ('y', 4)]}}
@@ -99,7 +99,6 @@ def test_native_terminal_automatic_refresh_matrix(query_rig, retained_rig, monke
         assert previous['status'] == 'completed', previous
         assert store.wait_for_command_workers([accepted.json()['command_id']], timeout=3)
         leaf.moves.clear()
-        leaf.expected_sta = False
     if history != 'intact':
         # Change real retained history, not current command ownership or OEM inputs.
         with store._lock, store._authority_write():
