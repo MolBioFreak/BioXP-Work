@@ -187,7 +187,7 @@ def test_cancelled_sqlite_admission_retains_owner_and_single_identity(installed_
         assert row['status'] == 'completed', row
 
 
-def test_live_reference_loss_during_read_is_not_cached_admission(installed_retained, retained_rig, monkeypatch):
+def test_live_reference_loss_during_read_does_not_block_dispatch(installed_retained, retained_rig, monkeypatch):
     from bioxp.services.reference_service import MarkAxisDesyncedCommand
     app, provider, primitive, references, root = installed_retained
     leaf, raw = ready(installed_retained, monkeypatch, retained_rig)
@@ -206,8 +206,9 @@ def test_live_reference_loss_during_read_is_not_cached_admission(installed_retai
     assert responses[0].status_code == 200, responses[0].text
     app.state.operator_command_plane.start()
     row = finish(TestClient(app), responses[0].json()['command_id'])
-    assert row['status'] == 'failed', row
-    assert not leaf.moves and not app.state.operator_command_plane.store.queue()['pending_count']
+    assert row['status'] == 'completed', row
+    assert leaf.moves and not app.state.operator_command_plane.store.queue()['pending_count']
+    assert references.snapshot(('x',))['rows']['x']['state'] == 'desynced'
 
 
 def test_populated_finite_poll_views_and_immediate_next_named_move(installed_retained, retained_rig, monkeypatch):

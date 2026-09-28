@@ -273,8 +273,10 @@ class DeckAuthoritySnapshot:
     def __post_init__(self) -> None:
         if type(self.captured_at) not in {int, float} or not math.isfinite(float(self.captured_at)):
             raise ValueError("captured_at must be finite")
-        if set(self.reference_versions) != {"x", "y", "z", "g"}:
-            raise ValueError("reference versions must contain x,y,z,g")
+        # Reference records are evidence, not ClassDeckBoard/HeadBoard.moveToAbs
+        # prerequisites. Absent records stay absent; never invent a version.
+        if not set(self.reference_versions) <= {"x", "y", "z", "g"}:
+            raise ValueError("unknown reference axis")
         if set(self.safety_epochs) != {"global", "x", "y", "z"}:
             raise ValueError("safety epochs must contain global,x,y,z")
         # ClassPipetteCollection uses -1 for group/all-channel mode, even loaded.
@@ -309,14 +311,16 @@ def _same_authority_after_resampling(before: DeckAuthoritySnapshot, after: DeckA
     Full receipt digests still bind timestamps and sensor transaction evidence.
     Serial206's compound latch ID includes a stable independent host-owner token
     plus a fresh sensor transaction digest. Only that sensor sample component may
-    change here; host identity, both predicates, coordinates and all epochs remain
-    exact. Unknown/legacy latch ID formats still require exact identity.
+    change here; host identity, both predicates, coordinates and safety/owner
+    epochs remain exact. Reference versions are diagnostic, not a move prerequisite.
+    Unknown/legacy latch ID formats still require exact identity.
     """
     return (
         after.captured_at >= before.captured_at
         and _latch_owner_identity(after.latch_observation_id) == _latch_owner_identity(before.latch_observation_id)
         and replace(after, captured_at=before.captured_at,
-                    latch_observation_id=before.latch_observation_id).digest == before.digest
+                    latch_observation_id=before.latch_observation_id,
+                    reference_versions=before.reference_versions).digest == before.digest
     )
 
 

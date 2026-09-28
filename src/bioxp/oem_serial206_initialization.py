@@ -4804,7 +4804,9 @@ class Serial206OemInitializationProvider:
         )
         board = projection.get("board") if isinstance(projection, Mapping) else None
         board_epoch_4 = board.get("active_board_epoch") if isinstance(board, Mapping) else None
-        board_epoch_5 = x_lifecycle.get("board_lifecycle_generation")
+        board_generation_reader = getattr(self.preparation_provider, "current_board_lifecycle_generation", None)
+        board_epoch_5 = (board_generation_reader() if callable(board_generation_reader)
+                         else x_lifecycle.get("board_lifecycle_generation"))
         if type(board_epoch_4) is not int or type(board_epoch_5) is not int:
             raise RuntimeError("deck_board_epochs_not_authoritative")
         return {
@@ -5051,7 +5053,9 @@ class Serial206OemInitializationProvider:
         )
         board4 = board4_projection.get("board") if isinstance(board4_projection, Mapping) else None
         board_epoch_4 = board4.get("active_board_epoch") if isinstance(board4, Mapping) else None
-        board_epoch_5 = x_lifecycle.get("board_lifecycle_generation")
+        board_generation_reader = getattr(self.preparation_provider, "current_board_lifecycle_generation", None)
+        board_epoch_5 = (board_generation_reader() if callable(board_generation_reader)
+                         else x_lifecycle.get("board_lifecycle_generation"))
         if type(board_epoch_4) is not int or type(board_epoch_5) is not int:
             raise RuntimeError("deck_bootstrap_board_epochs_unavailable")
         tip_loaded = machine.get("tip_loaded")
@@ -7716,24 +7720,15 @@ class Serial206OemInitializationProvider:
         }
         if not validate:
             return snapshot
-        # OEM XY calls use controller coordinates, not a human-observation ledger.
-        # Retain preparation/ownership, outstanding-command and interrupt fences.
-        allowed_x_states = {"prepared_unreferenced", "referenced_ready", "awaiting_operator_observation"}
-        allowed_y_states = {"prepared_unreferenced", "referenced_ready"}
+        # Host preparation/reference observations are not OEM XY prerequisites.
+        # Keep live command exclusion and Stop; native board calls check actual
+        # initialized/power state and the source motor envelope.
         valid = bool(
-            snapshot["x"]["lifecycle_state"] in allowed_x_states
-            and snapshot["x"]["generation"] == generation
-            and snapshot["x"]["board_lifecycle_generation"] == current_x_board_generation
-            and snapshot["x"]["pending_ticket"] is None
+            snapshot["x"]["pending_ticket"] is None
             and snapshot["x"]["active_receipt"] is None
             and snapshot["x"]["interrupt_active"] is False
-            and snapshot["y"]["lifecycle_state"] in allowed_y_states
-            and snapshot["y"]["ownership_generation"] == generation
-            and snapshot["y"]["board_state"] == "active"
-            and (snapshot["y"]["prepared_board_epoch"] == snapshot["y"]["active_board_epoch"]
-                 or self._native_y_reference_current(y_board, y_axis))
             and snapshot["y"]["pending_ticket"] is None
-            and type(snapshot["y"]["interrupt_epoch"]) is int
+            and snapshot["y"]["software_interrupt_active"] is not True
         )
         return {**snapshot, "ok": valid}
 
@@ -7747,12 +7742,11 @@ class Serial206OemInitializationProvider:
         current_y = current.get("y") if isinstance(current.get("y"), Mapping) else {}
         return bool(
             admitted.get("generation") == current.get("generation")
-            and admitted_x.get("generation") == current_x.get("generation")
-            and admitted_x.get("board_lifecycle_generation") == current_x.get("board_lifecycle_generation")
-            and admitted_x.get("current_board_lifecycle_generation") == current_x.get("current_board_lifecycle_generation")
             and admitted_x.get("interrupt_epoch") == current_x.get("interrupt_epoch")
             and current_x.get("interrupt_active") is False
-            and admitted_y == current_y
+            and admitted_y.get("interrupt_epoch") == current_y.get("interrupt_epoch")
+            and admitted_y.get("software_interrupt_epoch") == current_y.get("software_interrupt_epoch")
+            and current_y.get("software_interrupt_active") is not True
         )
 
     def _persist_xy_child_receipts(self, receipt: Mapping[str, Any]) -> None:
@@ -8943,18 +8937,14 @@ class Serial206OemInitializationProvider:
                 outcome = "failed" if isinstance(snapshot, Exception) else "observed"
                 if not isinstance(snapshot, Exception):
                     stamps = self.deck_owner_authority_stamps()
-                    if self.reference_store is None or not callable(self._deck_semantic_state_reader):
+                    if not callable(self._deck_semantic_state_reader):
                         return {"available": False, "outcome": "missing",
                                 "freshness": {"state": "missing", "age_s": None, "fresh_for_s": 15.0}}
-                    refs = self.reference_store.snapshot(("x", "y", "z", "g"))
                     semantic = self._deck_semantic_state_reader()
                     changed = (
                         snapshot["ownership_generation"] != expected_generation
                         or any(stamps.get(key) != snapshot.get(key) for key in
                                ("ownership_generation", "board_epoch_4", "board_epoch_5"))
-                        or any((refs.get("rows", {}).get(axis) or {}).get("state") != "referenced"
-                               or (refs.get("rows", {}).get(axis) or {}).get("state_version") != version
-                               for axis, version in snapshot["reference_versions"].items())
                         or semantic.get("semantic_state_revision") != snapshot["machine_state_revision"]
                         or hashlib.sha256(json.dumps(semantic.get("transition_provenance"),
                             sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -9059,14 +9049,10 @@ class Serial206OemInitializationProvider:
         shared = (_shared_observations or {}).get("snapshot")
         if shared is not None:
             stamps = self.deck_owner_authority_stamps()
-            refs = self.reference_store.snapshot(("x", "y", "z", "g")) if self.reference_store else {}
             safety = shared["safety_epochs"]
             if (
                 _shared_observations["epoch"] is not cache_epoch
                 or any(stamps[key] != shared[key] for key in stamps)
-                or any((refs.get("rows", {}).get(axis) or {}).get("state") != "referenced"
-                       or (refs.get("rows", {}).get(axis) or {}).get("state_version") != version
-                       for axis, version in shared["reference_versions"].items())
                 or current.get("semantic_state_revision") != shared["machine_state_revision"]
                 or hashlib.sha256(json.dumps(current.get("transition_provenance"),
                     sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -9105,25 +9091,22 @@ class Serial206OemInitializationProvider:
         )
         board4 = board4_projection.get("board") if isinstance(board4_projection, Mapping) else None
         board_epoch_4 = board4.get("active_board_epoch") if isinstance(board4, Mapping) else None
-        board_epoch_5 = x_lifecycle.get("board_lifecycle_generation")
+        board_generation_reader = getattr(self.preparation_provider, "current_board_lifecycle_generation", None)
+        board_epoch_5 = (board_generation_reader() if callable(board_generation_reader)
+                         else x_lifecycle.get("board_lifecycle_generation"))
         if type(board_epoch_4) is not int or type(board_epoch_5) is not int:
             raise RuntimeError("deck_board_epochs_not_authoritative")
-        if not isinstance(board4, Mapping) or board4.get("state") != "active":
-            raise RuntimeError("deck_board4_not_active")
 
-        if self.reference_store is None:
-            raise RuntimeError("deck_reference_store_not_bound")
-        references = self.reference_store.snapshot(("x", "y", "z", "g"))
+        # OEM moveToAbs consumes controller position, power and initialized
+        # state, not MotorHome or the host reference ledger. Keep real versions
+        # for diagnostics, including desynced records; missing rows stay absent.
+        references = self.reference_store.snapshot(("x", "y", "z", "g")) if self.reference_store else {}
         rows = references.get("rows") if isinstance(references, Mapping) else None
-        if not isinstance(rows, Mapping):
-            raise RuntimeError("deck_reference_snapshot_not_authoritative")
-        reference_versions: dict[str, int] = {}
-        for axis in ("x", "y", "z", "g"):
-            row = rows.get(axis)
-            version = row.get("state_version") if isinstance(row, Mapping) else None
-            if not isinstance(row, Mapping) or row.get("state") != "referenced" or type(version) is not int:
-                raise RuntimeError(f"deck_reference_not_authoritative:{axis}")
-            reference_versions[axis] = int(version)
+        reference_versions = {
+            axis: row["state_version"] for axis, row in (rows.items() if isinstance(rows, Mapping) else ())
+            if axis in {"x", "y", "z", "g"} and isinstance(row, Mapping)
+            and type(row.get("state_version")) is int
+        }
 
         coordinates = {}
         for axis in ("x", "y", "z"):
@@ -9139,12 +9122,6 @@ class Serial206OemInitializationProvider:
         if shared is not None:
             captured_at = shared["captured_at"]
             sample_started = _shared_observations["started"]
-        if scope != "offset.v1" and (
-            semantic["ownership_generation"] != observed_generation
-            or semantic["board_epoch_4"] != board_epoch_4
-            or semantic["board_epoch_5"] != board_epoch_5
-        ):
-            raise RuntimeError("deck_semantic_generation_epochs_stale")
         position_observation_id = hashlib.sha256(
             json.dumps(coordinates, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
@@ -9188,22 +9165,16 @@ class Serial206OemInitializationProvider:
                         required_facts=semantic.get("required_facts", ()),
                         consumed_state_digest=semantic.get("consumed_state_digest"))
         final_stamps = self.deck_owner_authority_stamps()
-        final_refs = self.reference_store.snapshot(("x", "y", "z", "g"))
         final_semantic = (self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed, allow_recovery=_allow_recovery)
                           if scope == "offset.v1" else self._canonical_deck_semantic_state(allow_recovery=_allow_recovery, no_tip_park=scope == "park.full"))
         if (
             (shared is not None and any(snapshot[key] != shared[key] for key in (
                 "ownership_generation", "provider_owner_id", "board_epoch_4", "board_epoch_5",
-                "reference_versions", "safety_epochs", "machine_state_revision", "semantic_state_provenance_digest"))) or
+                "safety_epochs", "machine_state_revision", "semantic_state_provenance_digest"))) or
             final_semantic.get("collection_tip_state") != semantic.get("collection_tip_state") or
             final_semantic.get("consumed_state_digest") != semantic.get("consumed_state_digest") or
             cache_epoch is not self._deck_authority_cache_epoch
             or any(final_stamps[key] != snapshot[key] for key in final_stamps)
-            or any(
-                (final_refs.get("rows", {}).get(axis) or {}).get("state") != "referenced"
-                or (final_refs.get("rows", {}).get(axis) or {}).get("state_version") != version
-                for axis, version in reference_versions.items()
-            )
             or final_semantic["semantic_state_revision"] != semantic["semantic_state_revision"]
             or final_semantic["transition_provenance_digest"] != semantic["transition_provenance_digest"]
         ):
@@ -11414,20 +11385,15 @@ class Serial206OemInitializationProvider:
         }
 
     def assert_deck_observation_current(self, authority: Mapping[str, Any]) -> None:
-        """Recheck independent owner/reference and semantic CAS at source seams.
+        """Recheck command ownership and consumed source state at source seams.
 
-        Positions are not compared after a successful motion; reference versions
-        and consumed host-state ownership must not silently change underneath it.
+        Reference records are diagnostic and may change independently of motion.
+        The durable command lane separately retains Stop/Abort and receipt identity.
         """
         stamps = self.deck_owner_authority_stamps()
         if any(stamps[key] != authority.get(key) for key in stamps):
             raise RuntimeError("deck_execution_owner_authority_changed")
         if authority.get("dependency_scope") == "offset.v1":
-            refs = self.reference_store.snapshot(("x", "y", "z", "g"))
-            if any((refs.get("rows", {}).get(axis) or {}).get("state") != "referenced"
-                   or (refs.get("rows", {}).get(axis) or {}).get("state_version") != version
-                   for axis, version in authority["reference_versions"].items()):
-                raise RuntimeError("deck_execution_reference_authority_changed")
             current = self._offset_deck_semantic_state(gripper_confirmed=authority["gripper_confirmed"])
             if (current["semantic_state_revision"] != authority["machine_state_revision"]
                     or current["transition_provenance_digest"] != authority["semantic_state_provenance_digest"]

@@ -176,10 +176,12 @@ def qualify_test_references(references):
     assert result['ok'] is True
 
 
-def test_retained_invalid_references_still_block(retained_rig):
+def test_retained_invalid_references_remain_evidence_not_admission(retained_rig):
     provider, primitive, runtime, references, store, root = retained_rig
-    with pytest.raises(RuntimeError, match='deck_reference_not_authoritative'):
-        provider.deck_authority_snapshot(expected_generation=3, target='LOC_OC')
+    before = references.snapshot(('x', 'y', 'z', 'g'))
+    snapshot = provider.deck_authority_snapshot(expected_generation=3, target='LOC_OC')
+    assert DeckAuthoritySnapshot(**snapshot).reference_versions
+    assert references.snapshot(('x', 'y', 'z', 'g')) == before
     assert store.deck_semantic_state()['semantic_state_revision'] == 0
     assert not any(row[0] == 'move' for row in primitive.calls)
 
@@ -192,6 +194,7 @@ def test_retained_real_owner_first_move_force_commit_and_fresh_process(retained_
     from bioxp.oem_deck_movement import make_deck_command_executor
     provider, primitive, runtime, references, store, root = retained_rig
     qualify_test_references(references)
+    construction_id = provider._load_state()['machine_status'].get('construction_id')
     initial = provider.deck_authority_snapshot(expected_generation=3, target='LOC_OC')
     assert initial['machine_state_revision'] == 0 and initial['current_location_id'] is None
     assert initial['tip_loaded'] is False and initial['tip_dirty'] is None
@@ -229,6 +232,7 @@ def test_retained_real_owner_first_move_force_commit_and_fresh_process(retained_
             return result
         monkeypatch.setattr(primitive, 'oem_move_to', completed_then_invalidated)
         from bioxp.oem_deck_movement import DeckExecutionFailure
+    if invalidation in {'board_epoch', 'semantic'}:
         with pytest.raises(DeckExecutionFailure) as failure:
             execute(command_id=admitted['command_id'], target='LOC_OC', camera_offset=False,
                     expected_ownership_generation=3, expected_board_epoch_by_board=request['expected_board_epoch_by_board'])
@@ -249,7 +253,7 @@ def test_retained_real_owner_first_move_force_commit_and_fresh_process(retained_
     assert semantic['semantic_state_revision'] == 2 and semantic['tip_dirty'] is None
     assert semantic['tip_loaded'] is None  # runtime observation did not manufacture a canonical owner write
     assert semantic['transition_provenance']['current_tray_association'] == 'unavailable'
-    assert provider._load_state()['machine_status'].get('construction_id') is None
+    assert provider._load_state()['machine_status'].get('construction_id') == construction_id
     assert provider._load_state()['machine_status']['psudo_z_home_steps'] == 500
     after = provider.deck_authority_snapshot(expected_generation=3, target='LOC_OC')
     assert after['machine_state_revision'] == 2 and after['tip_loaded'] is False

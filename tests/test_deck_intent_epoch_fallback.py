@@ -4,9 +4,9 @@ The catalog's expected board epochs are read from the live initialization
 projection; during an authority-busy window or a mid-reset projection that
 envelope is unbound, which used to disable the deck lane with
 ``deck_board_epochs_not_authoritative`` and an empty epoch map even though the
-durable deck authority still knew both epochs. The contract now fills missing
-epochs from the cache-local last deck-authority snapshot; honestly
-unavailable authority (no live epochs and no cached snapshot) still disables.
+durable deck authority still knew both epochs. Missing presentation epochs now
+stay missing without disabling intent or filling them from a stale cache.
+New durable commands bind their current provider owner independently.
 """
 from pathlib import Path
 from types import SimpleNamespace
@@ -125,22 +125,23 @@ def live_envelope():
     }
 
 
-def test_busy_envelope_falls_back_to_cached_epochs(assessment_rig, request):
+def test_busy_envelope_does_not_relabel_cached_epochs_as_current(assessment_rig, request):
     provider, app = assessment_rig({"board_epoch_4": 1059, "board_epoch_5": 44}, request)
     assessment = app.state.oem_deck_command_assessment(machine_state(busy_envelope()))
     assert assessment["enabled"] is True, assessment
     assert assessment["disabled_reason"] is None
-    assert assessment["expected_board_epoch_by_board"] == {"4": 1059, "5": 44}
-    assert provider.cached_calls == [(7, "LOC_MS")]
+    assert assessment["expected_board_epoch_by_board"] == {}
+    assert provider.cached_calls == []
     assert assessment["destination_options"], "destination options must stay selectable"
 
 
-def test_missing_cache_still_disables_with_named_reason(assessment_rig, request):
+def test_missing_cache_no_longer_disables_intent(assessment_rig, request):
     _, app = assessment_rig(RuntimeError("deck_authority_cache_unavailable"), request)
     assessment = app.state.oem_deck_command_assessment(machine_state(busy_envelope()))
-    assert assessment["enabled"] is False
-    assert assessment["disabled_reason"] == "deck_board_epochs_not_authoritative"
-    assert not [row for row in assessment["destination_options"] if row.get("enabled")]
+    assert assessment["enabled"] is True
+    assert assessment["disabled_reason"] is None
+    assert assessment["expected_board_epoch_by_board"] == {}
+    assert all(row["enabled"] for row in assessment["destination_options"])
 
 
 def test_complete_live_envelope_skips_the_fallback(assessment_rig, request):

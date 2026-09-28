@@ -658,7 +658,7 @@ def _active_board_epochs(state: Mapping[str, Any], action_id: str) -> dict[str, 
     if axis == "x" and isinstance(provider, Mapping):
         authority = provider.get("x_authority")
         if isinstance(authority, Mapping):
-            value = authority.get("active_board_epoch", authority.get("board_lifecycle_generation"))
+            value = authority.get("current_board_lifecycle_generation", authority.get("active_board_epoch", authority.get("board_lifecycle_generation")))
             if type(value) is int and value >= 0:
                 return {"5": value}
     candidates: list[Any] = []
@@ -1163,6 +1163,21 @@ class OperatorCommandStore:
                 for worker, command_id in self._worker_commands.items()
                 if worker.is_alive()
             }
+
+    def _current_deck_board_epochs(self, state: Mapping[str, Any], action_id: str) -> dict[str, int]:
+        """Read owner bindings, not caller/presentation epoch expectations.
+
+        Call under the provider-before-writer scope. Missing epochs stay absent;
+        downstream immutable ledger constraints are not weakened or fabricated.
+        """
+        reader = self._deck_owner_authority_reader
+        if not callable(reader):
+            return _active_board_epochs(state, action_id)
+        stamps = reader()
+        return {
+            board: stamps[key] for board, key in (("4", "board_epoch_4"), ("5", "board_epoch_5"))
+            if type(stamps.get(key)) is int and stamps[key] >= 0
+        }
 
     def _validate_deck_owner_authority(
         self, *, ownership_generation: int, board_epoch_4: int, board_epoch_5: int
@@ -5630,12 +5645,14 @@ class OperatorCommandStore:
             if schema_version != ACTION_REQUEST_SCHEMA:
                 raise HTTPException(status_code=422, detail={"error": "deck_action_requires_v2"})
             raw_board_epochs = request.get("expected_board_epoch_by_board")
-            if (not isinstance(raw_board_epochs, Mapping) or set(raw_board_epochs) != {"4", "5"}
-                    or any(type(value) is not int or value < 0 for value in raw_board_epochs.values())):
-                raise HTTPException(status_code=409, detail={"error": "board_epoch_mismatch"})
+            if (raw_board_epochs is not None and (not isinstance(raw_board_epochs, Mapping)
+                    or not set(raw_board_epochs) <= {"4", "5"}
+                    or any(type(value) is not int or value < 0 for value in raw_board_epochs.values()))):
+                raise HTTPException(status_code=422, detail={"error": "invalid_board_epoch_observation"})
             expected_board_epochs = dict(requested_board_epochs)
-            # A valid original admission observed exactly the requested epochs.
-            # Reconstruct that immutable binding, not today's owner, for replay.
+            # Retain the historical request fingerprint shape for replay. These
+            # values describe the caller's request, not current board observations;
+            # the actual new-command binding is read separately below.
             observed_board_epochs = dict(requested_board_epochs)
         canonical_request = {
             "schema_version": schema_version,
@@ -5656,7 +5673,11 @@ class OperatorCommandStore:
             replay_response = current or saved
             replay_response["idempotent_replay"] = True
             return replay_response
-        with self._transaction() as conn:
+        # Provider -> runtime writer is the established lock order. Resolving
+        # live bindings under a writer alone deadlocks passive provider readers.
+        owner_scope = (self._deck_owner_authority_scope()
+                       if action_id.startswith("oem.deck.") else nullcontext())
+        with owner_scope, self._transaction() as conn:
             replay = self._saved_idempotency(conn, "command", key, fingerprint)
             if replay is not None:
                 current_row = conn.execute(
@@ -5670,9 +5691,11 @@ class OperatorCommandStore:
                 actual_generation = int(state.get("ownership_generation") or -1)
                 if expected_generation != actual_generation:
                     raise HTTPException(status_code=409, detail={"error": "ownership_generation_mismatch", "actual": actual_generation})
-                observed_board_epochs = _active_board_epochs(state, action_id)
-                if set(requested_board_epochs) != {"4", "5"} or requested_board_epochs != observed_board_epochs:
-                    raise HTTPException(status_code=409, detail={"error": "board_epoch_mismatch", "requested": requested_board_epochs, "observed": observed_board_epochs})
+                # Bind this new command to the actual owner, never the caller's
+                # cached catalog. Keep the original requested map in the request
+                # fingerprint so replay cannot change its immutable identity.
+                observed_board_epochs = self._current_deck_board_epochs(state, action_id)
+                expected_board_epochs = dict(observed_board_epochs)
             count, bytes_used = self._capacity(conn)
             proposed_bytes = len(_canonical(inputs).encode("utf-8")) + len(_canonical(canonical_request).encode("utf-8"))
             if count >= COMMAND_CAPACITY or bytes_used + proposed_bytes > COMMAND_BYTES_CAPACITY:
@@ -5738,8 +5761,6 @@ class OperatorCommandStore:
             "continuation": intent.continuation,
         }
         epochs = _active_board_epochs(state, "oem.deck._mov_execution")
-        if set(epochs) != {"4", "5"}:
-            raise RuntimeError("mov_execution_board_authority_unavailable")
         request = {
             "schema_version": ACTION_REQUEST_SCHEMA,
             "action_id": "oem.deck._mov_execution",
@@ -5792,8 +5813,6 @@ class OperatorCommandStore:
             else {**dict(state), "serial206_initialization_provider": dict(state)}
         )
         epochs = _active_board_epochs(epoch_state, "oem.deck._finite_operation")
-        if set(epochs) != {"4", "5"}:
-            raise RuntimeError("finite_deck_operation_board_authority_unavailable")
         request = {
             "schema_version": ACTION_REQUEST_SCHEMA,
             "action_id": "oem.deck._finite_operation",
@@ -5860,16 +5879,6 @@ class OperatorCommandStore:
                     status_code=409,
                     detail={"error": "ownership_generation_mismatch", "actual": actual_generation},
                 )
-            observed_board_epochs = _active_board_epochs(state, method_action_id)
-            if set(requested_board_epochs) != {"4", "5"} or requested_board_epochs != observed_board_epochs:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "error": "board_epoch_mismatch",
-                        "requested": requested_board_epochs,
-                        "observed": observed_board_epochs,
-                    },
-                )
             expected_board_epochs = dict(requested_board_epochs)
         source = {
             "schema_version": METHOD_SCHEMA,
@@ -5893,7 +5902,9 @@ class OperatorCommandStore:
             replay_response = current or saved
             replay_response["idempotent_replay"] = True
             return replay_response
-        with self._transaction() as conn:
+        owner_scope = (self._deck_owner_authority_scope()
+                       if method_action_id in STRICT_METHOD_ACTIONS else nullcontext())
+        with owner_scope, self._transaction() as conn:
             replay = self._saved_idempotency(conn, "method", key, fingerprint)
             if replay is not None:
                 current_row = conn.execute(
@@ -5903,6 +5914,10 @@ class OperatorCommandStore:
                 replay_response = self._method_response(current_row) if current_row is not None else replay
                 replay_response["idempotent_replay"] = True
                 return replay_response
+            if method_action_id in STRICT_METHOD_ACTIONS:
+                expected_board_epochs = self._current_deck_board_epochs(state, method_action_id)
+                source["expected_board_epoch_by_board"] = expected_board_epochs
+                digest = _digest(source)
             count, bytes_used = self._capacity(conn)
             proposed_bytes = len(_canonical(source).encode("utf-8")) + sum(len(_canonical(i).encode("utf-8")) for _, i in expanded)
             if count + len(expanded) > COMMAND_CAPACITY or bytes_used + proposed_bytes > COMMAND_BYTES_CAPACITY:

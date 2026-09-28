@@ -152,8 +152,13 @@ def test_execution_rechecks_actual_authority(installed_retained, retained_rig, m
         references.mark_desynced(MarkAxisDesyncedCommand('x', reason='offline drift'))
     app.state.operator_command_plane.start()
     row = finish(client, cid)
-    assert row['status'] == 'failed', row
-    assert not leaf.moves and not raw
+    if drift == 'reference':
+        assert row['status'] == 'completed', row
+        assert leaf.moves and raw
+        assert references.snapshot(('x',))['rows']['x']['state'] == 'desynced'
+    else:
+        assert row['status'] == 'failed', row
+        assert not leaf.moves and not raw
     # Even after owner/readiness changes the original key resolves without sampling.
     monkeypatch.setattr(app.state.operator_admission_state_reader, '_collect', lambda: pytest.fail('replay sampled state'))
     replay = client.post(URL, json=body)
