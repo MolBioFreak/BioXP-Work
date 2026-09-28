@@ -228,9 +228,15 @@ class PipetteReceiptStore:
             channels = snapshot.get("channels", [])
             if len(channels) != 4:
                 raise PipetteReceiptError("pipette_collection_channels_unavailable")
-            positive = any(c.get("tip_loaded") is True and c.get("verified") is True for c in channels)
-            absent = all(c.get("tip_loaded") is False and c.get("verified") is True for c in channels)
+            # ClassPipetteCollection.TipExist ORs ClassPipette's logical
+            # booleans, including constructor false. Physical query proof is
+            # separate evidence, not an additional OEM branch prerequisite.
+            positive = any(c.get("tip_loaded") is True for c in channels)
+            absent = all(c.get("tip_loaded") is False for c in channels)
+            hardware_positive = any(c.get("tip_loaded") is True and c.get("verified") is True for c in channels)
+            hardware_absent = all(c.get("tip_loaded") is False and c.get("verified") is True for c in channels)
             return {"tip_exists": True if positive else False if absent else None,
+                "hardware_tip_exists": True if hardware_positive else False if hardware_absent else None,
                 "identity": dict(identity), "command_id": claim["command_id"],
                 "receipt_id": receipt.get("receipt_id"), "event_id": event_id}
 

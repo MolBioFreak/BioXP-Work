@@ -45,7 +45,7 @@ def native_leaves(rig, monkeypatch):
         Serial206ProductionPrimitiveAdapter.oem_initialize_motion_scriptmove_to_waste.__get__(rig[2]))
 
 
-@pytest.mark.parametrize('byte,expected', [(49,True),(48,False),(50,None)])
+@pytest.mark.parametrize('byte,expected', [(49,True),(48,False),(50,False)])
 def test_async_active_collection_and_passive_sql_owner(query_rig, byte, expected):
     rig = query_rig
     before = warm_no_tip(rig)
@@ -59,6 +59,7 @@ def test_async_active_collection_and_passive_sql_owner(query_rig, byte, expected
     assert result['pipette_collection']['tip_exists'] is expected, result
     current = state(rig)
     assert current['tip_exists'] is expected
+    assert current['hardware_tip_exists'] is (None if byte == 50 else expected)
     assert current['identity'] != old['identity'] and current['event_id']
     assert rig[6] == calls  # ordinary collection does not query pipettes
     assert rig[0].state.operator_command_plane.store.deck_semantic_state() == before

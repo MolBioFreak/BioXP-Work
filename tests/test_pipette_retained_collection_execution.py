@@ -118,7 +118,7 @@ def test_new_runtime_native_cover_document_keeps_retained_collection(integrated_
 
 @pytest.mark.parametrize('wire,expected', [
     ([[32, 96, 49], [32, 96, 50], [32, 96, 48], [32, 96, 48]], True),
-    ([[32, 96, 48], [32, 96, 50], [32, 96, 48], [32, 96, 48]], None),
+    ([[32, 96, 48], [32, 96, 50], [32, 96, 48], [32, 96, 48]], False),
 ])
 def test_retained_partial_channels_are_not_replaced_by_machine_tiploaded(query_rig, monkeypatch, wire, expected):
     from tests.test_deck_tip_query_publication_contradiction import invoke
@@ -131,6 +131,7 @@ def test_retained_partial_channels_are_not_replaced_by_machine_tiploaded(query_r
         AssertionError('historical reads must not resolve release authority')))
     current = api._pipette_collection_state()
     assert current['tip_exists'] is expected
+    assert current['hardware_tip_exists'] is (True if expected else None)
     assert history(rig) == before
 
 

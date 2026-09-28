@@ -275,12 +275,16 @@ def test_warm_invalid_prefix_never_overwrites_current_owner(query_rig, monkeypat
         assert after['transition_provenance']['upstream_source_command_id'] == 'later-owned-mutation'
     else:
         assert after == before
-    if fault in ('false_prefix', 'missing_first', 'malformed_first', 'uncorrelated', 'stale', 'reader', 'reader_replaced', 'interrupt'):
-        # MachineStatus stays unchanged; distinct collection source cannot
-        # manufacture verified absence from malformed/default channel returns.
-        assert_park_unready(rig, 'pipette_collection_reader_or_stop_changed'
-                            if fault in ('reader', 'reader_replaced', 'interrupt')
-                            else 'pipette_collection_state_not_authoritative')
+    if fault in ('reader', 'reader_replaced', 'interrupt'):
+        assert_park_unready(rig, 'pipette_collection_reader_or_stop_changed')
+    elif fault in ('false_prefix', 'missing_first', 'malformed_first', 'uncorrelated', 'stale'):
+        # Literal QueryTipStatus/processMessage setters still update the OEM
+        # Boolean. Missing physical proof is evidence, not a new Park gate.
+        from bioxp import api
+        collection = api._pipette_collection_state()
+        assert collection['tip_exists'] is (fault in ('uncorrelated', 'stale'))
+        assert collection['hardware_tip_exists'] is None
+        assert park_authority(rig)['collection_tip_state'] == collection
 
 
 @pytest.mark.parametrize('failure', ['publisher', 'receipt'])

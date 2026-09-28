@@ -388,12 +388,17 @@ def integrated_rig(query_rig, retained_rig, monkeypatch, tmp_path, request):
     monkeypatch.setattr(api, '_get_tester', lambda: native.tester)
     # The full predecessor is already bootstrapped by ready(); its query now
     # publishes a fresh real collection claim without changing clean_path.
-    if not partial:
-        tip_query = query(query_rig, key='integrated-predecessor-tip-status')
-    assert tip_query is not None
-    assert tip_query['hardware_query_verified'] is True, tip_query
-    assert tip_query['semantic_query_response_verified'] is True, tip_query
-    assert tip_query['deck_state_publication']['status'] == 'published', tip_query
+    if getattr(request, 'param', None) == 'constructor-no-tip-query':
+        from tests.test_pipette_constructor_collection import constructor
+        constructor(query_rig, monkeypatch)
+        assert api._pipette_collection_state()['hardware_tip_exists'] is None
+    else:
+        if not partial:
+            tip_query = query(query_rig, key='integrated-predecessor-tip-status')
+        assert tip_query is not None
+        assert tip_query['hardware_query_verified'] is True, tip_query
+        assert tip_query['semantic_query_response_verified'] is True, tip_query
+        assert tip_query['deck_state_publication']['status'] == 'published', tip_query
     assert api._pipette_collection_state()['tip_exists'] is False
     primitive.calls.clear()
     machine = provider._load_state()
