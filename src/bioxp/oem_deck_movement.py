@@ -447,47 +447,6 @@ class DeckExecutionFailure(RuntimeError):
         self.provider_results = [dict(row) for row in (provider_results or [])]
 
 
-class DeckMovementExecutor:
-    """Lease-bound execution seam; provider writes are reachable only here."""
-
-    def __init__(self, provider: Any, snapshot_reader: Callable[[], DeckAuthoritySnapshot]) -> None:
-        self.provider = provider
-        self.snapshot_reader = snapshot_reader
-        self._lease = threading.Lock()
-
-    @contextmanager
-    def movement_lease(self) -> Iterator[None]:
-        with self._lease:
-            yield
-
-    def execute(
-        self,
-        plan: DeckMovementPlan,
-        *,
-        before_first_write: Callable[[DeckMovementPlan], None] | None = None,
-        after_each_child: Callable[[DeckPlanStep], None] | None = None,
-    ) -> list[Any]:
-        if plan.blocked_reason:
-            raise MovementAuthorityChanged(plan.blocked_reason)
-        with self.movement_lease():
-            if before_first_write is not None:
-                before_first_write(plan)
-            if self.snapshot_reader().digest != plan.authority_digest:
-                raise MovementAuthorityChanged("deck_authority_changed_before_first_tx")
-            results = []
-            for step in plan.steps:
-                if step.operation in {"ForceToHighHome", "check_latch_status", "check_machine_latch_closed"}:
-                    continue
-                method = getattr(self.provider, step.operation, None)
-                if not callable(method):
-                    raise RuntimeError(f"source_authority_missing:{step.operation}")
-                result = method(**dict(step.arguments or {}))
-                if isinstance(result, Mapping) and result.get("ok") is not True:
-                    raise RuntimeError(f"provider_stage_failed:{step.operation}")
-                results.append(result)
-                if after_each_child is not None:
-                    after_each_child(step)
-            return results
 
 
 @dataclass(frozen=True)
