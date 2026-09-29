@@ -620,36 +620,6 @@ class OperatorReceiptStore:
             "actor": actor,
         }
 
-    def assess_evidence_legal_hold(
-        self,
-        command_id: str,
-        *,
-        legal_hold: bool,
-        actor: str,
-        assessment: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Append a governed legal-hold assessment and update its projection."""
-        if type(legal_hold) is not bool:
-            raise TypeError("legal_hold must be an exact boolean")
-        named_actor = str(actor).strip()
-        if not named_actor:
-            raise ValueError("legal-hold assessment requires a named actor")
-        with self.lock:
-            self.connection.execute("BEGIN IMMEDIATE")
-            try:
-                result = self._apply_legal_hold_assessment_locked(
-                    str(command_id),
-                    legal_hold=legal_hold,
-                    actor=named_actor,
-                    assessment=assessment,
-                    observed_at=time.time(),
-                )
-                self.connection.execute("COMMIT")
-                return result
-            except Exception:
-                if self.connection.in_transaction:
-                    self.connection.execute("ROLLBACK")
-                raise
 
     def expire_evidence(
         self,
@@ -819,29 +789,6 @@ class OperatorReceiptStore:
             "expiry_receipt_id": expiry_receipt_id,
         }
 
-    def sweep_expired_evidence(self, *, limit: int = 1000) -> dict[str, Any]:
-        selected_limit = int(limit)
-        if selected_limit < 1 or selected_limit > 1000:
-            raise ValueError("retention sweep limit must be between 1 and 1000")
-        with self.lock:
-            rows = self.connection.execute(
-                "SELECT evidence_artifact_id FROM runtime_evidence_objects "
-                "WHERE expiry_state='expiry_pending' OR "
-                "(expiry_state IN ('active','retained') AND legal_hold=0 "
-                "AND retention_deadline IS NOT NULL AND retention_deadline<=?) "
-                "ORDER BY COALESCE(retention_deadline,0),evidence_artifact_id LIMIT ?",
-                (time.time(), selected_limit),
-            ).fetchall()
-        outcomes = [
-            self.expire_evidence(evidence_artifact_id=str(row["evidence_artifact_id"]))
-            for row in rows
-        ]
-        return {
-            "selected": len(rows),
-            "expired": sum(item.get("state") == "expired" for item in outcomes),
-            "retained": sum(item.get("state") == "retained" for item in outcomes),
-            "legal_hold": sum(item.get("state") == "legal_hold" for item in outcomes),
-        }
 
     @staticmethod
     def _compact_receipt(receipt: Mapping[str, Any]) -> tuple[dict[str, Any], Any]:

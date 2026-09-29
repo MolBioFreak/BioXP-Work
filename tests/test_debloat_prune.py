@@ -67,3 +67,48 @@ def test_live_registry_identity_remains_byte_derived():
 
     path = Path(__file__).resolve().parents[1] / "docs/specs/2026-07-23-oem-movement-method-source-binary-registry.json"
     assert current_registry_sha256() == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_both_source_thermal_door_profiles_remain():
+    from bioxp.oem_config import OEM_THERMAL_DOOR_DEFAULTS_BY_SERIAL_CLASS
+
+    assert OEM_THERMAL_DOOR_DEFAULTS_BY_SERIAL_CLASS["serial_lt_10"]["TCDoorOpen"] == 93000
+    assert OEM_THERMAL_DOOR_DEFAULTS_BY_SERIAL_CLASS["serial_ge_10"]["TCDoorOpen"] == 16000
+
+
+def test_homing_program_modes_survive_historical_model_retirement():
+    from bioxp.oem_homing_spec import program_names
+
+    assert {
+        "initialize_motors_without_motion", "initialize_motors", "home_axis",
+        "home_xy", "rehome", "initialize_motion", "manual_home_x",
+        "manual_home_y", "manual_home_z", "manual_home_g", "manual_home_door",
+    } <= set(program_names())
+
+
+def test_standalone_source_api_retains_no_live_import_isolation():
+    import os
+    import subprocess
+    import sys
+
+    # A fresh interpreter is essential: the parent imports the real primary app.
+    code = """
+import asyncio
+import sys
+
+def offline(event, args):
+    if event in ('socket.connect', 'socket.getaddrinfo'):
+        raise AssertionError('unexpected network')
+    if event == 'open' and args and isinstance(args[0], str) and args[0].startswith(('/dev/bus/usb/', '/dev/video', '/var/lib/bioxp-oem-runtime/')):
+        raise AssertionError('unexpected hardware/live state')
+sys.addaudithook(offline)
+from bioxp.oem_source_only_api import list_programs, dry_run_program
+programs = asyncio.run(list_programs())
+assert programs['opened_usb'] is False
+assert programs['programs']
+result = asyncio.run(dry_run_program('initialize_motors_without_motion'))
+assert result['opened_usb'] is False
+assert result['physical_motion'] is False
+assert not any(name in sys.modules for name in ('bioxp.api', 'bioxp.usb_driver', 'bioxp.camera_provider', 'src.bioxp.usb_driver'))
+"""
+    subprocess.run([sys.executable, "-c", code], check=True, env=os.environ.copy(), capture_output=True, text=True)

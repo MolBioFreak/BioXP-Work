@@ -61,19 +61,6 @@ OEM_THERMAL_DOOR_DEFAULTS_BY_SERIAL_CLASS = {
 }
 
 
-def oem_thermal_door_defaults(serial_number: int | str | None) -> dict[str, int]:
-    """Return OEM thermal-door settings from ClassBioXPSettings serial branch.
-
-    OEM source: serial <10 uses the legacy long-travel door profile; serial >=10
-    uses the BioXP3200-era profile (TCDoorOpen=16000, velocity=50). Unknown
-    serials fail closed to the >=10 profile used by this instrument class.
-    """
-    try:
-        serial = int(serial_number) if serial_number is not None else 10
-    except (TypeError, ValueError):
-        serial = 10
-    key = "serial_lt_10" if serial < 10 else "serial_ge_10"
-    return dict(OEM_THERMAL_DOOR_DEFAULTS_BY_SERIAL_CLASS[key])
 
 
 OEM_CRITICAL_SOURCE_DEFAULTS = {
