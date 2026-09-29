@@ -420,9 +420,6 @@ class BioXpTester:
         # false at source unlock/caught-plate solenoid-write boundaries.
         self._oem_latch_status = True
         self._oem_latch_status_generation = 0
-        self._usb_sniff_ledger_path = None
-        self._usb_sniff_ledger_run_id = None
-        self._usb_sniff_ledger_seq = 0
         self._libc = ctypes.CDLL(None, use_errno=True)
         self.UVCIOC_CTRL_QUERY = self._build_uvc_ioctl_query()
         self._motion_arm = {
@@ -824,48 +821,8 @@ class BioXpTester:
         }
 
 
-    def set_usb_sniff_ledger_path(self, path=None, run_id=None):
-        """Enable/disable JSONL TX/RX ledger recording for external USB capture runs.
-
-        This is observability-only and never commands hardware by itself.
-        """
-        if path:
-            path = os.path.abspath(str(path))
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            self._usb_sniff_ledger_path = path
-            self._usb_sniff_ledger_run_id = str(run_id or "")
-            self._usb_sniff_ledger_seq = 0
-            self._record_usb_sniff_ledger("meta", event="ledger_enabled")
-            return {"ok": True, "enabled": True, "path": path, "run_id": self._usb_sniff_ledger_run_id}
-        old = self._usb_sniff_ledger_path
-        self._record_usb_sniff_ledger("meta", event="ledger_disabled")
-        self._usb_sniff_ledger_path = None
-        self._usb_sniff_ledger_run_id = None
-        return {"ok": True, "enabled": False, "previous_path": old, "run_id": str(run_id or "")}
 
 
-    def _record_usb_sniff_ledger(self, direction, frame=None, **extra):
-        path = getattr(self, "_usb_sniff_ledger_path", None)
-        if not path:
-            return None
-        try:
-            self._usb_sniff_ledger_seq = int(getattr(self, "_usb_sniff_ledger_seq", 0)) + 1
-            raw = list(frame) if frame is not None else None
-            row = {
-                "schema_version": "bioxp.usb_driver_ledger.v1",
-                "seq": self._usb_sniff_ledger_seq,
-                "run_id": getattr(self, "_usb_sniff_ledger_run_id", None),
-                "ts_ms": int(time.time() * 1000),
-                "direction": str(direction),
-                "frame_len": len(raw) if raw is not None else None,
-                "raw": raw,
-            }
-            row.update(extra)
-            with open(path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(row, sort_keys=True, default=str) + "\n")
-            return row
-        except Exception:
-            return None
 
     def clear_bus_event_buffer(self):
         current = list(getattr(self, "_bus_event_buffer", []))
@@ -968,7 +925,6 @@ class BioXpTester:
         ordinary_motor_retry=False,
     ):
         frame = self._build_frame(board_id, command, cmd_type, motor, value)
-        self._record_usb_sniff_ledger("OUT", frame, source="send_tmcl", board=int(board_id), command=int(command), cmd_type=int(cmd_type), motor=int(motor), value=int(value), wait_reply=bool(wait_reply), write_timeout_ms=int(write_timeout_ms))
         router = getattr(self, "novo_router", None)
         if router is None:
             return None
@@ -1006,15 +962,10 @@ class BioXpTester:
             if ordinary_motor_retry:
                 time.sleep(0.010)
         except usb.core.USBTimeoutError:
-            self._record_usb_sniff_ledger("error", None, source="send_tmcl", error="usb_write_timeout", board=int(board_id), command=int(command), write_timeout_ms=int(write_timeout_ms))
             return None
         except usb.core.USBError as exc:
             # USB disconnect / ENODEV / EPIPE — return None so
             # _motor_noresp_streak increments and reconnect() fires.
-            self._record_usb_sniff_ledger("error", None,
-                source="send_tmcl", error=f"usb_error_{exc.errno}",
-                errno=exc.errno, errmsg=str(exc), board=int(board_id),
-                command=int(command), write_timeout_ms=int(write_timeout_ms))
             return None
 
         if not wait_reply:

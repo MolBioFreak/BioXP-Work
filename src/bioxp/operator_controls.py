@@ -927,8 +927,6 @@ def _input_spec(name: str, schema: Mapping[str, Any], *, required: bool, locatio
 
 
 _IMPLICIT_OPERATOR_ACK_BY_PATH = {
-    "/diagnostics/usb-sniff/start": "USB_SNIFF",
-    "/diagnostics/usb-sniff/stop": "USB_SNIFF",
     "/maintenance/usb/recover_motion": "RECOVER",
     "/motion/oem/x/set_home": "SET_HOME_CURRENT_POSITION",
     "/motion/arm/strict_startup": "RECOVER_MOTION",
