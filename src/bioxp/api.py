@@ -1526,22 +1526,8 @@ def _execute_runtime_provider_z_intent(
     }
 
 
-def _runtime_z_abort_provider(command: Any) -> dict[str, Any]:
-    return _execute_runtime_provider_z_intent(
-        "abort",
-        command,
-        {"timeout_s": min(float(command.timeout_s), 3.0)},
-    )
 
 
-def _runtime_z_resume_provider(command: Any) -> dict[str, Any]:
-    return _execute_runtime_provider_z_intent(
-        "resume_after_abort",
-        command,
-        {
-            "wait_timeout_s": min(float(command.timeout_s), 60.0),
-        },
-    )
 
 
 def _get_tester() -> BioXpTester:
@@ -4048,114 +4034,6 @@ def _wait_for_motion_with_guardrails(
         time.sleep(max(0.02, float(poll_s)))
 
 
-def _guarded_home_search(
-    tester: BioXpTester,
-    preset: dict,
-    *,
-    speed: int,
-    timeout_s: float,
-) -> dict:
-    board = int(preset["board"])
-    motor = int(preset["motor"])
-    active_value = int(tester.MOTOR_SWITCH_ACTIVE_VALUE)
-    effective_speed = max(1, min(int(speed), _DEFAULT_MOTION_SPEED))
-    started = time.monotonic()
-    deadline = started + max(2.0, float(timeout_s))
-    position_before = tester.motor_get_position(board, motor=motor)
-    home_before = tester.motor_query_home_switch(board, motor=motor)
-    switch_before = tester.motor_get_switch_activity(board, motor=motor)
-
-    preclear = None
-    preclear_wait = None
-    home_cleared = None
-    if home_before.get("value") == active_value:
-        preclear = tester.motor_move_relative(board, _MOTION_HOME_PRECLEAR_STEPS, motor=motor)
-        if not preclear.get("ok"):
-            raise HTTPException(status_code=409, detail=f"Axis {preset['label']} home preclear command failed.")
-        preclear_wait = _wait_for_motion_with_guardrails(tester, board, motor, timeout_s=6.0)
-        if not preclear_wait.get("ok"):
-            raise HTTPException(status_code=409, detail=preclear_wait.get("error"))
-        home_cleared = tester.motor_query_home_switch(board, motor=motor)
-        if home_cleared.get("value") == active_value:
-            raise HTTPException(status_code=409, detail=f"Axis {preset['label']} home switch stayed active after preclear; refusing to home.")
-
-    sethome_init = tester.motor_set_home(board, motor=motor)
-    move_left = tester.motor_move_left(board, speed=effective_speed, motor=motor)
-    if not move_left.get("ok"):
-        raise HTTPException(status_code=409, detail=f"Axis {preset['label']} homing command failed.")
-
-    last_position = _position_value(position_before)
-    last_progress_at = time.monotonic()
-    polls = []
-    home_hit = None
-    while time.monotonic() < deadline:
-        home_row = tester.motor_query_home_switch(board, motor=motor)
-        speed_row = tester.motor_get_speed(board, motor=motor)
-        position_row = tester.motor_get_position(board, motor=motor)
-        switch_row = tester.motor_get_switch_activity(board, motor=motor)
-        now = time.monotonic()
-        position = _position_value(position_row)
-        speed_now = _speed_value(speed_row)
-        if position is not None and last_position is None:
-            last_position = position
-            last_progress_at = now
-        elif position is not None and last_position is not None and position != last_position:
-            last_position = position
-            last_progress_at = now
-        polls.append(
-            {
-                "elapsed_ms": int((now - started) * 1000),
-                "home": home_row.get("value"),
-                "speed": speed_now,
-                "position": position,
-                "left_active": switch_row.get("left_active"),
-                "right_active": switch_row.get("right_active"),
-            }
-        )
-        if len(polls) > 20:
-            polls = polls[-20:]
-        if home_row.get("value") == active_value:
-            home_hit = home_row
-            break
-        if now - last_progress_at >= _MOTION_NO_DELTA_TIMEOUT_S:
-            tester.motor_stop(board, motor=motor)
-            tester.motor_wait_stopped(board, motor=motor, timeout_s=2.0, poll_s=0.06)
-            raise HTTPException(status_code=409, detail=f"Axis {preset['label']} homing aborted after 2.0s with no position change.")
-        time.sleep(0.08)
-
-    stop = tester.motor_stop(board, motor=motor)
-    wait = tester.motor_wait_stopped(board, motor=motor, timeout_s=2.0, poll_s=0.06)
-    if home_hit is None:
-        raise HTTPException(status_code=409, detail=f"Axis {preset['label']} homing timed out before the home switch triggered.")
-
-    sethome_final = tester.motor_set_home(board, motor=motor)
-    home_after = tester.motor_query_home_switch(board, motor=motor)
-    position_after = tester.motor_get_position(board, motor=motor)
-    return {
-        "board": board,
-        "motor": motor,
-        "speed": effective_speed,
-        "acc": int(preset["acc"]),
-        "no_delta_timeout_s": _MOTION_NO_DELTA_TIMEOUT_S,
-        "position_before": position_before,
-        "position_after": position_after,
-        "position_delta": _position_delta(position_before, position_after),
-        "switch_activity_before": switch_before,
-        "switch_activity_after": tester.motor_get_switch_activity(board, motor=motor),
-        "home_before": home_before,
-        "home_after": home_after,
-        "preclear": preclear,
-        "preclear_wait": preclear_wait,
-        "home_cleared": home_cleared,
-        "sethome_init": sethome_init,
-        "move_left": move_left,
-        "home_hit": home_hit,
-        "stop": stop,
-        "wait": wait,
-        "sethome_final": sethome_final,
-        "elapsed_ms": int((time.monotonic() - started) * 1000),
-        "log_tail": polls,
-    }
 
 
 def _execute_relative_move(
@@ -7389,32 +7267,6 @@ async def led_rgb(req: LedRgbRequest):
     )
 
 
-def _execute_oem_home_xy(tester: BioXpTester, *, timeout_s: float, allow_implementation_mapped_predicate: bool = False) -> dict:
-    _require_motion_not_blocked_by_maintenance()
-    predicate_snapshots = {}
-    for axis in (AxisName.X, AxisName.Y):
-        snapshot = _home_predicate_snapshot(tester, axis)
-        predicate_snapshots[axis.value] = snapshot
-        _require_home_predicate_guard(
-            axis,
-            snapshot,
-            allow_implementation_mapped_predicate=bool(allow_implementation_mapped_predicate),
-        )
-    result = tester.motor_oem_home_xy(timeout_s=timeout_s)
-    ok = bool(isinstance(result, dict) and result.get("ok") is True)
-    return {
-        "ok": ok,
-        "source_mode": "HomeXY",
-        "route_semantics": {
-            "source_command": "HomeXY",
-            "home_semantics": "direct_oem_homexy_mode_guarded_switch_search",
-            "not_equivalent_to": ["/motion/axis/zero", "/motion/axis/home single-axis manual route"],
-            "raw_fastapi_route": "/motion/oem/home_xy",
-        },
-        "predicate_snapshots_before": predicate_snapshots,
-        "allow_implementation_mapped_predicate": bool(allow_implementation_mapped_predicate),
-        "result": result,
-    }
 
 
 def _collect_axis_diagnostic_status(

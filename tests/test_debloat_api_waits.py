@@ -40,4 +40,3 @@ def test_mov_owner_loss_does_not_read_receipt(monkeypatch):
     with pytest.raises(RuntimeError, match='workflow_child_owner_lost'):
         api._protocol_source_mov(object(), SimpleNamespace(source_occurrence_id='step'),
                                  SimpleNamespace(job_id='parent', workflow=None))
-
