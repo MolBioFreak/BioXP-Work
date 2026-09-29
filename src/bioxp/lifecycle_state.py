@@ -609,8 +609,20 @@ class CanonicalLifecycleOwner:
             provenance={"raw": copy.deepcopy(result)},
         )
 
-    def projection(self) -> dict[str, Any]:
+    def projection(self, *, compact_startup: bool = False) -> dict[str, Any]:
         with self._lock:
+            # Constructor transport detail is already in the canonical pipette
+            # receipt, bound by lifecycle_attempt_id. Do not copy that dump for
+            # polling. Other stages retain their sole evidence here.
+            stages = {
+                name: {
+                    key: copy.deepcopy(value)
+                    for key, value in row.items()
+                    if not (compact_startup and name == "constructor_pipette_stage"
+                            and key in {"evidence", "history"})
+                }
+                for name, row in self._stages.items()
+            }
             return {
                 "schema_version": "bioxp.canonical_lifecycle.v1",
                 "revision": self._revision,
@@ -625,7 +637,7 @@ class CanonicalLifecycleOwner:
                 "startup": {
                     "state": _aggregate_startup_state(self._stages),
                     "active_stage": next((name for name in STARTUP_STAGES if self._stages[name]["state"] == "running"), None),
-                    "stages": copy.deepcopy(self._stages),
+                    "stages": stages,
                 },
             }
 

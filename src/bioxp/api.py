@@ -5059,7 +5059,7 @@ def _status_payload() -> dict:
         and ownership.get("usb") == "service"
         and ownership.get("router") == "running"
     )
-    lifecycle = lifecycle_state.projection()
+    lifecycle = lifecycle_state.projection(compact_startup=True)
     # Display-only provider read: never queue behind authority-bearing work.
     # /status is exactly what the operator Reconnect probe calls; a busy
     # provider yields the explicit busy projection instead of a stall
@@ -5106,7 +5106,7 @@ def _status_payload() -> dict:
         "maintenance_state": _maintenance_state_payload(),
         "operation_state": lifecycle["operation_state"],
         "startup": lifecycle["startup"],
-        "lifecycle": lifecycle,
+        "lifecycle": {key: value for key, value in lifecycle.items() if key != "startup"},
         "oem_initialize_motors": serial206_initialization.get("initialize_motors"),
         "oem_initialize_motion": serial206_initialization.get("initialize_motion_ledger"),
         "serial206_initialization": serial206_initialization,
@@ -5132,7 +5132,7 @@ def _motion_power_status_payload(tester: BioXpTester | None = None) -> dict:
     power = _domain_observation(projection, "power") or {}
     interlock = _domain_observation(projection, "interlock") or {}
     latch = _domain_observation(projection, "latch") or {}
-    lifecycle = lifecycle_state.projection()
+    lifecycle = lifecycle_state.projection(compact_startup=True)
     return {
         **projection,
         "hardware_connected": transport.get("CAN_READY", (projection.get("ownership") or {}).get("CAN_READY")),
