@@ -482,15 +482,6 @@ _pipette_application = PipetteApplicationPlanner(
 )
 
 
-def bind_serial206_oem_initialization_provider(
-    provider: Serial206OemInitializationProvider | None,
-) -> dict[str, Any]:
-    """Bind or explicitly clear the live serial-206 initialization provider."""
-    global _serial206_oem_initialization_provider, _serial206_y_provider, _serial206_oem_initialization_provider_binding_error
-    _serial206_oem_initialization_provider = provider
-    _serial206_y_provider = getattr(provider, "y_provider", None) if provider is not None else None
-    _serial206_oem_initialization_provider_binding_error = None
-    return serial206_oem_initialization_provider_status()
 
 
 def serial206_oem_initialization_provider_status() -> dict[str, Any]:
@@ -1596,15 +1587,8 @@ def _get_oem_startup_program(*, dry_safe: bool = False) -> OEMStartupProgram:
     return _oem_startup_program
 
 
-def _get_existing_oem_startup_program() -> OEMStartupProgram:
-    if _oem_startup_program is not None:
-        return _oem_startup_program
-    return _get_oem_startup_program(dry_safe=False)
 
 
-def _get_live_oem_startup_program() -> OEMStartupProgram:
-    """Return a live-only provider when an explicit runtime command needs it."""
-    return _get_oem_startup_program(dry_safe=False)
 
 
 class _BioXpSwitchAuditHardware:
@@ -2193,10 +2177,6 @@ class OemXMoveAbsoluteRequest(BaseModel):
     acceleration: StrictInt | None = Field(default=None, ge=-(2**31), le=2**31 - 1)
 
 
-class OemXReconcileRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    confirm: Literal["RECONCILE_X_SWITCH_MASKS"]
 
 
 class OemXSetHomeRequest(BaseModel):
@@ -2258,14 +2238,8 @@ class OemZObservationRequest(BaseModel):
         return selected
 
 
-class OemZReconcileRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    confirm: Literal["RECONCILE_Z_SWITCH_MASKS"]
 
 
-class OemZDiagnosticHomeRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
 
 class OemMoveZHomeRequest(BaseModel):
@@ -2346,8 +2320,6 @@ class OemZSelfTestRequest(BaseModel):
     wait_timeout_s: float = Field(default=30.0, ge=2.0, le=60.0)
 
 
-class OemZAbortRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 class OemZResumeRequest(BaseModel):
@@ -2718,24 +2690,6 @@ class OemSerial206InitializeMotionStepRequest(BaseModel):
     timeout_s: float = Field(180.0, gt=1.0, le=300.0)
 
 
-class OemSerial206ObservationRequest(BaseModel):
-    """Strict operator evidence transition; this contract performs no I/O."""
-
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    stage: StrictStr = Field(min_length=1, max_length=128)
-    command_id: StrictStr = Field(min_length=1, max_length=256)
-    expected_generation: StrictInt = Field(ge=0, le=2_147_483_647)
-    observed_pass: StrictBool
-    note: StrictStr = Field(min_length=1, max_length=2000)
-
-    @field_validator("stage", "command_id", "note")
-    @classmethod
-    def _non_blank(cls, value: str) -> str:
-        selected = value.strip()
-        if not selected:
-            raise ValueError("value must not be blank")
-        return selected
 
 
 OEM_IDLE_STANDBY_CURRENT = 10
@@ -2881,8 +2835,6 @@ class PipetteErrorLogRequest(BaseModel):
     raw_byte: int = Field(0, ge=0, le=255)
 
 
-class PipetteDataRequest(BaseModel):
-    query: str = Field(..., min_length=3, max_length=3, pattern=r"^\\?[0-9]{2}$")
 
 
 class PipetteFluidDetectionRequest(BaseModel):
@@ -3266,14 +3218,6 @@ def _parse_axes_csv(axes_csv: str) -> list[AxisName]:
     return parsed
 
 
-def _axis_status_batch_payload(tester: BioXpTester, axes: list[AxisName]) -> dict:
-    rows = {}
-    for axis in axes:
-        rows[axis.value] = _axis_status_payload(tester, axis, include_current=(axis == AxisName.GRIPPER))
-    return {
-        "axes": [axis.value for axis in axes],
-        "rows": rows,
-    }
 
 
 def _position_value(row: Optional[dict]) -> Optional[int]:
@@ -5017,8 +4961,6 @@ def _prepare_motion_axis(
 
 
 
-def _hardware_connected_from_board_status(board_status: Any) -> bool:
-    return bool(isinstance(board_status, dict) and any(reply is not None for reply in board_status.values()))
 
 
 
@@ -5430,20 +5372,6 @@ def _hardware_collectors(tester: BioXpTester, *, before_query=None) -> dict[str,
     }
 
 
-def _camera_snapshot_with_data(tester: BioXpTester, preferred: str) -> dict:
-    result = _camera_capture_snapshot_direct(tester, preferred)
-    image_b64 = None
-    image_error = None
-    path = result.get("path")
-    if result.get("ok") and path and os.path.exists(path):
-        try:
-            with open(path, "rb") as handle:
-                image_b64 = base64.b64encode(handle.read()).decode("ascii")
-        except Exception as exc:
-            image_error = str(exc)
-    result["image_b64"] = image_b64
-    result["image_error"] = image_error
-    return result
 
 
 
@@ -6686,184 +6614,6 @@ def _camera_devices_payload(tester: BioXpTester) -> dict:
     return {"ok": True, "rows": rows, "preferred_device": preferred}
 
 
-async def _camera_mjpeg_response(
-    tester: BioXpTester,
-    preferred: str,
-    fps: int,
-    quality: int,
-    width: int,
-    height: int,
-):
-    fps = max(1, min(int(fps), 30))
-    quality = max(2, min(int(quality), 15))
-    width = max(160, min(int(width), 1920))
-    height = max(120, min(int(height), 1080))
-    if _camera_stream_lock.locked():
-        await run_in_threadpool(_camera_reset_local, preferred)
-        await asyncio.sleep(0.15)
-    await _camera_stream_lock.acquire()
-    proc = None
-    try:
-        pick = _pick_stream_device(preferred)
-        if not pick.get("ok"):
-            raise HTTPException(status_code=503, detail=pick.get("error") or "No capture-capable camera device found")
-
-        device = pick["device"]
-        if shutil.which("ffmpeg") is None:
-            detail = _camera_missing_dependency_payload(
-                "ffmpeg",
-                device=device,
-                fps=fps,
-                quality=quality,
-                width=width,
-                height=height,
-            )
-            _camera_stream_state.update({"active": False, "device": device, "last_error": detail["error"]})
-            raise HTTPException(status_code=503, detail=detail)
-
-        _camera_stream_state.update(
-            {
-                "active": True,
-                "device": device,
-                "fps": fps,
-                "quality": quality,
-                "width": width,
-                "height": height,
-                "frames_emitted": 0,
-                "started_at": time.time(),
-                "last_frame_at": None,
-                "last_error": None,
-            }
-        )
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-fflags",
-            "nobuffer",
-            "-flags",
-            "low_delay",
-            "-avioflags",
-            "direct",
-            "-f",
-            "v4l2",
-            "-input_format",
-            "mjpeg",
-            "-framerate",
-            str(fps),
-            "-video_size",
-            f"{width}x{height}",
-            "-i",
-            device,
-            "-an",
-            "-vf",
-            f"fps={fps}",
-            "-q:v",
-            str(quality),
-            "-vcodec",
-            "mjpeg",
-            "-f",
-            "image2pipe",
-            "pipe:1",
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        if proc.stdout is None:
-            raise HTTPException(status_code=500, detail="ffmpeg stream stdout unavailable")
-        await asyncio.sleep(0.25)
-        if proc.returncode is not None:
-            stderr = b""
-            if proc.stderr is not None:
-                try:
-                    stderr = await asyncio.wait_for(proc.stderr.read(), timeout=0.5)
-                except asyncio.TimeoutError:
-                    stderr = b""
-            detail = stderr.decode("utf-8", errors="replace").strip() or "camera stream exited before producing frames"
-            raise HTTPException(status_code=503, detail=detail)
-    except Exception as exc:
-        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-        _camera_stream_state.update({"active": False, "last_error": detail})
-        if proc is not None and proc.returncode is None:
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=3.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-        if _camera_stream_lock.locked():
-            _camera_stream_lock.release()
-        raise
-
-    cleanup_started = False
-    cleanup_guard = asyncio.Lock()
-
-    async def cleanup():
-        nonlocal cleanup_started
-        async with cleanup_guard:
-            if cleanup_started:
-                return
-            cleanup_started = True
-            if proc is not None and proc.returncode is None:
-                proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=3.0)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
-            _camera_stream_state["active"] = False
-            if _camera_stream_lock.locked():
-                _camera_stream_lock.release()
-
-    async def iterator():
-        buffer = bytearray()
-        soi = b"\xff\xd8"
-        eoi = b"\xff\xd9"
-        try:
-            while True:
-                if proc.stdout is None:
-                    break
-                chunk = await proc.stdout.read(16384)
-                if not chunk:
-                    break
-                buffer.extend(chunk)
-                while True:
-                    start = buffer.find(soi)
-                    if start == -1:
-                        if len(buffer) > 65536:
-                            buffer.clear()
-                        break
-                    if start > 0:
-                        del buffer[:start]
-                    end = buffer.find(eoi, 2)
-                    if end == -1:
-                        break
-                    frame = bytes(buffer[: end + 2])
-                    del buffer[: end + 2]
-                    _camera_stream_state["frames_emitted"] = int(_camera_stream_state.get("frames_emitted") or 0) + 1
-                    _camera_stream_state["last_frame_at"] = time.time()
-                    header = (
-                        b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n"
-                        + f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii")
-                    )
-                    yield header + frame + b"\r\n"
-        finally:
-            await cleanup()
-
-    headers = {
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-        "Pragma": "no-cache",
-    }
-    return StreamingResponse(
-        iterator(),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-        headers=headers,
-        background=BackgroundTask(cleanup),
-    )
 
 
 def _camera_cache_envelope(cache: dict[str, Any] | None) -> dict[str, Any]:
@@ -9705,22 +9455,10 @@ async def motion_oem_move_to(req: OemMoveToRequest):
     }
 
 
-def _serial206_stage_approvals(
-    rows: Mapping[str, OemSerial206StageApprovalRequest],
-) -> dict[str, Serial206StageApproval]:
-    return {key: Serial206StageApproval(**value.model_dump()) for key, value in rows.items()}
 
 
-def _serial206_stage_approval(
-    row: OemSerial206StageApprovalRequest | None,
-) -> Serial206StageApproval | None:
-    return None if row is None else Serial206StageApproval(**row.model_dump())
 
 
-def _serial206_commissioning_evidence(
-    rows: Mapping[str, OemSerial206CommissioningEvidenceRequest],
-) -> dict[str, Serial206CommissioningEvidence]:
-    return {key: Serial206CommissioningEvidence(**value.model_dump()) for key, value in rows.items()}
 
 
 def _run_idempotent_serial206_initialization(
@@ -10284,34 +10022,8 @@ async def camera_devices():
     return {**envelope, "ok": envelope.get("available", False), "rows": probe.get("rows", []), "preferred_device": probe.get("preferred_device")}
 
 
-async def camera_controls(device: str = "/dev/video0"):
-    envelope = _camera_cache_envelope(_camera_probe_cache)
-    probe = envelope.get("probe") or {}
-    controls = (probe.get("controls") or {}).get(device)
-    return {**envelope, "ok": controls is not None, "device": device, "rows": [] if controls is None else controls.get("rows", []), "error": "camera controls not present in explicit probe cache" if controls is None else controls.get("error")}
 
 
-async def camera_probe(payload: dict[str, Any] | None = None):
-    global _camera_probe_cache
-    if _camera_process_active():
-        raise HTTPException(status_code=409, detail="stop the owned camera stream before probing capabilities")
-    tester = _get_tester()
-    requested = (payload or {}).get("devices")
-
-    def collect() -> dict[str, Any]:
-        devices = _camera_devices_payload(tester)
-        names = requested if isinstance(requested, list) else [row.get("device") for row in devices.get("rows", [])]
-        controls = {}
-        for name in names:
-            if isinstance(name, str):
-                controls[name] = tester.camera_enumerate_controls(device=name)
-        return {**devices, "controls": controls}
-
-    result = await _run_blocking("Explicit camera capability probe", collect, timeout_s=30.0)
-    with _camera_projection_lock:
-        _camera_probe_cache = {**result, "probe_id": uuid.uuid4().hex, "available": bool(result.get("ok", True)), "camera_ownership_epoch": _camera_projection_epoch, "observed_at": _now_utc(), "observed_unix": time.time(), "provenance": "POST /camera/probe"}
-        lifecycle_state.record_camera_evidence(_camera_probe_cache)
-        return {"ok": True, "published": True, "probe": dict(_camera_probe_cache)}
 
 
 @app.post("/camera/stream/start")
@@ -10327,23 +10039,6 @@ async def camera_stream_start(
     return result
 
 
-async def camera_control(req: CameraControlRequest):
-    global _camera_probe_cache
-    tester = _get_tester()
-    result = await _run_blocking(
-        "Camera control",
-        lambda: {
-            **tester.v4l2_set_ctrl(req.cid, req.value, device=req.device),
-            "stream_active": bool(_camera_stream_state.get("active")),
-            "stream_state": _camera_stream_state_payload(),
-        },
-        timeout_s=15.0,
-    )
-    with _camera_projection_lock:
-        _camera_probe_cache = None
-    lifecycle_state.record_camera_evidence(None)
-    hardware_state.invalidate(reason="camera controls changed")
-    return result
 
 
 def _camera_jpeg_response(frame: CameraFrame) -> Response:
@@ -10460,30 +10155,8 @@ async def camera_stream_health(req: CameraHealthRequest):
     )
 
 
-async def camera_auto_recover(req: CameraRecoverRequest):
-    if _camera_process_active():
-        return {
-            "ok": False,
-            "busy": True,
-            "stream_active": True,
-            "device": req.device,
-            "error": "live stream is active; stop the stream before running auto recover",
-            "stream_state": _camera_stream_state_payload(),
-        }
-    tester = _get_tester()
-    ownership = await _stop_owned_camera_session(reason="auto recover")
-    result = await _run_blocking(
-        "Camera auto recover",
-        lambda: tester.camera_auto_oneclick(device=req.device, max_resets=req.max_resets),
-        timeout_s=75.0,
-    )
-    return {**result, "camera_ownership": ownership}
 
 
-async def camera_reset(req: CameraSnapshotRequest):
-    stopped = await _stop_owned_camera_session(reason="explicit reset")
-    reset = await run_in_threadpool(_camera_reset_local, req.device)
-    return {**reset, "owned_session": stopped}
 
 
 @app.post("/camera/stream/stop")
@@ -11316,12 +10989,6 @@ async def protocol_compile(req: ProtocolCompileRequest):
     return compiled.to_payload()
 
 
-def _optional_int_payload(params: dict[str, Any], *keys: str) -> int | None:
-    for key in keys:
-        value = params.get(key)
-        if value is not None:
-            return int(value)
-    return None
 
 
 def _protocol_live_move_handler(action, state):
