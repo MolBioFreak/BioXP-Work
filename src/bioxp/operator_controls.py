@@ -2371,12 +2371,12 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
     meta = [
         {
             "action_id": "meta.activate_motion",
-            "label": "Activate 24 V / Prepare Motion (OEM, No Movement)",
+            "label": "Activate 24 V / Prepare Motion (OEM, No Motion Commands)",
             "subsystem": "meta",
             "category": "activation",
             "kind": "meta",
             "safety_class": "service",
-            "description": "Prepare the serial-206 motion path using the OEM safety check, cmd64=0→1 board cycle, and initializeMotorsWithoutMotion sequence. This does not home or move an axis.",
+            "description": "Prepare the serial-206 motion path using the OEM safety check, conditional activation of uninitialized boards, and initializeMotorsWithoutMotion. Already initialized boards are not cycled. No homing or movement commands are issued; physical immobility and motor torque are not verified.",
             "source_anchor": "ClassIOControl.query24VSensor:92-110; ClassControlInterface.initializeMotorsWithoutMotion:3181-3265; activateBoard:3474-3493",
             "informational_method": "POST",
             "informational_path": "/motion/oem/prepare_without_motion",
@@ -2390,7 +2390,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "requires_confirmation": True,
             "timeout_seconds": 120.0,
             "inputs": list(prepare_provider.get("inputs", [])) if prepare_provider else [],
-            "stages": ["serial-206 authority", "24 V/door/latch query", "cmd64=0 boards 4/5/6/7", "cmd64=1 boards 4/5/6/7", "mint board generation", "initializeMotorsWithoutMotion", "exact parameter readback"],
+            "stages": ["serial-206 authority", "24 V/door/latch query", "activate uninitialized boards", "bind current board lifecycle", "initializeMotorsWithoutMotion", "exact parameter readback"],
         },
         {
             "action_id": "meta.recover_motion_non_homing",
@@ -2399,7 +2399,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "category": "recovery",
             "kind": "meta",
             "safety_class": "service",
-            "description": "Run the existing robot-owned strict startup recovery with homing disabled. This action is available only while the maintenance latch requires recovery.",
+            "description": "Run shared OEM motion preparation with the existing strict recovery physical checks and no homing. This action is available only while the maintenance latch requires recovery.",
             "source_anchor": "Motion strict startup; run_homing=false",
             "informational_method": "POST",
             "informational_path": "/motion/arm/strict_startup",

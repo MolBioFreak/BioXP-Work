@@ -7673,7 +7673,7 @@ async def maintenance_usb_recover_motion(req: MaintenanceRecoverMotionRequest, r
     tester = _get_tester()
     recovery = await _run_blocking(
         "Post-maintenance motion recovery",
-        lambda: tester.motion_arm_strict_startup(run_homing=False),
+        lambda: _prepare_non_homing_motion_recovery(tester),
         timeout_s=90.0,
     )
     evidence: dict[str, Any] = {"strict_startup": recovery, "operator_note": req.operator_note}
@@ -7748,6 +7748,119 @@ async def prepare_interlock():
     )
 
 
+def _prepare_non_homing_motion_recovery(tester) -> dict[str, Any]:
+    """Use global preparation, retaining strict recovery's physical checks.
+
+    The legacy native startup also reconnected twice and pulsed XY currents.
+    Only its latch acknowledgements and live sensor gates belong here; board
+    activation/configuration and live-owner/Stop exclusion belong to the provider.
+    Latch completion remains the caller's responsibility, exactly once.
+    """
+    started = time.time()
+    report: dict[str, Any] = {"homing": None, "run_homing": False, "checks": [],
+                              "pre_gate": None, "lock": None, "post_lock_gate": None,
+                              "interlock": None, "final_gate": None, "board_status": None}
+
+    def check(name, ok, detail, *, critical=True):
+        report["checks"].append({"name": name, "ok": bool(ok),
+                                 "critical": critical, "detail": detail})
+
+    def physical_checks():
+        # Keep the pre-lock observation diagnostic, not an admission gate.
+        pre = tester.motion_gate_live_snapshot()
+        report["pre_gate"] = pre
+        check("pre_gate_live", pre.get("ok"), pre.get("error_keys"), critical=False)
+        lock = tester.latch_oem(True)
+        report["lock"] = lock
+        check("lock_cmd_ack", tester._tmcl_success(lock.get("ack")), lock.get("ack"))
+        time.sleep(0.12)
+        post = tester.motion_gate_live_snapshot()
+        report["post_lock_gate"] = post
+        check("post_lock_gate_live", post.get("ok"), post.get("error_keys"))
+        # Preserve the old interlock's second lock ACK and rail observation,
+        # without its reconnect, activate-all or calibration current pulses.
+        snap_before = tester.io_snapshot(tester.BOARD_DECK)
+        latch = tester.latch_oem(True)
+        time.sleep(0.08)
+        snap_after = tester.io_snapshot(tester.BOARD_DECK)
+        rail = tester.motor_query_24v_sensor()
+        override = tester.motion_latch_override_state()
+        raw_ok = rail.get("no24v") is False
+        rail_override = bool(override.get("override_rail_24v", False))
+        report["interlock"] = {"latch": latch, "rail_24v": rail, "ops": [],
+                               "snap_before": snap_before, "snap_after": snap_after}
+        check("interlock_24v", raw_ok or rail_override, {
+            "raw": rail.get("raw"), "no24v": rail.get("no24v"), "raw_ok": raw_ok,
+            "override_rail_24v": rail_override, "override_seq": override.get("seq")})
+        check("interlock_latch_ack", tester._tmcl_success(latch.get("ack")), latch.get("ack"))
+        final = tester.motion_gate_live_snapshot()
+        report["final_gate"] = final
+        check("final_gate_live", final.get("ok"), final.get("error_keys"))
+        failed = [row["name"] for row in report["checks"] if row["critical"] and not row["ok"]]
+        return {"ok": not failed, "failure": ",".join(failed) if failed else None}
+
+    result = _prepare_operator_motion_state(
+        tester, Serial206MotionAuthority.from_active_snapshot(), before_publication=physical_checks,
+    )
+    check("global_motion_preparation", result.get("ok") is True, result.get("failure"))
+    if result.get("ok") is not True:
+        tester.motion_disarm(reason="strict_init_fail", note=result.get("failure"))
+    report.update(result)
+    report["arm_state"] = tester.motion_arm_state()
+    report["motion_arm_state"] = report["arm_state"]
+    report["error_code"] = None if result.get("ok") is True else int(tester.MOTION_ERROR_CODES["STRICT_INIT_FAILED"])
+    report["elapsed_ms"] = int((time.time() - started) * 1000)
+    tester._motion_last_strict_init = report
+    return report
+
+
+def _prepare_operator_motion_state(tester, authority, *, before_publication=None) -> dict[str, Any]:
+    provider = _serial206_oem_initialization_provider
+    if provider is None:
+        return {"ok": False, "failure": "serial206_motion_provider_unavailable",
+                "physical_motion_commanded": False}
+    global_result = provider.prepare_global_motion_without_motion(tester, authority=authority)
+    if not isinstance(global_result, Mapping) or global_result.get("ok") is not True:
+        return dict(global_result) if isinstance(global_result, Mapping) else {
+            "ok": False,
+            "failure": "global_motion_preparation_result_invalid",
+        }
+    if before_publication is not None:
+        gate_result = before_publication()
+        if gate_result.get("ok") is not True:
+            return {**dict(global_result), **gate_result, "ok": False}
+    # Forward preparation evidence; preparation is not a Z home/reference.
+    z_receipt = (global_result.get("component_prepare_receipts") or {}).get("z") or {
+        "ok": True,
+        "physical_motion_commanded": False,
+        "state": "deferred_to_explicit_z_action",
+        "next_required_action": None,
+    }
+    can_ready = hardware_state.publish_can_ready_from_preparation(
+        expected_ownership_epoch=global_result["generation"],
+        reason="oem_prepare_without_motion_completed",
+    )
+    ready = bool(can_ready.get("published") is True)
+    if ready:
+        arm_confirm = getattr(tester, "motion_arm_confirm", None)
+        arm_state = (
+            arm_confirm(reason="oem_prepare_without_motion_completed")
+            if callable(arm_confirm)
+            else {"state": "armed", "source": "preparation"}
+        )
+    else:
+        arm_state_fn = getattr(tester, "motion_arm_state", None)
+        arm_state = arm_state_fn() if callable(arm_state_fn) else {"state": "unknown"}
+    return {
+        **dict(global_result),
+        "ok": ready,
+        "z_prepare_receipt": _json_safe(z_receipt),
+        "can_ready_publication": _json_safe(can_ready),
+        "motion_arm_state": _json_safe(arm_state),
+        "failure": None if ready else "operator_motion_state_publication_failed",
+    }
+
+
 @app.post("/motion/oem/prepare_without_motion")
 async def motion_oem_prepare_without_motion():
     try:
@@ -7776,58 +7889,16 @@ async def motion_oem_prepare_without_motion():
     # observation times so they age normally until the next collection.
     tester = _get_tester()
 
-    def prepare_operator_motion_state() -> dict[str, Any]:
-        provider = _serial206_oem_initialization_provider
-        if provider is None:
-            return {"ok": False, "failure": "serial206_motion_provider_unavailable",
-                    "physical_motion_commanded": False}
-        global_result = provider.prepare_global_motion_without_motion(tester, authority=authority)
-        if not isinstance(global_result, Mapping) or global_result.get("ok") is not True:
-            return dict(global_result) if isinstance(global_result, Mapping) else {
-                "ok": False,
-                "failure": "global_motion_preparation_result_invalid",
-            }
-        # Forward preparation evidence; preparation is not a Z home/reference.
-        z_receipt = (global_result.get("component_prepare_receipts") or {}).get("z") or {
-            "ok": True,
-            "physical_motion_commanded": False,
-            "state": "deferred_to_explicit_z_action",
-            "next_required_action": "home_z",
-        }
-        can_ready = hardware_state.publish_can_ready_from_preparation(
-            expected_ownership_epoch=global_result["generation"],
-            reason="oem_prepare_without_motion_completed",
-        )
-        ready = bool(can_ready.get("published") is True)
-        if ready:
-            arm_confirm = getattr(tester, "motion_arm_confirm", None)
-            arm_state = (
-                arm_confirm(reason="oem_prepare_without_motion_completed")
-                if callable(arm_confirm)
-                else {"state": "armed", "source": "preparation"}
-            )
-        else:
-            arm_state_fn = getattr(tester, "motion_arm_state", None)
-            arm_state = arm_state_fn() if callable(arm_state_fn) else {"state": "unknown"}
-        return {
-            **dict(global_result),
-            "ok": ready,
-            "z_prepare_receipt": _json_safe(z_receipt),
-            "can_ready_publication": _json_safe(can_ready),
-            "motion_arm_state": _json_safe(arm_state),
-            "failure": None if ready else "operator_motion_state_publication_failed",
-        }
-
     result = await _run_blocking(
         "OEM motion preparation without movement",
-        prepare_operator_motion_state,
+        lambda: _prepare_operator_motion_state(tester, authority),
         timeout_s=60.0,
     )
     response = {
         **result,
         "ownership_bootstrap": ownership_bootstrap,
         "next_required_action": (
-            "Home Z from the normal cockpit to establish the operator reference."
+            "No homing was performed. Select any homing or movement as a separate explicit action."
             if result.get("ok") is True
             else result.get("error") or result.get("failure") or "Inspect the failed preparation receipt before another activation attempt."
         ),
@@ -7964,7 +8035,7 @@ async def motion_arm_strict_startup(req: MotionArmStartupRequest):
     tester = _get_tester()
     response = await _run_blocking(
         "Motion strict startup",
-        lambda: tester.motion_arm_strict_startup(run_homing=False),
+        lambda: _prepare_non_homing_motion_recovery(tester),
         timeout_s=90.0,
     )
     maintenance = _complete_non_homing_motion_recovery(
