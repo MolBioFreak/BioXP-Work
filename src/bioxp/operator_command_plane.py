@@ -4077,17 +4077,28 @@ class OperatorCommandStore:
                     )
                 if changed and not owned_tip_child:
                     raise RuntimeError("deck_semantic_authority_changed_before_commit")
+            pending_orders = {
+                row[0] for row in conn.execute(
+                    "SELECT stage_order FROM operator_plane_deck_stages WHERE command_id=? AND terminal_state='planned'",
+                    (str(command_id),),
+                )
+            }
             result_index = 0
             for step in plan.steps:
                 result = None
                 if step.operation not in {"ForceToHighHome", "check_latch_status", "check_machine_latch_closed"}:
                     result = results[result_index]
                     result_index += 1
+                if step.order not in pending_orders:
+                    continue
                 evidence = self._deck_stage_evidence(step, result)
                 conn.execute(
                     "UPDATE operator_plane_deck_stages SET terminal_state='completed',terminal_evidence_json=? WHERE command_id=? AND stage_order=? AND terminal_state='planned'",
                     (_canonical(evidence), str(command_id), int(step.order)),
                 )
+            if all(row.get("source_noop") is True for row in results):
+                # Source Park returned before updateLocation or tray access.
+                return
             current = conn.execute(
                 "SELECT semantic_state_revision,movable_plate_locations_json,current_tray FROM operator_plane_deck_semantic_state WHERE singleton=1"
             ).fetchone()
@@ -4119,9 +4130,9 @@ class OperatorCommandStore:
                 "authority_snapshot_digest": str(plan.semantic_transition["authority_snapshot_digest"]),
                 "position_table_revision": str(plan.semantic_transition["position_table_revision"]),
                 "destination_catalog_revision": str(plan.semantic_transition["destination_catalog_revision"]),
-                "latch_status": bool(plan.semantic_transition["latch_status"]),
-                "machine_latch_closed": bool(plan.semantic_transition["machine_latch_closed"]),
-                "latch_observation_id": str(plan.semantic_transition["latch_observation_id"]),
+                "latch_status": bool((expected_authority or plan.semantic_transition)["latch_status"]),
+                "machine_latch_closed": bool((expected_authority or plan.semantic_transition)["machine_latch_closed"]),
+                "latch_observation_id": str((expected_authority or plan.semantic_transition)["latch_observation_id"]),
             }
             conn.execute(
                 "UPDATE operator_plane_deck_semantic_state SET current_location=?,current_well=?,current_tray=?,semantic_state_revision=?,producer_operation='updateLocation',producer_command_id=?,ownership_generation=?,board_epoch_4=?,board_epoch_5=?,transition_provenance_json=?,updated_at=? WHERE singleton=1",

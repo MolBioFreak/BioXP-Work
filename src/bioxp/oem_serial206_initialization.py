@@ -4723,9 +4723,6 @@ class Serial206OemInitializationProvider:
 
     def _deck_owner_authority_stamps_locked(self) -> dict[str, int]:
         ownership_generation = int(self.generation_provider())
-        with self._lock:
-            state = self._load_state()
-            x_lifecycle = dict(state.get("x_lifecycle") or {})
         projection = (
             self.state_store.board4_authority_projection()
             if self.state_store is not None
@@ -4735,8 +4732,12 @@ class Serial206OemInitializationProvider:
         board = projection.get("board") if isinstance(projection, Mapping) else None
         board_epoch_4 = board.get("active_board_epoch") if isinstance(board, Mapping) else None
         board_generation_reader = getattr(self.preparation_provider, "current_board_lifecycle_generation", None)
-        board_epoch_5 = (board_generation_reader() if callable(board_generation_reader)
-                         else x_lifecycle.get("board_lifecycle_generation"))
+        if callable(board_generation_reader):
+            board_epoch_5 = board_generation_reader()
+        else:
+            with self._lock:
+                state = self._load_state()
+                board_epoch_5 = (state.get("x_lifecycle") or {}).get("board_lifecycle_generation")
         if type(board_epoch_4) is not int or type(board_epoch_5) is not int:
             raise RuntimeError("deck_board_epochs_not_authoritative")
         return {
@@ -11208,13 +11209,16 @@ class Serial206OemInitializationProvider:
             "source_anchor": "DefaultParameters.ForceToHighHome:81-84",
         }
 
-    def assert_deck_observation_current(self, authority: Mapping[str, Any]) -> None:
+    def assert_deck_observation_current(
+        self, authority: Mapping[str, Any], *, stamps: Mapping[str, Any] | None = None,
+    ) -> None:
         """Recheck command ownership and consumed source state at source seams.
 
         Reference records are diagnostic and may change independently of motion.
         The durable command lane separately retains Stop/Abort and receipt identity.
         """
-        stamps = self.deck_owner_authority_stamps()
+        if stamps is None:
+            stamps = self.deck_owner_authority_stamps()
         if any(stamps[key] != authority.get(key) for key in stamps):
             raise RuntimeError("deck_execution_owner_authority_changed")
         if authority.get("dependency_scope") == "offset.v1":
@@ -14471,11 +14475,12 @@ class Serial206OemInitializationProvider:
         """Manual btnLOC Park; native callers explicitly retain their context."""
         from .oem_compat.pathing import LOCATION_ID_TO_NAME
 
-        if authority_snapshot is not None and authority_snapshot.get("dependency_scope", "full") != "full":
-            raise RuntimeError("deck_dependency_scope_mismatch")
-        semantics = self._deck_execution_semantics(authority_snapshot, no_tip_park=True)
-        current_location_name = str(semantics["current_location_id"])
-        if current_location_name == "LOC_PARK":
+        # ControlLib returns at current Park before gripper/tip/tray access.
+        # Manual callers already ran ForceToHighHome and both latch predicates;
+        # native/script callers keep their own prefix.
+        reader = self._deck_semantic_state_reader
+        logical = reader() if callable(reader) else {}
+        if logical.get("current_location") == "LOC_PARK":
             return {
                 "ok": True,
                 "source_noop": True,
@@ -14486,6 +14491,10 @@ class Serial206OemInitializationProvider:
                 "source_children": [],
                 "source_anchor": "ControlLib.parkGantry:7073-7076",
             }
+        if authority_snapshot is not None and authority_snapshot.get("dependency_scope", "full") != "full":
+            raise RuntimeError("deck_dependency_scope_mismatch")
+        semantics = self._deck_execution_semantics(authority_snapshot, no_tip_park=True)
+        current_location_name = str(semantics["current_location_id"])
         name_to_id = {name: ordinal for ordinal, name in LOCATION_ID_TO_NAME.items()}
         if current_location_name not in name_to_id:
             raise RuntimeError("park_current_location_not_authoritative")
