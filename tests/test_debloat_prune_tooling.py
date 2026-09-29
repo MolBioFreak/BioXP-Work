@@ -14,6 +14,7 @@ RETIRED = (
     "bioxp_supervised_oem_app_startup.sh", "bioxp_motion_readiness_snapshot.sh",
     "generate_bioxp_runtime_audit_entrypoint_denominator.py", "led_cycle.py",
     "github_bootstrap.sh", "bioxp_latency_microbench.py",
+    "oem_compat_workstation_readiness.py",
 )
 
 
