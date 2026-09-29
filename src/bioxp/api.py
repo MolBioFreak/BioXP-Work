@@ -7485,17 +7485,6 @@ async def motion_range_status(axes: str = Query("x,y,z,g", description="Comma-se
     return {**projection, "ok": projection.get("available", False), "axes": [axis.value for axis in requested_axes], "rows": rows, "motion_config": config, "live_status_available": bool(live_rows), "live_status_error": None if live_rows else "canonical range observation unavailable"}
 
 
-@app.post("/motion/interlock/prepare", deprecated=True)
-async def prepare_interlock():
-    raise HTTPException(
-        status_code=410,
-        detail={
-            "error": "legacy_inferred_motion_prepare_quarantined",
-            "message": "This legacy inferred latch/power route is retired. Use the one-click /motion/oem/prepare_without_motion route.",
-            "replacement": "/motion/oem/prepare_without_motion",
-            "physical_motion_commanded": False,
-        },
-    )
 
 
 def _prepare_non_homing_motion_recovery(tester) -> dict[str, Any]:
@@ -8875,16 +8864,6 @@ async def motion_oem_z_clear():
     )
 
 
-@app.post("/motion/oem/z/live_right_reference")
-async def motion_oem_z_live_right_reference():
-    raise HTTPException(
-        status_code=410,
-        detail={
-            "error": "z_live_right_reference_retired",
-            "reason": "GAP10 is diagnostic evidence and cannot establish the production Z reference.",
-            "replacement": "/motion/oem/z/status",
-        },
-    )
 
 
 
@@ -8911,15 +8890,6 @@ async def motion_oem_z_stop():
     )
 
 
-@app.post("/motion/oem/z/abort")
-async def motion_oem_z_abort():
-    raise HTTPException(
-        status_code=410,
-        detail={
-            "error": "retired_duplicate_abort_identity",
-            "replacement_action_id": "oem.abort_all",
-        },
-    )
 
 
 @app.post("/motion/oem/z/resume_after_abort")
@@ -10838,12 +10808,6 @@ async def liquid_tip_status():
     return await _run_blocking("Pipette tip status", _query_and_publish_pipette_tip_status, timeout_s=120.0)
 
 
-@app.get("/liquid/data", include_in_schema=False)
-async def liquid_data_get_retired():
-    raise HTTPException(
-        status_code=410,
-        detail={"error": "hardware_query_get_retired", "replacement": "POST /liquid/data", "provider_called": False, "receipt_written": False},
-    )
 
 
 @app.post("/liquid/data")
@@ -10859,13 +10823,6 @@ async def liquid_data(query: str | None = Query(None, min_length=3, max_length=3
     )
 
 
-@app.get("/liquid/fluid-detection/{channel}/timestamp", include_in_schema=False)
-async def liquid_fluid_timestamp_get_retired(channel: int):
-    del channel
-    raise HTTPException(
-        status_code=410,
-        detail={"error": "receipt_producing_get_retired", "replacement": "POST /liquid/fluid-detection/{channel}/timestamp", "provider_called": False, "receipt_written": False},
-    )
 
 
 @app.post("/liquid/fluid-detection/{channel}/timestamp")
@@ -10894,12 +10851,6 @@ async def liquid_set_top_speed(req: PipetteSpeedRequest):
     )
 
 
-@app.get("/liquid/pressure", include_in_schema=False)
-async def liquid_pressure_get_retired():
-    raise HTTPException(
-        status_code=410,
-        detail={"error": "hardware_query_get_retired", "replacement": "POST /liquid/pressure", "provider_called": False, "receipt_written": False},
-    )
 
 
 @app.post("/liquid/pressure")
@@ -10941,12 +10892,6 @@ async def liquid_reinitialize():
     )
 
 
-@app.get("/liquid/condition", include_in_schema=False)
-async def liquid_condition_get_retired():
-    raise HTTPException(
-        status_code=410,
-        detail={"error": "hardware_query_get_retired", "replacement": "POST /liquid/condition", "provider_called": False, "receipt_written": False},
-    )
 
 
 @app.post("/liquid/condition")
@@ -10962,12 +10907,6 @@ async def liquid_condition():
     )
 
 
-@app.get("/liquid/status/readback", include_in_schema=False)
-async def liquid_status_readback_get_retired():
-    raise HTTPException(
-        status_code=410,
-        detail={"error": "hardware_query_get_retired", "replacement": "POST /liquid/status/readback", "provider_called": False, "receipt_written": False},
-    )
 
 
 @app.post("/liquid/status/readback")

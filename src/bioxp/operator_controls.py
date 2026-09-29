@@ -1124,7 +1124,6 @@ _LOCAL_ONLY_PATH_PREFIXES = (
 )
 
 _OPERATOR_SEMANTIC_QUARANTINE_PATHS = {
-    "/motion/interlock/prepare": "Quarantined: this legacy route performs inferred latch/power writes and is not the source-grounded serial-206 preparation provider.",
     "/motion/power/diag": "Quarantined: this diagnostic can enter the same unverified power-enable sequence and lacks truthful aggregate acknowledgment/readback.",
 }
 
@@ -1786,8 +1785,6 @@ _NON_OPERATOR_COMPAT_PATHS = {
     "/motion/axis/absolute",
     "/motion/axis/home",
     "/motion/axis/zero",
-    "/motion/oem/z/live_right_reference",
-    "/motion/oem/z/abort",
 }
 _SERIAL206_PROVIDER_CAPABILITIES = {
     "/motion/oem/initialization/initialize_motors": "initialize_motors",
