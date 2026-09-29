@@ -3577,7 +3577,21 @@ class OperatorCommandStore:
     ) -> None:
         if state not in {"completed", "failed", "ambiguous"}:
             raise ValueError("invalid WP8 terminal state")
-        evidence = {"result": _bounded_json(result, 131072), "terminalized_at": _now()}
+        if isinstance(result, Mapping) and "relocations" in result:
+            # RT-036: relocation facts are consumed after SQLite readback.
+            # A nested diagnostic tree must not displace these terminal facts.
+            from .oem_vision_acceptance import inspection_transfer_outcome
+            bounded = {
+                **inspection_transfer_outcome(result),
+                **{key: result[key] for key in (
+                    "cover_count", "error_status", "detected", "relocations",
+                    "final_cover_locations", "door_open_verified", "inspection_log_only",
+                    "source_anchor", "relocation_receipts",
+                ) if key in result},
+            }
+        else:
+            bounded = _bounded_json(result, 131072)
+        evidence = {"result": bounded, "terminalized_at": _now()}
         with self._deck_owner_authority_scope(), self._transaction() as conn:
             active = conn.execute(
                 """

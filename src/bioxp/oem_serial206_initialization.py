@@ -13866,7 +13866,7 @@ class Serial206OemInitializationProvider:
         """
         del operation
         from .oem_deck_movement import compile_cover_inspection_finalize
-        from .oem_vision_acceptance import plan_cover_relocations
+        from .oem_vision_acceptance import plan_cover_relocations, inspection_transfer_outcome
 
         log_only = arguments.get("inspection_log_only")
         if type(log_only) is not bool:
@@ -13890,7 +13890,7 @@ class Serial206OemInitializationProvider:
                 raise DeckExecutionFailure(
                     f"cover_inspection_{phase}_failed:{result.get('failed_child')}",
                     delivery_attempted=True,
-                    provider_results=[*receipts, {"phase": phase, "result": dict(result)}],
+                    provider_results=[*receipts, {"phase": phase, "result": inspection_transfer_outcome(result)}],
                 )
 
         if plan["cover_count"] == 2 and plan["error_status"] is None:
@@ -13909,20 +13909,21 @@ class Serial206OemInitializationProvider:
                 )
                 receipts.append({
                     "relocation": dict(relocation),
-                    "catch": catch, "release": release,
+                    "catch": inspection_transfer_outcome(catch),
+                    "release": inspection_transfer_outcome(release),
                 })
                 require_completed("release", release)
             finalize = self._wp8_execute_nested_plan(
                 plan=compile_cover_inspection_finalize(),
                 command_id=command_id, owner_identity=owner_identity,
             )
-            receipts.append({"finalize": finalize})
+            receipts.append({"finalize": inspection_transfer_outcome(finalize)})
             require_completed("finalize", finalize)
             door = self._wp8_compile_and_execute(
                 operation="thermal_door", inputs={"open": True},
                 command_id=command_id, owner_identity=owner_identity,
             )
-            receipts.append({"door_open": door})
+            receipts.append({"door_open": inspection_transfer_outcome(door)})
             require_completed("door_open", door)
             sensors = self.wp8_read_door_sensors("readDoorSensors", {})
             door_open_verified = isinstance(sensors, Mapping) and sensors.get("door_open") is True
