@@ -3164,7 +3164,6 @@ def install_operator_control_plane(
     app.state.operator_command_plane = command_plane
     if oem_deck_provider is not None and oem_deck_position_table_provider is not None:
         from .oem_deck_movement import (
-            compile_finite_plate_operation,
             make_deck_command_executor,
             make_wp8_operation_executor,
         )
@@ -3257,20 +3256,8 @@ def install_operator_control_plane(
             inputs: Mapping[str, Any],
             idempotency_key: str | None = None,
         ) -> dict[str, Any]:
-            current_provider = refresh_deck_provider()
-            snapshot_reader = getattr(current_provider, "wp8_operation_machine_state", None)
-            if not callable(snapshot_reader):
-                raise RuntimeError("source_authority_missing:wp8_operation_machine_state")
-            machine_inputs = snapshot_reader(operation, dict(inputs))
-            if not isinstance(machine_inputs, Mapping):
-                raise RuntimeError("source_authority_invalid:wp8_operation_machine_state")
-            compile_finite_plate_operation(
-                operation,
-                source_leaf_available=callable(
-                    getattr(current_provider, "execute_wp8_child", None)
-                ),
-                **{**dict(machine_inputs), **dict(inputs)},
-            )
+            # The store validates intent; dispatch consumes current source state.
+            refresh_deck_provider()
             return command_plane.store.admit_internal_wp8_operation(
                 operation,
                 inputs=inputs,
