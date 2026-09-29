@@ -27,7 +27,8 @@ def routes(monkeypatch):
     monkeypatch.setattr(tester, "io_snapshot", io_snapshot)
     monkeypatch.setattr(tester, "motor_query_24v_sensor", lambda: state["rail"])
     monkeypatch.setattr(tester, "motion_latch_override_state", lambda: state["override"])
-    def latch(lock):
+    def latch(lock, *, activate_first):
+        assert activate_first is False
         calls.append("latch")
         return {"ack": {"status": 1} if state.get("bad_second_lock") and calls.count("latch") == 2 else state["ack"]}
     monkeypatch.setattr(tester, "latch_oem", latch)
@@ -260,6 +261,23 @@ def test_routes_connected_to_real_provider_native_and_sqlite(rig, monkeypatch, r
         assert not any(command in (3, 4, 13) or (command == 5 and typ in (0, 1))
                        for board, command, typ, motor, value in frames)
         assert provider.state_store.read_oem_serial206_initialization_state()["preparation"]
+        assert [row for row in frames if row[1] == 64] == [
+            (board, 64, 0, 0, 1) for board in driver.BOARDS]
+        assert [row for row in frames if row[0] == 4 and row[1] == 5 and row[3] == 1] == [
+            (4, 5, 4, 1, 1791), (4, 5, 5, 1, 576),
+            (4, 5, 6, 1, 31), (4, 5, 205, 1, 3)]
+        first_generation = report["board_lifecycle_generation"]
+        first_board = provider.state_store.board4_authority_projection()["board"]
+        start = len(frames)
+        api._maintenance_state.update(motion_blocked=True, recovery_required=True)
+        repeated = invoke(api, route)
+        warm = repeated.get("recovery", repeated)
+        assert warm["ok"] is True
+        assert warm["board_lifecycle_generation"] == first_generation
+        assert provider.state_store.board4_authority_projection()["board"] == first_board
+        assert not any(row[1] == 64 for row in frames[start:])
+        assert not any(command in (3, 4, 13) or (command == 5 and typ in (0, 1))
+                       for board, command, typ, motor, value in frames[start:])
     finally:
         for service in driver._oem_fan_services().values():
             service["running"] = False

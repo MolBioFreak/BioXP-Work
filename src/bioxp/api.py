@@ -7770,7 +7770,7 @@ def _prepare_non_homing_motion_recovery(tester) -> dict[str, Any]:
         pre = tester.motion_gate_live_snapshot()
         report["pre_gate"] = pre
         check("pre_gate_live", pre.get("ok"), pre.get("error_keys"), critical=False)
-        lock = tester.latch_oem(True)
+        lock = tester.latch_oem(True, activate_first=False)
         report["lock"] = lock
         check("lock_cmd_ack", tester._tmcl_success(lock.get("ack")), lock.get("ack"))
         time.sleep(0.12)
@@ -7780,7 +7780,7 @@ def _prepare_non_homing_motion_recovery(tester) -> dict[str, Any]:
         # Preserve the old interlock's second lock ACK and rail observation,
         # without its reconnect, activate-all or calibration current pulses.
         snap_before = tester.io_snapshot(tester.BOARD_DECK)
-        latch = tester.latch_oem(True)
+        latch = tester.latch_oem(True, activate_first=False)
         time.sleep(0.08)
         snap_after = tester.io_snapshot(tester.BOARD_DECK)
         rail = tester.motor_query_24v_sensor()

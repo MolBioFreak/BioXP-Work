@@ -2132,10 +2132,13 @@ class BioXpTester:
             time.sleep(interval_s)
         return stats
 
-    def latch_oem(self, locked):
+    def latch_oem(self, locked, *, activate_first=True):
         state = 1 if locked else 0
         t0 = time.time()
-        self.activate_boards(expect_reply=False)
+        # Recovery's shared preparation already owns board activation. Preserve
+        # standalone callers without reactivating prepared boards behind it.
+        if activate_first:
+            self.activate_boards(expect_reply=False)
 
         # OEM-equivalent write: board 0x05, cmd14, type2, motor0, value {0|1}
         ack = self.send_tmcl_retry(

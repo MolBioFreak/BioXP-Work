@@ -240,3 +240,14 @@ def test_explicit_complete_cycle_contract_unchanged(connected):
     rejected = driver.oem_begin_board_lifecycle_generation(deactivation={}, activation={})
     assert rejected['ok'] is False
     assert rejected['failure'] == 'incomplete_oem_deactivate_activate_cycle'
+
+
+@pytest.mark.parametrize('option', [{}, {'activate_first': True}, {'activate_first': False}])
+def test_latch_activation_option_preserves_standalone_default(connected, option):
+    driver, provider, frames, fault, root = connected
+    result = driver.latch_oem(True, **option)
+    assert result['ack']['status'] == 100
+    assert [row for row in frames if row[1] == 64] == (
+        [(board, 64, 0, 0, 1) for board in driver.BOARDS]
+        if option.get('activate_first', True) else [])
+    assert frames.count((5, 14, 2, 0, 1)) == 3
