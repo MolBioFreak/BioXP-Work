@@ -1,5 +1,11 @@
 # BioXP3200 OEM Runtime-App Parity Hard Requirement Spec
 
+> Historical design record: the unmounted runtime API/worker/events/status and
+> standalone full-lifecycle planner described here are retired. Current execution
+> belongs to the operator command plane and targeted protocol jobs. The canonical
+> lifecycle, historical SQLite records, migration sources and live registry remain.
+
+
 > For Hermes: Use subagent-driven-development and test-driven-development when implementing this spec. The target is source-shaped OEM runtime parity, not merely HTTP endpoint coverage.
 
 Date: 2026-05-03

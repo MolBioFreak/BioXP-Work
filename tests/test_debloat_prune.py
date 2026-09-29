@@ -40,3 +40,30 @@ def test_real_app_keeps_status_and_protocol_routes():
     paths = set(app.openapi()["paths"])
     assert "/status" in paths
     assert "/protocol/compile" in paths
+
+
+def test_retired_runtime_router_is_not_an_app_dependency():
+    import ast
+    from pathlib import Path
+
+    retired = {"oem_runtime_api", "oem_runtime_commands", "oem_runtime_events",
+               "oem_runtime_status", "oem_runtime_worker"}
+    source = Path(__file__).resolve().parents[1] / "src" / "bioxp"
+    for name in retired:
+        assert not (source / f"{name}.py").exists()
+    for path in source.rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                assert (node.module or "").split(".")[-1] not in retired, path
+            elif isinstance(node, ast.Import):
+                assert not any(alias.name.split(".")[-1] in retired for alias in node.names), path
+
+
+def test_live_registry_identity_remains_byte_derived():
+    import hashlib
+    from pathlib import Path
+    from bioxp.oem_full_lifecycle import current_registry_sha256
+
+    path = Path(__file__).resolve().parents[1] / "docs/specs/2026-07-23-oem-movement-method-source-binary-registry.json"
+    assert current_registry_sha256() == hashlib.sha256(path.read_bytes()).hexdigest()

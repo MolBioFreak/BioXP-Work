@@ -1,5 +1,11 @@
 # BioXP3200 OEM Full-Init Pipette + Vision Conversion Plan
 
+> Historical design record: the unmounted runtime API/worker/events/status and
+> standalone full-lifecycle planner described here are retired. Current execution
+> belongs to the operator command plane and targeted protocol jobs. The canonical
+> lifecycle, historical SQLite records, migration sources and live registry remain.
+
+
 Date: 2026-05-03
 
 Goal: fully decode and convert the OEM full-initialization portions that happen after/around motion initialization: ClassPipetteCollection/ClassPipette startup and cleanup, plus CVisionLib/ClassFrameGrabber camera/inspection/barcode/cover behaviors. This document is intentionally not a claim that pipette or camera parity already exists.

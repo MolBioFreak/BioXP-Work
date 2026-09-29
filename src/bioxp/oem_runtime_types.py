@@ -1,26 +1,11 @@
 from __future__ import annotations
 
 import time
-import uuid
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
 
-class OEMCommandName(str, Enum):
-    UNLOCK_PROCESS = "unlockProcess"
-    PREPARE_TO_RUN_JOB = "PrepareToRunJob"
-    ABORT_JOB = "abortjob"
-    VALIDATE_JOB = "validateJob"
-    WAKE_FROM_PAUSE = "wakefrompause"
-
-    @classmethod
-    def validate(cls, value: str) -> "OEMCommandName":
-        try:
-            return cls(value)
-        except ValueError as exc:
-            allowed = ",".join(item.value for item in cls)
-            raise ValueError(f"unknown OEM runtime command {value!r}; allowed={allowed}") from exc
 
 
 class OEMRuntimeMode(str, Enum):
@@ -77,51 +62,10 @@ def utc_ts() -> float:
     return time.time()
 
 
-def new_id(prefix: str) -> str:
-    return f"{prefix}_{int(time.time()*1000)}_{uuid.uuid4().hex[:10]}"
 
 
-@dataclass
-class OEMRuntimeCommand:
-    name: str
-    mode: str = OEMRuntimeMode.DRY_RUN.value
-    source: str = "api"
-    params: dict[str, Any] = field(default_factory=dict)
-    command_id: str = field(default_factory=lambda: new_id("cmd"))
-    session_id: str | None = None
-    operator_ack: str | None = None
-    artifact_root: str | None = None
-    created_at: float = field(default_factory=utc_ts)
-    timeout_s: float = 30.0
-
-    def __post_init__(self) -> None:
-        self.name = OEMCommandName.validate(self.name).value
-        if self.mode not in {m.value for m in OEMRuntimeMode}:
-            raise ValueError(f"invalid OEM runtime mode {self.mode!r}")
-        if self.mode == OEMRuntimeMode.LIVE.value:
-            if not self.operator_ack:
-                raise ValueError("operator_ack required for live OEM runtime command")
-            if not self.artifact_root:
-                raise ValueError("artifact_root required for live OEM runtime command")
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
 
 
-@dataclass
-class OEMRuntimeEvent:
-    event_type: str
-    source: str = "api"
-    payload: dict[str, Any] = field(default_factory=dict)
-    event_id: str = field(default_factory=lambda: new_id("evt"))
-    created_at: float = field(default_factory=utc_ts)
-    state_before: dict[str, Any] | None = None
-    state_after: dict[str, Any] | None = None
-    actions_taken: list[str] = field(default_factory=list)
-    artifact_path: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
 
 
 @dataclass
