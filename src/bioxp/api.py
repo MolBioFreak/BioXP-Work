@@ -10761,14 +10761,19 @@ def _protocol_source_mov(intent, action, state):
         command_id = admitted["command_id"]
         if state.workflow is not None and command_id not in state.workflow.child_command_ids:
             state.workflow.child_command_ids.append(command_id)
+        from concurrent.futures import TimeoutError as FutureTimeoutError
+        completion = store.workflow_child_completion(command_id)
         while True:
-            receipt = store.get_command(command_id)
-            if receipt["status"] in COMMAND_TERMINAL:
-                response = dict((receipt.get("terminal_evidence") or {}).get("response") or {})
-                return {**response, "ok": receipt["status"] == "completed",
-                        "command_id": command_id, "receipt": receipt}
-            if store._stop.wait(0.02):
-                raise RuntimeError("workflow_child_owner_lost")
+            try:
+                receipt = completion.result(timeout=0.25)["receipt"]
+                break
+            except FutureTimeoutError:
+                # Owner cancellation only; no receipt decoding while pending.
+                if store._stop.is_set():
+                    raise RuntimeError("workflow_child_owner_lost")
+        response = dict((receipt.get("terminal_evidence") or {}).get("response") or {})
+        return {**response, "ok": receipt["status"] == "completed",
+                "command_id": command_id, "receipt": receipt}
 
 
 def _protocol_workflow_initial_check(state: Any, *, validate_current) -> dict[str, Any]:
