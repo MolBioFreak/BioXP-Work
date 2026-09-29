@@ -1131,7 +1131,8 @@ class OperatorCommandStore:
         }
 
     def _validate_deck_owner_authority(
-        self, *, ownership_generation: int, board_epoch_4: int, board_epoch_5: int
+        self, *, ownership_generation: int, board_epoch_4: int, board_epoch_5: int,
+        current: Mapping[str, Any] | None = None,
     ) -> None:
         supplied = (ownership_generation, board_epoch_4, board_epoch_5)
         if any(type(value) is not int or value < 0 for value in supplied):
@@ -1139,7 +1140,8 @@ class OperatorCommandStore:
         reader = self._deck_owner_authority_reader
         if not callable(reader):
             return
-        current = reader()
+        if current is None:
+            current = reader()
         observed = (
             current.get("ownership_generation"),
             current.get("board_epoch_4"),
@@ -3382,7 +3384,7 @@ class OperatorCommandStore:
             if not isinstance(current_stamps, Mapping):
                 raise RuntimeError("deck_execution_owner_authority_not_bound")
             supplied = dict(authority_stamps or current_stamps)
-            self._validate_deck_owner_authority(**supplied)
+            self._validate_deck_owner_authority(**supplied, current=current_stamps)
             generation = int(supplied.get("ownership_generation", -1))
             if generation != int(command["ownership_generation"]):
                 raise RuntimeError("delivery attempt ownership generation mismatch")
@@ -6518,7 +6520,7 @@ class OperatorCommandStore:
             return True
         return any(self._axis_priority_fences[axis].is_set() for axis in self._axes_for_action(action_id))
 
-    def assert_deck_execution_current(self, command_id: str, *, boundary: str | None = None) -> None:
+    def assert_deck_execution_current(self, command_id: str, *, boundary: str | None = None) -> Mapping[str, Any]:
         with self._lock:
             parent = self.connection.execute("SELECT parent_command_id FROM operator_commands WHERE command_id=?", (command_id,)).fetchone()
             if parent and parent[0]:
@@ -6555,6 +6557,7 @@ class OperatorCommandStore:
             raise RuntimeError("deck_execution_board_epoch_changed")
         if row["ownership_generation"] != stamps.get("ownership_generation"):
             raise RuntimeError("deck_execution_ownership_generation_changed")
+        return stamps
 
     def queue_pending_interrupt_reconciliation(self, record: Mapping[str, Any]) -> None:
         pending = dict(record)
