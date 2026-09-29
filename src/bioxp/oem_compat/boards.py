@@ -98,8 +98,6 @@ class Board:
     def deactivate(self) -> None:
         self._send_payload(bytes([64, 0, 0, 0, 0, 0, 0]), f"{self.label}.deactivateBoard")
 
-    def query_firmware_version(self) -> None:
-        self._send_payload(bytes([173, 0, 0, 0, 0, 0, 0]), f"{self.label}.queryFirmwareVersion")
 
 
 @dataclass
@@ -113,20 +111,10 @@ class DeckBoard(Board):
         self.set_led(1, g)
         self.set_led(2, b)
 
-    def query_24v_sensor(self) -> None:
-        self._send_payload(bytes([15, 0, 0, 0, 0, 0, 0]), "DECK.query24VSensor")
 
-    def query_door_sensor(self) -> None:
-        self._send_payload(bytes([15, 1, 0, 0, 0, 0, 0]), "DECK.queryDoorSensor")
 
-    def query_solenoid_control(self) -> None:
-        self._send_payload(bytes([15, 2, 0, 0, 0, 0, 0]), "DECK.querySolenoidControl")
 
-    def query_latch_sensor(self) -> None:
-        self._send_payload(bytes([15, 3, 0, 0, 0, 0, 0]), "DECK.queryLatchSensor")
 
-    def set_solenoid_control(self, onoff: int) -> None:
-        self._send_payload(bytes([14, 2, 0, 0, 0, 0, int(onoff) & 0xFF]), f"DECK.setSolenoidControl({onoff})")
 
 
 @dataclass

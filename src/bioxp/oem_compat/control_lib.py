@@ -344,8 +344,6 @@ class BioXPControlLib:
 
 
 
-    def stop_script(self) -> dict:
-        return {"mode": "dry_run", "status": "planned", "action": "stop"}
 
     def cleanup(self) -> dict:
         return {"mode": "dry_run", "status": "planned", "action": "cleanup"}

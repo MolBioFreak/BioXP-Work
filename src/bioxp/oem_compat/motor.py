@@ -59,8 +59,6 @@ class Motor:
         )
         return self.transport.transmit(frame)
 
-    def move_right(self, speed: int = 200) -> OemReplyFrame:
-        return self._send(CMD_ROR, 0, speed, f"{self.label}.ROR({speed})")
 
     def move_left(self, speed: int = 200) -> OemReplyFrame:
         return self._send(CMD_ROL, 0, speed, f"{self.label}.ROL({speed})")
@@ -116,8 +114,6 @@ class Motor:
     def set_pdiv(self, value: int) -> OemReplyFrame:
         return self.set_axis_param(PARAM_PDIV, value)
 
-    def set_ramp_mode(self, value: int) -> OemReplyFrame:
-        return self.set_axis_param(PARAM_RAMP_MODE, value)
 
     def move_relative(self, steps: int) -> OemReplyFrame:
         return self._send(CMD_MVP, MVP_REL, int(steps), f"{self.label}.MVP_REL({steps})")
@@ -131,8 +127,6 @@ class Motor:
             self.set_max_speed(int(speed))
         return self.move_left(speed or 200)
 
-    def move_to_home_position(self) -> OemReplyFrame:
-        return self._send(CMD_MVP, MVP_ABS, 0, f"{self.label}.MoveHome")
 
     def set_home(self) -> OemReplyFrame:
         # OEM ClassMotor.setHome payload is SAP param 1, not RFS.
@@ -141,23 +135,3 @@ class Motor:
     def stop(self) -> list[OemReplyFrame]:
         # OEM StopMotor sends twice and checks the second response.
         return [self._send(CMD_MST, 0, 0, f"{self.label}.MST"), self._send(CMD_MST, 0, 0, f"{self.label}.MST")]
-
-    def query_actual_position(self) -> OemReplyFrame:
-        return self.get_axis_param(PARAM_ACTUAL_POSITION)
-
-    def query_motor_speed(self) -> OemReplyFrame:
-        return self.get_axis_param(PARAM_ACTUAL_SPEED)
-
-    def query_reached_position(self) -> OemReplyFrame:
-        return self.get_axis_param(PARAM_TARGET_REACHED)
-
-    def query_left_switch_status(self) -> OemReplyFrame:
-        return self.get_axis_param(PARAM_LEFT_SWITCH)
-
-    def query_right_switch_status(self) -> OemReplyFrame:
-        return self.get_axis_param(PARAM_RIGHT_SWITCH)
-
-    def query_motor_stop(self, axis: int = -1) -> OemReplyFrame:
-        value = 1 << self.motor if axis == -1 else 0
-        motor = self.motor if axis == -1 else int(axis)
-        return self._send(CMD_QUERY_STOP, 0, value, f"{self.label}.QUERY_STOP(axis={axis})")
