@@ -837,12 +837,6 @@ class NovoRouter:
             for channel, values in samples.items()
         }
 
-    def calculate_pressure_offsets(self) -> dict[int, float]:
-        return {
-            channel: float(row["offset"])
-            for channel, row in self.calculate_pressure_offset_evidence().items()
-            if row.get("valid") is True and row.get("offset") is not None
-        }
 
     def begin_pressure_epoch(self) -> dict[str, Any]:
         """Start the OEM stream-on pressure-offset sample window."""

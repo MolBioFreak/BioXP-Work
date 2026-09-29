@@ -851,16 +851,6 @@ class Serial206YProvider:
             "observation": observation,
         }
 
-    def publish_home_xy_reference(self, result: Mapping[str, Any], *, command_id: str) -> dict[str, Any]:
-        del result
-        return {
-            "ok": False,
-            "axis": self.axis,
-            "command_id": command_id,
-            "physical_motion": False,
-            "reference_published": False,
-            "failure": "homexy_reference_owned_by_parent_observation",
-        }
 
     @_interrupt_fenced
     def set_home(self, operator_ack: str, *, command_id: str | None = None) -> dict[str, Any]:

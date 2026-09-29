@@ -30,7 +30,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Mapping
 
 INTERRUPT_JOURNAL_SCHEMA = "bioxp.operator_interrupt_journal_event.v1"
 INTERRUPT_JOURNAL_FILENAME = "operator_interrupt_journal.v1.jsonl"
@@ -293,19 +293,3 @@ class InterruptJournal:
                     os.close(self._fd)
                 finally:
                     self._fd = None
-
-
-def journal_events_for_attempt(
-    journal: InterruptJournal | None, interrupt_attempt_id: str | None,
-) -> list[dict[str, Any]]:
-    if journal is None or not interrupt_attempt_id:
-        return []
-    return [
-        row
-        for row in journal.events()
-        if str(row.get("interrupt_attempt_id")) == str(interrupt_attempt_id)
-    ]
-
-
-def iter_phases(rows: Iterable[Mapping[str, Any]]) -> list[str]:
-    return [str(row.get("phase")) for row in rows]

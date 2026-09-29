@@ -342,11 +342,7 @@ class BioXPControlLib:
     def _plan_command(self, command: OemScriptCommand) -> PlannedScriptAction:
         return PlannedScriptAction(index=command.index, verb=command.verb, raw=command.raw)
 
-    def pause_script(self) -> dict:
-        return {"mode": "dry_run", "status": "planned", "action": "pause"}
 
-    def resume_job(self) -> dict:
-        return {"mode": "dry_run", "status": "planned", "action": "resume"}
 
     def stop_script(self) -> dict:
         return {"mode": "dry_run", "status": "planned", "action": "stop"}

@@ -87,14 +87,6 @@ def _relative(raw: str) -> str:
     return value
 
 
-def _assert_unique_regular(path: Path) -> os.stat_result:
-    try:
-        info = path.lstat()
-    except FileNotFoundError as exc:
-        raise OemRuntimeStateError(f"runtime-state file is missing: {path}") from exc
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        raise OemRuntimeStateError(f"runtime-state file must be a unique regular file: {path}")
-    return info
 
 
 def _read_no_follow(path: Path) -> bytes:
@@ -428,8 +420,6 @@ class OemRuntimeStateStore:
     def operation_parameters_projection(self) -> dict[str, Any]:
         return dict(self._operation_parameters)
 
-    def read_record(self, relative_path: str) -> bytes:
-        return self._verified_read(relative_path)
 
     def write_record(
         self,
@@ -504,8 +494,6 @@ class OemRuntimeStateStore:
                     raise OemRuntimeStateError(f"state transaction and failure-provenance append both failed: {exc}; {journal_exc}") from exc
                 raise
 
-    def write_operation_parameters(self, data: bytes, *, writer: str, call_path: str) -> RuntimeStateTransaction:
-        return self.write_record("appdata/Operation_parameters.xml", data, writer=writer, call_path=call_path)
 
     def update_operation_parameters(self, transform, *, writer: str, call_path: str) -> RuntimeStateTransaction:
         """Serialize a read/modify/write under the canonical record's transaction owner."""
@@ -516,24 +504,8 @@ class OemRuntimeStateStore:
                 call_path=call_path, _transaction_guard_held=True,
             )
 
-    def write_process_times(self, data: bytes, *, writer: str, call_path: str) -> RuntimeStateTransaction:
-        return self.write_record("appdata/processtime.xml", data, writer=writer, call_path=call_path)
 
-    def write_pressure_buffer(self, data: bytes, *, writer: str, call_path: str) -> RuntimeStateTransaction:
-        return self.write_record("appdata/pressurebuffer.txt", data, writer=writer, call_path=call_path)
 
-    def append_config_history(self, data: bytes, *, writer: str, call_path: str) -> RuntimeStateTransaction:
-        if not isinstance(data, bytes) or not data:
-            raise OemRuntimeStateError("config-history append requires non-empty exact bytes")
-        with self._lock, self._transaction_guard():
-            before = self._verified_read("appdata_parent/Config_History/config_history.csv")
-            return self.write_record(
-                "appdata_parent/Config_History/config_history.csv",
-                before + data,
-                writer=writer,
-                call_path=call_path,
-                _transaction_guard_held=True,
-            )
 
 
 def set_active_oem_runtime_state_store(store: OemRuntimeStateStore) -> OemRuntimeStateStore:

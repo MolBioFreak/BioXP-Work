@@ -7,7 +7,6 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .oem_config import find_oem_config
 from .oem_parity_config import load_oem_parity_config
 from .oem_startup_types import OemStartupState
 from .oem_gripper import GRIPPER_COMMISSION_HOME_ACK, gripper_commission_home
@@ -116,8 +115,6 @@ class DryRunStartupHardware:
         self.motion_calls: list[str] = []
         self.initial_check_calls = 0
 
-    def load_config(self) -> dict:
-        return self.config_status or {"status": "missing", "path": None, "searched_roots": [], "fields": {}, "missing_fields": ["StartMode", "GripperVersion"], "live_ready": False, "derived_requirements": {}}
 
     def initial_check(self, *, mode: str = "dry_run") -> dict:
         self.initial_check_calls += 1
@@ -132,17 +129,11 @@ class DryRunStartupHardware:
             ],
         }
 
-    def configure_without_motion(self, *, mode: str = "dry_run") -> dict:
-        return {"ok": True, "physical_motion": False, "source_anchor": SOURCE_ANCHORS["initializeMotorsWithoutMotion"]}
 
     def pipette_startup_check(self, *, mode: str = "dry_run") -> dict:
         return {"ok": not self.pipette_required, "required": self.pipette_required, "available": False, "skipped": True, "blocks_ready": self.pipette_required, "reason": "ClassPipetteCollection startup parity not live-bound in this shell"}
 
-    def vision_startup_check(self, *, mode: str = "dry_run") -> dict:
-        return {"ok": not self.vision_required, "required": self.vision_required, "available": False, "skipped": True, "blocks_ready": self.vision_required, "reason": "CVisionLib inspection parity not live-bound in this shell"}
 
-    def homing_predicates(self) -> dict[str, dict]:
-        return dict(self.home_predicates)
 
 class BioXpStartupHardware:
     def __init__(self, tester_factory, *, config_roots: list[str] | None = None):
@@ -156,8 +147,6 @@ class BioXpStartupHardware:
             self._tester = self._tester_factory()
         return self._tester
 
-    def load_config(self) -> dict:
-        return find_oem_config(self.config_roots)
 
     # Canonical initialCheck adapter methods.  They are invoked only by an
     # explicit lifecycle stage; none is called during provider construction.
@@ -256,24 +245,11 @@ class BioXpStartupHardware:
             "checks": [{"name": "door_latch", "ok": ok}],
         }
 
-    def configure_without_motion(self, *, mode: str = "shadow") -> dict:
-        live = mode == "live"
-        return {
-            "ok": not live,
-            "physical_motion": False,
-            "source_anchor": SOURCE_ANCHORS["initializeMotorsWithoutMotion"],
-            "skipped_live_write": True,
-            "failure": "provider_owned_initialize_motors_required" if live else None,
-        }
 
     def pipette_startup_check(self, *, mode: str = "shadow") -> dict:
         return {"ok": False, "required": True, "available": False, "skipped": True, "blocks_ready": True, "reason": "pipette ACK/readback parity gate not yet proven"}
 
-    def vision_startup_check(self, *, mode: str = "shadow") -> dict:
-        return {"ok": False, "required": True, "available": False, "skipped": True, "blocks_ready": True, "reason": "vision/inspection artifact parity gate not yet proven"}
 
-    def homing_predicates(self) -> dict[str, dict]:
-        return {}
 
 class OEMStartupProgram:
     def __init__(self, *, hardware: Any, artifact_base: str | Path = "/tmp/bioxp-live-runs", allowlist_roots: list[str | Path] | None = None):
@@ -356,33 +332,6 @@ class OEMStartupProgram:
         _atomic_json(root / "failure.json", {"reason": reason, "state": status["state"]})
         return self._closeout(status)
 
-    def request_startup(self, request: dict) -> dict:
-        req = dict(request or {})
-        req.setdefault("mode", "dry_run")
-        req.setdefault("require_config", True)
-        req.setdefault("door_policy", "wait_for_closed")
-
-        if req["mode"] == "live" and req.get("operator_ack") != "INITIALIZE":
-            status = self._new_session(req)
-            return self._fail(status, "operator_ack INITIALIZE required for live mode")
-        status = self._new_session(req)
-        if status.get("failed_closed"):
-            return status
-        # Generic startup binds a session/artifact owner only.  The accepted
-        # constructor -> initialize-without-motion -> initialCheck stages are
-        # separately approved POST/worker actions and cannot execute here.
-        from .lifecycle_state import lifecycle_state
-
-        lifecycle = lifecycle_state.transition("waiting", reason="startup_session_bound_awaiting_constructor_stage")
-        status.update({
-            "state": "waiting_for_constructor_pipette_stage",
-            "active_stage": None,
-            "ready": False,
-            "queued": False,
-            "lifecycle": lifecycle,
-            "next_action": "POST /oem/startup/constructor_pipettes",
-        })
-        return self._closeout(status)
 
     def door_event(self, session_id: str | None, *, door_closed: bool, latch_closed: bool) -> dict:
         from .lifecycle_state import lifecycle_state
