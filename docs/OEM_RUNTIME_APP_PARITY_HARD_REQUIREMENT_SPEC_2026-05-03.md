@@ -561,12 +561,8 @@ Existing `/oem/startup/*` routes may remain but must become thin wrappers over `
   - `oem_query_door_status()`;
 - ensure no function silently claims OEM success without hardware/readback proof.
 
-#### `scripts/bioxp_supervised_oem_app_startup.sh`
-
-- call runtime enqueue/status endpoints;
-- show worker/event state;
-- never call direct homing endpoints;
-- include timeout and emergency stop instructions.
+The monolithic startup shell wrapper is retired. Startup is staged through the
+current lifecycle/operator interfaces, not the historical runtime queue.
 
 ## 4. Exact runtime state machine
 

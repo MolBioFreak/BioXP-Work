@@ -64,8 +64,8 @@ Purpose:
 - useful for command-sequence context and reverse-engineering validation
 
 Examples:
-- `demo.xml`
-- `lifetest.xml`
+- `testdata/oem_xml/demo.xml` (canonical fixture, outside `scripts/`)
+- `testdata/oem_xml/lifetest.xml` (canonical fixture, outside `scripts/`)
 - `TP015 48 HOUR SYSTEM BURN-IN.xml`
 
 ## 7. Documentation and Data Dependencies

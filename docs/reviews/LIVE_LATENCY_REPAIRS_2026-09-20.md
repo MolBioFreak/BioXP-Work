@@ -206,11 +206,10 @@ A generated 100,406-byte state, 200 calls per measurement, on the authoring host
 
 These compare the real methods in separate base/candidate interpreters, with
 synthetic data and no hardware. They are indicative mechanism measurements, not
-promised whole-move speedups. Reproduce on either source tree with the candidate
-script path and that tree on PYTHONPATH:
+promised whole-move speedups. The one-off synthetic microbenchmark is retired;
+the HTTP probe below measures a different boundary, not an equivalent replacement.
 
 ```bash
-PYTHONPATH=src:. python /path/to/candidate/scripts/bioxp_latency_microbench.py
 # Light observation of an existing command (never creates a move):
 python scripts/bioxp_latency_probe.py --base-url http://ROBOT_API \
   --command EXISTING_COMMAND_ID --count 10 --interval 0.5
