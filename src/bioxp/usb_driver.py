@@ -1234,6 +1234,34 @@ class BioXpTester:
             "source_order": ["cmd64=0", "cmd64=1"],
         }
 
+    def oem_bind_initialized_board_lifecycle_generation(self, *, transport_generation):
+        """Bind current accepted initialization, without claiming an off/on cycle.
+
+        Conditional activation invalidates the old profile/generation itself.
+        With no activation, retain the existing native generation; a new host
+        binding needs no deactivation and supplies no historical reference proof.
+        """
+        current_transport = int(getattr(self, "_oem_transport_generation", 0))
+        initialized = self._oem_board_state()
+        if (current_transport != transport_generation
+                or not all(initialized.get(int(board)) is True for board in self.BOARDS)):
+            self._oem_active_board_lifecycle_generation = None
+            return {"ok": False, "failure": "current_board_initialization_incomplete_or_transport_changed"}
+        generation = self.oem_current_board_lifecycle_generation()
+        reused = generation is not None
+        if not reused:
+            generation = int(getattr(self, "_oem_board_lifecycle_generation", 0)) + 1
+            self._oem_board_lifecycle_generation = generation
+            self._oem_active_board_lifecycle_generation = generation
+        return {
+            "ok": True,
+            "board_lifecycle_generation": generation,
+            "transport_generation": current_transport,
+            "reused": reused,
+            "initialized_boards": sorted(int(board) for board in self.BOARDS),
+            "binding_source": "current_oem_initialized_state",
+        }
+
     def oem_current_board_lifecycle_generation(self):
         value = getattr(self, "_oem_active_board_lifecycle_generation", None)
         return int(value) if type(value) is int and value > 0 else None
