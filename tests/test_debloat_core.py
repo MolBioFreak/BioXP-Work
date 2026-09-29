@@ -199,9 +199,10 @@ def test_closeout_builds_only_pending_evidence(named, monkeypatch, pending):
 def test_source_move_branches(named, target, camera, loaded):
     run, provider, store, counts, frames, fault = named
     if loaded:
-        state = provider._load_state()
-        state['machine_status']['tip_loaded'] = True
-        provider._save_state(state)
+        store.publish_deck_owner_state(source_operation='pipette_owner', source_command_id='fixture-loaded',
+            updates={'tip_loaded': True, 'tip_dirty': False, 'tip_location': -1},
+            **provider.deck_owner_authority_stamps())
+        assert store.deck_semantic_state()['tip_loaded'] is True
     result, cid = run(target, camera_offset=camera)
     assert result['ok'], json.dumps(result, indent=2)
     assert counts['deck_authority_snapshot'] == 1
