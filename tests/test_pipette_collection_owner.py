@@ -86,10 +86,12 @@ def test_source_identity_drift_never_reuses_false(query_rig, fault):
         assert result['pipette_collection']['available'] is False
 
 
-def test_pending_real_receipt_write_refusal_cannot_publish_ram(query_rig):
+@pytest.mark.parametrize('loaded', [True, False])
+def test_pending_real_receipt_write_refusal_preserves_source_ram_not_durable_truth(query_rig, monkeypatch, loaded):
     rig = query_rig
+    native_leaves(rig, monkeypatch)
     warm_no_tip(rig)
-    rig[7]['data'][0] = [32,96,49]
+    rig[7]['data'][0] = [32,96,49 if loaded else 48]
     denied = []
     def authorizer(action, table, column, db, trigger):
         if action == sqlite3.SQLITE_UPDATE and table == 'pipette_operations' and column == 'receipt_json':
@@ -105,8 +107,20 @@ def test_pending_real_receipt_write_refusal_cannot_publish_ram(query_rig):
     with pytest.raises(PipetteReceiptError, match='pending'): state(rig)
     result = api._collect_and_publish_hardware_snapshot(['axes','latch'], reason='pending-owner-test')
     assert result['pipette_collection']['available'] is False
-    refusal = assert_park_unready(rig, 'pipette_collection_receipt_pending')
-    assert_worker_refused(rig, 'pending-receipt-active-worker', refusal)
+    # Pending durable truth must not become an OEM TipExist/Park admission gate.
+    from tests.test_deck_tip_query_publication_contradiction import assert_source_park
+    source = assert_source_park(rig, tip_exists=loaded, hardware_tip_exists=loaded)
+    assert [c['tip_loaded'] for c in source['channels']] == [loaded, False, False, False]
+    assert rig[6] == [0, 1, 2, 3] * 2
+    if not loaded:
+        prior_motion = len(rig[2].calls)
+        receipt = submit_named(rig, 'LOC_PARK', 'pending-no-tip-source-park')
+        assert receipt['terminal'] is True and receipt['status'] == 'completed'
+        assert any(c[0] == 'move' for c in rig[2].calls[prior_motion:])
+        assert rig[6] == [0, 1, 2, 3] * 2  # No query to overcome missing receipt.
+        with pytest.raises(PipetteReceiptError, match='pending'): state(rig)
+        assert rig[5].connection.execute('SELECT status FROM pipette_operations WHERE command_id=?',
+            (row['command_id'],)).fetchone()[0] == row['status']
 
 
 def test_async_receiver_does_not_wait_on_sql_writer_and_midcommit_drift(query_rig):
