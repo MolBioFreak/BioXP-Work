@@ -5058,9 +5058,6 @@ class Serial206OemInitializationProvider:
         if not isinstance(raw, Mapping):
             raise RuntimeError("deck_semantic_state_not_authoritative:malformed")
         semantic = dict(raw)
-        revision = semantic.get("semantic_state_revision")
-        if not pseudo_home_only and (type(revision) is not int or revision < 0):
-            raise RuntimeError("deck_semantic_state_not_authoritative:location_revision")
         # Historical uncertainty/provenance is evidence, not an OEM branch input.
         provenance = semantic.get("transition_provenance")
         with self._lock:
