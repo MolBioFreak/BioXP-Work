@@ -98,7 +98,7 @@ def test_overlapping_continuing_native_fifo(installed_retained, retained_rig, mo
     assert plane.store.wait_for_command_workers(ids, timeout=3)
     assert plane.store.queue()['items'] == []
     assert all(name.startswith('bioxp-operator-command-') for name in samples)
-    assert len(samples) == 2 * len(ids), 'only leased planning and final pre-TX samples per ordinary move'
+    assert len(samples) == len(ids), 'one leased planning sample; final live fences do not resweep'
     # Read the same canonical results through a fresh SQLite process.
     plane.stop()
     code = ('import json,sys; from tests.test_deck_scoped_integration import fresh_process_receipts; '
