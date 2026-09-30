@@ -824,17 +824,3 @@ async def oem_shadow_readback(axes: str = "x,y,z,g,door") -> dict[str, Any]:
         "switch_mask_mutation_commanded": False,
         "error": None if observed is not None else "canonical shadow_readback observation unavailable",
     }
-
-
-@router.post("/motion/oem/shadow_readback/capture")
-async def oem_shadow_readback_capture(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    del payload
-    raise HTTPException(
-        status_code=409,
-        detail={
-            "error": "shadow_readback_collection_moved",
-            "required_route": "POST /hardware/snapshot/collect",
-            "required_domain": "shadow_readback",
-            "hardware_queried": False,
-        },
-    )
