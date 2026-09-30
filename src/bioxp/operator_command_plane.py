@@ -4103,8 +4103,10 @@ class OperatorCommandStore:
                     "UPDATE operator_plane_deck_stages SET terminal_state='completed',terminal_evidence_json=? WHERE command_id=? AND stage_order=? AND terminal_state='planned'",
                     (_canonical(evidence), str(command_id), int(step.order)),
                 )
-            if all(row.get("source_noop") is True for row in results):
+            if plan.target == "LOC_PARK" and all(row.get("source_noop") is True for row in results):
                 # Source Park returned before updateLocation or tray access.
+                # An axis-level no-op at another named target still runs the
+                # source caller's updateLocation and must commit that location.
                 return
             current = conn.execute(
                 "SELECT semantic_state_revision,movable_plate_locations_json,current_tray FROM operator_plane_deck_semantic_state WHERE singleton=1"
