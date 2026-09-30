@@ -151,6 +151,22 @@ def assert_park_unready(rig, match):
 
 
 def warm_no_tip(rig):
+    # The retained motor fixture does not establish process-local CAN constructor
+    # ownership. Establish it through the real source owner, at the offline wire
+    # seam, before a cached collection reader requests ensure_constructor.
+    from bioxp import api
+    from bioxp.lifecycle_state import CanonicalLifecycleOwner
+    from tests.test_pipette_constructor_collection import constructor
+    with pytest.MonkeyPatch.context() as setup:
+        owner = CanonicalLifecycleOwner()
+        owner.transport_changed(True, reason='offline collection fixture CAN owner')
+        setup.setattr(api, 'lifecycle_state', owner)
+        def action():
+            attempt = owner.projection()['startup']['stages']['constructor_pipette_stage']['attempt_id']
+            return constructor(rig, setup, key=attempt)[0]
+        projection = owner.run_stage('constructor_pipette_stage', action)
+        assert projection['startup']['stages']['constructor_pipette_stage']['state'] == 'passed'
+        assert rig[8]._constructor_started  # Set by the real producer, not fixture intent.
     named_move(rig)
     query(rig)
     authority = park_authority(rig)

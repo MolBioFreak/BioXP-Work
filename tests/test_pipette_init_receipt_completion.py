@@ -75,7 +75,7 @@ def test_four_channel_init_records_controller_completion(tmp_path, monkeypatch, 
         assert json.loads(row["response_summary_json"])["ok"] is False
     else:
         assert result["ok"] is True and result["outcome"] == "completion"
-        assert [r["result"]["ok"] for r in result["status_readback_final"]] == [True] * 4
+        assert [r["result"]["ok"] for r in (result["status_readback_retry"] if result["status_readback_retry"] is not None else result["status_readback_first"])] == [True] * 4
         assert result["initial_group"]["completion_verified"] is True
         assert result["single_conditional_retry_performed"] is (mode == "conditional_retry")
         assert all(r["result"]["software_initialized"] for r in result["channels"])

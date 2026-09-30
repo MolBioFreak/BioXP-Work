@@ -26,7 +26,7 @@ def constructor(rig, monkeypatch, key='startup'):
     for channel, leaf in enumerate(transport._transports):
         driver = leaf._get_driver()
         assert not getattr(driver, '_pipette_message_state', {}).get('tip_source_actor')
-        driver.bus = SimpleNamespace(router=router)
+        monkeypatch.setattr(driver, 'bus', SimpleNamespace(router=router), raising=False)
         driver._pipette_completion_owner_token = None
         driver._sleep = lambda _: None
         def exchange(command, *, command_name, channel=channel, driver=driver, **kwargs):

@@ -178,7 +178,7 @@ class CanPipetteTransport:
                 setattr(self._driver, "_pipette_error_callback", self._error_callback)
         return self._driver
 
-    def _status_payload(self, **extra: Any) -> dict[str, Any]:
+    def _status_payload(self, *, include_transaction: bool = True, **extra: Any) -> dict[str, Any]:
         ok = bool(extra.pop("ok", True))
         delivery_verified = bool(extra.pop("delivery_verified", False))
         controller_acknowledged = extra.pop("controller_acknowledged", None)
@@ -209,7 +209,7 @@ class CanPipetteTransport:
             "pressure_profile": self._pressure_profile,
             "top_speed": self._top_speed,
             "last_command": self._last_command,
-            "last_transaction": self._last_transaction,
+            **({"last_transaction": self._last_transaction} if include_transaction else {}),
             "pipette_message_state": message_state,
             "oem_initialization_counter": int(message_state.get("initialization_counter", 0) or 0),
             "oem_diagnosis": message_state.get("diagnosis"),
@@ -465,7 +465,7 @@ class CanPipetteTransport:
             can_ids=can_ids() if callable(can_ids) else None,
         )
 
-    def initialize(self, command: PipetteInitCommand) -> dict[str, Any]:
+    def initialize(self, command: PipetteInitCommand, *, constructor_detail: bool = False) -> dict[str, Any]:
         if command.prime_volume_ul is not None:
             raise PipetteCommandError(
                 "OEM pipette initialization has no priming operation; use an explicit liquid command.",
@@ -480,6 +480,7 @@ class CanPipetteTransport:
         self._pressure_profile = command.pressure_profile
         self._last_command = "initialize"
         payload = self._status_payload(
+            include_transaction=not constructor_detail,
             command="initialize",
             driver_result=init_result,
             requested=command.to_payload(),
@@ -1058,16 +1059,19 @@ class FourPipetteTransport:
             self._error_callback(int(channel), int(error_code))
 
 
-    def get_status(self) -> dict[str, Any]:
-        rows = [
+    def _channel_status_rows(self, *, include_transaction: bool = True) -> list[dict[str, Any]]:
+        return [
             {
-                **transport._status_payload(hardware_truth_level="cached_transport_state"),
+                **transport._status_payload(include_transaction=include_transaction, hardware_truth_level="cached_transport_state"),
                 "channel": index,
                 "available": bool(transport._transport_details.get("shared_bioxp_usb_runtime"))
                 if transport._transport_name == "novo_usb_can" else True,
             }
             for index, transport in enumerate(self._transports)
         ]
+
+    def get_status(self) -> dict[str, Any]:
+        rows = self._channel_status_rows()
         return {
             "ok": all(bool(row.get("available")) for row in rows),
             "transport": "novo_usb_can",
@@ -1165,7 +1169,8 @@ class FourPipetteTransport:
         }
 
     def _run_group_cycle(self, command: PipetteInitCommand, *, cycle: str,
-                         continue_after_completion_failure: bool = False) -> dict[str, Any]:
+                         continue_after_completion_failure: bool = False,
+                         constructor_detail: bool = False) -> dict[str, Any]:
         sends: list[dict[str, Any]] = []
         for channel, transport in enumerate(self._transports):
             driver = transport._get_driver()
@@ -1179,6 +1184,7 @@ class FourPipetteTransport:
                 )
                 result = {
                     **transport._status_payload(
+                        include_transaction=not constructor_detail,
                         command="initialize",
                         driver_result=driver_result,
                         requested=command.to_payload(),
@@ -1188,7 +1194,7 @@ class FourPipetteTransport:
                     "driver_result": driver_result,
                 }
             else:
-                result = transport.initialize(command)
+                result = transport.initialize(command, constructor_detail=True) if constructor_detail else transport.initialize(command)
             sends.append({"channel": channel, "result": result})
             if not result.get("driver_result", {}).get("immediate_ack_received"):
                 for registered in range(channel + 1):
@@ -1374,22 +1380,22 @@ class FourPipetteTransport:
         # Process-local constructor ownership, never restored from a receipt.
         self._constructor_started = True
         started = time.monotonic()
-        initial_group = self._run_group_cycle(command, cycle="constructor_initiateGroup")
+        initial_group = self._run_group_cycle(command, cycle="constructor_initiateGroup", constructor_detail=True)
         if not initial_group.get("ok"):
             self._last_group_transaction = {
                 "ok": False,
                 "outcome": "initial_group_cycle_failed",
                 "channels": [
                     {"channel": row["channel"], "result": row}
-                    for row in self.get_status()["channels"]
+                    for row in self._channel_status_rows(include_transaction=False)
                 ],
                 "initial_group": initial_group,
-                "pressure_stream": dict(initial_group.get("pressure_stream") or {}),
-                "pressure_epoch": initial_group.get("pressure_epoch"),
-                "pressure_offsets": dict(initial_group.get("pressure_offsets") or {}),
-                "pressure_offset_evidence": dict(initial_group.get("pressure_offset_evidence") or {}),
-                "pressure_offsets_valid": initial_group.get("pressure_offsets_valid") is True,
-                "pressure_offset_order": initial_group.get("pressure_offset_order"),
+                # Move the selected pressure owner: no duplicate constructor attachment.
+                "pressure_epoch": initial_group.pop("pressure_epoch", None),
+                "pressure_offsets": initial_group.pop("pressure_offsets", {}),
+                "pressure_offset_evidence": initial_group.pop("pressure_offset_evidence", {}),
+                "pressure_offsets_valid": initial_group.pop("pressure_offsets_valid", None) is True,
+                "pressure_offset_order": initial_group.pop("pressure_offset_order", None),
                 "group_wait_ms": 10_000,
             }
             return dict(self._last_group_transaction)
@@ -1401,7 +1407,7 @@ class FourPipetteTransport:
         retry_group = None
         retry_status = None
         if condition_ok and not first_status_ok:
-            retry_group = self._run_group_cycle(command, cycle="single_conditional_status_retry")
+            retry_group = self._run_group_cycle(command, cycle="single_conditional_status_retry", constructor_detail=True)
             if retry_group.get("ok"):
                 retry_status = self._query_status()
         final_status = retry_status if retry_status is not None else first_status
@@ -1431,7 +1437,7 @@ class FourPipetteTransport:
             } if ok else {}),
             "channels": [
                 {"channel": row["channel"], "result": row}
-                for row in self.get_status()["channels"]
+                for row in self._channel_status_rows(include_transaction=False)
             ],
             "initial_group": initial_group,
             "condition_readback": condition,
@@ -1439,13 +1445,11 @@ class FourPipetteTransport:
             "single_conditional_retry_performed": retry_group is not None,
             "retry_group": retry_group,
             "status_readback_retry": retry_status,
-            "status_readback_final": final_status,
-            "pressure_stream": dict(pressure_group.get("pressure_stream") or {}),
-            "pressure_epoch": pressure_group.get("pressure_epoch"),
-            "pressure_offsets": dict(pressure_group.get("pressure_offsets") or {}),
-            "pressure_offset_evidence": dict(pressure_group.get("pressure_offset_evidence") or {}),
-            "pressure_offsets_valid": pressure_group.get("pressure_offsets_valid") is True,
-            "pressure_offset_order": pressure_group.get("pressure_offset_order"),
+            "pressure_epoch": pressure_group.pop("pressure_epoch", None),
+            "pressure_offsets": pressure_group.pop("pressure_offsets", {}),
+            "pressure_offset_evidence": pressure_group.pop("pressure_offset_evidence", {}),
+            "pressure_offsets_valid": pressure_group.pop("pressure_offsets_valid", None) is True,
+            "pressure_offset_order": pressure_group.pop("pressure_offset_order", None),
             "group_wait_ms": 10_000,
             "pipette_transaction_timeout_ms": 60_000,
             "elapsed_ms": int(round((time.monotonic() - started) * 1000.0)),

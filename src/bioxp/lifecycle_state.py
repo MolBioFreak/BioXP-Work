@@ -170,8 +170,10 @@ class CanonicalLifecycleOwner:
             return attempt_id
 
     def _finish_stage(self, name: str, attempt_id: str, result: Mapping[str, Any]) -> dict[str, Any]:
-        evidence = copy.deepcopy(dict(result))
-        ok = bool(evidence.get("ok"))
+        # Constructor detail already belongs to the canonical pipette attempt.
+        # Other startup stages retain their unique evidence and initial-check history.
+        evidence = None if name == "constructor_pipette_stage" else copy.deepcopy(dict(result))
+        ok = bool(result.get("ok"))
         with self._lock:
             row = self._stages[name]
             if row["attempt_id"] != attempt_id or row["state"] != "running":
@@ -180,7 +182,7 @@ class CanonicalLifecycleOwner:
                 "state": "passed" if ok else "failed",
                 "completed_at": _utc_now(),
                 "evidence": evidence,
-                "error": None if ok else str(evidence.get("error") or evidence.get("outcome") or f"{name}_failed"),
+                "error": None if ok else str(result.get("error") or result.get("outcome") or f"{name}_failed"),
             })
             successor_index = STARTUP_STAGES.index(name) + 1
             if ok and successor_index < len(STARTUP_STAGES):
