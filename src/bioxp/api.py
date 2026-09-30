@@ -1702,6 +1702,35 @@ def _active_lifecycle_attempt_id(stage_id: str) -> str:
     return attempt_id
 
 
+def _constructor_detail_projection(projection: dict[str, Any]) -> dict[str, Any]:
+    """Explicit detail from the existing canonical attempt; never retained or required."""
+    stage = projection.get("startup", {}).get("stages", {}).get("constructor_pipette_stage")
+    if not isinstance(stage, dict) or not stage.get("attempt_id") or _pipette_receipts is None:
+        return projection
+    try:
+        with _pipette_receipts.lock:
+            row = _pipette_receipts.connection.execute(
+                "SELECT command_id,pipette_operation_id,receipt_json FROM pipette_operations "
+                "WHERE lifecycle_stage_id=? AND lifecycle_attempt_id=? ORDER BY updated_at DESC LIMIT 1",
+                ("constructor_pipette_stage", stage["attempt_id"]),
+            ).fetchone()
+        if row is None:
+            return projection
+        receipt = json.loads(row["receipt_json"])
+        detail = receipt.get("result", receipt)
+        if receipt.get("schema") == "bioxp.pipette.receipt.v1" and isinstance(detail, dict):
+            detail = {
+                **detail, "command_id": row["command_id"],
+                "receipt_id": receipt["receipt_id"], "receipt_truth": receipt["truth"],
+                "source_identity": receipt["source_identity"],
+            }
+    except Exception:
+        # Missing optional detail cannot change completion or admission.
+        return projection
+    stage["evidence"] = detail
+    return projection
+
+
 def _constructor_pipette_action() -> dict[str, Any]:
     owner = _get_pipette_transport()
     if owner.__class__.__name__ != "FourPipetteTransport":
@@ -1829,6 +1858,7 @@ def _oem_non_motion_startup_result(
     *,
     failed_stage: str | None = None,
 ) -> dict[str, Any]:
+    projection = _constructor_detail_projection(projection)
     return {
         "ok": failed_stage is None and projection["startup"]["state"] == "passed",
         "failed_stage": failed_stage,
@@ -1958,7 +1988,7 @@ async def oem_startup_status_latest():
 async def oem_startup_status(session_id: str):
     if session_id != "canonical":
         raise HTTPException(status_code=404, detail="startup session not found")
-    projection = lifecycle_state.projection()
+    projection = _constructor_detail_projection(lifecycle_state.projection())
     return {"ok": True, "available": True, "cache_state": "memory", "session_id": session_id, "state": projection["startup"]["state"], "lifecycle": projection}
 
 
@@ -1974,6 +2004,7 @@ async def oem_startup_constructor_pipettes():
         )
     except LifecycleStateError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    projection = _constructor_detail_projection(projection)
     if projection["startup"]["stages"]["constructor_pipette_stage"]["state"] != "passed":
         raise HTTPException(status_code=409, detail=projection)
     return {"ok": True, "lifecycle": projection}
@@ -9711,6 +9742,7 @@ async def liquid_init(req: PipetteInitRequest):
         )
     except LifecycleStateError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    projection = _constructor_detail_projection(projection)
     if projection["startup"]["stages"]["constructor_pipette_stage"]["state"] != "passed":
         raise HTTPException(status_code=409, detail=projection)
     return {"ok": True, "lifecycle": projection}
