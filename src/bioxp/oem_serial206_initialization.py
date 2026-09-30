@@ -11169,9 +11169,7 @@ class Serial206OemInitializationProvider:
             raise RuntimeError("deck_execution_owner_authority_changed")
         if authority.get("dependency_scope") == "offset.v1":
             current = self._offset_deck_semantic_state(gripper_confirmed=authority["gripper_confirmed"])
-            if (current["semantic_state_revision"] != authority["machine_state_revision"]
-                    or current["transition_provenance_digest"] != authority["semantic_state_provenance_digest"]
-                    or current["consumed_state_digest"] != authority["consumed_state_digest"]):
+            if current["consumed_state_digest"] != authority["consumed_state_digest"]:
                 raise RuntimeError("deck_execution_semantic_authority_changed")
 
     def _deck_execution_semantics(self, authority_snapshot: Mapping[str, Any] | None, *, no_tip_park: bool = False) -> dict[str, Any]:
@@ -11206,9 +11204,7 @@ class Serial206OemInitializationProvider:
                 required_types.pop(key)
             required_types["gripper_confirmed"] = bool
             current = self._offset_deck_semantic_state(gripper_confirmed=authority_snapshot.get("gripper_confirmed"))
-            if (current["semantic_state_revision"] != authority_snapshot.get("machine_state_revision")
-                    or current["transition_provenance_digest"] != authority_snapshot.get("semantic_state_provenance_digest")
-                    or current["consumed_state_digest"] != authority_snapshot.get("consumed_state_digest")):
+            if current["consumed_state_digest"] != authority_snapshot.get("consumed_state_digest"):
                 raise RuntimeError("deck_authority_changed_before_first_tx")
         elif authority_snapshot.get("dependency_scope", "full") != "full":
             raise RuntimeError("deck_dependency_scope_mismatch")

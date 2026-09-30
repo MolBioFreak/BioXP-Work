@@ -35,3 +35,12 @@ def test_unrelated_publication_during_observation_is_not_refusal(query_rig, monk
     assert snapshot['board_epoch_4'] == provider.deck_owner_authority_stamps()['board_epoch_4']
     assert calls == []
 
+
+def test_unrelated_publication_after_observation_is_not_native_entry_refusal(query_rig):
+    app, provider, primitive, references, root, receipts, calls, wire, owner = query_rig
+    snapshot = provider.deck_authority_snapshot(expected_generation=provider.generation_provider(), target='LOC_OC')
+    publish_unrelated(app.state.operator_command_plane.store, provider, 'unrelated-before-native-entry')
+    result = provider.moveTo(location_id=1, authority_snapshot=snapshot)
+    assert result['ok'] is True
+    assert any(row[0] == 'move' for row in primitive.calls)
+
