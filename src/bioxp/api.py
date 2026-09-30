@@ -11075,7 +11075,9 @@ def _protocol_bindings(bundle, *, source_executor=None):
     validate_oem_selected_dependencies(
         ProtocolDocument.from_payload(bundle["protocol"]["document"]), capabilities=capabilities,
     )
-    return ProtocolBindings(_protocol_live_handlers(), {**native, **pipette}, lifecycle, **lifetime)
+    from .protocols.executor import oem_source_default_handlers
+    return ProtocolBindings(_protocol_live_handlers(), {**oem_source_default_handlers(), **native, **pipette},
+                            lifecycle, **lifetime)
 
 
 @app.post("/protocol/execute")

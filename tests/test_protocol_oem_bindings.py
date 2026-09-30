@@ -280,7 +280,11 @@ def test_prepared_mov_uses_typed_intent_and_records_child(rig, monkeypatch):
         trace.append(("mov", intent, idempotency_key, store.occurrence))
         return {"command_id": "mov-child"}
     monkeypatch.setattr(api.app.state, "oem_mov_execution_admitter", admit, raising=False)
-    store.get_command = lambda cid: {"status": "completed", "terminal_evidence": {"response": {"source_return": [7]}}}
+    from concurrent.futures import Future
+    receipt = {"status": "completed", "terminal_evidence": {"response": {"source_return": [7]}}}
+    settled = Future()
+    settled.set_result({"ok": True, "command_id": "mov-child", "status": "completed", "receipt": receipt})
+    store.workflow_child_completion = lambda cid: settled
     doc = document("mov", {"m_destination": {"enum_type": "locationID", "value": 6},
                            "m_well": "A1", "m_oldWell": False}, form="ClassMoveTo")
     _, handlers, _ = bind(doc)

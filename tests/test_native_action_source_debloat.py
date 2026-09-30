@@ -53,8 +53,9 @@ def test_real_manual_latch_denials_still_block_before_motion(rig, monkeypatch, o
     table = load_bound_oem_position_table()
     plan = compile_named_location(NamedLocationIntent(target='LOC_OC'),
         DeckCatalog.from_position_table(table), table, authority)
+    # C1: the plan stays immutable; the manual caller's final live latch check
+    # refuses before delivery (tests/test_debloat_core.py covers execution).
     assert plan.blocked_reason == 'latch_not_closed'
-    assert not any(step.operation == 'moveTo' for step in plan.steps)
     assert not any(row[0] == 'move' for row in primitive.calls)
 
 

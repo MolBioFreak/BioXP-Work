@@ -15,6 +15,12 @@ SETTINGS = {"MotionOnly": False, "StartMode": 0, "DeckInspection": False,
             "CameraInstalled": False, "CameraCalibrated": False}
 
 
+
+def _xml(name):
+    # Prune moved duplicate retained scripts to testdata; others stay in scripts/.
+    moved = ROOT / 'testdata/oem_xml' / name
+    return moved if moved.exists() else ROOT / 'scripts' / name
+
 def actions(doc):
     return [a for s in doc.stages for a in s.actions]
 
@@ -50,7 +56,7 @@ def test_system_check_single_xml_definition_and_children():
 
 @pytest.mark.parametrize('name', ['Inital Test Script.xml', 'demo.xml', 'tp506.xml'])
 def test_retained_mechanical_thermal_scripts_expand(name):
-    doc = expand_oem_xml_protocol(ROOT / 'scripts' / name, source_settings=SETTINGS)
+    doc = expand_oem_xml_protocol(_xml(name), source_settings=SETTINGS)
     assert doc.metadata['input_mode'] == 'oem_prepared'
     assert all(a.oem_opcode in SOURCE_DOMAINS for a in actions(doc))
 
@@ -59,7 +65,7 @@ def test_retained_mechanical_thermal_scripts_expand(name):
                                      ('TP015 48 HOUR SYSTEM BURN-IN.xml', {'MT'})])
 def test_retained_liquid_gap_is_explicit_no_executable_prefix(name, verbs):
     with pytest.raises(UnexpandedOemGenerator) as error:
-        expand_oem_xml_protocol(ROOT / 'scripts' / name, source_settings=SETTINGS)
+        expand_oem_xml_protocol(_xml(name), source_settings=SETTINGS)
     assert {c['verb'] for c in error.value.commands} == verbs
 
 

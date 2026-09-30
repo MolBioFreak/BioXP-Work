@@ -14478,23 +14478,26 @@ class Serial206OemInitializationProvider:
         # ControlLib returns at current Park before gripper/tip/tray access.
         # Manual callers already ran ForceToHighHome and both latch predicates;
         # native/script callers keep their own prefix.
-        reader = self._deck_semantic_state_reader
+        already_parked = {
+            "ok": True,
+            "source_noop": True,
+            "delivery_attempted": False,
+            "controller_command_acknowledged": False,
+            "controller_completion_verified": False,
+            "hardware_postcondition_verified": False,
+            "source_children": [],
+            "source_anchor": "ControlLib.parkGantry:7073-7076",
+        }
+        reader = getattr(self, "_deck_semantic_state_reader", None)
         logical = reader() if callable(reader) else {}
         if logical.get("current_location") == "LOC_PARK":
-            return {
-                "ok": True,
-                "source_noop": True,
-                "delivery_attempted": False,
-                "controller_command_acknowledged": False,
-                "controller_completion_verified": False,
-                "hardware_postcondition_verified": False,
-                "source_children": [],
-                "source_anchor": "ControlLib.parkGantry:7073-7076",
-            }
+            return dict(already_parked)
         if authority_snapshot is not None and authority_snapshot.get("dependency_scope", "full") != "full":
             raise RuntimeError("deck_dependency_scope_mismatch")
         semantics = self._deck_execution_semantics(authority_snapshot, no_tip_park=True)
         current_location_name = str(semantics["current_location_id"])
+        if current_location_name == "LOC_PARK":
+            return dict(already_parked)
         name_to_id = {name: ordinal for ordinal, name in LOCATION_ID_TO_NAME.items()}
         if current_location_name not in name_to_id:
             raise RuntimeError("park_current_location_not_authoritative")
