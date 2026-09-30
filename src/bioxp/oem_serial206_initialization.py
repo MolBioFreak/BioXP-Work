@@ -2934,6 +2934,12 @@ class Serial206ProductionPrimitiveAdapter:
         """Normalize only explicit production ACK/terminal evidence for one child."""
         if not isinstance(result, Mapping):
             return {"command_required": True, "acknowledged": False, "terminal": False}
+        # Production axis wrappers already normalize a native source no-op.
+        # Preserve that command requirement when moveTo aggregates the wrapper.
+        if result.get("controller_command_required") is False:
+            nested_move = result.get("move")
+            if isinstance(nested_move, Mapping) and nested_move.get("source_noop") is True:
+                return self._oem_controller_child_evidence(nested_move)
         # The native Y provider retains board exact-noop evidence under result;
         # it does not claim a motor ACK for its source-only completion.
         native = result.get("result")
