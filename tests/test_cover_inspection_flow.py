@@ -144,7 +144,10 @@ class TestRetainedTrayCleanPath:
         provider = object.__new__(Serial206OemInitializationProvider)
         provider._lock = nullcontext()
         provider._load_state = lambda: {"machine_status": {"thermal_door_open": False}}
-        provider._canonical_deck_semantic_state = lambda: {
+        provider.deck_owner_authority_stamps = lambda: {
+            "ownership_generation": 1, "board_epoch_4": 108, "board_epoch_5": 1,
+        }
+        provider._canonical_deck_semantic_state = lambda **unused: {
             "current_location": "LOC_RC_COVER_STORAGE", "semantic_state_revision": 581,
             "ownership_generation": 1, "board_epoch_4": 108, "board_epoch_5": 1,
             "current_well": 0, "tip_loaded": False, "tip_dirty": False,
