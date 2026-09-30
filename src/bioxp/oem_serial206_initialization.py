@@ -14460,9 +14460,17 @@ class Serial206OemInitializationProvider:
         if not callable(reader):
             raise RuntimeError("pipette_collection_owner_not_bound")
         state = reader()
-        if not isinstance(state, Mapping) or type(state.get("tip_exists")) is not bool:
+        if not isinstance(state, Mapping):
             raise RuntimeError("pipette_collection_state_not_authoritative")
-        return dict(state)
+        state = dict(state)
+        if type(state.get("tip_exists")) is not bool:
+            # ClassPipetteCollection.TipExist ORs the four logical TipLoaded
+            # values; a channel never set reads as constructor false. The reader
+            # already returns True when any channel is positive, so an unknown
+            # mix is the OEM's false. Keep the unknown as evidence, not a refusal.
+            state["tip_exists_unknown_channels"] = True
+            state["tip_exists"] = False
+        return state
 
     def parkGantry(
         self,
