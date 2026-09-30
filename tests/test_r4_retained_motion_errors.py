@@ -19,7 +19,9 @@ DB = Path(os.environ.get(
 
 
 def receipt(command, table='operator_plane_wp8_children'):
-    with sqlite3.connect(f'file:{DB}?mode=ro', uri=True) as connection:
+    # This is a completed, closed backup, never a live WAL database. An
+    # immutable reader avoids creating -shm/-wal beside a read-only file mount.
+    with sqlite3.connect(f'file:{DB}?mode=ro&immutable=1', uri=True) as connection:
         suffix = " AND operation='parkGantry'" if table == 'operator_plane_deck_stages' else " AND terminal_state NOT IN ('completed','planned')"
         row = connection.execute(f'SELECT terminal_evidence_json FROM {table} WHERE command_id=?{suffix}', (command,)).fetchone()
     assert row is not None
