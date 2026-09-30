@@ -1,6 +1,7 @@
 """R4 exact retained receipts, with connected real producer regressions."""
 import copy
 import json
+import os
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,10 @@ from tests.test_deck_scoped_authority import rig, retained_rig  # noqa: F401
 from tests.test_moveto_x_noop_connected import exact_native  # noqa: F401
 from tests.test_cover_carry_release_connected import connected  # noqa: F401
 
-DB = Path('/home/dalab/.hermes/profiles/fresh/robot-audit/debloat-plan-20260929/implementation/finish/live-retained/bioxp_runtime.db')
+DB = Path(os.environ.get(
+    'BIOXP_R4_RETAINED_CAPTURE',
+    '/home/dalab/.hermes/profiles/fresh/robot-audit/debloat-plan-20260929/implementation/finish/live-retained/bioxp_runtime.db',
+))
 
 
 def receipt(command, table='operator_plane_wp8_children'):
