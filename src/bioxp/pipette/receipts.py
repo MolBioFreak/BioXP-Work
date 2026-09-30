@@ -459,35 +459,20 @@ class PipetteReceiptStore:
                 pipette_operation_id=claim["pipette_operation_id"],
                 expected_status=str(claim["status"]),
             )
-        source_identity = self._source_identity()
-        receipt = {
-            "schema": "bioxp.pipette.receipt.v1",
-            "receipt_id": uuid.uuid4().hex,
-            "created_at": _utc_now(),
-            "operation": str(operation),
-            "requested_inputs": _redact(dict(requested_inputs or {})),
-            "effective_inputs": _redact(dict(effective_inputs or {})),
-            "result": critical_receipt(_redact(dict(result))),
-            "truth": self._truth(result),
-            "runtime_binding": _redact(dict(runtime_binding or {"owner": "pipette_receipt_store"})),
-            "ownership_epoch": int(getattr(hardware_state, "ownership_epoch", 0)),
-            "source_identity": source_identity,
-            "deployment_identity": current_release_identity(),
-        }
-        # Passive display observations consume only the actual collection flags
-        # and their source timestamps. Keep the existing envelope fields needed
-        # by collection_state/replay_result, not another copy of wire/driver data.
-        # Failed/uncertain observations retain their complete diagnostic receipt.
-        if (operation == "tip_status" and result.get("ok") is True
+        # Select the existing representation before constructing discarded bulk.
+        # This is not query or success admission: negative/explicit paths are unchanged.
+        compact_passive = (operation == "tip_status" and result.get("ok") is True
                 and result.get("semantic_query_response_verified") is True
                 and (runtime_binding or {}).get("entrypoint_id")
                     == "hardware.snapshot.park_tip_observation"
-                and isinstance(result.get("collection_source"), Mapping)):
-            receipt["result"] = {
+                and isinstance(result.get("collection_source"), Mapping))
+        source_identity = self._source_identity()
+        if compact_passive:
+            receipt_result = {
                 key: _redact(result[key]) for key in ("ok", "outcome", "collection_source", "hardware_query_verified")
                 if key in result
             }
-            receipt["result"]["channels"] = [
+            receipt_result["channels"] = [
                 {"channel": row["channel"], "tip_loaded": row.get("tip_loaded"),
                  "result": {key: row["result"][key]
                             for key in ("observed_at", "source_tip_loaded")
@@ -496,7 +481,23 @@ class PipetteReceiptStore:
                 if isinstance(row, Mapping) and "channel" in row
                 and isinstance(row.get("result"), Mapping)
             ]
-            receipt.pop("deployment_identity")  # Replay reads source_identity instead.
+        else:
+            receipt_result = critical_receipt(_redact(dict(result)))
+        receipt = {
+            "schema": "bioxp.pipette.receipt.v1",
+            "receipt_id": uuid.uuid4().hex,
+            "created_at": _utc_now(),
+            "operation": str(operation),
+            "requested_inputs": _redact(dict(requested_inputs or {})),
+            "effective_inputs": _redact(dict(effective_inputs or {})),
+            "result": receipt_result,
+            "truth": self._truth(result),
+            "runtime_binding": _redact(dict(runtime_binding or {"owner": "pipette_receipt_store"})),
+            "ownership_epoch": int(getattr(hardware_state, "ownership_epoch", 0)),
+            "source_identity": source_identity,
+        }
+        if not compact_passive:
+            receipt["deployment_identity"] = current_release_identity()
         if command_id is not None and pipette_operation_id is not None:
             linked_operator_claim = self._is_linked_operator_claim(
                 command_id=str(command_id),

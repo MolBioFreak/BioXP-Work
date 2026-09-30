@@ -357,6 +357,3 @@ def test_constructor_public_detail_and_lifecycle_owner(query_rig, monkeypatch):
     artifact('lifecycle-construction.json', {'constructor_detail_deepcopies': candidate_copies,
         'baseline_constructor_detail_deepcopies': len(copies), 'stage': stage,
         'canonical_command_id': row['command_id'], 'canonical_pipette_operation_id': row['pipette_operation_id']})
-
-
-
