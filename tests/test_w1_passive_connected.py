@@ -1,7 +1,7 @@
 """W1b actual passive producer/service/public readers and constructor-cost qualification."""
 from tests.test_w1_diagnostics_connected import (
     asyncio, copy, inspect, json, sqlite3, subprocess, sys, pytest, rm,
-    baseline_module, bind_full_infrastructure_identity, artifact, stable,
+    baseline_module, bind_full_infrastructure_identity, artifact, stable, database_artifact,
 )
 from tests.test_deck_tip_query_publication import query_rig
 from tests.test_deck_scoped_integration import installed_retained
@@ -94,6 +94,7 @@ def test_passive_actual_service_record_cost_and_exports(query_rig, monkeypatch, 
             script = 'import json,sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute("SELECT receipt_json FROM pipette_operations WHERE pipette_operation_id=?",(sys.argv[2],)).fetchone()[0])'
             reopened = json.loads(subprocess.check_output([sys.executable, '-c', script, db, child['pipette_operation_id']], text=True))
             assert reopened == receipt
+            database_artifact('passive-' + mode + '.db', db)
             if mode in {'eligible', 'eligible_true', 'explicit'}:
                 replay = store.replay_result(command_id=child['command_id'], pipette_operation_id=child['pipette_operation_id'])
                 assert replay['replayed'] and replay['ok']

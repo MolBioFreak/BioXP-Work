@@ -57,6 +57,15 @@ def artifact(name, value):
         p.write_text(json.dumps(value, indent=2, sort_keys=True))
 
 
+def database_artifact(name, database):
+    if os.environ.get('W1_ARTIFACT_ROOT'):
+        target = Path(os.environ['W1_ARTIFACT_ROOT']) / name
+        with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True) as source:
+            with sqlite3.connect(target) as destination:
+                source.backup(destination)
+                assert destination.execute('PRAGMA quick_check').fetchone()[0] == 'ok'
+
+
 def stable(value):
     """Only remove nondeterministic execution/identity leaves, not truth/errors/offsets."""
     volatile = {'elapsed_ms', 'observed_at', 'last_updated', 'received_at', 'receive_timestamp',
@@ -197,6 +206,7 @@ def test_constructor_differential_sqlite(tmp_path, monkeypatch, mode):
         script = 'import json,sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.row_factory=sqlite3.Row; r=dict(c.execute("SELECT * FROM pipette_operations WHERE command_id=?",(sys.argv[2],)).fetchone()); print(json.dumps(r))'
         reopened = json.loads(subprocess.check_output([sys.executable, '-c', script, db, command_id], text=True))
         assert reopened == row
+        database_artifact('constructor-' + mode + '-' + label + '.db', db)
         assert row['lifecycle_attempt_id'] == 'controlled-' + mode
         assert command['status'] == row['status']
         assert command['outcome'] == row['outcome']
