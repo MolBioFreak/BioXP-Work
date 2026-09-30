@@ -3504,6 +3504,32 @@ class OperatorCommandStore(CommandReceiptReader):
                 ).fetchone()
                 if current is not None and str(current["state"]) == state:
                     return
+                # A source worker can return after an addressed interrupt has
+                # already settled its command. Preserve that durable outcome;
+                # the late return is evidence, not renewed completion authority.
+                interrupted = conn.execute(
+                    "SELECT t.state,c.terminal_json FROM operator_plane_wp8_background_tasks t "
+                    "JOIN operator_plane_commands c ON c.command_id=t.command_id "
+                    "JOIN serial206_movement_commands m ON m.command_id=c.command_id "
+                    "JOIN operator_plane_delivery_attempts a ON a.attempt_sequence=t.delivery_attempt_sequence "
+                    "JOIN operator_plane_lane l ON l.singleton=1 "
+                    "WHERE t.task_id=? AND t.state IN ('created','running') "
+                    "AND c.status IN ('stopped','aborted','interrupted') AND m.state='interrupted' "
+                    "AND json_extract(c.terminal_json,'$.interrupt_id') IS NOT NULL "
+                    "AND a.owner_id=? AND l.owner_id=a.owner_id AND l.owner_lease_until>? "
+                    "AND a.command_id=t.command_id AND a.dispatch_attempt_id=t.dispatch_attempt_id "
+                    "AND c.dispatch_attempt_id=a.dispatch_attempt_id AND a.plan_digest=t.plan_digest",
+                    (str(task_id), self.owner_id, now),
+                ).fetchone()
+                if interrupted is not None:
+                    conn.execute(
+                        "UPDATE operator_plane_wp8_background_tasks SET state='interrupted',evidence_json=?,updated_at=? "
+                        "WHERE task_id=? AND state IN ('created','running')",
+                        (_canonical({"interrupt": _json_load(interrupted["terminal_json"], {}),
+                                     "late_source_state": state, "late_source_evidence": dict(evidence)}),
+                         now, str(task_id)),
+                    )
+                    return
                 raise RuntimeError("wp8 background task terminal authority is stale")
             owner = conn.execute(
                 "SELECT t.command_id,c.status FROM operator_plane_wp8_background_tasks AS t "
