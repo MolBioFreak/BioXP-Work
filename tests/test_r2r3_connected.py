@@ -49,6 +49,8 @@ def test_protocol_xy_seals_mta_and_records_actual_owner_lineage(connected):
     assert native['source_context_sealed'] is True
     assert native['source_context'] == 'ControlLib.MotionThread'
     assert native['wait_schedule'] == 'MTA_WaitAll'
+    assert r.native.waits[0][1]['sta_sequential'] is False
+    assert r.native.waits[0][1]['timeout_s'] == 5.0
     assert r.native.moves
     attempts = r.store.connection.execute('SELECT * FROM operator_plane_delivery_attempts WHERE command_id=?',
         (claimed['command_id'],)).fetchall()
@@ -161,7 +163,13 @@ def test_inspection_reaps_real_preview_then_initializes_led_and_captures(led_rig
                 await asyncio.to_thread(runtime.initialize_illumination)
                 await asyncio.to_thread(runtime.led, channel=1, on=True)
             else:
-                await asyncio.to_thread(api._deck_inspection_led, channel=1, on=True)
+                from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider
+                inspector = object.__new__(Serial206OemInitializationProvider)
+                monkeypatch.setattr(api, '_deck_inspection_settings', lambda: {
+                    'InspectionSettings': {'r2': {'Exposure': 1000, 'LED1': True,
+                        'LED2': False, 'LED3': False}}})
+                api._bind_deck_cover_inspection(inspector)
+                await asyncio.to_thread(inspector._cover_inspection_profile, 'r2')
             result = await asyncio.to_thread(runtime.snapshot_image, condition='r2', artifact_id='r2')
             assert result['ok'] and Path(result['path']).read_bytes() == jpeg()
             assert api._camera_session is None and processes[0].returncode is not None
