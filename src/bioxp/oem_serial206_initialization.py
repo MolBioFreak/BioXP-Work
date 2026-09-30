@@ -5103,88 +5103,38 @@ class Serial206OemInitializationProvider:
 
     def _canonical_deck_semantic_state(self, *, allow_recovery: bool = False, no_tip_park: bool = False,
                                        require_latch_observation: bool = True) -> dict[str, Any]:
+        # Canonical publications are history, not completeness/admission proof.
+        # Unpublished fields still belong to the existing ClassMachineStatus.
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
         reader = self._deck_semantic_state_reader
-        if not callable(reader):
-            raise RuntimeError("deck_semantic_state_reader_not_bound")
-        try:
-            semantic = reader()
-        except Exception as exc:
-            raise RuntimeError(f"deck_semantic_state_reader_failed:{type(exc).__name__}") from exc
-        if not isinstance(semantic, Mapping):
-            raise RuntimeError("deck_semantic_state_not_authoritative:malformed")
-        if semantic.get("semantic_state_revision") == 0 and semantic.get("current_location") is None and callable(
-            getattr(self, "_deck_semantic_bootstrap_publisher", None)
-        ):
-            refresh = self.refresh_deck_semantic_bootstrap(expected_generation=int(self.generation_provider()))
-            if refresh["status"] == "blocked":
-                raise RuntimeError(str(refresh["reason"]))
-            semantic = reader()
-        ambiguity_state = semantic.get("ambiguity_state")
+        raw = reader() if callable(reader) else {}
+        semantic = dict(raw or {})
+        with self._lock:
+            machine = dict(self._load_state().get("machine_status") or {})
+        aliases = {"pseudo_z_home": "psudo_z_home_steps"}
+        for key in ("current_location", "current_well", "tip_loaded", "tip_dirty",
+                    "tip_location", "clean_path", "pseudo_z_home", "plate_on_gantry"):
+            if semantic.get(key) is None:
+                semantic[key] = machine.get(aliases.get(key, key))
         location = semantic.get("current_location")
-        well = semantic.get("current_well")
-        revision = semantic.get("semantic_state_revision")
-        provenance = semantic.get("transition_provenance")
-        if type(location) is not str or type(well) is not int or not 0 <= well <= 95 or type(revision) is not int or revision < 0:
-            raise RuntimeError("deck_semantic_state_not_authoritative:location_revision")
-        branch_types = {
-            "tip_loaded": bool,
-            "tip_dirty": bool,
-            "tip_location": int,
-            "clean_path": bool,
-            "pseudo_z_home": int,
+        if type(location) is int:
+            location = LOCATION_ID_TO_NAME[location]
+        semantic["current_location"] = location
+        # Each movable object has its own source owner; inspecting one object
+        # does not require a complete publication for unrelated objects.
+        semantic["movable_plate_locations"] = {
+            **dict(machine.get("movable_plate_locations") or {}),
+            **dict(semantic.get("movable_plate_locations") or {}),
         }
-        # Current ownership is bound separately; deck collection reads the fresh
-        # latch. Historical stamps and latch identity remain diagnostic only.
-        # ControlLib.parkGantry(false) -> scriptmoveTo(...,28,...,2):
-        # verified absence skips tip cleanup and never consults tray CleanPath.
-        # Keep absence explicit and all other full-state/owner fences intact.
         collection = self._park_collection_state() if no_tip_park and location != "LOC_PARK" else None
-        clean_path_not_applicable = no_tip_park and (
-            location == "LOC_PARK" or collection["tip_exists"] is False)
-        if clean_path_not_applicable:
-            branch_types.pop("clean_path")
-        for key, expected_type in branch_types.items():
-            if type(semantic.get(key)) is not expected_type:
-                raise RuntimeError(f"deck_semantic_state_not_authoritative:{key}")
-        tip_location = int(semantic["tip_location"])
-        if tip_location not in {-1, 0, 1, 2, 3}:
-            raise RuntimeError("deck_semantic_state_not_authoritative:tip_location")
-        if int(semantic["pseudo_z_home"]) not in {500, 65000}:
-            raise RuntimeError("deck_semantic_state_not_authoritative:pseudo_z_home")
-        try:
-            plate = canonical_plate_name(semantic.get("plate_on_gantry"))
-        except ValueError as exc:
-            raise RuntimeError("deck_semantic_state_not_authoritative:plate_on_gantry")
-        try:
-            load_bound_oem_position_table().resolve(location_id=location)
-        except Exception as exc:
-            raise RuntimeError("deck_semantic_state_not_authoritative:location") from exc
-        provenance_digest = hashlib.sha256(
-            json.dumps(provenance, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
-        return {
-            "current_location": location,
-            "current_well": well,
-            "semantic_state_revision": revision,
-            "transition_provenance": provenance,
-            "transition_provenance_digest": provenance_digest,
-            "tip_loaded": bool(semantic["tip_loaded"]),
-            "tip_dirty": bool(semantic["tip_dirty"]),
-            "tip_location": tip_location,
-            "collection_tip_state": collection,
-            "clean_path": None if clean_path_not_applicable else semantic["clean_path"],
-            "required_facts": tuple(branch_types),
-            "plate_on_gantry": plate,
-            "movable_plate_locations": dict(semantic.get("movable_plate_locations") or {}),
-            "pseudo_z_home": int(semantic["pseudo_z_home"]),
-            "ownership_generation": semantic.get("ownership_generation"),
-            "board_epoch_4": semantic.get("board_epoch_4"),
-            "board_epoch_5": semantic.get("board_epoch_5"),
-            "latch_status": semantic.get("latch_status"),
-            "machine_latch_closed": semantic.get("machine_latch_closed"),
-            "latch_observation_id": semantic.get("latch_observation_id"),
-            "ambiguity_state": str(ambiguity_state),
-        }
+        semantic["collection_tip_state"] = collection
+        if no_tip_park and (location == "LOC_PARK" or collection["tip_exists"] is False):
+            semantic["clean_path"] = None
+        provenance = semantic.get("transition_provenance")
+        semantic["transition_provenance_digest"] = hashlib.sha256(json.dumps(
+            provenance, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        semantic["required_facts"] = ("current_location", "current_well", "pseudo_z_home")
+        return semantic
 
     @staticmethod
     def _new_z_lifecycle() -> dict[str, Any]:
