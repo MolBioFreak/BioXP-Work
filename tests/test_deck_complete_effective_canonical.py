@@ -76,6 +76,9 @@ def test_canonical_special_and_camera(query_rig, retained_rig, monkeypatch, targ
     monkeypatch.setattr(observations, 'oem_initialize_motion_scriptmove_to_waste',
         adapter.oem_initialize_motion_scriptmove_to_waste, raising=False)
     if target == 'LOC_PARK':
+        from tests.test_r1_constructor_owner_connected import prepare_constructor
+        prepare_constructor(query_rig, monkeypatch)
+        provider._park_collection_state()
         seal_park_fixture(provider, store, monkeypatch)
         observed = query(query_rig, key='park-fixture-source-query')
         assert observed['source_tip_exists'] is False

@@ -222,9 +222,14 @@ def test_retained_real_owner_first_move_force_commit_and_fresh_process(retained_
                 from bioxp.services.reference_service import MarkAxisDesyncedCommand
                 references.mark_desynced(MarkAxisDesyncedCommand('x', reason='isolated late reference change'))
             elif invalidation == 'board_epoch':
-                original_stamps = provider.deck_owner_authority_stamps
-                monkeypatch.setattr(provider, 'deck_owner_authority_stamps', lambda: {
-                    **original_stamps(), 'board_epoch_5': stamps['board_epoch_5'] + 1})
+                if getattr(provider, 'preparation_provider', None) is not None:
+                    monkeypatch.setattr(provider.preparation_provider,
+                        'current_board_lifecycle_generation', lambda: stamps['board_epoch_5'] + 1,
+                        raising=False)
+                else:
+                    current = provider._load_state()
+                    current['x_lifecycle']['board_lifecycle_generation'] = stamps['board_epoch_5'] + 1
+                    provider._save_state(current)
             else:
                 state = provider._load_state()
                 state['machine_status']['tip_loaded'] = True

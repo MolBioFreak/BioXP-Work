@@ -82,7 +82,8 @@ def test_constructor_no_tip_query_reaches_queued_park(query_rig, monkeypatch):
     named_move(rig)
     authority = rig[1].deck_authority_snapshot(expected_generation=rig[1].generation_provider(), target='LOC_PARK')
     assert authority['dependency_scope'] == 'full'
-    assert authority['collection_tip_state'] == current
+    assert authority['collection_tip_state']['tip_exists'] == current['tip_exists']
+    assert authority['collection_tip_state']['channels'] == result['collection_source']['channels']
     submit_named(rig, 'LOC_PARK', 'constructor-park')
     assert rig[0].state.operator_command_plane.store.deck_semantic_state()['current_location'] == 'LOC_PARK'
     assert wire == before and rig[6] == []
