@@ -8993,15 +8993,11 @@ class Serial206OemInitializationProvider:
         final_semantic = (self._offset_deck_semantic_state(gripper_confirmed=gripper_confirmed, allow_recovery=_allow_recovery)
                           if scope == "offset.v1" else self._canonical_deck_semantic_state(allow_recovery=_allow_recovery, no_tip_park=scope == "park.full"))
         if (
-            (shared is not None and any(snapshot[key] != shared[key] for key in (
-                "ownership_generation", "provider_owner_id", "board_epoch_4", "board_epoch_5",
-                "safety_epochs", "machine_state_revision", "semantic_state_provenance_digest"))) or
-            final_semantic.get("collection_tip_state") != semantic.get("collection_tip_state") or
-            final_semantic.get("consumed_state_digest") != semantic.get("consumed_state_digest") or
-            cache_epoch is not self._deck_authority_cache_epoch
+            final_semantic.get("consumed_state_digest") != semantic.get("consumed_state_digest")
             or any(final_stamps[key] != snapshot[key] for key in final_stamps)
-            or final_semantic["semantic_state_revision"] != semantic["semantic_state_revision"]
-            or final_semantic["transition_provenance_digest"] != semantic["transition_provenance_digest"]
+            or safety_epochs["x"] != self._x_interrupt_epoch
+            or safety_epochs["y"] != int(getattr(self.y_provider, "interrupt_epoch", 0) or 0)
+            or safety_epochs["z"] != self._z_interrupt_epoch
         ):
             raise RuntimeError("deck_authority_changed_during_observation")
         if not _allow_recovery:
