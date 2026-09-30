@@ -70,4 +70,3 @@ def test_unrelated_publication_after_observation_is_not_native_entry_refusal(que
     result = provider.moveTo(location_id=1, authority_snapshot=snapshot)
     assert result['ok'] is True
     assert any(row[0] == 'move' for row in primitive.calls)
-
