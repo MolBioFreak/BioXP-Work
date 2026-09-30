@@ -474,6 +474,29 @@ class PipetteReceiptStore:
             "source_identity": source_identity,
             "deployment_identity": current_release_identity(),
         }
+        # Passive display observations consume only the actual collection flags
+        # and their source timestamps. Keep the existing envelope fields needed
+        # by collection_state/replay_result, not another copy of wire/driver data.
+        # Failed/uncertain observations retain their complete diagnostic receipt.
+        if (operation == "tip_status" and result.get("ok") is True
+                and result.get("semantic_query_response_verified") is True
+                and (runtime_binding or {}).get("entrypoint_id")
+                    == "hardware.snapshot.park_tip_observation"
+                and isinstance(result.get("collection_source"), Mapping)):
+            receipt["result"] = {
+                key: _redact(result[key]) for key in ("ok", "outcome", "collection_source", "hardware_query_verified")
+                if key in result
+            }
+            receipt["result"]["channels"] = [
+                {"channel": row["channel"], "tip_loaded": row.get("tip_loaded"),
+                 "result": {key: row["result"][key]
+                            for key in ("observed_at", "source_tip_loaded")
+                            if key in row["result"]}}
+                for row in result.get("channels", [])
+                if isinstance(row, Mapping) and "channel" in row
+                and isinstance(row.get("result"), Mapping)
+            ]
+            receipt.pop("deployment_identity")  # Replay reads source_identity instead.
         if command_id is not None and pipette_operation_id is not None:
             linked_operator_claim = self._is_linked_operator_claim(
                 command_id=str(command_id),
