@@ -67,7 +67,7 @@ def test_named_then_park_partial_publication_current_owner(query_rig, monkeypatc
 
 
 @pytest.mark.parametrize('event', ['restart', 'reconnect'])
-def test_protocol_child_reads_partial_semantics_after_owner_boundary(integrated_rig, query_rig, monkeypatch, event):
+def test_protocol_child_reads_partial_semantics_after_owner_boundary(integrated_rig, query_rig, monkeypatch, event, tmp_path):
     from bioxp import api
     rig = integrated_rig
     prepare_constructor(query_rig, monkeypatch)
@@ -93,11 +93,44 @@ def test_protocol_child_reads_partial_semantics_after_owner_boundary(integrated_
     job = rig.start(payload)
     done = rig.terminal(job)
     import json
+    import os
     from pathlib import Path
-    Path('/home/dalab/.hermes/profiles/fresh/robot-audit/debloat-plan-20260929/implementation/finish/r1-protocol-' + event + '.json').write_text(json.dumps(done, indent=2))
+    export_root = Path(os.environ.get('R1_PROTOCOL_EXPORT_DIR') or tmp_path)
+    export_root.mkdir(parents=True, exist_ok=True)
+    (export_root / ('r1-protocol-' + event + '.json')).write_text(json.dumps(done, indent=2))
     assert done['command']['status'] == 'completed', done
     children = rig.child_rows(done)
     from bioxp.runtime_audit_store import TERMINAL_COMMAND_STATES
     assert children and all(row['status'] in TERMINAL_COMMAND_STATES for row in children), children
     assert any(row['action_id'] == 'oem.deck._mov_execution' and row['status'] == 'completed'
         for row in children if 'action_id' in row)
+
+
+def test_plate_assignment_does_not_publish_unrelated_source_fallbacks(query_rig):
+    """Resolved OEM values are not new observations of unrelated objects."""
+    import json
+    import sqlite3
+    from pathlib import Path
+
+    app, provider, primitive, refs, root, receipts, calls, wire, group = query_rig
+    store = app.state.operator_command_plane.store
+    assert store.deck_semantic_state()['movable_plate_locations'] == {}
+    resolved = provider._canonical_deck_semantic_state()
+    assert 'OUTPUT_PLATE' in resolved['movable_plate_locations']
+    expected = {}
+    for index, (plate, location, name) in enumerate([
+        ('OUTPUT_COVER', 18, 'LOC_OC_COVER_STORAGE'),
+        ('REAGENT_COVER', 20, 'LOC_RC_COVER_STORAGE'),
+    ]):
+        provider.wp8_update_plate_location('updatePlateLocation',
+            {'plate': plate, 'location': location}, command_id='r1-plate-assignment',
+            child_order=index, plan_digest='offline-r1-plate-assignment')
+        expected[plate] = name
+        state = store.deck_semantic_state()
+        assert state['movable_plate_locations'] == expected
+        assert state['tip_dirty'] is None
+        with sqlite3.connect(Path(root) / 'bioxp_runtime.db') as reader:
+            persisted = reader.execute('SELECT movable_plate_locations_json FROM '
+                'operator_plane_deck_semantic_state WHERE singleton=1').fetchone()[0]
+        assert json.loads(persisted) == expected
+    assert calls == []

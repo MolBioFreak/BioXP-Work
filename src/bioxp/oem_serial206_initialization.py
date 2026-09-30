@@ -13416,8 +13416,12 @@ class Serial206OemInitializationProvider:
     ) -> dict[str, Any]:
         from .oem_compat.pathing import LOCATION_ID_TO_NAME
 
-        state = self._canonical_deck_semantic_state()
-        movable = dict(state.get("movable_plate_locations") or {})
+        # Publish only retained assignments plus this owner's mutation. The
+        # execution reader can resolve unpublished ClassMachineStatus values,
+        # but those fallbacks are not observations of unrelated objects.
+        reader = self._deck_semantic_state_reader
+        state = reader() if callable(reader) else {}
+        movable = dict((state or {}).get("movable_plate_locations") or {})
         # Ordinary catches/releases publish one assignment. inspectCover's
         # final re-labelling publishes both assignments in one SQLite update.
         for assignment in arguments.get("locations", [arguments]):
