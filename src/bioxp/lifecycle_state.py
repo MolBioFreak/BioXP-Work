@@ -398,35 +398,6 @@ class CanonicalLifecycleOwner:
             "trace": trace,
         }
 
-    def initialize_system_camera_dependency(self) -> dict[str, Any]:
-        """Evaluate the OEM camera gate at its initializeSystem boundary."""
-        result = self._camera_dependency()
-        return {
-            **result,
-            "stage": "initializeSystem_after_initializeMotion_before_inspectCover",
-            "source_anchor": "BioXPMainWindow.initializeSystem lines 1172-1181",
-        }
-
-    def _camera_dependency(self) -> dict[str, Any]:
-        if not self._check_camera:
-            return {"required": False, "ok": True, "source": "OperationParameters.CheckCamera"}
-        with self._lock:
-            evidence = copy.deepcopy(self._camera_evidence)
-        ok = bool(
-            isinstance(evidence, dict)
-            and evidence.get("available") is True
-            and evidence.get("ok", True) is True
-            and (evidence.get("probe_id") or evidence.get("session_id"))
-        )
-        return {
-            "required": True,
-            "ok": ok,
-            "source": "explicit POST /camera/probe or POST /camera/stream/start evidence",
-            "evidence": evidence,
-            "lazy_camera_open_performed": False,
-            "error": None if ok else "explicit_camera_probe_or_session_evidence_missing_or_failed",
-        }
-
     def _check_door_status(
         self,
         hardware: Any,

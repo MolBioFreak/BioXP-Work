@@ -1,5 +1,7 @@
 """Section 5 deletion-only contracts, no live transport or captured fixtures."""
 import ast
+import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +25,39 @@ def test_exact_dead_definitions_absent(module, names):
     definitions = {n.name for n in ast.walk(tree)
                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
     assert not definitions.intersection(names)
+
+
+@pytest.mark.parametrize('module,owner,names', [
+    ('oem_runtime_store', 'OEMRuntimeStore',
+     ('append_event', 'append_error', 'read_journal', 'recover_state')),
+    ('lifecycle_state', 'CanonicalLifecycleOwner',
+     ('initialize_system_camera_dependency', '_camera_dependency')),
+])
+def test_exact_dead_owner_definitions_absent(module, owner, names):
+    tree = ast.parse((ROOT / f'src/bioxp/{module}.py').read_text())
+    selected = next(node for node in tree.body
+                    if isinstance(node, ast.ClassDef) and node.name == owner)
+    definitions = {node.name for node in selected.body
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    assert not definitions.intersection(names)
+
+
+def test_actual_openapi_has_no_retired_sniff_routes():
+    from bioxp import api
+
+    paths = sorted(api.app.openapi()['paths'])
+    assert '/status' in paths
+    assert '/protocol/compile' in paths
+    assert not any('usb-sniff' in path for path in paths)
+    target = os.environ.get('SANITY_OPENAPI_EXPORT')
+    if target:
+        output = Path(target)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps({
+            'commit': os.environ.get('BIOXP_TEST_SOURCE_COMMIT'),
+            'paths': paths,
+            'scope': 'actual OpenAPI generation; no lifespan startup',
+        }, indent=2) + '\n')
 
 
 def test_label_histogram_boundary_through_retained_two_exposure_primitive():

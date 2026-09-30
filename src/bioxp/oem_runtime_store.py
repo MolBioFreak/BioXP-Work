@@ -5154,37 +5154,3 @@ class OEMRuntimeStore:
                     (sequence, str(name), encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest(), time.time()),
                 )
         return row
-
-
-
-    def append_event(self, event: dict[str, Any]) -> dict[str, Any]:
-        return self.append_journal("event_journal.jsonl", event)
-
-    def append_error(self, error: dict[str, Any]) -> dict[str, Any]:
-        return self.append_journal("runtime_errors.jsonl", error)
-
-    def read_journal(self, name: str, limit: int = 50) -> list[dict[str, Any]]:
-        bounded = max(1, min(int(limit), 500))
-        with self._lock:
-            rows = self._db.execute(
-                "SELECT payload_json,payload_sha256 FROM runtime_journal WHERE stream=? ORDER BY sequence DESC LIMIT ?",
-                (str(name), bounded),
-            ).fetchall()
-        result = []
-        for row in reversed(rows):
-            encoded = str(row["payload_json"])
-            if encoded != json.dumps(json.loads(encoded), sort_keys=True, separators=(",", ":"), allow_nan=False):
-                raise RuntimeError("runtime journal JSON is not canonical")
-            if str(row["payload_sha256"]) != hashlib.sha256(encoded.encode("utf-8")).hexdigest():
-                raise RuntimeError("runtime journal digest mismatch")
-            result.append(json.loads(encoded))
-        return result
-
-    def recover_state(self) -> dict[str, Any]:
-        state = self.read_state()
-        if state is None:
-            return {"recovery": "fresh", "state": None, "recovery_required": False}
-        worker = state.get("worker") or {}
-        active = worker.get("active_command")
-        running = worker.get("state") == "running" or active is not None
-        return {"recovery": "active_command" if running else "idle", "state": state, "recovery_required": bool(running)}
