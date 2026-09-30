@@ -1371,6 +1371,8 @@ class FourPipetteTransport:
         }
 
     def initialize(self, command: PipetteInitCommand) -> dict[str, Any]:
+        # Process-local constructor ownership, never restored from a receipt.
+        self._constructor_started = True
         started = time.monotonic()
         initial_group = self._run_group_cycle(command, cycle="constructor_initiateGroup")
         if not initial_group.get("ok"):

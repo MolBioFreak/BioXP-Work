@@ -6418,15 +6418,35 @@ def _snapshot_proves_can_ready(snapshot: Mapping[str, Any]) -> bool:
     return True
 
 
-def _pipette_collection_state():
-    if _pipette_transport is None or _pipette_receipts is None:
-        raise RuntimeError("pipette_collection_owner_not_bound")
-    identity = _pipette_transport.collection_source_identity()
-    result = _pipette_receipts.collection_state(identity=identity,
-        ownership_generation=int(hardware_state.ownership_epoch))
-    if _pipette_transport.collection_source_identity() != identity:
-        raise RuntimeError("pipette_collection_owner_changed_during_read")
-    return result
+def _pipette_collection_state(*, ensure_constructor: bool = False):
+    if not ensure_constructor:
+        if _pipette_transport is None or _pipette_receipts is None:
+            raise RuntimeError("pipette_collection_owner_not_bound")
+        identity = _pipette_transport.collection_source_identity()
+        result = _pipette_receipts.collection_state(identity=identity,
+            ownership_generation=int(hardware_state.ownership_epoch))
+        if _pipette_transport.collection_source_identity() != identity:
+            raise RuntimeError("pipette_collection_owner_changed_during_read")
+        return result
+    owner = _get_pipette_transport()
+    # Park follows the same constructor path as startup, not a separate tip
+    # probe or a lookup of historical receipt evidence. Reconnect replaces this
+    # process-local owner, so its constructor must run again before TipExist.
+    with owner._transaction_lock:
+        if ensure_constructor and not getattr(owner, "_constructor_started", False):
+            lifecycle_state.run_stage("constructor_pipette_stage", _constructor_pipette_action)
+        snapshot = owner.collection_source_snapshot()
+        channels = snapshot["channels"]
+        positive = any(channel.get("tip_loaded") is True for channel in channels)
+        absent = all(channel.get("tip_loaded") is False for channel in channels)
+        hardware_positive = any(channel.get("tip_loaded") is True and channel.get("verified") is True
+                                for channel in channels)
+        hardware_absent = all(channel.get("tip_loaded") is False and channel.get("verified") is True
+                              for channel in channels)
+        return {"tip_exists": positive,
+                "tip_exists_unknown_channels": not positive and not absent,
+                "hardware_tip_exists": True if hardware_positive else False if hardware_absent else None,
+                "identity": snapshot["identity"], "channels": channels}
 
 
 def _collect_and_publish_hardware_snapshot(

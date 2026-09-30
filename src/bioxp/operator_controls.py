@@ -3188,7 +3188,7 @@ def install_operator_control_plane(
             collection_binder = getattr(current_provider, "bind_pipette_collection_state_reader", None)
             if callable(collection_binder):
                 from .api import _pipette_collection_state
-                collection_binder(_pipette_collection_state)
+                collection_binder(lambda: _pipette_collection_state(ensure_constructor=True))
             semantic_binder = getattr(current_provider, "bind_deck_semantic_state_reader", None)
             if callable(semantic_binder):
                 semantic_binder(command_plane.store.deck_semantic_state)
