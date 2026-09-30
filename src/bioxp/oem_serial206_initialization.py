@@ -14583,15 +14583,9 @@ class Serial206OemInitializationProvider:
                     "source_children": source_children,
                     "source_anchor": "ControlLib.parkGantry:7093-7112",
                 }
-            # The independently receipted final query already owns this
-            # no-tip transition. Do not mint a second, unlinked clock-named
-            # publication that defeats the parent command's revision fence.
-            published_tip_state = self._deck_semantic_state_reader()
-            if (not isinstance(published_tip_state, Mapping)
-                    or published_tip_state.get("tip_loaded") is not False
-                    or published_tip_state.get("tip_dirty") is not False
-                    or published_tip_state.get("tip_location") != -1):
-                raise RuntimeError("park_tip_query_semantic_publication_unavailable")
+            # TipExist above consumes the current collection's actual query
+            # result. Its optional semantic publication is evidence, not an
+            # additional OEM Park prerequisite.
 
         script_move = getattr(self.primitives, "oem_initialize_motion_scriptmove_to_waste", None)
         if not callable(script_move):

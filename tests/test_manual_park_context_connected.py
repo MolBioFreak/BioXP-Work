@@ -60,6 +60,12 @@ def no_hardware(monkeypatch):
 
 @pytest.fixture
 def park(query_rig, monkeypatch):
+    # Park now runs the real constructor before reading its current source
+    # owner; a standalone tip-status query is not constructor completion.
+    from tests.test_r1_constructor_owner_connected import prepare_constructor
+    from bioxp import api
+    prepare_constructor(query_rig, monkeypatch)
+    api._pipette_collection_state(ensure_constructor=True)
     query(query_rig)
     _, provider, observations, refs, *_ = query_rig
     qualify_test_references(refs)
