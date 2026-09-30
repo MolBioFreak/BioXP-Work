@@ -1516,7 +1516,76 @@ class OperatorReceiptStore:
                     self.connection.execute("ROLLBACK")
                 raise
 
+    def _canonical_receipt(self, row: sqlite3.Row, *, detail: bool, compact: bool = False) -> dict[str, Any] | None:
+        # Only plane-owned movement claims are duplicates. Direct native and
+        # protocol receipts keep their own contract and evidence authority.
+        if (row["entrypoint_id"] != "operator_command_plane" or row["command_kind"] != "operator"
+                or row["action_id"] != "oem.deck.move_to_location"):
+            return None
+        tables = {item[0] for item in self.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('operator_plane_commands','serial206_movement_commands')"
+        )}
+        if len(tables) != 2:
+            return None
+        exists = self.connection.execute(
+            "SELECT 1 FROM operator_plane_commands p JOIN serial206_movement_commands c USING(command_id) "
+            "WHERE p.command_id=? AND p.action_id=? AND c.action_id=p.action_id",
+            (row["command_id"], row["action_id"]),
+        ).fetchone()
+        if exists is None:
+            return None
+        from .operator_command_receipts import CommandReceiptReader
+        reader = CommandReceiptReader(self.connection, self.lock)
+        receipt = (reader.get_command_summary(row["command_id"]) if compact else
+                   reader.command_detail_v2(row["command_id"]) if detail else
+                   reader.get_command(row["command_id"]))
+        assert receipt is not None
+        # The legacy public envelope's sequence belongs to its SQL claim, not
+        # the movement stream. Preserve pagination/idempotency identities.
+        receipt["sequence"] = int(row["sequence"])
+        # Preserve the legacy envelope's separate SQL flags (including explicit
+        # operator assessment). Native/controller truth remains in terminal and
+        # typed deck evidence exactly as rendered by the canonical owner.
+        receipt["controller_acknowledged"] = bool(row["controller_acknowledged"])
+        receipt["physical_effect_verified"] = bool(row["physical_effect_verified"])
+        if receipt["status"] not in TERMINAL_STATES:
+            receipt["retry_forbidden"] = True
+            receipt.setdefault("outcome", "in_progress")
+        for key in ("outcome", "failure_code"):
+            if row[key] is not None:
+                receipt[key] = row[key]
+        receipt["response"] = (None if row["response_summary_json"] is None else
+                               json.loads(row["response_summary_json"]))
+        receipt["stage_receipts"] = []
+        # Older receipts can carry an assessment predating the transition
+        # reader. Retain that fallback without decoding the duplicated body.
+        saved = self.connection.execute(
+            "SELECT json_extract(receipt_json,'$.operator_assessment'),"
+            "json_extract(receipt_json,'$.operator_note'),"
+            "json_extract(receipt_json,'$.operator_assessment_idempotency_key'),"
+            "json_extract(receipt_json,'$.operator_assessed_at') "
+            "FROM operator_commands WHERE command_id=?", (row["command_id"],),
+        ).fetchone()
+        if saved is not None:
+            for key, value in zip(("operator_assessment", "operator_note",
+                                   "operator_assessment_idempotency_key", "operator_assessed_at"), saved):
+                if value is not None:
+                    receipt[key] = value
+        return self._with_assessment(row, receipt)
+
+    def canonical_receipt(self, command_id: str, *, detail: bool = False) -> dict[str, Any] | None:
+        """Typed route projection, preserving assessments and legacy identity."""
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT * FROM operator_commands WHERE command_id=?", (command_id,),
+            ).fetchone()
+            return None if row is None else self._canonical_receipt(row, detail=detail, compact=not detail)
+
     def _row_receipt(self, row: sqlite3.Row, *, include_evidence: bool) -> dict[str, Any]:
+        canonical = self._canonical_receipt(row, detail=False)
+        if canonical is not None:
+            return canonical
         receipt = json.loads(row["receipt_json"])
         # Historical receipt JSON can predate sequence publication. The SQL
         # ordering key is authoritative for both projection and pagination.
@@ -1569,6 +1638,9 @@ class OperatorReceiptStore:
             receipt["authority_receipt_id"] = receipt.get("authority_receipt_id") or receipt["command_id"]
             if not isinstance(receipt.get("authority_receipt_status"), str):
                 receipt["authority_receipt_status"] = receipt.get("status")
+        return self._with_assessment(row, receipt)
+
+    def _with_assessment(self, row: sqlite3.Row, receipt: dict[str, Any]) -> dict[str, Any]:
         assessment = self.connection.execute(
             """
             SELECT detail_json FROM operator_transitions
@@ -1628,7 +1700,7 @@ class OperatorReceiptStore:
                 """,
                 (key,),
             ).fetchone()
-        return None if row is None else self._row_receipt(row, include_evidence=include_evidence)
+            return None if row is None else self._row_receipt(row, include_evidence=include_evidence)
 
 
 _LEGACY_COMMAND_COLUMNS = frozenset({

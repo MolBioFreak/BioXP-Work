@@ -11,11 +11,13 @@ import base64
 import json
 import math
 import sqlite3
-from contextlib import closing
+from contextlib import closing, nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from collections.abc import Mapping
+
+from .operator_command_receipts import CommandReceiptReader
 
 HistoryKey = tuple[float, int, int, str]
 
@@ -96,16 +98,29 @@ def read_history_page(root: str | Path, limit: int, cursor: str | None = None) -
         try:
             tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             sources = []
+            plane_claims = {"operator_commands", "operator_plane_commands", "serial206_movement_commands"} <= tables
+            canonical_join = ("LEFT JOIN operator_plane_commands p ON p.command_id=d.command_id "
+                              "AND d.entrypoint_id='operator_command_plane' AND d.command_kind='operator' "
+                              "AND d.action_id='oem.deck.move_to_location' "
+                              "AND d.action_id=p.action_id "
+                              "AND EXISTS (SELECT 1 FROM serial206_movement_commands c "
+                              "WHERE c.command_id=p.command_id AND c.action_id=p.action_id)" if plane_claims else "")
             if "operator_commands" in tables:
-                sources.append("""
-                    SELECT command_id,sequence,1 AS source_rank,
-                        history_timestamp(CASE
-                            WHEN json_type(receipt_json,'$.accepted_at') IS NOT NULL
-                                THEN json_extract(receipt_json,'$.accepted_at')
-                            WHEN json_type(receipt_json,'$.queued_at') IS NOT NULL
-                                THEN json_extract(receipt_json,'$.queued_at')
-                            ELSE json_extract(receipt_json,'$.started_at') END) AS accepted_at
-                    FROM operator_commands
+                timestamp = ("CASE WHEN p.command_id IS NOT NULL THEN p.queued_at ELSE "
+                             "CASE WHEN json_type(d.receipt_json,'$.accepted_at') IS NOT NULL "
+                             "THEN json_extract(d.receipt_json,'$.accepted_at') "
+                             "WHEN json_type(d.receipt_json,'$.queued_at') IS NOT NULL "
+                             "THEN json_extract(d.receipt_json,'$.queued_at') "
+                             "ELSE json_extract(d.receipt_json,'$.started_at') END END" if plane_claims else
+                             "CASE WHEN json_type(d.receipt_json,'$.accepted_at') IS NOT NULL "
+                             "THEN json_extract(d.receipt_json,'$.accepted_at') "
+                             "WHEN json_type(d.receipt_json,'$.queued_at') IS NOT NULL "
+                             "THEN json_extract(d.receipt_json,'$.queued_at') "
+                             "ELSE json_extract(d.receipt_json,'$.started_at') END")
+                sources.append(f"""
+                    SELECT d.command_id,d.sequence,1 AS source_rank,
+                        history_timestamp({timestamp}) AS accepted_at
+                    FROM operator_commands d {canonical_join}
                 """)
             if "operator_plane_commands" in tables:
                 join = "LEFT JOIN serial206_movement_commands c ON c.command_id=p.command_id" if "serial206_movement_commands" in tables else ""
@@ -181,6 +196,27 @@ def read_history_page(root: str | Path, limit: int, cursor: str | None = None) -
                         "operator_assessment": assessment_value.get("operator_assessment", item.pop("saved_operator_assessment")),
                         "operator_note": assessment_value.get("operator_note", item.pop("saved_operator_note")),
                     }
+                    if plane_claims:
+                        claim = db.execute(
+                            "SELECT p.command_id FROM operator_commands d " + canonical_join +
+                            " WHERE d.command_id=?", (item["command_id"],),
+                        ).fetchone()
+                        if claim is not None and claim[0] is not None:
+                            canonical_item = CommandReceiptReader(db, nullcontext()).get_command_summary(item["command_id"])
+                            assert canonical_item is not None
+                            # Preserve direct source rank/claim sequence and all
+                            # operator assessments; lifecycle comes from owner.
+                            physical_effect_verified = item["physical_effect_verified"]
+                            controller_acknowledged = bool(item["controller_acknowledged"])
+                            item.update(canonical_item)
+                            item["physical_effect_verified"] = physical_effect_verified
+                            item["controller_acknowledged"] = controller_acknowledged
+                            item["history"].update({
+                                "source_schema": canonical_item["schema_version"],
+                                "recorded_status": canonical_item["status"],
+                                "remote_acknowledged": canonical_item["remote_acknowledged"],
+                                "controller_acknowledged": controller_acknowledged,
+                            })
                     result[item["command_id"]] = item
             if retained_ids:
                 canonical = "serial206_movement_commands" in tables

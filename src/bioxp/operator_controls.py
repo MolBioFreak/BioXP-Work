@@ -4036,13 +4036,11 @@ def install_operator_control_plane(
 
     @router.get("/v2/actions/receipts/{command_id}")
     async def action_receipt_v2(command_id: str, detail: bool = False) -> dict[str, Any]:
-        # Match the single history reader's identity precedence. Never show a
-        # retained projection for a command whose direct receipt is authoritative.
-        row = await asyncio.to_thread(
-            store.by_command,
-            command_id,
-            include_evidence=detail,
-        )
+        # Plane-owned movement claims share the canonical typed reader. Direct
+        # native receipts retain precedence for every other identity.
+        row = await asyncio.to_thread(store.canonical_receipt, command_id, detail=detail)
+        if row is None:
+            row = await asyncio.to_thread(store.by_command, command_id, include_evidence=detail)
         source_receipt = row if detail else None
         if row is not None and not detail and str(row.get("status") or "") in {"failed", "blocked", "rejected", "outcome_unknown", "ambiguous"}:
             detailed_row = await asyncio.to_thread(store.by_command, command_id, include_evidence=True)
