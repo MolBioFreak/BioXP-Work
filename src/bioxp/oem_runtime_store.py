@@ -3089,11 +3089,6 @@ def _verify_v2_schema(connection: sqlite3.Connection) -> None:
         raise RuntimeError(f"runtime physical schema fingerprint mismatch: {physical_schema_sha256}")
 
 
-def verify_runtime_database_v2(connection: sqlite3.Connection) -> None:
-    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    if version != SERIAL206_SCHEMA_VERSION:
-        raise RuntimeError(f"runtime schema v2 is not prepared (found {version})")
-    _verify_v2_schema(connection)
 
 
 def _verify_report_identity_metadata_v1(connection: sqlite3.Connection) -> None:
@@ -3136,15 +3131,6 @@ def _verify_report_identity_metadata_v1(connection: sqlite3.Connection) -> None:
         raise RuntimeError("runtime report identity trigger attestation failed")
 
 
-def _manifest_statement(statement: str) -> tuple[tuple[str, str], str]:
-    normalized = normalize_sql_definition(statement)
-    match = re.match(
-        r"^CREATE(?:UNIQUE)?(TABLE|INDEX|TRIGGER|VIEW)(?:IFNOTEXISTS)?([A-Z_][A-Z0-9_]*)",
-        normalized,
-    )
-    if match is None:
-        raise RuntimeError("canonical migration DDL contains an unclassifiable schema statement")
-    return (match.group(1).lower(), match.group(2).lower()), normalized
 
 
 def canonical_runtime_schema_manifest(*, version: int = _deck_v14.VERSION) -> dict[tuple[str, str], str]:
@@ -4943,17 +4929,6 @@ class OEMRuntimeStore:
             ).fetchone()
         return None if row is None else json.loads(row["receipt_json"])
 
-    def list_serial206_receipts(self, stream: str, limit: int = 50) -> list[dict[str, Any]]:
-        selected_limit = max(1, min(int(limit), 200))
-        with self._lock:
-            rows = self._db.execute(
-                """
-                SELECT receipt_json FROM serial206_receipts
-                WHERE stream=? ORDER BY observed_at DESC, receipt_id DESC LIMIT ?
-                """,
-                (str(stream).strip().lower(), selected_limit),
-            ).fetchall()
-        return [json.loads(row["receipt_json"]) for row in reversed(rows)]
 
     def _load_seq(self) -> int:
         row = self._db.execute(
@@ -5053,42 +5028,6 @@ class OEMRuntimeStore:
                 raise
             return self._seq
 
-    def write_state(self, snapshot: OEMRuntimeSnapshot | dict[str, Any]) -> dict[str, Any]:
-        if isinstance(snapshot, OEMRuntimeSnapshot):
-            payload: dict[str, Any] = snapshot.to_dict()
-        else:
-            payload = dict(snapshot)
-        from .hardware_status import hardware_state
-        from .lifecycle_state import lifecycle_state
-
-        canonical = hardware_state.completed_snapshot()
-        payload["canonical_hardware_snapshot"] = {
-            "snapshot_id": None if canonical is None else canonical.get("snapshot_id"),
-            "ownership_epoch": hardware_state.ownership_epoch,
-            "available": canonical is not None,
-            "reference_only": True,
-        }
-        lifecycle = lifecycle_state.projection()
-        payload["runtime_state"] = lifecycle["operation_state"]
-        payload["operation_state"] = lifecycle["operation_state"]
-        payload["startup"] = lifecycle["startup"]
-        payload["lifecycle_revision"] = lifecycle["revision"]
-        sequence = self.next_seq()
-        payload["sequence"] = sequence
-        payload["updated_at"] = utc_ts()
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        with self._lock:
-            with self._authority_write():
-                self._db.execute(
-                    "INSERT INTO runtime_state_snapshots(sequence,state_json,state_sha256,created_at) VALUES(?,?,?,?)",
-                    (
-                        sequence,
-                        encoded,
-                        hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
-                        time.time(),
-                    ),
-                )
-        return payload
 
     def read_state(self) -> dict[str, Any] | None:
         with self._lock:
@@ -5216,11 +5155,7 @@ class OEMRuntimeStore:
                 )
         return row
 
-    def append_command_queue(self, command: dict[str, Any]) -> dict[str, Any]:
-        return self.append_journal("command_queue.jsonl", command)
 
-    def append_command_history(self, row: dict[str, Any]) -> dict[str, Any]:
-        return self.append_journal("command_history.jsonl", row)
 
     def append_event(self, event: dict[str, Any]) -> dict[str, Any]:
         return self.append_journal("event_journal.jsonl", event)

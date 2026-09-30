@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import math
-import threading
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Mapping
 
 from .oem_deck_catalog import DeckCatalog, configured_location_names
 from .oem_compat.position_table import PositionTable, well_id_from_label
@@ -305,23 +304,26 @@ def _latch_owner_identity(value: str) -> str:
     return value
 
 
-def _same_authority_after_resampling(before: DeckAuthoritySnapshot, after: DeckAuthoritySnapshot) -> bool:
-    """Compare owner/state fences, not identity of two distinct observations.
 
-    Full receipt digests still bind timestamps and sensor transaction evidence.
-    Serial206's compound latch ID includes a stable independent host-owner token
-    plus a fresh sensor transaction digest. Only that sensor sample component may
-    change here; host identity, both predicates, coordinates and safety/owner
-    epochs remain exact. Reference versions are diagnostic, not a move prerequisite.
-    Unknown/legacy latch ID formats still require exact identity.
-    """
-    return (
-        after.captured_at >= before.captured_at
-        and _latch_owner_identity(after.latch_observation_id) == _latch_owner_identity(before.latch_observation_id)
-        and replace(after, captured_at=before.captured_at,
-                    latch_observation_id=before.latch_observation_id,
-                    reference_versions=before.reference_versions).digest == before.digest
-    )
+
+@dataclass(frozen=True)
+class ParkNoopObservation:
+    """Logical Park branch inputs only; no unperformed physical observations."""
+    ownership_generation: int
+    board_epoch_4: int
+    board_epoch_5: int
+    position_table_sha256: str
+    machine_state_revision: int
+    semantic_state_provenance_digest: str
+    current_location_id: str
+    dependency_scope: str = "park.noop"
+    latch_status: bool | None = None
+    machine_latch_closed: bool | None = None
+    latch_observation_id: str | None = None
+
+    @property
+    def digest(self) -> str:
+        return _digest(asdict(self))
 
 
 @dataclass(frozen=True)
@@ -360,9 +362,9 @@ class DeckMovementPlan:
         return _digest(payload)
 
 
-def compile_named_location(intent: NamedLocationIntent, catalog: DeckCatalog, table: PositionTable, authority: DeckAuthoritySnapshot) -> DeckMovementPlan:
+def compile_named_location(intent: NamedLocationIntent, catalog: DeckCatalog, table: PositionTable, authority: DeckAuthoritySnapshot | ParkNoopObservation) -> DeckMovementPlan:
     destination = catalog.resolve(intent.target)
-    if destination.branch == "park" and authority.dependency_scope != "full":
+    if destination.branch == "park" and authority.dependency_scope not in {"full", "park.noop"}:
         raise ValueError("deck_dependency_scope_mismatch")
     if table.digest != authority.position_table_sha256 or table.digest != catalog.position_table_sha256:
         raise ValueError("position_table_authority_mismatch")
@@ -376,7 +378,7 @@ def compile_named_location(intent: NamedLocationIntent, catalog: DeckCatalog, ta
     blocked = None
     if not authority.latch_status or not authority.machine_latch_closed:
         blocked = "latch_not_closed"
-    elif destination.branch == "park":
+    if destination.branch == "park":
         steps.append(DeckPlanStep(3, "parkGantry", "ClassControlInterface.btnLOC1_Click:Park", ("x", "y", "z", "g")))
     elif destination.branch == "barcode":
         steps.extend((
@@ -447,47 +449,6 @@ class DeckExecutionFailure(RuntimeError):
         self.provider_results = [dict(row) for row in (provider_results or [])]
 
 
-class DeckMovementExecutor:
-    """Lease-bound execution seam; provider writes are reachable only here."""
-
-    def __init__(self, provider: Any, snapshot_reader: Callable[[], DeckAuthoritySnapshot]) -> None:
-        self.provider = provider
-        self.snapshot_reader = snapshot_reader
-        self._lease = threading.Lock()
-
-    @contextmanager
-    def movement_lease(self) -> Iterator[None]:
-        with self._lease:
-            yield
-
-    def execute(
-        self,
-        plan: DeckMovementPlan,
-        *,
-        before_first_write: Callable[[DeckMovementPlan], None] | None = None,
-        after_each_child: Callable[[DeckPlanStep], None] | None = None,
-    ) -> list[Any]:
-        if plan.blocked_reason:
-            raise MovementAuthorityChanged(plan.blocked_reason)
-        with self.movement_lease():
-            if before_first_write is not None:
-                before_first_write(plan)
-            if self.snapshot_reader().digest != plan.authority_digest:
-                raise MovementAuthorityChanged("deck_authority_changed_before_first_tx")
-            results = []
-            for step in plan.steps:
-                if step.operation in {"ForceToHighHome", "check_latch_status", "check_machine_latch_closed"}:
-                    continue
-                method = getattr(self.provider, step.operation, None)
-                if not callable(method):
-                    raise RuntimeError(f"source_authority_missing:{step.operation}")
-                result = method(**dict(step.arguments or {}))
-                if isinstance(result, Mapping) and result.get("ok") is not True:
-                    raise RuntimeError(f"provider_stage_failed:{step.operation}")
-                results.append(result)
-                if after_each_child is not None:
-                    after_each_child(step)
-            return results
 
 
 @dataclass(frozen=True)
@@ -2078,12 +2039,31 @@ def make_deck_command_executor(
         store_assert_current = getattr(command_store, "assert_deck_execution_current", None)
         if not callable(store_assert_current):
             raise RuntimeError("named_deck_durable_store_not_bound")
-        execution_authority: DeckAuthoritySnapshot | None = None
+        execution_authority: DeckAuthoritySnapshot | ParkNoopObservation | None = None
         def assert_current(command_id: str, *, boundary: str) -> None:
-            store_assert_current(command_id, boundary=boundary)
-            observer = getattr(provider, "assert_deck_observation_current", None)
-            if execution_authority is not None and callable(observer):
-                observer(asdict(execution_authority))
+            scope = getattr(provider, "deck_owner_authority_scope", None)
+            with scope() if callable(scope) else nullcontext():
+                stamps = store_assert_current(command_id, boundary=boundary)
+                observer = getattr(provider, "assert_deck_observation_current", None)
+                if execution_authority is not None and callable(observer):
+                    observer(asdict(execution_authority), stamps=stamps)
+                    if (execution_authority.dependency_scope == "full"
+                            and boundary.startswith("before_provider_stage_")):
+                        current = provider._canonical_deck_semantic_state(no_tip_park=True)
+                        pairs = {
+                            "current_location": "current_location_id", "current_well": "current_well_id",
+                            "tip_loaded": "tip_loaded", "tip_dirty": "tip_dirty", "tip_location": "tip_location",
+                            "plate_on_gantry": "plate_on_gantry", "pseudo_z_home": "pseudo_z_home",
+                            "semantic_state_revision": "machine_state_revision",
+                            "transition_provenance_digest": "semantic_state_provenance_digest",
+                            "collection_tip_state": "collection_tip_state",
+                        }
+                        if any(current[key] != getattr(execution_authority, bound) for key, bound in pairs.items()):
+                            raise MovementAuthorityChanged("deck_authority_changed_before_first_tx")
+                        clean = (None if current["clean_path"] is None
+                                 else provider._clean_path_from_tip_tray_authority())
+                        if clean != execution_authority.clean_path:
+                            raise MovementAuthorityChanged("deck_authority_changed_before_first_tx")
         lease_factory = getattr(provider, "movement_lease", None)
         lease = lease_factory() if callable(lease_factory) else nullcontext()
         with lease:
@@ -2096,7 +2076,19 @@ def make_deck_command_executor(
             snapshot_arguments: dict[str, Any] = {"expected_generation": expected_ownership_generation}
             if getattr(provider, "deck_scoped_authority_version", None) == 1:
                 snapshot_arguments["target"] = target
-            dispatch_authority = DeckAuthoritySnapshot(**dict(snapshot_fn(**snapshot_arguments)))
+            logical_reader = getattr(provider, "_deck_semantic_state_reader", None)
+            logical = logical_reader() if target == "LOC_PARK" and callable(logical_reader) else {}
+            source_noop = logical.get("current_location") == "LOC_PARK"
+            if source_noop:
+                dispatch_authority = ParkNoopObservation(
+                    **provider.deck_owner_authority_stamps(),
+                    position_table_sha256=table.digest,
+                    machine_state_revision=logical["semantic_state_revision"],
+                    semantic_state_provenance_digest=_digest(logical["transition_provenance"]),
+                    current_location_id=logical["current_location"],
+                )
+            else:
+                dispatch_authority = DeckAuthoritySnapshot(**dict(snapshot_fn(**snapshot_arguments)))
             require_expected_board_epochs(dispatch_authority, phase="before_first_provider_write")
             plan = compile_named_location(
                 NamedLocationIntent(target=target, camera_offset=camera_offset),
@@ -2195,7 +2187,15 @@ def make_deck_command_executor(
                                   result=dict(force_result), reason="source_mutation_completed")
             try:
                 semantic_reader = getattr(provider, "_offset_deck_semantic_state", None)
-                if (dispatch_authority.dependency_scope == "offset.v1"
+                if source_noop:
+                    semantic = logical_reader()
+                    authority = replace(
+                        dispatch_authority,
+                        machine_state_revision=semantic["semantic_state_revision"],
+                        semantic_state_provenance_digest=_digest(semantic["transition_provenance"]),
+                        current_location_id=semantic["current_location"],
+                    )
+                elif (dispatch_authority.dependency_scope == "offset.v1"
                         and callable(persist_pseudo) and callable(semantic_reader)):
                     # ForceToHighHome is a host-only pseudo-home mutation, not a
                     # motor operation. Read its committed owner rather than query
@@ -2223,7 +2223,27 @@ def make_deck_command_executor(
                         consumed_state_digest=semantic["consumed_state_digest"],
                     )
                 else:
-                    authority = DeckAuthoritySnapshot(**dict(snapshot_fn(**snapshot_arguments)))
+                    # Park consumes its full logical branch state, not offset.v1.
+                    semantic = provider._canonical_deck_semantic_state(no_tip_park=True)
+                    authority = replace(
+                        dispatch_authority,
+                        machine_state_revision=semantic["semantic_state_revision"],
+                        semantic_state_provenance_digest=semantic["transition_provenance_digest"],
+                        current_location_id=semantic["current_location"],
+                        current_well_id=semantic["current_well"],
+                        tip_loaded=semantic["tip_loaded"], tip_dirty=semantic["tip_dirty"],
+                        tip_location=semantic["tip_location"],
+                        collection_tip_state=semantic["collection_tip_state"],
+                        plate_on_gantry=semantic["plate_on_gantry"],
+                        pseudo_z_home=semantic["pseudo_z_home"],
+                        clean_path=(None if semantic["clean_path"] is None
+                                    else provider._clean_path_from_tip_tray_authority()),
+                    )
+                # The manual caller checks both latches after ForceToHighHome.
+                # Keep the target plan immutable; an earlier latch is not a decision.
+                authority = replace(authority, **provider._fresh_deck_latch_observation())
+                execution_authority = authority
+                assert_current(command_id, boundary="final_manual_latch_check")
                 require_expected_board_epochs(authority, phase="planning")
             except Exception as exc:
                 raise DeckExecutionFailure(str(exc), delivery_attempted=False,
@@ -2261,7 +2281,7 @@ def make_deck_command_executor(
                                 else "source_predicate_not_satisfied"
                             ),
                         )
-            if plan.blocked_reason:
+            if not authority.latch_status or not authority.machine_latch_closed:
                 return {
                     "ok": False,
                     "admitted": True,
@@ -2271,7 +2291,7 @@ def make_deck_command_executor(
                     "hardware_postcondition_verified": False,
                     "semantic_state_committed": False,
                     "physical_effect_verified": False,
-                    "error": plan.blocked_reason,
+                    "error": "latch_not_closed",
                     "deck_movement": {
                         "target": plan.target,
                         "target_label": catalog.resolve(plan.target).panel_label,
@@ -2281,13 +2301,7 @@ def make_deck_command_executor(
                         "physical_observation_verified": False,
                     },
                 }
-            revalidated = DeckAuthoritySnapshot(**dict(snapshot_fn(**snapshot_arguments)))
-            require_expected_board_epochs(revalidated, phase="before_first_movement_write")
-            # Fresh time/sensor transaction evidence is not authority drift.
-            # Preserve the full receipt digest and fence every owner/state field.
-            if not _same_authority_after_resampling(authority, revalidated):
-                raise MovementAuthorityChanged("deck_authority_changed_before_first_tx")
-            execution_authority = revalidated
+            revalidated = authority
             results: list[Mapping[str, Any]] = []
             delivery_attempted = False
             record_delivery = getattr(command_store, "record_delivery_attempt", None)
@@ -2518,6 +2532,7 @@ def make_deck_command_executor(
                 destination = catalog.resolve(plan.target)
                 return {
                     "ok": source_terminal_complete and semantic_committed,
+                    "source_noop": all_source_noop,
                     "admitted": True,
                     "delivery_attempted": any(
                         row.get("source_noop") is not True

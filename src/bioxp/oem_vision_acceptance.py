@@ -362,6 +362,33 @@ def plan_cover_relocations(detected: Mapping[Any, bool]) -> dict[str, Any]:
     }
 
 
+def inspection_transfer_outcome(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep source outcomes, not duplicate nested controller transport trees."""
+    fields = (
+        "ok", "operation", "order", "source_return", "source_return_code",
+        "source_noop", "source_branch_skipped", "delivery_attempted",
+        "controller_command_acknowledged", "controller_completion_verified",
+        "controller_terminal_state_verified", "hardware_postcondition_verified",
+        "physical_effect_verified", "exception_suppressed", "exception_type",
+        "exception_message", "exception", "error", "failure", "failed_child",
+        "residual_state", "background_pending", "source_plan_digest",
+        "semantic_state_committed", "door_open", "door_closed", "phase",
+        "command_id", "child_order", "dispatch_attempt_id", "plan_digest",
+        "ownership_generation", "board_epoch_4", "board_epoch_5", "source_anchor",
+        "target", "effective_target", "completion_class", "outcome_unknown",
+        "physical_motion_commanded", "command_issued", "source_call_completed",
+    )
+    outcome = {key: result[key] for key in fields if key in result}
+    for key in ("completed_children", "failure_evidence", "provider_results"):
+        if isinstance(result.get(key), (list, tuple)):
+            outcome[key] = [inspection_transfer_outcome(row) if isinstance(row, Mapping) else row
+                            for row in result[key]]
+    for key in ("result", "motion_evidence"):
+        if isinstance(result.get(key), Mapping):
+            outcome[key] = inspection_transfer_outcome(result[key])
+    return outcome
+
+
 def _recursive_bool(value: Any, key: str) -> bool | None:
     if isinstance(value, dict):
         if type(value.get(key)) is bool:
