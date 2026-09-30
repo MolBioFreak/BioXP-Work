@@ -70,7 +70,7 @@ def capture_selected_preparation(*, snapshot: Any, metadata: Mapping[str, Any]) 
 
 
 class PreparationCameraRuntime:
-    """Uses only the existing shared CameraProvider; never stops preview."""
+    """Uses the shared camera and its existing stream-service stop/reap hook."""
 
     def __init__(self, camera: Any, *, artifact_root: Path):
         self.camera = camera

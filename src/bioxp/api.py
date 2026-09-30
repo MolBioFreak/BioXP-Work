@@ -6222,6 +6222,12 @@ async def _start_owned_camera_session_locked(payload: dict[str, Any]) -> dict[st
     if shutil.which("ffmpeg") is None:
         raise HTTPException(status_code=503, detail=_camera_missing_dependency_payload("ffmpeg"))
     provider = _camera_provider
+    loop = asyncio.get_running_loop()
+    def stop_inspection_preview():
+        # Native children run on workers; the original loop owns cleanup.
+        asyncio.run_coroutine_threadsafe(
+            _stop_owned_camera_session(reason="inspection"), loop).result()
+    provider.bind_preview_stopper(stop_inspection_preview)
     session_id = uuid.uuid4().hex
     # Fence camera-only facts before begin_stream/spawn can yield to a
     # concurrent snapshot collector. Failed starts never renew older evidence.
@@ -10735,6 +10741,13 @@ def _deck_cover_inspection_save(*, frame, condition: str, artifact_id: str) -> d
     return artifact
 
 
+def _deck_inspection_led(*, channel, on):
+    # checkTips can enter independently of inspectCover's explicit preflight.
+    # Use the same camera owner; discovery precedes the first profile write.
+    _camera_provider.prepare_inspection()
+    return _camera_provider.set_illumination(channel=channel, on=on)
+
+
 def _bind_deck_cover_inspection(provider) -> None:
     """Compose the cover-inspection callbacks onto the serial-206 provider."""
     from .vision.oem_inspection import scan_barcode
@@ -10742,7 +10755,7 @@ def _bind_deck_cover_inspection(provider) -> None:
         settings=_deck_inspection_settings,
         capture=_deck_cover_inspection_capture,
         save=_deck_cover_inspection_save,
-        led=lambda *, channel, on: _camera_provider.set_illumination(channel=channel, on=on),
+        led=_deck_inspection_led,
         rgb=lambda r, g, b: _get_tester().strip_set_rgb(r, g, b, reconnect_first=False, activate_first=False),
         barcode=scan_barcode,
     )

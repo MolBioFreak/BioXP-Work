@@ -218,6 +218,7 @@ class CameraProvider:
         self._stream_owner: str | None = None
         self._stream_identity: CameraIdentity | None = None
         self._stream_accepting = False
+        self._preview_stopper = None
         self._led_fd: int | None = None
         self._led_leaf: Any = None
         self._led_binding: Any = None
@@ -330,8 +331,27 @@ class CameraProvider:
         """Read-only GET_LEN/INFO preflight; never register/bank writes."""
         return self._illumination("probe")
 
+    def bind_preview_stopper(self, stopper) -> None:
+        """Use the existing stream service to stop and reap its process."""
+        with self._lock:
+            self._preview_stopper = stopper
+
+    def _stop_inspection_preview(self) -> None:
+        # Reaping calls end_stream, which acquires our lock: never hold it
+        # while asking the event-loop-owned stream service to stop.
+        with self._lock:
+            stopper = self._preview_stopper if self._stream_owner is not None else None
+        if stopper is not None:
+            stopper()
+
+    def prepare_inspection(self) -> dict[str, Any]:
+        """Stop preview before discovery; preserve an initialized LED binding."""
+        self._stop_inspection_preview()
+        return self._illumination("ensure_initialized")
+
     def initialize_illumination(self) -> dict[str, Any]:
-        """Explicit source discovery for inspection or operator illumination."""
+        """Explicit source discovery after the existing preview owner is reaped."""
+        self._stop_inspection_preview()
         return self._illumination("initialize")
 
     def set_illumination(self, *, channel: int, on: bool) -> dict[str, Any]:

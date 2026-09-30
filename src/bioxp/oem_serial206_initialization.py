@@ -3532,7 +3532,7 @@ class Serial206ProductionPrimitiveAdapter:
         # Source thread, not Linux's worker: the UI button runs on STA, while
         # BioXPMainWindow's dedicated Motion thread invokes inspectCover on MTA.
         # ClassControlInterface.moveXY uses WaitAny on STA and WaitAll on MTA.
-        if source_context not in (None, "ClassControlInterface.btnLOC1_Click", "ControlLib.inspectCover"):
+        if source_context not in (None, "ClassControlInterface.btnLOC1_Click", "ControlLib.inspectCover", "ControlLib.MotionThread"):
             raise ValueError("unsealed_moveXY_source_context")
         sta_sequential = source_context == "ClassControlInterface.btnLOC1_Click"
         requested = {"x": int(x), "y": int(y)}
@@ -3553,7 +3553,7 @@ class Serial206ProductionPrimitiveAdapter:
             "source_context_sealed": source_context is not None,
             "wait_schedule": (
                 "STA_WaitAny_X_then_Y" if sta_sequential else
-                "MTA_WaitAll" if source_context == "ControlLib.inspectCover" else
+                "MTA_WaitAll" if source_context in ("ControlLib.inspectCover", "ControlLib.MotionThread") else
                 "unsealed_legacy_WaitAll"
             ),
         }
@@ -12771,7 +12771,10 @@ class Serial206OemInitializationProvider:
                 raise RuntimeError("source_pipette_z_calibration_missing")
             return {**self.moveZ(target), "source_return": target if operation == "sourceLowerTo" else 0}
         if operation == "sourceMoveXY":
-            return self.primitives.oem_move_xy(arguments["x"], arguments["y"])
+            # This finite source leaf is invoked by the OEM protocol motion
+            # worker, not the manual STA button. Seal its MTA wait schedule.
+            return self.primitives.oem_move_xy(arguments["x"], arguments["y"],
+                source_context="ControlLib.MotionThread")
         if operation == "sourcePosition":
             positions = {axis: self.primitives._read_axis_position(axis) for axis in ("x", "y", "z")}
             return {"ok": True, "delivery_attempted": True, **positions}
