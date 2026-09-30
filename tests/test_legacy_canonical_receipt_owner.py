@@ -39,11 +39,18 @@ def test_named_receipt_readers_without_duplicate_writes(installed_retained, reta
     detail = terminal(client, cid)
     assert plane.store.wait_for_command_workers([cid], timeout=2)
     plane.stop()
+    # Trace only the producer, not later cross-connection reader/maintenance work.
+    plane.store.connection.set_trace_callback(None)
     compact = client.get('/operator/v2/actions/receipts/' + cid).json()
     saved = legacy.connection.execute('SELECT * FROM operator_commands WHERE command_id=?', (cid,)).fetchone()
     assert saved['receipt_json'] == '{}'
     assert saved['status'] == plane.store.get_command(cid)['status']
-    assert float(saved['finished_at']) == plane.store.get_command(cid)['finished_at']
+    # Legacy TEXT affinity follows this SQLite build's float-to-text format.
+    # Compare the exact SQL conversion, not a different precision round-trip.
+    canonical_finished = plane.store.get_command(cid)['finished_at']
+    assert saved['finished_at'] == plane.store.connection.execute(
+        'SELECT CAST(? AS TEXT)', (canonical_finished,),
+    ).fetchone()[0]
     assert not any(sql.lstrip().upper().startswith('UPDATE OPERATOR_COMMANDS SET') and
                    'RECEIPT_JSON=' in sql.upper().replace(' ', '') for sql in traced)
     claims = legacy.by_command(cid)
