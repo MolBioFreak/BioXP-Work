@@ -21,6 +21,18 @@ def test_offset_reads_source_facts_without_host_revision_precondition(query_rig,
     assert calls == []
 
 
+def test_same_fact_publication_does_not_change_offset_permission(query_rig):
+    app, provider, primitive, references, root, receipts, calls, wire, owner = query_rig
+    snapshot = provider.deck_authority_snapshot(expected_generation=provider.generation_provider(), target='LOC_OC')
+    assert app.state.operator_command_plane.store.deck_semantic_state()['tip_loaded'] is None
+    provider.publish_pipette_owner_state(tip_loaded=snapshot['tip_loaded'],
+        tip_dirty=None, tip_location=None, source_command_id='actual-same-tip-state')
+    provider.assert_deck_observation_current(snapshot)
+    result = provider.moveTo(location_id=1, authority_snapshot=snapshot)
+    assert result['ok'] is True
+    assert any(row[0] == 'move' for row in primitive.calls)
+
+
 def publish_unrelated(store, provider, key):
     return store.publish_deck_owner_state(source_operation='updatePlateLocation',
         source_command_id=key, updates={'movable_plate_locations': {'OUTPUT_PLATE': 'LOC_P_OC'}},

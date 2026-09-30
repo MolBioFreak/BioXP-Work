@@ -5092,7 +5092,7 @@ class Serial206OemInitializationProvider:
                 raise RuntimeError("deck_semantic_state_not_authoritative:plate_on_gantry") from exc
         semantic["required_facts"] = tuple(required)
         semantic["consumed_state_digest"] = hashlib.sha256(json.dumps(
-            {key: {"value": semantic[key], "owner": sources.get(key, "canonical")} for key in required},
+            {key: semantic[key] for key in required},
             sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         semantic["transition_provenance_digest"] = hashlib.sha256(json.dumps(
             provenance, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
