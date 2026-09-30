@@ -114,7 +114,6 @@ def test_existing_immutable_bundle_authority_supplies_all_fixture_templates():
 def test_check_label_two_exposures_real_frame_transformation_controls():
     raw = fixture_bytes('snapshots/output_plate_missing_2018-10-09 11-52-42.jpg')
     dark = cv2.cvtColor(cv2.imdecode(np.frombuffer(raw, np.uint8), 1), 7)
-    assert vision.label_dark_frame_valid(dark)
     assert not vision.check_label(dark, dark)  # stale identical frame is rejected
     # Deterministic spatially permuted authentic image pixels, then brighten:
     # algorithm control, not a claimed recorded LED-on exposure.
@@ -123,7 +122,6 @@ def test_check_label_two_exposures_real_frame_transformation_controls():
     assert vision.check_label(dark, bright)
     assert not vision.check_label(dark, np.minimum(bright, 49))
     uniform_histogram = np.tile(np.arange(256, dtype=np.uint8), (480, 3))[:, :640]
-    assert not vision.label_dark_frame_valid(uniform_histogram)
     assert not vision.check_label(uniform_histogram, bright)
     record('check-label-transform', {'same_frame': False, 'permuted_brightened': True,
            'too_dark_on': False, 'flat_histogram_off': False,

@@ -9,7 +9,6 @@ class OemVisionReceiptError(ValueError):
     pass
 
 
-CHECK_CAMERA_SOURCE_ANCHOR = "ControlLib.CheckCamera:1929-1960"
 
 
 def _exact_bool(value: Any, name: str) -> bool:
@@ -30,93 +29,6 @@ def _mapping(value: Any, name: str, keys: set[str]) -> dict[str, Any]:
     return value
 
 
-def _validate_attempt(attempt: Any, *, index: int, expected_offset_x: int) -> tuple[bool, bool]:
-    row = _mapping(
-        attempt,
-        f"attempts[{index}]",
-        {"location_id", "offset_x", "offset_y", "check_label", "failure_snapshot_written"},
-    )
-    if type(row["location_id"]) is not int or row["location_id"] != 23:
-        raise OemVisionReceiptError(f"attempts[{index}].location_id must be exact OEM location 23")
-    if type(row["offset_x"]) is not int or type(row["offset_y"]) is not int:
-        raise OemVisionReceiptError(f"attempts[{index}] offsets must be exact integers")
-    if row["offset_x"] != expected_offset_x or row["offset_y"] != 0:
-        ordinal = "first" if index == 0 else "second"
-        raise OemVisionReceiptError(f"{ordinal} camera attempt does not match the OEM offset")
-    detected = _exact_bool(row["check_label"], f"attempts[{index}].check_label")
-    snapshot = _exact_bool(row["failure_snapshot_written"], f"attempts[{index}].failure_snapshot_written")
-    if detected and snapshot:
-        raise OemVisionReceiptError(f"attempts[{index}] cannot write a failure snapshot after success")
-    if not detected and not snapshot:
-        raise OemVisionReceiptError(f"attempts[{index}] must persist the OEM failure snapshot")
-    return detected, snapshot
-
-
-def evaluate_check_camera_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
-    row = _mapping(
-        receipt,
-        "receipt",
-        {
-            "camera_owner",
-            "settings_item",
-            "led_white_acknowledged",
-            "door_closed_verified",
-            "attempts",
-            "location_23_persisted",
-            "all_leds_off_acknowledged",
-            "gantry_park_verified",
-        },
-    )
-    if row["camera_owner"] != "oem_full_lifecycle":
-        raise OemVisionReceiptError("camera_owner must be the robot-owned full lifecycle")
-    if type(row["settings_item"]) is not int or row["settings_item"] != 4:
-        raise OemVisionReceiptError("settings_item must be OEM InspectionItems value 4")
-    led_white = _exact_bool(row["led_white_acknowledged"], "led_white_acknowledged")
-    door_closed = _exact_bool(row["door_closed_verified"], "door_closed_verified")
-    attempts = row["attempts"]
-    if not isinstance(attempts, list) or len(attempts) not in {1, 2}:
-        raise OemVisionReceiptError("attempts must contain one or two OEM camera attempts")
-    first_detected, _ = _validate_attempt(attempts[0], index=0, expected_offset_x=4738)
-    if first_detected and len(attempts) != 1:
-        raise OemVisionReceiptError("CheckCamera must stop after first success")
-    if not first_detected and len(attempts) != 2:
-        raise OemVisionReceiptError("CheckCamera requires the exact second attempt after first failure")
-    second_detected = False
-    if len(attempts) == 2:
-        second_detected, _ = _validate_attempt(attempts[1], index=1, expected_offset_x=1895)
-
-    cleanup_failures: list[str] = []
-    for field, failure in (
-        ("location_23_persisted", "location_23_not_persisted"),
-        ("all_leds_off_acknowledged", "all_leds_off_not_verified"),
-        ("gantry_park_verified", "gantry_park_not_verified"),
-    ):
-        if not _exact_bool(row[field], field):
-            cleanup_failures.append(failure)
-    if not led_white:
-        cleanup_failures.append("white_led_not_verified")
-    if not door_closed:
-        cleanup_failures.append("door_closed_not_verified")
-    label_detected = first_detected or second_detected
-    failure = None if label_detected else "camera_label_not_detected"
-    ok = bool(label_detected and not cleanup_failures)
-    return {
-        "ok": ok,
-        "status": "receipt_valid" if ok else "receipt_rejected",
-        "receipt_validation_pass": ok,
-        "production_admission_pass": False,
-        "provider_live_bound": False,
-        "physical_motion_commanded": False,
-        "physical_effect_verified": False,
-        "label_detected": label_detected,
-        "attempt_count": len(attempts),
-        "failure": failure,
-        "cleanup_verified": not cleanup_failures,
-        "cleanup_failures": cleanup_failures,
-        "source_anchor": CHECK_CAMERA_SOURCE_ANCHOR,
-        "exact_attempt_offsets_x": [4738, 1895],
-        "camera_session_disposition": "not_released_by_CheckCamera",
-    }
 
 
 INSPECT_COVER_SOURCE_ANCHOR = "ControlLib.inspectCover:3663-3768"

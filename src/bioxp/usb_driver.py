@@ -2009,47 +2009,6 @@ class BioXpTester:
             "elapsed_ms": int((time.time() - t0) * 1000),
         }
 
-    def bus_health(self, cycles=20, interval_s=0.30):
-        stats = {bid: {"ok": 0, "noresp": 0, "last": "n/a"} for bid in self.BOARDS}
-        all_dead_streak = 0
-        for i in range(cycles):
-            line = [f"{i+1:02d}/{cycles}"]
-            cycle_ok = 0
-            for bid in self.BOARDS:
-                r = self.send_tmcl_retry(
-                    bid,
-                    64,
-                    0,
-                    0,
-                    1,
-                    attempts=1,
-                    wait_reply=True,
-                    write_timeout_ms=35,
-                    read_timeout_ms=30,
-                    max_reads=10,
-                    strict_match=True,
-                )
-                if r is None:
-                    stats[bid]["noresp"] += 1
-                    stats[bid]["last"] = "no resp"
-                    line.append(f"0x{bid:02X}:NR")
-                else:
-                    stats[bid]["ok"] += 1
-                    stats[bid]["last"] = r["status_str"]
-                    line.append(f"0x{bid:02X}:{r['status_str'][:3]}")
-                    cycle_ok += 1
-                time.sleep(0.003)
-            print("  " + " ".join(line))
-            if cycle_ok == 0:
-                all_dead_streak += 1
-            else:
-                all_dead_streak = 0
-            if all_dead_streak >= 2:
-                print("  [auto] all boards no-response streak; reconnecting USB interface...")
-                self.reconnect()
-                all_dead_streak = 0
-            time.sleep(interval_s)
-        return stats
 
     def latch_oem(self, locked, *, activate_first=True):
         state = 1 if locked else 0
@@ -2280,32 +2239,7 @@ class BioXpTester:
         out["tmcl_value"] = val
         return out
 
-    def led_logo_pwm_raw(self, pwm_raw, broad=False):
-        # setLogoPWM forwards user integer directly to setLED(mask=3, intensity=pwm_raw)
-        out = self.led_write(mask=3, value=int(pwm_raw), broad=broad, retries=2)
-        out["pwm_raw"] = int(pwm_raw)
-        return out
 
-    def led_rgb_scaled(self, r, g, b, broad=False):
-        t0 = time.time()
-        rr = self.led_mask_scaled(0, r, broad=broad)
-        gg = self.led_mask_scaled(1, g, broad=broad)
-        bb = self.led_mask_scaled(2, b, broad=broad)
-        sent = rr["sent"] + gg["sent"] + bb["sent"]
-        acks = {}
-        for bid in (self.BOARDS if broad else [self.BOARD_DECK]):
-            acks[bid] = {
-                "r": rr["acks"].get(bid),
-                "g": gg["acks"].get(bid),
-                "b": bb["acks"].get(bid),
-            }
-        return {
-            "rgb": (self._clamp_u8(r), self._clamp_u8(g), self._clamp_u8(b)),
-            "board_mode": "broad" if broad else f"0x{self.BOARD_DECK:02X}",
-            "acks": acks,
-            "sent": sent,
-            "elapsed_ms": int((time.time() - t0) * 1000),
-        }
 
     def led_firstpath_restart(self, leave_on=True):
         """
@@ -2355,34 +2289,6 @@ class BioXpTester:
             time.sleep(0.35)
         return {"status": st, "steps": out}
 
-    def led_firstpath_matrix(self):
-        """
-        Exhaustive but bounded probe for OEM cmd50 across boards/masks/values.
-        """
-        self.reconnect()
-        st = self.activate_boards(expect_reply=True)
-        values = [0, 64, 255, 1024, 4095]
-        masks = [3, 0, 1, 2]
-        rows = []
-        for bid in self.BOARDS:
-            for mask in masks:
-                for value in values:
-                    ack = self.send_tmcl_retry(
-                        bid,
-                        50,
-                        0,
-                        mask,
-                        value,
-                        attempts=2,
-                        wait_reply=True,
-                        write_timeout_ms=55,
-                        read_timeout_ms=65,
-                        max_reads=16,
-                        strict_match=True,
-                    )
-                    rows.append({"board": bid, "mask": mask, "value": value, "ack": ack})
-                    time.sleep(0.03)
-        return {"status": st, "rows": rows}
 
     def strip_set_rgb(
         self,
@@ -5093,30 +4999,6 @@ class BioXpTester:
             "ok": self._tmcl_success(ack),
         }
 
-    def motor_move_right(self, board_id, speed=250, motor=0):
-        # TMCL rotate-right counterpart retained only as an explicitly non-OEM
-        # diagnostic direction primitive; OEM Z authority never selects it.
-        vel = max(1, abs(int(speed)))
-        ack = self._send_motor(
-            int(board_id),
-            1,
-            0,
-            int(motor),
-            vel,
-            attempts=1,
-            wait_reply=True,
-            write_timeout_ms=55,
-            read_timeout_ms=70,
-            max_reads=18,
-            strict_match=True,
-        )
-        return {
-            "board": int(board_id),
-            "motor": int(motor),
-            "speed": vel,
-            "ack": ack,
-            "ok": self._tmcl_success(ack),
-        }
 
     def motor_query_home_switch(self, board_id, motor=0):
         row = self.motor_get_axis_param(board_id, 9, motor=motor)
@@ -8037,26 +7919,6 @@ class BioXpTester:
     def motor_stop(self, board_id, motor=0):
         return self.motor_oem_stop_exact(board_id, motor=motor)
 
-    def motor_spin_test(self, board_id, velocity, seconds=2.0, motor=0):
-        dur = max(0.2, min(8.0, float(seconds)))
-        pre = self.motor_get_position(board_id, motor=motor)
-        start = self.motor_rotate(board_id, velocity, motor=motor)
-        time.sleep(dur)
-        stop = self.motor_stop(board_id, motor=motor)
-        post = self.motor_get_position(board_id, motor=motor)
-        return {
-            "board": int(board_id),
-            "motor": int(motor),
-            "velocity": int(velocity),
-            "seconds": dur,
-            "pre": pre,
-            "start": start,
-            "stop": stop,
-            "post": post,
-            "delta": None
-            if pre.get("position") is None or post.get("position") is None
-            else int(post["position"]) - int(pre["position"]),
-        }
 
     @staticmethod
     def _probe_switch_direction_guard(pre_left, pre_right, steps):

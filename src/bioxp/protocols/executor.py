@@ -511,13 +511,6 @@ class ProtocolExecutor:
             self._condition.notify_all()
             return {"ok": True, "delivery_attempted": False, "source_script_finalized": True}
 
-    def register_child(self, command_id: str) -> None:
-        """Canonical owner calls at actual admission, preserving admission order."""
-        if not isinstance(command_id, str) or not command_id:
-            raise ValueError("Child requires actual canonical identity")
-        with self._condition:
-            if command_id not in self._state.workflow.child_command_ids:
-                self._state.workflow.child_command_ids.append(command_id)
 
     def _notify(self) -> None:
         with self._condition:
