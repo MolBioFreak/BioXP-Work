@@ -435,7 +435,7 @@ class CameraProvider:
                 raise CameraFrameUnavailable("obsolete camera stream owner")
             assert self._stream_identity is not None
             # Only exact immutable bytes from this owner's retained, validated
-            # frame qualify. Changed/untrusted payloads still receive full decode.
+            # frame qualify. Changed/untrusted payloads still receive decode.
             latest = self._latest
             if (type(content) is bytes and latest is not None
                     and type(latest.content) is bytes
@@ -445,7 +445,7 @@ class CameraProvider:
                 return self._publish(latest.content, self._stream_identity,
                                      source_captured_at=source_captured_at)
             try:
-                self._validate_jpeg(content)
+                self._validate_jpeg(content, reduced_stream=type(content) is bytes)
             except CameraError:
                 self.drop_stream_frame(owner, invalid=True)
                 raise
@@ -827,7 +827,7 @@ class CameraProvider:
         return max(0.0, (self._aware_now() - frame.captured_at).total_seconds())
 
     @staticmethod
-    def _validate_jpeg(content: bytes) -> None:
+    def _validate_jpeg(content: bytes, *, reduced_stream: bool = False) -> None:
         if len(content) > MAX_JPEG_BYTES:
             raise CameraUnavailable("camera JPEG exceeds bounded frame size")
         if not content.startswith(b"\xff\xd8") or not content.endswith(b"\xff\xd9"):
@@ -836,6 +836,20 @@ class CameraProvider:
             with Image.open(io.BytesIO(content)) as image:
                 if image.format != "JPEG" or image.size != (640, 480):
                     raise CameraUnavailable("camera capture is not a 640x480 JPEG")
+                # Validate original dimensions/format before draft changes size.
+                # Only the qualified sequential YCbCr layouts use the discarded
+                # 80x60 grayscale raster. Still entropy-decode with the shipped
+                # Pillow tolerance; never replace decoding with header checks.
+                # Other encodings and capture/inspection retain full decoding.
+                if (reduced_stream and image.mode == "RGB"
+                        and not image.info.get("progressive")
+                        and "adobe" not in image.info
+                        and [(c, h, v) for c, h, v, _q in getattr(image, "layer", ())] in (
+                            [(1, 1, 1), (2, 1, 1), (3, 1, 1)],
+                            [(1, 2, 1), (2, 1, 1), (3, 1, 1)],
+                            [(1, 2, 2), (2, 1, 1), (3, 1, 1)],
+                        )):
+                    image.draft("L", (80, 60))
                 image.load()
         except CameraUnavailable:
             raise
