@@ -571,8 +571,8 @@ def make_workflow_lifecycle_control_executor(
                             if writer is not None:
                                 writer.close()
                         with command_store._lock:
-                            if command_store._workflow_child_waiters.get(command_id) is completion:
-                                command_store._workflow_child_waiters.pop(command_id)
+                            if command_store._workflow_child_waiters.get((command_id, False)) is completion:
+                                command_store._workflow_child_waiters.pop((command_id, False))
                         if not completion.done():
                             completion.set_result(resolved)
 
@@ -3280,8 +3280,16 @@ def install_operator_control_plane(
             workflow = state.workflow
             if workflow is not None and command_id not in workflow.child_command_ids:
                 workflow.child_command_ids.append(command_id)
+            from concurrent.futures import TimeoutError as FutureTimeoutError
+            wake = command_plane.store.workflow_child_completion(command_id, include_issued_pending=True)
             while True:
-                receipt = command_plane.store.get_command(command_id)
+                try:
+                    receipt = wake.result(timeout=0.25)["receipt"]
+                except FutureTimeoutError:
+                    # Bounded only to observe owner stop; no receipt polling.
+                    if command_plane.store._stop.is_set():
+                        raise RuntimeError("workflow_child_owner_lost")
+                    continue
                 if receipt is None:
                     raise RuntimeError("workflow_child_receipt_missing")
                 status = receipt["status"]
@@ -3295,11 +3303,7 @@ def install_operator_control_plane(
                                 domains=("Gripper",), command_id=command_id),)}
                 if status in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"}:
                     return _workflow_terminal_result(receipt)
-                if command_plane.store._stop.is_set():
-                    raise RuntimeError("workflow_child_owner_lost")
-                # The existing dispatcher renews/executes; this is only the
-                # source handler's wait for its original admitted child.
-                command_plane.store._stop.wait(0.02)
+                raise RuntimeError(f"workflow_child_unexpected_status:{status}")
 
         def workflow_initial_check(state: Any, *, validate_current: Callable[[str], bool]) -> Mapping[str, Any]:
             callback = getattr(app.state, "oem_workflow_initial_check", None)

@@ -2564,17 +2564,21 @@ class OperatorCommandStore:
                 with self._transaction() as conn:
                     conn.execute("UPDATE operator_commands SET status='completed',updated_at=? WHERE command_id=?", (_now(), command_id))
 
-    def workflow_child_completion(self, command_id: str):
+    def workflow_child_completion(self, command_id: str, *, include_issued_pending: bool = False):
+        # Terminal-only and issued_pending waiters are separate identities, so
+        # an issued_pending wake never settles a terminal-only waiter.
         from concurrent.futures import Future
         with self._lock:
-            future = self._workflow_child_waiters.setdefault(command_id, Future())
+            future = self._workflow_child_waiters.setdefault(
+                (command_id, bool(include_issued_pending)), Future())
         self._wake.set()
         return future
 
     def _settle_workflow_child_waiters(self) -> None:
         ready = []
         with self._lock:
-            for command_id, future in list(self._workflow_child_waiters.items()):
+            for key, future in list(self._workflow_child_waiters.items()):
+                command_id, include_issued_pending = key
                 # Pending children need only a durable status check. Building
                 # the full receipt here repeatedly defeats completion wakeups.
                 row = self.connection.execute(
@@ -2582,11 +2586,14 @@ class OperatorCommandStore:
                     "LEFT JOIN serial206_movement_commands m ON m.command_id=p.command_id "
                     "WHERE p.command_id=?", (command_id,),
                 ).fetchone()
-                if row is not None and row["status"] in COMMAND_TERMINAL | {"rejected"}:
+                settled = COMMAND_TERMINAL | {"rejected"}
+                if include_issued_pending:
+                    settled = settled | {"issued_pending"}
+                if row is not None and row["status"] in settled:
                     receipt = self.get_command(command_id)
                     ready.append((future, {"ok": receipt["status"] == "completed", "command_id": command_id,
                                            "status": receipt["status"], "receipt": receipt}))
-                    del self._workflow_child_waiters[command_id]
+                    del self._workflow_child_waiters[key]
         for future, result in ready:
             future.set_result(result)
 
