@@ -927,8 +927,6 @@ def _input_spec(name: str, schema: Mapping[str, Any], *, required: bool, locatio
 
 
 _IMPLICIT_OPERATOR_ACK_BY_PATH = {
-    "/diagnostics/usb-sniff/start": "USB_SNIFF",
-    "/diagnostics/usb-sniff/stop": "USB_SNIFF",
     "/maintenance/usb/recover_motion": "RECOVER",
     "/motion/oem/x/set_home": "SET_HOME_CURRENT_POSITION",
     "/motion/arm/strict_startup": "RECOVER_MOTION",
@@ -1124,7 +1122,6 @@ _LOCAL_ONLY_PATH_PREFIXES = (
 )
 
 _OPERATOR_SEMANTIC_QUARANTINE_PATHS = {
-    "/motion/interlock/prepare": "Quarantined: this legacy route performs inferred latch/power writes and is not the source-grounded serial-206 preparation provider.",
     "/motion/power/diag": "Quarantined: this diagnostic can enter the same unverified power-enable sequence and lacks truthful aggregate acknowledgment/readback.",
 }
 
@@ -1786,8 +1783,6 @@ _NON_OPERATOR_COMPAT_PATHS = {
     "/motion/axis/absolute",
     "/motion/axis/home",
     "/motion/axis/zero",
-    "/motion/oem/z/live_right_reference",
-    "/motion/oem/z/abort",
 }
 _SERIAL206_PROVIDER_CAPABILITIES = {
     "/motion/oem/initialization/initialize_motors": "initialize_motors",
@@ -3169,7 +3164,6 @@ def install_operator_control_plane(
     app.state.operator_command_plane = command_plane
     if oem_deck_provider is not None and oem_deck_position_table_provider is not None:
         from .oem_deck_movement import (
-            compile_finite_plate_operation,
             make_deck_command_executor,
             make_wp8_operation_executor,
         )
@@ -3262,20 +3256,8 @@ def install_operator_control_plane(
             inputs: Mapping[str, Any],
             idempotency_key: str | None = None,
         ) -> dict[str, Any]:
-            current_provider = refresh_deck_provider()
-            snapshot_reader = getattr(current_provider, "wp8_operation_machine_state", None)
-            if not callable(snapshot_reader):
-                raise RuntimeError("source_authority_missing:wp8_operation_machine_state")
-            machine_inputs = snapshot_reader(operation, dict(inputs))
-            if not isinstance(machine_inputs, Mapping):
-                raise RuntimeError("source_authority_invalid:wp8_operation_machine_state")
-            compile_finite_plate_operation(
-                operation,
-                source_leaf_available=callable(
-                    getattr(current_provider, "execute_wp8_child", None)
-                ),
-                **{**dict(machine_inputs), **dict(inputs)},
-            )
+            # The store validates intent; dispatch consumes current source state.
+            refresh_deck_provider()
             return command_plane.store.admit_internal_wp8_operation(
                 operation,
                 inputs=inputs,

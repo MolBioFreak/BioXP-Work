@@ -482,15 +482,6 @@ _pipette_application = PipetteApplicationPlanner(
 )
 
 
-def bind_serial206_oem_initialization_provider(
-    provider: Serial206OemInitializationProvider | None,
-) -> dict[str, Any]:
-    """Bind or explicitly clear the live serial-206 initialization provider."""
-    global _serial206_oem_initialization_provider, _serial206_y_provider, _serial206_oem_initialization_provider_binding_error
-    _serial206_oem_initialization_provider = provider
-    _serial206_y_provider = getattr(provider, "y_provider", None) if provider is not None else None
-    _serial206_oem_initialization_provider_binding_error = None
-    return serial206_oem_initialization_provider_status()
 
 
 def serial206_oem_initialization_provider_status() -> dict[str, Any]:
@@ -815,8 +806,6 @@ _camera_projection_lock = threading.RLock()
 _camera_projection_epoch = 0
 _camera_probe_cache: dict[str, Any] | None = None
 _camera_session: dict[str, Any] | None = None
-USB_SNIFF_ACK = "USB_SNIFF"
-USB_SNIFF_PROFILES = {"passive", "manual_observe", "debug"}
 RESET_PROVENANCE_SCHEMA_VERSION = "bioxp.reset_provenance.v1"
 MAINTENANCE_STATE_SCHEMA_VERSION = "bioxp.maintenance_state.v1"
 MAINTENANCE_RECOVERY_ACK = "RECOVER"
@@ -1537,22 +1526,8 @@ def _execute_runtime_provider_z_intent(
     }
 
 
-def _runtime_z_abort_provider(command: Any) -> dict[str, Any]:
-    return _execute_runtime_provider_z_intent(
-        "abort",
-        command,
-        {"timeout_s": min(float(command.timeout_s), 3.0)},
-    )
 
 
-def _runtime_z_resume_provider(command: Any) -> dict[str, Any]:
-    return _execute_runtime_provider_z_intent(
-        "resume_after_abort",
-        command,
-        {
-            "wait_timeout_s": min(float(command.timeout_s), 60.0),
-        },
-    )
 
 
 def _get_tester() -> BioXpTester:
@@ -1596,15 +1571,8 @@ def _get_oem_startup_program(*, dry_safe: bool = False) -> OEMStartupProgram:
     return _oem_startup_program
 
 
-def _get_existing_oem_startup_program() -> OEMStartupProgram:
-    if _oem_startup_program is not None:
-        return _oem_startup_program
-    return _get_oem_startup_program(dry_safe=False)
 
 
-def _get_live_oem_startup_program() -> OEMStartupProgram:
-    """Return a live-only provider when an explicit runtime command needs it."""
-    return _get_oem_startup_program(dry_safe=False)
 
 
 class _BioXpSwitchAuditHardware:
@@ -2193,10 +2161,6 @@ class OemXMoveAbsoluteRequest(BaseModel):
     acceleration: StrictInt | None = Field(default=None, ge=-(2**31), le=2**31 - 1)
 
 
-class OemXReconcileRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    confirm: Literal["RECONCILE_X_SWITCH_MASKS"]
 
 
 class OemXSetHomeRequest(BaseModel):
@@ -2258,14 +2222,8 @@ class OemZObservationRequest(BaseModel):
         return selected
 
 
-class OemZReconcileRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    confirm: Literal["RECONCILE_Z_SWITCH_MASKS"]
 
 
-class OemZDiagnosticHomeRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
 
 class OemMoveZHomeRequest(BaseModel):
@@ -2346,8 +2304,6 @@ class OemZSelfTestRequest(BaseModel):
     wait_timeout_s: float = Field(default=30.0, ge=2.0, le=60.0)
 
 
-class OemZAbortRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 class OemZResumeRequest(BaseModel):
@@ -2583,18 +2539,6 @@ class MotionInterlockOverrideRequest(BaseModel):
     operator_note: Optional[str] = Field(None, max_length=2000)
 
 
-class UsbSniffCaptureRequest(BaseModel):
-    profile: str = Field("passive", description="Capture profile: passive, manual_observe, or debug.")
-    duration_s: int = Field(300, ge=1, le=1800)
-    include_pcap: bool = True
-    include_driver_ledger: bool = True
-    passive_only: bool = True
-    reason: Optional[str] = Field(None, max_length=2000)
-    operator_ack: Optional[str] = Field(None, description="Must be exactly USB_SNIFF for start/stop actions.")
-    operator: Optional[str] = Field("bms-cockpit", max_length=200)
-    stop_existing: bool = False
-    run_id: Optional[str] = Field(None, max_length=120)
-    tail: Optional[int] = Field(None, ge=1, le=1000)
 
 
 class MaintenanceRecoverMotionRequest(BaseModel):
@@ -2718,24 +2662,6 @@ class OemSerial206InitializeMotionStepRequest(BaseModel):
     timeout_s: float = Field(180.0, gt=1.0, le=300.0)
 
 
-class OemSerial206ObservationRequest(BaseModel):
-    """Strict operator evidence transition; this contract performs no I/O."""
-
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    stage: StrictStr = Field(min_length=1, max_length=128)
-    command_id: StrictStr = Field(min_length=1, max_length=256)
-    expected_generation: StrictInt = Field(ge=0, le=2_147_483_647)
-    observed_pass: StrictBool
-    note: StrictStr = Field(min_length=1, max_length=2000)
-
-    @field_validator("stage", "command_id", "note")
-    @classmethod
-    def _non_blank(cls, value: str) -> str:
-        selected = value.strip()
-        if not selected:
-            raise ValueError("value must not be blank")
-        return selected
 
 
 OEM_IDLE_STANDBY_CURRENT = 10
@@ -2881,8 +2807,6 @@ class PipetteErrorLogRequest(BaseModel):
     raw_byte: int = Field(0, ge=0, le=255)
 
 
-class PipetteDataRequest(BaseModel):
-    query: str = Field(..., min_length=3, max_length=3, pattern=r"^\\?[0-9]{2}$")
 
 
 class PipetteFluidDetectionRequest(BaseModel):
@@ -3266,14 +3190,6 @@ def _parse_axes_csv(axes_csv: str) -> list[AxisName]:
     return parsed
 
 
-def _axis_status_batch_payload(tester: BioXpTester, axes: list[AxisName]) -> dict:
-    rows = {}
-    for axis in axes:
-        rows[axis.value] = _axis_status_payload(tester, axis, include_current=(axis == AxisName.GRIPPER))
-    return {
-        "axes": [axis.value for axis in axes],
-        "rows": rows,
-    }
 
 
 def _position_value(row: Optional[dict]) -> Optional[int]:
@@ -4118,114 +4034,6 @@ def _wait_for_motion_with_guardrails(
         time.sleep(max(0.02, float(poll_s)))
 
 
-def _guarded_home_search(
-    tester: BioXpTester,
-    preset: dict,
-    *,
-    speed: int,
-    timeout_s: float,
-) -> dict:
-    board = int(preset["board"])
-    motor = int(preset["motor"])
-    active_value = int(tester.MOTOR_SWITCH_ACTIVE_VALUE)
-    effective_speed = max(1, min(int(speed), _DEFAULT_MOTION_SPEED))
-    started = time.monotonic()
-    deadline = started + max(2.0, float(timeout_s))
-    position_before = tester.motor_get_position(board, motor=motor)
-    home_before = tester.motor_query_home_switch(board, motor=motor)
-    switch_before = tester.motor_get_switch_activity(board, motor=motor)
-
-    preclear = None
-    preclear_wait = None
-    home_cleared = None
-    if home_before.get("value") == active_value:
-        preclear = tester.motor_move_relative(board, _MOTION_HOME_PRECLEAR_STEPS, motor=motor)
-        if not preclear.get("ok"):
-            raise HTTPException(status_code=409, detail=f"Axis {preset['label']} home preclear command failed.")
-        preclear_wait = _wait_for_motion_with_guardrails(tester, board, motor, timeout_s=6.0)
-        if not preclear_wait.get("ok"):
-            raise HTTPException(status_code=409, detail=preclear_wait.get("error"))
-        home_cleared = tester.motor_query_home_switch(board, motor=motor)
-        if home_cleared.get("value") == active_value:
-            raise HTTPException(status_code=409, detail=f"Axis {preset['label']} home switch stayed active after preclear; refusing to home.")
-
-    sethome_init = tester.motor_set_home(board, motor=motor)
-    move_left = tester.motor_move_left(board, speed=effective_speed, motor=motor)
-    if not move_left.get("ok"):
-        raise HTTPException(status_code=409, detail=f"Axis {preset['label']} homing command failed.")
-
-    last_position = _position_value(position_before)
-    last_progress_at = time.monotonic()
-    polls = []
-    home_hit = None
-    while time.monotonic() < deadline:
-        home_row = tester.motor_query_home_switch(board, motor=motor)
-        speed_row = tester.motor_get_speed(board, motor=motor)
-        position_row = tester.motor_get_position(board, motor=motor)
-        switch_row = tester.motor_get_switch_activity(board, motor=motor)
-        now = time.monotonic()
-        position = _position_value(position_row)
-        speed_now = _speed_value(speed_row)
-        if position is not None and last_position is None:
-            last_position = position
-            last_progress_at = now
-        elif position is not None and last_position is not None and position != last_position:
-            last_position = position
-            last_progress_at = now
-        polls.append(
-            {
-                "elapsed_ms": int((now - started) * 1000),
-                "home": home_row.get("value"),
-                "speed": speed_now,
-                "position": position,
-                "left_active": switch_row.get("left_active"),
-                "right_active": switch_row.get("right_active"),
-            }
-        )
-        if len(polls) > 20:
-            polls = polls[-20:]
-        if home_row.get("value") == active_value:
-            home_hit = home_row
-            break
-        if now - last_progress_at >= _MOTION_NO_DELTA_TIMEOUT_S:
-            tester.motor_stop(board, motor=motor)
-            tester.motor_wait_stopped(board, motor=motor, timeout_s=2.0, poll_s=0.06)
-            raise HTTPException(status_code=409, detail=f"Axis {preset['label']} homing aborted after 2.0s with no position change.")
-        time.sleep(0.08)
-
-    stop = tester.motor_stop(board, motor=motor)
-    wait = tester.motor_wait_stopped(board, motor=motor, timeout_s=2.0, poll_s=0.06)
-    if home_hit is None:
-        raise HTTPException(status_code=409, detail=f"Axis {preset['label']} homing timed out before the home switch triggered.")
-
-    sethome_final = tester.motor_set_home(board, motor=motor)
-    home_after = tester.motor_query_home_switch(board, motor=motor)
-    position_after = tester.motor_get_position(board, motor=motor)
-    return {
-        "board": board,
-        "motor": motor,
-        "speed": effective_speed,
-        "acc": int(preset["acc"]),
-        "no_delta_timeout_s": _MOTION_NO_DELTA_TIMEOUT_S,
-        "position_before": position_before,
-        "position_after": position_after,
-        "position_delta": _position_delta(position_before, position_after),
-        "switch_activity_before": switch_before,
-        "switch_activity_after": tester.motor_get_switch_activity(board, motor=motor),
-        "home_before": home_before,
-        "home_after": home_after,
-        "preclear": preclear,
-        "preclear_wait": preclear_wait,
-        "home_cleared": home_cleared,
-        "sethome_init": sethome_init,
-        "move_left": move_left,
-        "home_hit": home_hit,
-        "stop": stop,
-        "wait": wait,
-        "sethome_final": sethome_final,
-        "elapsed_ms": int((time.monotonic() - started) * 1000),
-        "log_tail": polls,
-    }
 
 
 def _execute_relative_move(
@@ -5017,8 +4825,6 @@ def _prepare_motion_axis(
 
 
 
-def _hardware_connected_from_board_status(board_status: Any) -> bool:
-    return bool(isinstance(board_status, dict) and any(reply is not None for reply in board_status.values()))
 
 
 
@@ -5131,7 +4937,7 @@ def _status_payload() -> dict:
         and ownership.get("usb") == "service"
         and ownership.get("router") == "running"
     )
-    lifecycle = lifecycle_state.projection()
+    lifecycle = lifecycle_state.projection(compact_startup=True)
     # Display-only provider read: never queue behind authority-bearing work.
     # /status is exactly what the operator Reconnect probe calls; a busy
     # provider yields the explicit busy projection instead of a stall
@@ -5178,7 +4984,7 @@ def _status_payload() -> dict:
         "maintenance_state": _maintenance_state_payload(),
         "operation_state": lifecycle["operation_state"],
         "startup": lifecycle["startup"],
-        "lifecycle": lifecycle,
+        "lifecycle": {key: value for key, value in lifecycle.items() if key != "startup"},
         "oem_initialize_motors": serial206_initialization.get("initialize_motors"),
         "oem_initialize_motion": serial206_initialization.get("initialize_motion_ledger"),
         "serial206_initialization": serial206_initialization,
@@ -5204,7 +5010,7 @@ def _motion_power_status_payload(tester: BioXpTester | None = None) -> dict:
     power = _domain_observation(projection, "power") or {}
     interlock = _domain_observation(projection, "interlock") or {}
     latch = _domain_observation(projection, "latch") or {}
-    lifecycle = lifecycle_state.projection()
+    lifecycle = lifecycle_state.projection(compact_startup=True)
     return {
         **projection,
         "hardware_connected": transport.get("CAN_READY", (projection.get("ownership") or {}).get("CAN_READY")),
@@ -5430,20 +5236,6 @@ def _hardware_collectors(tester: BioXpTester, *, before_query=None) -> dict[str,
     }
 
 
-def _camera_snapshot_with_data(tester: BioXpTester, preferred: str) -> dict:
-    result = _camera_capture_snapshot_direct(tester, preferred)
-    image_b64 = None
-    image_error = None
-    path = result.get("path")
-    if result.get("ok") and path and os.path.exists(path):
-        try:
-            with open(path, "rb") as handle:
-                image_b64 = base64.b64encode(handle.read()).decode("ascii")
-        except Exception as exc:
-            image_error = str(exc)
-    result["image_b64"] = image_b64
-    result["image_error"] = image_error
-    return result
 
 
 
@@ -5455,501 +5247,8 @@ def _json_safe(value: Any) -> Any:
         return str(value)
 
 
-class UsbSniffManager:
-    """Robot-local capture manager for Novo USB observability.
-
-    This is capture-only diagnostics: it never homes, arms, recovers, or moves axes.
-    It can run a driver TX/RX JSONL ledger immediately. Kernel usbmon pcap capture
-    is enabled only when the service user can see a tcpdump usbmon interface.
-    """
-
-    def __init__(self) -> None:
-        self.root = os.path.abspath(os.environ.get("BIOXP_USB_SNIFF_ROOT") or os.path.join(os.environ.get("BIOXP_LOG_ROOT") or "/tmp/bioxp-live-runs", "usb-sniff"))
-        self._lock = threading.RLock()
-        self._active: dict[str, Any] | None = None
-        self._latest_run_id: str | None = None
-
-    def _ensure_root(self) -> None:
-        os.makedirs(self.root, exist_ok=True)
-
-    def _safe_run_id(self, run_id: str) -> str:
-        safe = str(run_id or "").strip()
-        if not safe or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for ch in safe):
-            raise HTTPException(status_code=400, detail="invalid usb-sniff run_id")
-        return safe
-
-    def _run_dir(self, run_id: str) -> str:
-        return os.path.join(self.root, self._safe_run_id(run_id))
-
-    def _read_json(self, path: str, fallback: Any = None) -> Any:
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                return json.load(handle)
-        except Exception:
-            return fallback
-
-    def _write_json(self, path: str, payload: dict[str, Any]) -> None:
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True, default=str)
-            handle.write("\n")
-        os.replace(tmp, path)
-
-    def _append_jsonl(self, path: str, payload: dict[str, Any]) -> None:
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
-
-    def _tool(self, name: str) -> str | None:
-        return shutil.which(name)
-
-    def _command_output(self, args: list[str], timeout_s: float = 5.0) -> dict[str, Any]:
-        try:
-            cp = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout_s)
-            return {"ok": cp.returncode == 0, "returncode": cp.returncode, "output": cp.stdout}
-        except Exception as exc:
-            return {"ok": False, "returncode": None, "output": str(exc), "error": str(exc)}
-
-    def _usb_inventory(self) -> dict[str, Any]:
-        return {
-            "lsusb": self._command_output(["lsusb"], timeout_s=5.0),
-            "lsusb_tree": self._command_output(["lsusb", "-t"], timeout_s=5.0),
-            "target_vid_pid": "03eb:2423",
-            "target_hint": "Novo USB-to-CAN Board; expected on USB bus 002 at full-speed 12M on this robot",
-        }
-
-    def _pcap_probe(self) -> dict[str, Any]:
-        tcpdump = self._tool("tcpdump")
-        probe: dict[str, Any] = {
-            "available": False,
-            "tool": tcpdump,
-            "mode": None,
-            "interface": None,
-            "reason": None,
-            "interfaces": [],
-        }
-        if tcpdump:
-            result = self._command_output([tcpdump, "-D"], timeout_s=8.0)
-            probe["tcpdump_D"] = {k: result.get(k) for k in ("ok", "returncode", "error") if k in result}
-            interfaces: list[str] = []
-            for raw_line in str(result.get("output") or "").splitlines():
-                line = raw_line.strip()
-                if not line:
-                    continue
-                # tcpdump -D format: "1.eth0 [...]" or "10.usbmon2 ..."
-                name = line.split(" ", 1)[0].split(".", 1)[-1]
-                interfaces.append(name)
-            probe["interfaces"] = interfaces
-            preferred = os.environ.get("BIOXP_USB_SNIFF_IFACE") or "usbmon2"
-            if preferred in interfaces:
-                probe.update({"available": True, "mode": "tcpdump_pcap", "interface": preferred, "reason": "tcpdump_usbmon_interface_available"})
-                return probe
-            for name in interfaces:
-                if name.startswith("usbmon"):
-                    probe.update({"available": True, "mode": "tcpdump_pcap", "interface": name, "reason": "tcpdump_usbmon_interface_available"})
-                    return probe
-        else:
-            probe["tcpdump_D"] = {"ok": False, "returncode": None, "error": "tcpdump_not_installed_in_runtime"}
-
-        # Fallback: the robot handler runs as root inside the udocker/proot runtime,
-        # where tcpdump may be absent but debugfs usbmon text streams can be readable.
-        # This is still packet-level IN/OUT evidence, just not pcapng.
-        candidates = []
-        env_path = os.environ.get("BIOXP_USBMON_TEXT_PATH")
-        if env_path:
-            candidates.append(env_path)
-        bus_hint = os.environ.get("BIOXP_USBMON_BUS") or "2"
-        candidates.extend([
-            f"/sys/kernel/debug/usb/usbmon/{bus_hint}u",
-            f"/sys/kernel/debug/usb/usbmon/{bus_hint}t",
-            "/sys/kernel/debug/usb/usbmon/0u",
-            "/sys/kernel/debug/usb/usbmon/0t",
-        ])
-        checked = []
-        for path in candidates:
-            if not path or path in checked:
-                continue
-            checked.append(path)
-            try:
-                if os.path.exists(path) and os.access(path, os.R_OK):
-                    probe.update({"available": True, "mode": "usbmon_text", "interface": path, "reason": "debugfs_usbmon_text_available", "checked_paths": checked})
-                    return probe
-            except Exception:
-                continue
-        probe["checked_paths"] = checked
-        probe["reason"] = "usbmon_not_visible_to_service_user" if tcpdump else "tcpdump_not_installed_and_usbmon_text_not_readable"
-        return probe
-
-    def _status_payload_locked(self) -> dict[str, Any]:
-        active = self._active
-        runs = self._list_runs_locked(limit=8)
-        pcap = self._pcap_probe()
-        return {
-            "ok": True,
-            "available": True,
-            "active": active is not None,
-            "current_run": self._public_run(active) if active else None,
-            "latest_run": runs[0] if runs else None,
-            "runs": runs,
-            "capture_only": True,
-            "safety_boundary": {
-                "homes_axes": False,
-                "arms_motion": False,
-                "recovers_motion": False,
-                "commands_axis_motion": False,
-                "requires_operator_ack": USB_SNIFF_ACK,
-            },
-            "capabilities": {
-                "driver_ledger": True,
-                "pcap": bool(pcap.get("available")),
-                "pcap_probe": pcap,
-                "export_bundle": True,
-                "tail": True,
-            },
-            "root": self.root,
-            "target": {"vid_pid": "03eb:2423", "endpoints": {"in": "0x81", "out": "0x02"}, "speed": "full-speed 12M"},
-            "warnings": [] if pcap.get("available") else ["kernel usbmon pcap is not visible to the bioxp-api service user; driver ledger can still run, but full packet capture needs usbmon/debugfs privilege"],
-        }
-
-    def status(self) -> dict[str, Any]:
-        with self._lock:
-            return self._status_payload_locked()
-
-    def _public_run(self, run: dict[str, Any] | None) -> dict[str, Any] | None:
-        if not run:
-            return None
-        return {k: v for k, v in run.items() if k not in {"process", "timer"}}
-
-    def _run_summary_from_manifest(self, manifest: dict[str, Any]) -> dict[str, Any]:
-        files = manifest.get("files") if isinstance(manifest.get("files"), dict) else {}
-        return {
-            "run_id": manifest.get("run_id"),
-            "status": manifest.get("status"),
-            "profile": manifest.get("profile"),
-            "reason": manifest.get("reason"),
-            "operator": manifest.get("operator"),
-            "started_at": manifest.get("started_at"),
-            "ended_at": manifest.get("ended_at"),
-            "duration_s": manifest.get("duration_s"),
-            "run_dir": manifest.get("run_dir"),
-            "pcap_available": bool(((manifest.get("capabilities") or {}).get("pcap_probe") or {}).get("available")),
-            "driver_ledger": bool(files.get("driver_ledger")),
-            "pcap": bool(files.get("pcap")),
-            "export": files.get("export"),
-            "packet_accounting": manifest.get("packet_accounting"),
-            "warnings": manifest.get("warnings") or [],
-        }
-
-    def _list_runs_locked(self, limit: int | None = None) -> list[dict[str, Any]]:
-        self._ensure_root()
-        rows = []
-        for name in os.listdir(self.root):
-            if name.startswith("."):
-                continue
-            mpath = os.path.join(self.root, name, "manifest.json")
-            if not os.path.exists(mpath):
-                continue
-            manifest = self._read_json(mpath, {})
-            if isinstance(manifest, dict):
-                rows.append(self._run_summary_from_manifest(manifest))
-        rows.sort(key=lambda row: str(row.get("started_at") or row.get("run_id") or ""), reverse=True)
-        return rows[:limit] if limit else rows
-
-    def runs(self) -> dict[str, Any]:
-        with self._lock:
-            return {"ok": True, "available": True, "active": self._active is not None, "runs": self._list_runs_locked(limit=50)}
-
-    def _new_run_id(self) -> str:
-        return f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
-
-    def _start_pcap(self, run_dir: str, pcap_probe: dict[str, Any]) -> tuple[subprocess.Popen | None, str | None, dict[str, Any]]:
-        if not pcap_probe.get("available"):
-            return None, None, {"started": False, "reason": pcap_probe.get("reason") or "pcap_unavailable"}
-        mode = str(pcap_probe.get("mode") or "tcpdump_pcap")
-        iface = str(pcap_probe.get("interface") or "usbmon2")
-        if mode == "usbmon_text":
-            capture_path = os.path.join(run_dir, "usbmon_capture.txt")
-            log_path = os.path.join(run_dir, "usbmon_text.log")
-            cmd = ["cat", iface]
-            out_handle = open(capture_path, "ab")
-            log_handle = open(log_path, "ab")
-            try:
-                proc = subprocess.Popen(cmd, stdout=out_handle, stderr=log_handle)
-            except Exception as exc:
-                out_handle.close()
-                log_handle.close()
-                return None, None, {"started": False, "reason": "usbmon_text_start_failed", "error": str(exc), "command": cmd}
-            return proc, capture_path, {"started": True, "pid": proc.pid, "mode": mode, "interface": iface, "command": cmd, "log": log_path, "format": "linux_usbmon_text"}
-        tcpdump = str(pcap_probe.get("tool") or "tcpdump")
-        pcap_path = os.path.join(run_dir, "usbmon_capture.pcap")
-        log_path = os.path.join(run_dir, "tcpdump.log")
-        cmd = [tcpdump, "-i", iface, "-w", pcap_path, "-U", "-s", "0"]
-        log_handle = open(log_path, "ab")
-        try:
-            proc = subprocess.Popen(cmd, stdout=log_handle, stderr=subprocess.STDOUT)
-        except Exception as exc:
-            log_handle.close()
-            return None, None, {"started": False, "reason": "tcpdump_start_failed", "error": str(exc), "command": cmd}
-        return proc, pcap_path, {"started": True, "pid": proc.pid, "mode": mode, "interface": iface, "command": cmd, "log": log_path, "format": "pcap"}
-
-    def start(self, req: "UsbSniffCaptureRequest") -> dict[str, Any]:
-        payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
-        if str(payload.get("operator_ack") or "") != USB_SNIFF_ACK:
-            raise HTTPException(status_code=409, detail=f"operator_ack {USB_SNIFF_ACK} required for USB capture")
-        reason = str(payload.get("reason") or "").strip()
-        if not reason:
-            raise HTTPException(status_code=409, detail="reason is required for USB packet capture")
-        profile = str(payload.get("profile") or "passive")
-        if profile not in USB_SNIFF_PROFILES:
-            raise HTTPException(status_code=400, detail=f"profile must be one of {sorted(USB_SNIFF_PROFILES)}")
-        duration_s = max(1, min(1800, int(payload.get("duration_s") or 300)))
-        with self._lock:
-            if self._active is not None:
-                if bool(payload.get("stop_existing")):
-                    self._stop_locked(reason="replaced by new USB capture", operator=str(payload.get("operator") or "bms-cockpit"))
-                else:
-                    raise HTTPException(status_code=409, detail={"error": "usb_sniff_already_active", "current_run": self._public_run(self._active)})
-            self._ensure_root()
-            run_id = self._new_run_id()
-            run_dir = self._run_dir(run_id)
-            os.makedirs(run_dir, exist_ok=False)
-            ledger_path = os.path.join(run_dir, "driver_ledger.jsonl")
-            event_path = os.path.join(run_dir, "events.jsonl")
-            manifest_path = os.path.join(run_dir, "manifest.json")
-            pcap_probe = self._pcap_probe()
-            inventory = self._usb_inventory()
-            pcap_proc = None
-            pcap_path = None
-            pcap_start = {"started": False, "reason": "not_requested"}
-            if bool(payload.get("include_pcap", True)):
-                pcap_proc, pcap_path, pcap_start = self._start_pcap(run_dir, pcap_probe)
-            tester = None
-            driver_ledger_enabled = False
-            driver_ledger_result: dict[str, Any] = {"enabled": False, "reason": "not_requested"}
-            if bool(payload.get("include_driver_ledger", True)):
-                try:
-                    tester = _get_tester()
-                    enable = getattr(tester, "set_usb_sniff_ledger_path", None)
-                    if callable(enable):
-                        driver_ledger_result = enable(ledger_path, run_id=run_id)
-                        driver_ledger_enabled = bool(driver_ledger_result.get("enabled"))
-                    else:
-                        driver_ledger_result = {"enabled": False, "error": "BioXpTester lacks set_usb_sniff_ledger_path"}
-                except Exception as exc:
-                    driver_ledger_result = {"enabled": False, "error": str(exc)}
-            warnings = []
-            if bool(payload.get("include_pcap", True)) and not bool(pcap_start.get("started")):
-                warnings.append(f"pcap_not_active:{pcap_start.get('reason')}")
-            if bool(payload.get("include_driver_ledger", True)) and not driver_ledger_enabled:
-                warnings.append("driver_ledger_not_active")
-            if bool(payload.get("include_pcap", True)) and bool(payload.get("include_driver_ledger", True)) and not bool(pcap_start.get("started")) and not driver_ledger_enabled:
-                raise HTTPException(status_code=503, detail={"error": "no_usb_capture_channel_available", "pcap": pcap_start, "driver_ledger": driver_ledger_result})
-            run = {
-                "run_id": run_id,
-                "status": "active",
-                "profile": profile,
-                "duration_s": duration_s,
-                "passive_only": bool(payload.get("passive_only", True)),
-                "reason": reason,
-                "operator": str(payload.get("operator") or "bms-cockpit"),
-                "started_at": _now_utc(),
-                "run_dir": run_dir,
-                "manifest_path": manifest_path,
-                "ledger_path": ledger_path if driver_ledger_enabled else None,
-                "event_path": event_path,
-                "pcap_path": pcap_path,
-                "process": pcap_proc,
-                "pcap_start": pcap_start,
-                "driver_ledger": driver_ledger_result,
-                "warnings": warnings,
-            }
-            manifest = dict(run)
-            manifest.pop("process", None)
-            manifest["schema_version"] = "bioxp.usb_sniff_run.v1"
-            manifest["capture_only"] = True
-            manifest["safety_boundary"] = {"homes_axes": False, "arms_motion": False, "recovers_motion": False, "commands_axis_motion": False}
-            manifest["capabilities"] = {"pcap_probe": pcap_probe, "driver_ledger": driver_ledger_result}
-            manifest["usb_inventory"] = inventory
-            manifest["files"] = {"manifest": manifest_path, "driver_ledger": ledger_path if driver_ledger_enabled else None, "pcap": pcap_path, "events": event_path}
-            manifest["packet_accounting"] = {"driver_ledger_lines": 0, "pcap_size_bytes": 0, "unmatched_frames": None, "status": "pending"}
-            self._write_json(manifest_path, manifest)
-            self._append_jsonl(event_path, {"at": _now_utc(), "event": "start", "run_id": run_id, "pcap": pcap_start, "driver_ledger": driver_ledger_result})
-            timer = threading.Timer(duration_s, lambda: self.stop(reason="duration elapsed", operator="auto_timer"))
-            timer.daemon = True
-            timer.start()
-            run["timer"] = timer
-            self._active = run
-            self._latest_run_id = run_id
-            return {"ok": True, "available": True, "active": True, "current_run": self._public_run(run), "status": self._status_payload_locked()}
-
-    def _ledger_line_count(self, path: str | None) -> int:
-        if not path or not os.path.exists(path):
-            return 0
-        try:
-            with open(path, "rb") as handle:
-                return sum(1 for _ in handle)
-        except Exception:
-            return 0
-
-    def _file_sha256(self, path: str) -> str | None:
-        if not path or not os.path.exists(path):
-            return None
-        h = hashlib.sha256()
-        try:
-            with open(path, "rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    h.update(chunk)
-            return h.hexdigest()
-        except Exception:
-            return None
-
-    def _finalize_manifest(self, run: dict[str, Any], *, status: str, reason: str, operator: str) -> dict[str, Any]:
-        manifest_path = str(run.get("manifest_path"))
-        manifest = self._read_json(manifest_path, {})
-        if not isinstance(manifest, dict):
-            manifest = {}
-        manifest.update({
-            "run_id": run.get("run_id"),
-            "status": status,
-            "ended_at": _now_utc(),
-            "stop_reason": reason,
-            "stop_operator": operator,
-            "run_dir": run.get("run_dir"),
-        })
-        files = manifest.get("files") if isinstance(manifest.get("files"), dict) else {}
-        for key in ("driver_ledger", "pcap", "events"):
-            path = files.get(key)
-            if path and os.path.exists(path):
-                files[f"{key}_size_bytes"] = os.path.getsize(path)
-                files[f"{key}_sha256"] = self._file_sha256(path)
-        manifest["files"] = files
-        manifest["packet_accounting"] = {
-            "driver_ledger_lines": self._ledger_line_count(files.get("driver_ledger")),
-            "pcap_size_bytes": os.path.getsize(files.get("pcap")) if files.get("pcap") and os.path.exists(files.get("pcap")) else 0,
-            "unmatched_frames": None,
-            "status": "pcap_and_driver_reconciliation_pending" if files.get("pcap") and files.get("driver_ledger") else "partial_capture_channel",
-        }
-        self._write_json(manifest_path, manifest)
-        return manifest
-
-    def _stop_locked(self, *, reason: str, operator: str) -> dict[str, Any]:
-        run = self._active
-        if run is None:
-            return {"ok": True, "available": True, "active": False, "message": "no active USB capture", "latest_run": self._list_runs_locked(limit=1)[0] if self._list_runs_locked(limit=1) else None}
-        timer = run.get("timer")
-        if timer is not None:
-            try:
-                timer.cancel()
-            except Exception:
-                pass
-        proc = run.get("process")
-        pcap_stop: dict[str, Any] = {"stopped": False, "reason": "no_process"}
-        if proc is not None:
-            try:
-                if proc.poll() is None:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=4)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait(timeout=4)
-                pcap_stop = {"stopped": True, "returncode": proc.returncode}
-            except Exception as exc:
-                pcap_stop = {"stopped": False, "error": str(exc)}
-        try:
-            tester = _get_tester()
-            disable = getattr(tester, "set_usb_sniff_ledger_path", None)
-            if callable(disable):
-                disable(None, run_id=str(run.get("run_id") or ""))
-        except Exception:
-            pass
-        event_path = run.get("event_path")
-        if event_path:
-            self._append_jsonl(str(event_path), {"at": _now_utc(), "event": "stop", "run_id": run.get("run_id"), "reason": reason, "operator": operator, "pcap_stop": pcap_stop})
-        manifest = self._finalize_manifest(run, status="stopped", reason=reason, operator=operator)
-        self._latest_run_id = str(run.get("run_id") or self._latest_run_id or "")
-        self._active = None
-        return {"ok": True, "available": True, "active": False, "stopped_run": self._run_summary_from_manifest(manifest), "pcap_stop": pcap_stop, "status": self._status_payload_locked()}
-
-    def stop(self, *, reason: str = "operator stopped USB capture", operator: str = "bms-cockpit") -> dict[str, Any]:
-        with self._lock:
-            return self._stop_locked(reason=reason, operator=operator)
-
-    def _resolve_run_id_locked(self, run_id: str | None = None) -> str:
-        if run_id:
-            return self._safe_run_id(run_id)
-        if self._active is not None:
-            return str(self._active.get("run_id"))
-        if self._latest_run_id:
-            return self._latest_run_id
-        rows = self._list_runs_locked(limit=1)
-        if rows:
-            return str(rows[0].get("run_id"))
-        raise HTTPException(status_code=404, detail="no USB capture run available")
-
-    def tail(self, run_id: str, limit: int = 200) -> dict[str, Any]:
-        limit = max(1, min(1000, int(limit or 200)))
-        with self._lock:
-            rid = self._safe_run_id(run_id)
-            run_dir = self._run_dir(rid)
-            ledger = os.path.join(run_dir, "driver_ledger.jsonl")
-            events = os.path.join(run_dir, "events.jsonl")
-            rows: list[str] = []
-            for path in [ledger, events]:
-                if not os.path.exists(path):
-                    continue
-                try:
-                    with open(path, "r", encoding="utf-8", errors="replace") as handle:
-                        rows.extend(handle.readlines()[-limit:])
-                except Exception:
-                    continue
-            rows = rows[-limit:]
-            parsed = []
-            for line in rows:
-                try:
-                    parsed.append(json.loads(line))
-                except Exception:
-                    parsed.append({"raw": line.rstrip("\n")})
-            return {"ok": True, "run_id": rid, "limit": limit, "lines": [line.rstrip("\n") for line in rows], "events": parsed}
-
-    def files(self, run_id: str) -> dict[str, Any]:
-        with self._lock:
-            rid = self._safe_run_id(run_id)
-            run_dir = self._run_dir(rid)
-            if not os.path.isdir(run_dir):
-                raise HTTPException(status_code=404, detail="USB capture run not found")
-            files = []
-            for name in sorted(os.listdir(run_dir)):
-                path = os.path.join(run_dir, name)
-                if not os.path.isfile(path):
-                    continue
-                files.append({"name": name, "path": path, "size_bytes": os.path.getsize(path), "sha256": self._file_sha256(path)})
-            return {"ok": True, "run_id": rid, "run_dir": run_dir, "files": files}
-
-    def export(self, run_id: str | None = None) -> dict[str, Any]:
-        with self._lock:
-            rid = self._resolve_run_id_locked(run_id)
-            run_dir = self._run_dir(rid)
-            if not os.path.isdir(run_dir):
-                raise HTTPException(status_code=404, detail="USB capture run not found")
-            export_path = os.path.join(run_dir, f"{rid}.tar.gz")
-            with tarfile.open(export_path, "w:gz") as tar:
-                for name in sorted(os.listdir(run_dir)):
-                    path = os.path.join(run_dir, name)
-                    if os.path.isfile(path) and path != export_path:
-                        tar.add(path, arcname=os.path.join(rid, name))
-            manifest_path = os.path.join(run_dir, "manifest.json")
-            manifest = self._read_json(manifest_path, {})
-            if isinstance(manifest, dict):
-                files = manifest.get("files") if isinstance(manifest.get("files"), dict) else {}
-                files["export"] = export_path
-                files["export_size_bytes"] = os.path.getsize(export_path)
-                files["export_sha256"] = self._file_sha256(export_path)
-                manifest["files"] = files
-                self._write_json(manifest_path, manifest)
-            return {"ok": True, "run_id": rid, "export_path": export_path, "size_bytes": os.path.getsize(export_path), "sha256": self._file_sha256(export_path), "files": self.files(rid)["files"]}
 
 
-_usb_sniff_manager = UsbSniffManager()
 
 
 _PROTOCOL_NORMAL_MUTATIONS = {
@@ -6686,184 +5985,6 @@ def _camera_devices_payload(tester: BioXpTester) -> dict:
     return {"ok": True, "rows": rows, "preferred_device": preferred}
 
 
-async def _camera_mjpeg_response(
-    tester: BioXpTester,
-    preferred: str,
-    fps: int,
-    quality: int,
-    width: int,
-    height: int,
-):
-    fps = max(1, min(int(fps), 30))
-    quality = max(2, min(int(quality), 15))
-    width = max(160, min(int(width), 1920))
-    height = max(120, min(int(height), 1080))
-    if _camera_stream_lock.locked():
-        await run_in_threadpool(_camera_reset_local, preferred)
-        await asyncio.sleep(0.15)
-    await _camera_stream_lock.acquire()
-    proc = None
-    try:
-        pick = _pick_stream_device(preferred)
-        if not pick.get("ok"):
-            raise HTTPException(status_code=503, detail=pick.get("error") or "No capture-capable camera device found")
-
-        device = pick["device"]
-        if shutil.which("ffmpeg") is None:
-            detail = _camera_missing_dependency_payload(
-                "ffmpeg",
-                device=device,
-                fps=fps,
-                quality=quality,
-                width=width,
-                height=height,
-            )
-            _camera_stream_state.update({"active": False, "device": device, "last_error": detail["error"]})
-            raise HTTPException(status_code=503, detail=detail)
-
-        _camera_stream_state.update(
-            {
-                "active": True,
-                "device": device,
-                "fps": fps,
-                "quality": quality,
-                "width": width,
-                "height": height,
-                "frames_emitted": 0,
-                "started_at": time.time(),
-                "last_frame_at": None,
-                "last_error": None,
-            }
-        )
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-fflags",
-            "nobuffer",
-            "-flags",
-            "low_delay",
-            "-avioflags",
-            "direct",
-            "-f",
-            "v4l2",
-            "-input_format",
-            "mjpeg",
-            "-framerate",
-            str(fps),
-            "-video_size",
-            f"{width}x{height}",
-            "-i",
-            device,
-            "-an",
-            "-vf",
-            f"fps={fps}",
-            "-q:v",
-            str(quality),
-            "-vcodec",
-            "mjpeg",
-            "-f",
-            "image2pipe",
-            "pipe:1",
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        if proc.stdout is None:
-            raise HTTPException(status_code=500, detail="ffmpeg stream stdout unavailable")
-        await asyncio.sleep(0.25)
-        if proc.returncode is not None:
-            stderr = b""
-            if proc.stderr is not None:
-                try:
-                    stderr = await asyncio.wait_for(proc.stderr.read(), timeout=0.5)
-                except asyncio.TimeoutError:
-                    stderr = b""
-            detail = stderr.decode("utf-8", errors="replace").strip() or "camera stream exited before producing frames"
-            raise HTTPException(status_code=503, detail=detail)
-    except Exception as exc:
-        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-        _camera_stream_state.update({"active": False, "last_error": detail})
-        if proc is not None and proc.returncode is None:
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=3.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-        if _camera_stream_lock.locked():
-            _camera_stream_lock.release()
-        raise
-
-    cleanup_started = False
-    cleanup_guard = asyncio.Lock()
-
-    async def cleanup():
-        nonlocal cleanup_started
-        async with cleanup_guard:
-            if cleanup_started:
-                return
-            cleanup_started = True
-            if proc is not None and proc.returncode is None:
-                proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=3.0)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
-            _camera_stream_state["active"] = False
-            if _camera_stream_lock.locked():
-                _camera_stream_lock.release()
-
-    async def iterator():
-        buffer = bytearray()
-        soi = b"\xff\xd8"
-        eoi = b"\xff\xd9"
-        try:
-            while True:
-                if proc.stdout is None:
-                    break
-                chunk = await proc.stdout.read(16384)
-                if not chunk:
-                    break
-                buffer.extend(chunk)
-                while True:
-                    start = buffer.find(soi)
-                    if start == -1:
-                        if len(buffer) > 65536:
-                            buffer.clear()
-                        break
-                    if start > 0:
-                        del buffer[:start]
-                    end = buffer.find(eoi, 2)
-                    if end == -1:
-                        break
-                    frame = bytes(buffer[: end + 2])
-                    del buffer[: end + 2]
-                    _camera_stream_state["frames_emitted"] = int(_camera_stream_state.get("frames_emitted") or 0) + 1
-                    _camera_stream_state["last_frame_at"] = time.time()
-                    header = (
-                        b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n"
-                        + f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii")
-                    )
-                    yield header + frame + b"\r\n"
-        finally:
-            await cleanup()
-
-    headers = {
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-        "Pragma": "no-cache",
-    }
-    return StreamingResponse(
-        iterator(),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-        headers=headers,
-        background=BackgroundTask(cleanup),
-    )
 
 
 def _camera_cache_envelope(cache: dict[str, Any] | None) -> dict[str, Any]:
@@ -7735,17 +6856,6 @@ async def motion_range_status(axes: str = Query("x,y,z,g", description="Comma-se
     return {**projection, "ok": projection.get("available", False), "axes": [axis.value for axis in requested_axes], "rows": rows, "motion_config": config, "live_status_available": bool(live_rows), "live_status_error": None if live_rows else "canonical range observation unavailable"}
 
 
-@app.post("/motion/interlock/prepare", deprecated=True)
-async def prepare_interlock():
-    raise HTTPException(
-        status_code=410,
-        detail={
-            "error": "legacy_inferred_motion_prepare_quarantined",
-            "message": "This legacy inferred latch/power route is retired. Use the one-click /motion/oem/prepare_without_motion route.",
-            "replacement": "/motion/oem/prepare_without_motion",
-            "physical_motion_commanded": False,
-        },
-    )
 
 
 def _prepare_non_homing_motion_recovery(tester) -> dict[str, Any]:
@@ -8157,32 +7267,6 @@ async def led_rgb(req: LedRgbRequest):
     )
 
 
-def _execute_oem_home_xy(tester: BioXpTester, *, timeout_s: float, allow_implementation_mapped_predicate: bool = False) -> dict:
-    _require_motion_not_blocked_by_maintenance()
-    predicate_snapshots = {}
-    for axis in (AxisName.X, AxisName.Y):
-        snapshot = _home_predicate_snapshot(tester, axis)
-        predicate_snapshots[axis.value] = snapshot
-        _require_home_predicate_guard(
-            axis,
-            snapshot,
-            allow_implementation_mapped_predicate=bool(allow_implementation_mapped_predicate),
-        )
-    result = tester.motor_oem_home_xy(timeout_s=timeout_s)
-    ok = bool(isinstance(result, dict) and result.get("ok") is True)
-    return {
-        "ok": ok,
-        "source_mode": "HomeXY",
-        "route_semantics": {
-            "source_command": "HomeXY",
-            "home_semantics": "direct_oem_homexy_mode_guarded_switch_search",
-            "not_equivalent_to": ["/motion/axis/zero", "/motion/axis/home single-axis manual route"],
-            "raw_fastapi_route": "/motion/oem/home_xy",
-        },
-        "predicate_snapshots_before": predicate_snapshots,
-        "allow_implementation_mapped_predicate": bool(allow_implementation_mapped_predicate),
-        "result": result,
-    }
 
 
 def _collect_axis_diagnostic_status(
@@ -9125,16 +8209,6 @@ async def motion_oem_z_clear():
     )
 
 
-@app.post("/motion/oem/z/live_right_reference")
-async def motion_oem_z_live_right_reference():
-    raise HTTPException(
-        status_code=410,
-        detail={
-            "error": "z_live_right_reference_retired",
-            "reason": "GAP10 is diagnostic evidence and cannot establish the production Z reference.",
-            "replacement": "/motion/oem/z/status",
-        },
-    )
 
 
 
@@ -9161,15 +8235,6 @@ async def motion_oem_z_stop():
     )
 
 
-@app.post("/motion/oem/z/abort")
-async def motion_oem_z_abort():
-    raise HTTPException(
-        status_code=410,
-        detail={
-            "error": "retired_duplicate_abort_identity",
-            "replacement_action_id": "oem.abort_all",
-        },
-    )
 
 
 @app.post("/motion/oem/z/resume_after_abort")
@@ -9705,22 +8770,10 @@ async def motion_oem_move_to(req: OemMoveToRequest):
     }
 
 
-def _serial206_stage_approvals(
-    rows: Mapping[str, OemSerial206StageApprovalRequest],
-) -> dict[str, Serial206StageApproval]:
-    return {key: Serial206StageApproval(**value.model_dump()) for key, value in rows.items()}
 
 
-def _serial206_stage_approval(
-    row: OemSerial206StageApprovalRequest | None,
-) -> Serial206StageApproval | None:
-    return None if row is None else Serial206StageApproval(**row.model_dump())
 
 
-def _serial206_commissioning_evidence(
-    rows: Mapping[str, OemSerial206CommissioningEvidenceRequest],
-) -> dict[str, Serial206CommissioningEvidence]:
-    return {key: Serial206CommissioningEvidence(**value.model_dump()) for key, value in rows.items()}
 
 
 def _run_idempotent_serial206_initialization(
@@ -10077,53 +9130,18 @@ async def motion_reference_mark_desynced(req: ReferenceDesyncRequest):
     )
 
 
-@app.get("/diagnostics/usb-sniff/status")
-async def diagnostics_usb_sniff_status():
-    return _usb_sniff_manager.status()
 
 
-@app.get("/diagnostics/usb-sniff/runs")
-async def diagnostics_usb_sniff_runs():
-    return _usb_sniff_manager.runs()
 
 
-@app.post("/diagnostics/usb-sniff/start")
-async def diagnostics_usb_sniff_start(req: UsbSniffCaptureRequest):
-    return _usb_sniff_manager.start(req)
 
 
-@app.post("/diagnostics/usb-sniff/stop")
-async def diagnostics_usb_sniff_stop(req: UsbSniffCaptureRequest | None = None):
-    reason = "operator stopped USB packet capture"
-    operator = "bms-cockpit"
-    if req is not None:
-        payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
-        if str(payload.get("operator_ack") or "") != USB_SNIFF_ACK:
-            raise HTTPException(status_code=409, detail=f"operator_ack {USB_SNIFF_ACK} required for USB capture stop")
-        reason = str(payload.get("reason") or reason).strip() or reason
-        operator = str(payload.get("operator") or operator)
-    return _usb_sniff_manager.stop(reason=reason, operator=operator)
 
 
-@app.post("/diagnostics/usb-sniff/export")
-async def diagnostics_usb_sniff_export(req: UsbSniffCaptureRequest | None = None):
-    run_id = None
-    if req is not None:
-        payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
-        if payload.get("operator_ack") and str(payload.get("operator_ack")) != USB_SNIFF_ACK:
-            raise HTTPException(status_code=409, detail=f"operator_ack {USB_SNIFF_ACK} required for USB capture export")
-        run_id = payload.get("run_id")
-    return _usb_sniff_manager.export(run_id=run_id)
 
 
-@app.get("/diagnostics/usb-sniff/runs/{run_id}/tail")
-async def diagnostics_usb_sniff_tail(run_id: str, limit: int = Query(200, ge=1, le=1000)):
-    return _usb_sniff_manager.tail(run_id, limit=limit)
 
 
-@app.get("/diagnostics/usb-sniff/runs/{run_id}/files")
-async def diagnostics_usb_sniff_files(run_id: str):
-    return _usb_sniff_manager.files(run_id)
 
 
 @app.post("/thermal/baseline")
@@ -10284,34 +9302,8 @@ async def camera_devices():
     return {**envelope, "ok": envelope.get("available", False), "rows": probe.get("rows", []), "preferred_device": probe.get("preferred_device")}
 
 
-async def camera_controls(device: str = "/dev/video0"):
-    envelope = _camera_cache_envelope(_camera_probe_cache)
-    probe = envelope.get("probe") or {}
-    controls = (probe.get("controls") or {}).get(device)
-    return {**envelope, "ok": controls is not None, "device": device, "rows": [] if controls is None else controls.get("rows", []), "error": "camera controls not present in explicit probe cache" if controls is None else controls.get("error")}
 
 
-async def camera_probe(payload: dict[str, Any] | None = None):
-    global _camera_probe_cache
-    if _camera_process_active():
-        raise HTTPException(status_code=409, detail="stop the owned camera stream before probing capabilities")
-    tester = _get_tester()
-    requested = (payload or {}).get("devices")
-
-    def collect() -> dict[str, Any]:
-        devices = _camera_devices_payload(tester)
-        names = requested if isinstance(requested, list) else [row.get("device") for row in devices.get("rows", [])]
-        controls = {}
-        for name in names:
-            if isinstance(name, str):
-                controls[name] = tester.camera_enumerate_controls(device=name)
-        return {**devices, "controls": controls}
-
-    result = await _run_blocking("Explicit camera capability probe", collect, timeout_s=30.0)
-    with _camera_projection_lock:
-        _camera_probe_cache = {**result, "probe_id": uuid.uuid4().hex, "available": bool(result.get("ok", True)), "camera_ownership_epoch": _camera_projection_epoch, "observed_at": _now_utc(), "observed_unix": time.time(), "provenance": "POST /camera/probe"}
-        lifecycle_state.record_camera_evidence(_camera_probe_cache)
-        return {"ok": True, "published": True, "probe": dict(_camera_probe_cache)}
 
 
 @app.post("/camera/stream/start")
@@ -10327,23 +9319,6 @@ async def camera_stream_start(
     return result
 
 
-async def camera_control(req: CameraControlRequest):
-    global _camera_probe_cache
-    tester = _get_tester()
-    result = await _run_blocking(
-        "Camera control",
-        lambda: {
-            **tester.v4l2_set_ctrl(req.cid, req.value, device=req.device),
-            "stream_active": bool(_camera_stream_state.get("active")),
-            "stream_state": _camera_stream_state_payload(),
-        },
-        timeout_s=15.0,
-    )
-    with _camera_projection_lock:
-        _camera_probe_cache = None
-    lifecycle_state.record_camera_evidence(None)
-    hardware_state.invalidate(reason="camera controls changed")
-    return result
 
 
 def _camera_jpeg_response(frame: CameraFrame) -> Response:
@@ -10460,30 +9435,8 @@ async def camera_stream_health(req: CameraHealthRequest):
     )
 
 
-async def camera_auto_recover(req: CameraRecoverRequest):
-    if _camera_process_active():
-        return {
-            "ok": False,
-            "busy": True,
-            "stream_active": True,
-            "device": req.device,
-            "error": "live stream is active; stop the stream before running auto recover",
-            "stream_state": _camera_stream_state_payload(),
-        }
-    tester = _get_tester()
-    ownership = await _stop_owned_camera_session(reason="auto recover")
-    result = await _run_blocking(
-        "Camera auto recover",
-        lambda: tester.camera_auto_oneclick(device=req.device, max_resets=req.max_resets),
-        timeout_s=75.0,
-    )
-    return {**result, "camera_ownership": ownership}
 
 
-async def camera_reset(req: CameraSnapshotRequest):
-    stopped = await _stop_owned_camera_session(reason="explicit reset")
-    reset = await run_in_threadpool(_camera_reset_local, req.device)
-    return {**reset, "owned_session": stopped}
 
 
 @app.post("/camera/stream/stop")
@@ -11165,12 +10118,6 @@ async def liquid_tip_status():
     return await _run_blocking("Pipette tip status", _query_and_publish_pipette_tip_status, timeout_s=120.0)
 
 
-@app.get("/liquid/data", include_in_schema=False)
-async def liquid_data_get_retired():
-    raise HTTPException(
-        status_code=410,
-        detail={"error": "hardware_query_get_retired", "replacement": "POST /liquid/data", "provider_called": False, "receipt_written": False},
-    )
 
 
 @app.post("/liquid/data")
@@ -11186,13 +10133,6 @@ async def liquid_data(query: str | None = Query(None, min_length=3, max_length=3
     )
 
 
-@app.get("/liquid/fluid-detection/{channel}/timestamp", include_in_schema=False)
-async def liquid_fluid_timestamp_get_retired(channel: int):
-    del channel
-    raise HTTPException(
-        status_code=410,
-        detail={"error": "receipt_producing_get_retired", "replacement": "POST /liquid/fluid-detection/{channel}/timestamp", "provider_called": False, "receipt_written": False},
-    )
 
 
 @app.post("/liquid/fluid-detection/{channel}/timestamp")
@@ -11221,12 +10161,6 @@ async def liquid_set_top_speed(req: PipetteSpeedRequest):
     )
 
 
-@app.get("/liquid/pressure", include_in_schema=False)
-async def liquid_pressure_get_retired():
-    raise HTTPException(
-        status_code=410,
-        detail={"error": "hardware_query_get_retired", "replacement": "POST /liquid/pressure", "provider_called": False, "receipt_written": False},
-    )
 
 
 @app.post("/liquid/pressure")
@@ -11268,12 +10202,6 @@ async def liquid_reinitialize():
     )
 
 
-@app.get("/liquid/condition", include_in_schema=False)
-async def liquid_condition_get_retired():
-    raise HTTPException(
-        status_code=410,
-        detail={"error": "hardware_query_get_retired", "replacement": "POST /liquid/condition", "provider_called": False, "receipt_written": False},
-    )
 
 
 @app.post("/liquid/condition")
@@ -11289,12 +10217,6 @@ async def liquid_condition():
     )
 
 
-@app.get("/liquid/status/readback", include_in_schema=False)
-async def liquid_status_readback_get_retired():
-    raise HTTPException(
-        status_code=410,
-        detail={"error": "hardware_query_get_retired", "replacement": "POST /liquid/status/readback", "provider_called": False, "receipt_written": False},
-    )
 
 
 @app.post("/liquid/status/readback")
@@ -11316,12 +10238,6 @@ async def protocol_compile(req: ProtocolCompileRequest):
     return compiled.to_payload()
 
 
-def _optional_int_payload(params: dict[str, Any], *keys: str) -> int | None:
-    for key in keys:
-        value = params.get(key)
-        if value is not None:
-            return int(value)
-    return None
 
 
 def _protocol_live_move_handler(action, state):
@@ -11697,14 +10613,19 @@ def _protocol_source_mov(intent, action, state):
         command_id = admitted["command_id"]
         if state.workflow is not None and command_id not in state.workflow.child_command_ids:
             state.workflow.child_command_ids.append(command_id)
+        from concurrent.futures import TimeoutError as FutureTimeoutError
+        completion = store.workflow_child_completion(command_id)
         while True:
-            receipt = store.get_command(command_id)
-            if receipt["status"] in COMMAND_TERMINAL:
-                response = dict((receipt.get("terminal_evidence") or {}).get("response") or {})
-                return {**response, "ok": receipt["status"] == "completed",
-                        "command_id": command_id, "receipt": receipt}
-            if store._stop.wait(0.02):
-                raise RuntimeError("workflow_child_owner_lost")
+            try:
+                receipt = completion.result(timeout=0.25)["receipt"]
+                break
+            except FutureTimeoutError:
+                # Owner cancellation only; no receipt decoding while pending.
+                if store._stop.is_set():
+                    raise RuntimeError("workflow_child_owner_lost")
+        response = dict((receipt.get("terminal_evidence") or {}).get("response") or {})
+        return {**response, "ok": receipt["status"] == "completed",
+                "command_id": command_id, "receipt": receipt}
 
 
 def _protocol_workflow_initial_check(state: Any, *, validate_current) -> dict[str, Any]:

@@ -420,9 +420,6 @@ class BioXpTester:
         # false at source unlock/caught-plate solenoid-write boundaries.
         self._oem_latch_status = True
         self._oem_latch_status_generation = 0
-        self._usb_sniff_ledger_path = None
-        self._usb_sniff_ledger_run_id = None
-        self._usb_sniff_ledger_seq = 0
         self._libc = ctypes.CDLL(None, use_errno=True)
         self.UVCIOC_CTRL_QUERY = self._build_uvc_ioctl_query()
         self._motion_arm = {
@@ -458,12 +455,6 @@ class BioXpTester:
                 cleanup_report=cleanup_report,
             ) from exc
 
-    def receiver_audit_status(self):
-        """Internal logging health only; does not rewrite motion admission."""
-        audit = getattr(self, "_receiver_audit", None)
-        return {"setup_error": getattr(self, "_receiver_audit_setup_error", None),
-                "buffer": audit.status() if audit is not None else None,
-                "router": self.novo_router.audit_status() if self.novo_router is not None else None}
 
     def _transport_guard(self):
         """Return the per-device reentrant endpoint-ownership lock.
@@ -829,62 +820,9 @@ class BioXpTester:
             "observed_ms": int(time.time() * 1000),
         }
 
-    def _remember_bus_event(self, resp, source="usb_in"):
-        event = self._decode_bus_event_frame(resp, source=source)
-        if event is None:
-            return None
-        self._bus_event_sequence = int(getattr(self, "_bus_event_sequence", 0)) + 1
-        event["event_sequence"] = self._bus_event_sequence
-        self._bus_event_buffer.append(event)
-        overflow = len(self._bus_event_buffer) - int(self._bus_event_buffer_max)
-        if overflow > 0:
-            del self._bus_event_buffer[:overflow]
-        return event
 
-    def set_usb_sniff_ledger_path(self, path=None, run_id=None):
-        """Enable/disable JSONL TX/RX ledger recording for external USB capture runs.
 
-        This is observability-only and never commands hardware by itself.
-        """
-        if path:
-            path = os.path.abspath(str(path))
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            self._usb_sniff_ledger_path = path
-            self._usb_sniff_ledger_run_id = str(run_id or "")
-            self._usb_sniff_ledger_seq = 0
-            self._record_usb_sniff_ledger("meta", event="ledger_enabled")
-            return {"ok": True, "enabled": True, "path": path, "run_id": self._usb_sniff_ledger_run_id}
-        old = self._usb_sniff_ledger_path
-        self._record_usb_sniff_ledger("meta", event="ledger_disabled")
-        self._usb_sniff_ledger_path = None
-        self._usb_sniff_ledger_run_id = None
-        return {"ok": True, "enabled": False, "previous_path": old, "run_id": str(run_id or "")}
 
-    def usb_sniff_ledger_status(self):
-        return {"enabled": bool(self._usb_sniff_ledger_path), "path": self._usb_sniff_ledger_path, "run_id": self._usb_sniff_ledger_run_id, "seq": self._usb_sniff_ledger_seq}
-
-    def _record_usb_sniff_ledger(self, direction, frame=None, **extra):
-        path = getattr(self, "_usb_sniff_ledger_path", None)
-        if not path:
-            return None
-        try:
-            self._usb_sniff_ledger_seq = int(getattr(self, "_usb_sniff_ledger_seq", 0)) + 1
-            raw = list(frame) if frame is not None else None
-            row = {
-                "schema_version": "bioxp.usb_driver_ledger.v1",
-                "seq": self._usb_sniff_ledger_seq,
-                "run_id": getattr(self, "_usb_sniff_ledger_run_id", None),
-                "ts_ms": int(time.time() * 1000),
-                "direction": str(direction),
-                "frame_len": len(raw) if raw is not None else None,
-                "raw": raw,
-            }
-            row.update(extra)
-            with open(path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(row, sort_keys=True, default=str) + "\n")
-            return row
-        except Exception:
-            return None
 
     def clear_bus_event_buffer(self):
         current = list(getattr(self, "_bus_event_buffer", []))
@@ -987,7 +925,6 @@ class BioXpTester:
         ordinary_motor_retry=False,
     ):
         frame = self._build_frame(board_id, command, cmd_type, motor, value)
-        self._record_usb_sniff_ledger("OUT", frame, source="send_tmcl", board=int(board_id), command=int(command), cmd_type=int(cmd_type), motor=int(motor), value=int(value), wait_reply=bool(wait_reply), write_timeout_ms=int(write_timeout_ms))
         router = getattr(self, "novo_router", None)
         if router is None:
             return None
@@ -1025,15 +962,10 @@ class BioXpTester:
             if ordinary_motor_retry:
                 time.sleep(0.010)
         except usb.core.USBTimeoutError:
-            self._record_usb_sniff_ledger("error", None, source="send_tmcl", error="usb_write_timeout", board=int(board_id), command=int(command), write_timeout_ms=int(write_timeout_ms))
             return None
         except usb.core.USBError as exc:
             # USB disconnect / ENODEV / EPIPE — return None so
             # _motor_noresp_streak increments and reconnect() fires.
-            self._record_usb_sniff_ledger("error", None,
-                source="send_tmcl", error=f"usb_error_{exc.errno}",
-                errno=exc.errno, errmsg=str(exc), board=int(board_id),
-                command=int(command), write_timeout_ms=int(write_timeout_ms))
             return None
 
         if not wait_reply:
@@ -1064,9 +996,6 @@ class BioXpTester:
             "provenance": transaction,
         }
 
-    def _wait_for_reply(self, board_id, command, strict_match, read_timeout_ms, max_reads):
-        del board_id, command, strict_match, read_timeout_ms, max_reads
-        raise RuntimeError("direct Novo receive is forbidden; use send_tmcl router transaction")
 
     def collect_bus_events(self, duration_s=0.50, timeout_ms=20, max_events=96):
         """Capture asynchronous TMCL frames without competing for endpoint ownership."""
@@ -1113,16 +1042,6 @@ class BioXpTester:
                 return r
         return None
 
-    def enable_motor_power(self):
-        """Reject the removed non-OEM command-14 "ESM relay" shim.
-
-        Decompiled ``ClassControlInterface.ESM`` delegates directly to the
-        selected board's ``activateBoard()``.  That method sends command 64;
-        it never writes command 14 type 0/1 on deck IO bank 2.
-        """
-        raise RuntimeError(
-            "non-OEM command-14 motor-power shim is disabled; use OEM board activation"
-        )
 
     def _record_oem_board_activation(self, board_id, *, active, ack):
         """Own IsInitialized evidence only at the OEM activate/deactivate boundary."""
@@ -3013,53 +2932,7 @@ class BioXpTester:
             "speed_source": speed_source,
         }
 
-    def motor_x_terminal_status(self):
-        """Return one fresh, ACK-qualified serial-206 X controller snapshot."""
-        board = int(self.BOARD_DECK)
-        motor = 0
-        readbacks = {}
-        failures = []
-        for parameter in (1, 3, 4, 5, 6, 9, 10, 12, 13, 205):
-            row = self.motor_get_axis_param(board, parameter, motor=motor)
-            value = row.get("value") if isinstance(row, dict) else None
-            valid = bool(
-                isinstance(row, dict)
-                and self._tmcl_success(row.get("ack"))
-                and type(value) is int
-            )
-            readbacks[str(parameter)] = {**row, "valid": valid}
-            if not valid:
-                failures.append(parameter)
-        return {
-            "schema_version": "bioxp.serial206_x_terminal_status.v1",
-            "board": board,
-            "motor": motor,
-            "readbacks": readbacks,
-            "position": readbacks["1"].get("value"),
-            "speed": readbacks["3"].get("value"),
-            "max_speed": readbacks["4"].get("value"),
-            "max_acceleration": readbacks["5"].get("value"),
-            "max_current": readbacks["6"].get("value"),
-            "left_switch": readbacks["9"].get("value"),
-            "right_switch": readbacks["10"].get("value"),
-            "right_switch_disabled": readbacks["12"].get("value"),
-            "left_switch_disabled": readbacks["13"].get("value"),
-            "stall_guard": readbacks["205"].get("value"),
-            "failures": failures,
-            "ok": not failures,
-        }
 
-    def motor_x_reconcile_switch_masks(self):
-        """Retired replacement repair; recovered OEM X initialization emits no mask writes."""
-        return {
-            "ok": False,
-            "retired": True,
-            "axis": "x",
-            "source_exact": False,
-            "physical_motion_commanded": False,
-            "physical_effect_verified": False,
-            "failure": "recovered_oem_x_initialization_has_no_switch_mask_reconciliation",
-        }
 
     def motor_oem_set_xy_current_mode(self, enabled, *, sleep_fn=time.sleep):
         """Execute exact ClassControlInterface.enableXY current ordering."""
@@ -3562,8 +3435,6 @@ class BioXpTester:
             "warning": "commissioning override only; independent physical clearance/operator watch required before any motion",
         }
 
-    def motion_last_strict_init_report(self):
-        return self._motion_last_strict_init
 
     def motion_disarm(self, reason="manual", note=None):
         prev_seq = 0
@@ -10413,46 +10284,7 @@ class BioXpTester:
     def _ffmpeg_available():
         return shutil.which("ffmpeg") is not None
 
-    @staticmethod
-    def _start_ffmpeg_keepalive(device="/dev/video0"):
-        if shutil.which("ffmpeg") is None:
-            return None
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "v4l2",
-            "-i",
-            device,
-            "-f",
-            "null",
-            "-",
-        ]
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            time.sleep(0.20)
-            return proc
-        except Exception:
-            return None
 
-    @staticmethod
-    def _stop_process(proc):
-        if proc is None:
-            return
-        try:
-            proc.terminate()
-            proc.wait(timeout=1.0)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
 
     @staticmethod
     def camera_usb_sysfs_paths(device="/dev/video0"):
@@ -11206,11 +11038,6 @@ def print_status(tester):
     print(f"Deck IO snapshot (0x05): {snap}")
 
 
-def fmt_ack_map(acks):
-    parts = []
-    for bid in sorted(acks):
-        parts.append(f"0x{bid:02X}:{fmt_resp(acks[bid])}")
-    return " ".join(parts)
 
 
 def fmt_rgb_acks(acks):
@@ -11566,53 +11393,6 @@ def _print_motion_gate_status(tester, refresh=True, snapshot=None):
     )
 
 
-def _print_strict_startup_report(out):
-    if not isinstance(out, dict):
-        print("No strict startup report.")
-        return
-    print(
-        f"strict startup init: ok={out.get('ok')} "
-        f"error_code={out.get('error_code')} "
-        f"time={out.get('elapsed_ms')}ms"
-    )
-    st = out.get("board_status", {})
-    print(
-        "board status:"
-        f" HEAD={fmt_resp(st.get(BioXpTester.BOARD_HEAD))}"
-        f" DECK={fmt_resp(st.get(BioXpTester.BOARD_DECK))}"
-        f" THERMAL={fmt_resp(st.get(BioXpTester.BOARD_THERMAL))}"
-    )
-    for key in ("pre_gate", "post_lock_gate", "final_gate"):
-        g = out.get(key, {})
-        rail = g.get("rail_24v", {})
-        print(
-            f"  {key}: ok={g.get('ok')} errors={g.get('error_keys')} "
-            f"io={g.get('io')} 24V_raw={rail.get('raw')} no24v={rail.get('no24v')}"
-        )
-    print("checks:")
-    for row in out.get("checks", []):
-        if row.get("ok"):
-            tag = "PASS"
-        elif bool(row.get("critical", True)):
-            tag = "FAIL"
-        else:
-            tag = "WARN"
-        print(f"  {tag} {row.get('name')}: {row.get('detail')}")
-    h = out.get("homing")
-    if isinstance(h, dict):
-        for label, key in (("Z", "z_home"), ("G", "g_home"), ("X", "x_home"), ("Y", "y_home"), ("DOOR", "door_home")):
-            hr = h.get(key, {})
-            print(
-                f"  home {label}: move={fmt_resp(hr.get('move_left', {}).get('ack'))} "
-                f"wait={hr.get('wait', {}).get('stopped')} "
-                f"set={fmt_resp(hr.get('sethome_final', {}).get('ack'))} "
-                f"home_after={hr.get('home_after', {}).get('value')}"
-            )
-    arm = out.get("arm_state", {})
-    print(
-        f"arm state: armed={arm.get('armed')} reason={arm.get('reason')} "
-        f"note={arm.get('note')} seq={arm.get('arm_seq')}"
-    )
 
 
 def _run_motor_clear_lock_action(tester):
