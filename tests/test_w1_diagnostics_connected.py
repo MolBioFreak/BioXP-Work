@@ -44,7 +44,11 @@ def bind_full_infrastructure_identity(monkeypatch):
     monkeypatch.setattr(rm, 'current_registry_sha256', lambda: identity['registry_sha256'])
 
 def baseline_module(path, owner):
-    source = subprocess.check_output(['git', 'show', BASE + ':' + path], text=True)
+    # Image qualification mounts the manifest-verified exact baseline read-only;
+    # the production image intentionally has no Git executable or worktree.
+    baseline_root = os.environ.get('W1_BASELINE_ROOT')
+    source = ((Path(baseline_root) / path).read_text() if baseline_root else
+              subprocess.check_output(['git', 'show', BASE + ':' + path], text=True))
     namespace = {'__name__': owner.__name__ + '_w1_baseline', '__package__': owner.__package__}
     exec(compile(source, path + '@' + BASE, 'exec'), namespace)
     return SimpleNamespace(**namespace)
