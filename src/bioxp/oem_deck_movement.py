@@ -285,7 +285,7 @@ class DeckAuthoritySnapshot:
             raise ValueError("offset consumed predicates are not authoritative")
         tip_location_unused = self.tip_location is None and (
             self.dependency_scope == "offset.v1" or
-            (self.collection_tip_state is not None and self.collection_tip_state.get("tip_exists") is False))
+            self.collection_tip_state is not None)
         if not tip_location_unused and (type(self.tip_location) is not int or self.tip_location not in {-1, 0, 1, 2, 3}):
             raise ValueError("tip_location is outside the source domain")
         if len(self.position_table_sha256) != 64:

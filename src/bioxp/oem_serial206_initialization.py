@@ -5128,7 +5128,7 @@ class Serial206OemInitializationProvider:
         }
         collection = self._park_collection_state() if no_tip_park and location != "LOC_PARK" else None
         semantic["collection_tip_state"] = collection
-        if no_tip_park and (location == "LOC_PARK" or collection["tip_exists"] is False):
+        if no_tip_park:
             semantic["clean_path"] = None
         provenance = semantic.get("transition_provenance")
         semantic["transition_provenance_digest"] = hashlib.sha256(json.dumps(
@@ -11217,12 +11217,10 @@ class Serial206OemInitializationProvider:
         elif authority_snapshot.get("dependency_scope", "full") != "full":
             raise RuntimeError("deck_dependency_scope_mismatch")
         if no_tip_park:
-            collection = (self._park_collection_state()
-                          if authority_snapshot.get("current_location_id") != "LOC_PARK" else None)
-            if collection != authority_snapshot.get("collection_tip_state"):
-                raise RuntimeError("pipette_collection_owner_changed_before_dispatch")
-            if collection is None or collection["tip_exists"] is False:
-                required_types.pop("clean_path")
+            # Park consumes collection TipExist, then ejects before its final
+            # scriptmoveTo. It never consumes MachineStatus tip bookkeeping.
+            for key in ("tip_loaded", "tip_dirty", "tip_location", "clean_path"):
+                required_types.pop(key, None)
         for key, expected_type in required_types.items():
             if type(authority_snapshot.get(key)) is not expected_type:
                 raise RuntimeError(f"deck_execution_authority_not_authoritative:{key}")
@@ -14491,9 +14489,9 @@ class Serial206OemInitializationProvider:
                 )
             return row
 
+        # Consume the current collection predicate at native entry. A previous
+        # query/publication identity is evidence, not permission to enter Park.
         collection = self._park_collection_state()
-        if authority_snapshot is not None and authority_snapshot.get("collection_tip_state") != collection:
-            raise RuntimeError("pipette_collection_owner_changed_before_dispatch")
         if collection["tip_exists"] is True:
             waste = table.resolve(location_id="WASTE_BIN")
             waste_coordinates = waste.oem_offset_move_coordinates(

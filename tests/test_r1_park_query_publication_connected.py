@@ -12,7 +12,8 @@ def test_cleanup_query_uses_tip_owner_without_semantic_publication(park, query_r
     query(query_rig, key='loaded-park-predecessor')
     assert provider._park_collection_state()['tip_exists'] is True
     assert provider._deck_semantic_state_reader()['tip_loaded'] is None
-    authority = dict(park.authority, collection_tip_state=provider._park_collection_state())
+    authority = dict(park.authority, collection_tip_state=provider._park_collection_state(),
+        tip_loaded=None, tip_dirty=None, tip_location=None, clean_path=None)
     park.native.positions.update({(5, 0): 1000, (4, 0): 1000})
     def eject():
         # Inert mechanical exchange changes the bytes returned by the next
@@ -37,3 +38,13 @@ def test_cleanup_query_uses_tip_owner_without_semantic_publication(park, query_r
     assert provider._deck_semantic_state_reader()['tip_loaded'] is None
     assert len(calls) == 12  # setup query, loaded query, existing cleanup query
     assert any(row['operation'] == 'queryTipStatus(-1)' for row in result['source_children'])
+
+
+def test_park_consumes_current_tip_value_not_previous_query_identity(park, query_rig):
+    previous = dict(park.authority['collection_tip_state'])
+    query(query_rig, key='new-query-same-tip-value')
+    current = park.provider._park_collection_state()
+    assert current['identity'] != previous['identity']
+    assert current['tip_exists'] is previous['tip_exists'] is False
+    result = park.provider.parkGantry(authority_snapshot=park.authority)
+    assert result['ok'], result
