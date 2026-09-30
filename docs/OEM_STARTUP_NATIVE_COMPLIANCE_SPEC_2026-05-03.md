@@ -735,7 +735,6 @@ Y setHome
 **Files:**
 
 - Modify: `scripts/bioxp_supervised_oem_startup_homing_stepwise.sh`
-- Maybe create: `scripts/bioxp_supervised_oem_app_startup.sh`
 
 **Script behavior:**
 

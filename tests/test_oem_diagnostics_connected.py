@@ -126,7 +126,7 @@ def test_cached_dispense_all_and_diagnoses(diagnostic, rig, monkeypatch):
     rig.group._transports[1]._tip_loaded = False
     rig.group._transports[3]._tip_loaded = False
     rig.group._tip_location = 1  # deliberately unrelated to cached eligibility
-    assert rig.group._cached_tip_channels() == []  # ordinary primitive policy stays unchanged
+    assert rig.group._tip_eligibility()[0] == []  # ordinary primitive policy stays unchanged
     body = run("dispense_all")
     assert body["cached_tip_channels"] == [0, 2]
     assert body["dispense_all"]["timeout_ms"] == 7000

@@ -73,21 +73,6 @@ def test_historical_live_review_cannot_reconstruct_executor(tmp_path):
         review_protocol_job("historical", store=store)
 
 
-def test_retired_worker_cannot_dispatch_live_or_write_parallel_history():
-    from bioxp.oem_runtime_worker import OEMRuntimeWorker
-    from bioxp.oem_runtime_types import OEMRuntimeCommand
-    class NoWrites:
-        def __getattr__(self, name):
-            raise AssertionError("unexpected store write: " + name)
-    called = []
-    worker = OEMRuntimeWorker(store=NoWrites(), handlers={"validateJob": lambda command: called.append(command) or {"ok": True}}, autostart=True)
-    result = worker.enqueue(OEMRuntimeCommand(name="validateJob", mode="live", operator_ack=True, artifact_root="/tmp/offline-unused"))
-    assert result["ok"] is False and result["queued"] is False and called == []
-    preview = worker.enqueue(OEMRuntimeCommand(name="validateJob", mode="dry_run"))
-    assert preview["preview_only"] is True and preview["queued"] is False
-    assert len(called) == 1
-    assert worker.snapshot()["queue_depth"] == 0
-    worker.stop()
 
 
 def test_real_control_route_validation_and_refusal(monkeypatch):
@@ -101,12 +86,3 @@ def test_real_control_route_validation_and_refusal(monkeypatch):
     monkeypatch.setattr(api, "_protocol_command_store", absent)
     refused = client.post("/protocol/jobs/protocol-live-test/control", json={**TARGET, "action": "abort"})
     assert refused.status_code == 503
-
-
-def test_label_only_pause_does_not_modify_lifecycle():
-    from bioxp.oem_runtime_events import OEMRuntimeEventRouter
-    from bioxp.lifecycle_state import lifecycle_state
-    before = lifecycle_state.projection()
-    result = OEMRuntimeEventRouter(store=None, worker=None).handle_pause()
-    assert result["ok"] is False
-    assert lifecycle_state.projection() == before

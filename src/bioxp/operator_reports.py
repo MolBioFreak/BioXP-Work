@@ -243,8 +243,6 @@ class _JsonObject(RootModel[dict[str, JsonValue]]):
     model_config = ConfigDict(strict=True)
 
 
-class _JsonArray(RootModel[list[JsonValue]]):
-    model_config = ConfigDict(strict=True)
 
 
 class _PublicListener(_ClosedModel):

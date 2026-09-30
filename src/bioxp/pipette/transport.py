@@ -1057,20 +1057,6 @@ class FourPipetteTransport:
         if callable(self._error_callback):
             self._error_callback(int(channel), int(error_code))
 
-    def _channel_status(self, channel: int, transport: CanPipetteTransport) -> dict[str, Any]:
-        driver = transport._get_driver()
-        tip = transport._safe_query_tip_status(driver)
-        pressure = transport._safe_query_pressure(driver)
-        return {
-            **transport._status_payload(
-                hardware_tip_status=tip,
-                hardware_pressure=pressure,
-                hardware_truth_level="hardware_query" if any(
-                    isinstance(row, dict) and row.get("ok") for row in (tip, pressure)
-                ) else "unavailable",
-            ),
-            "channel": int(channel),
-        }
 
     def get_status(self) -> dict[str, Any]:
         rows = [
@@ -1520,12 +1506,6 @@ class FourPipetteTransport:
             }
         return eligible, ledger
 
-    def _cached_tip_channels(
-        self,
-        channels: list[int] | tuple[int, ...] | None = None,
-    ) -> list[int]:
-        eligible, _ledger = self._tip_eligibility(channels)
-        return eligible
 
     def reinitialize_pipette(self, *, force_wake: bool = False) -> dict[str, Any]:
         """Separate OEM reinitializePipette path: all WR sends, then one 10 s wait.
@@ -1844,8 +1824,6 @@ class FourPipetteTransport:
         rows = [{"channel": channel, "result": transport.heartbeat(command)} for channel, transport in enumerate(self._transports)]
         return {"ok": all(row["result"].get("ok") for row in rows), "channels": rows, "requested": command.to_payload()}
 
-    def disable_heartbeat(self) -> dict[str, Any]:
-        return self.heartbeat(PipetteHeartbeatCommand(enabled=False))
 
     def _run_group_liquid_operation(
         self,
@@ -2472,29 +2450,7 @@ class FourPipetteTransport:
         selected = self._selected_channels([channel])[0]
         return self._fluid_detection_timestamps[selected]
 
-    def waitforcompletion(self, job: str, timeout_ms: int) -> dict[str, Any]:
-        deadline = time.monotonic() + max(0.0, int(timeout_ms) / 1000.0)
-        rows: list[dict[str, Any]] = []
-        for channel, transport in enumerate(self._transports):
-            remaining = max(0.0, deadline - time.monotonic())
-            driver = transport._get_driver()
-            wait_fn = getattr(driver, "wait_pipette_command_completion", None)
-            if not callable(wait_fn):
-                result = {"ok": False, "outcome": "completion_wait_unavailable", "channel": channel}
-            else:
-                result = wait_fn(remaining)
-            rows.append({"channel": channel, "result": result})
-        return {
-            "ok": all(row["result"].get("ok") is True for row in rows),
-            "job": str(job),
-            "timeout_ms": int(timeout_ms),
-            "channels": rows,
-            "outcome": "completion" if all(row["result"].get("ok") is True for row in rows) else "completion_timeout_or_error",
-            "wait_policy": "single_shared_deadline_safety_hardening",
-        }
 
-    def queryIndividualTipStatus(self) -> list[bool]:  # noqa: N802
-        return [bool(row["tip_loaded"]) for row in self.query_tip_status_all()["channels"]]
 
     def loadTip(self, tip_type: int, tip_location: int = -1) -> dict[str, Any]:  # noqa: N802
         self._tip_type = int(tip_type)

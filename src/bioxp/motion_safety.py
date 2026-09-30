@@ -85,14 +85,6 @@ def _board_cycle_status(rows: Any, board: int) -> int | None:
     return int(status) if type(status) is int else None
 
 
-def _board_cycle_ok(rows: Any, boards: tuple[int, ...]) -> bool:
-    if not isinstance(rows, Mapping) or any(int(board) not in rows for board in boards):
-        return False
-    return all(
-        _board_cycle_status(rows, board) == 100
-        or (int(board) == 7 and _board_cycle_status(rows, board) == 2)
-        for board in boards
-    )
 
 
 def _stage(stage_id: str, status: str, source_anchor: str, evidence: Any) -> dict[str, Any]:

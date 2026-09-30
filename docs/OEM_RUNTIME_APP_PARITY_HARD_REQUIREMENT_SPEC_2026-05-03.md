@@ -1,5 +1,11 @@
 # BioXP3200 OEM Runtime-App Parity Hard Requirement Spec
 
+> Historical design record: the unmounted runtime API/worker/events/status and
+> standalone full-lifecycle planner described here are retired. Current execution
+> belongs to the operator command plane and targeted protocol jobs. The canonical
+> lifecycle, historical SQLite records, migration sources and live registry remain.
+
+
 > For Hermes: Use subagent-driven-development and test-driven-development when implementing this spec. The target is source-shaped OEM runtime parity, not merely HTTP endpoint coverage.
 
 Date: 2026-05-03
@@ -561,12 +567,8 @@ Existing `/oem/startup/*` routes may remain but must become thin wrappers over `
   - `oem_query_door_status()`;
 - ensure no function silently claims OEM success without hardware/readback proof.
 
-#### `scripts/bioxp_supervised_oem_app_startup.sh`
-
-- call runtime enqueue/status endpoints;
-- show worker/event state;
-- never call direct homing endpoints;
-- include timeout and emergency stop instructions.
+The monolithic startup shell wrapper is retired. Startup is staged through the
+current lifecycle/operator interfaces, not the historical runtime queue.
 
 ## 4. Exact runtime state machine
 

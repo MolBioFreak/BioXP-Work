@@ -1,5 +1,10 @@
 # BioXP OEM homing source matrix and API topology (no-motion artifact)
 
+> The redundant executable historical homing model is retired. This source-mode
+> matrix remains historical evidence; the supported program definitions are in
+> `src/bioxp/oem_homing_spec.py`. No source mode or physical provider was removed.
+
+
 Truth level: `source_model_only_no_motion_no_usb`.
 
 This artifact separates OEM homing modes and route surfaces before any further live Linux route repair. It is not hardware proof and does not claim physical motion succeeded.

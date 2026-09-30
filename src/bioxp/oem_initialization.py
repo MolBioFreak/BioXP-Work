@@ -199,8 +199,6 @@ def build_machine_calibration_manifest(bundle: dict[str, Any] | None = None, *, 
     return manifest
 
 
-def oem_initialization_phase_catalog() -> list[dict[str, Any]]:
-    return [phase.to_dict() for phase in OEM_INIT_PHASES]
 
 
 

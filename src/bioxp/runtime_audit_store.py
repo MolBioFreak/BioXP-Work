@@ -3089,6 +3089,3 @@ def record_runtime_release_start(
     finally:
         database.close()
     return receipt
-
-def connect_runtime_database(root: str | Path | None = None) -> RuntimeAuditDatabase:
-    return RuntimeAuditDatabase(root)

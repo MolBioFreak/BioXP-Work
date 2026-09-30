@@ -153,65 +153,12 @@ Pass criteria:
 - `preflight.json` is written in the job directory.
 - Any live action result includes enough artifact references to reconstruct what was physically verified.
 
-## 7. Motor functionality testing sequence
+## 7. Motor functionality testing
 
-Use the robot-local API first for motor testing. BMS proxy/UI can be checked afterward, but the first motion evidence should come from the robot daemon itself.
-
-Recommended artifact root:
-
-```bash
-export BIOXP_BASE_URL=http://100.124.140.56:8123
-export BIOXP_LOG_ROOT=/mnt/BioModStack/bms_results/bioxp_validation/2026-04-26T19-46-01Z/motor
-```
-
-Initial no-motion readiness snapshot:
-
-```bash
-scripts/bioxp_motion_readiness_snapshot.sh | tee /mnt/BioModStack/bms_results/bioxp_validation/2026-04-26T19-46-01Z/motor/readiness_initial.log
-```
-
-If motion is not armed, run strict startup without homing first:
-
-```bash
-scripts/bioxp_supervised_strict_startup.sh
-```
-
-Only proceed to movement if:
-
-- `motion_arm.armed == true`
-- `motion_arm.reason == "strict_init_pass"`
-- `rail_24v.no24v == false`
-- door/latch/solenoid are in the permissive locked state
-- selected axis speed is zero
-- operator is physically watching the robot
-
-First supervised relative probes:
-
-```bash
-scripts/bioxp_supervised_relative_move.sh z -500
-scripts/bioxp_supervised_relative_move.sh x 500
-scripts/bioxp_supervised_relative_move.sh y 500
-```
-
-Interpretation rules:
-
-- `reuse_prepared=false` is forced by the helper; do not debug the prepared fast path during baseline motor validation.
-- A successful API response is controller-side evidence only. The operator must confirm physical motion, sound, and absence of binding.
-- If `reported_delta` differs from requested steps, or post-move speed is not zero, stop.
-- If physical motion disagrees with telemetry, stop and capture journal/kernel logs before retrying.
-- If reference state is `unknown`, avoid blind absolute moves. Use supervised relative micro-moves or homing/re-reference under direct observation.
-
-Only after micro-moves look sane should homing be tested, one axis at a time:
-
-```bash
-scripts/bioxp_supervised_home_axis.sh x
-scripts/bioxp_supervised_home_axis.sh y
-scripts/bioxp_supervised_home_axis.sh z --timeout 25.0
-scripts/bioxp_supervised_home_axis.sh g
-scripts/bioxp_supervised_home_axis.sh door
-```
-
-Do not start full startup homing until individual-axis behavior is understood. Telemetry plus physical observation are both required.
+The historical supervised shell workflow is retired. Use the current robot-owned
+operator catalog for X/Y/Z actions, and the manual gripper/door and maintenance
+recovery interfaces documented in [tooling retirement](TOOLING_RETIREMENT.md).
+This historical validation record does not authorize motion or establish current state.
 
 ## 8. BMS proxy/UI validation
 

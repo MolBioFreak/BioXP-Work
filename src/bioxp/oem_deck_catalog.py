@@ -106,11 +106,6 @@ class DeckCatalog:
         except KeyError as exc:
             raise KeyError(f"unknown finite deck target: {target}") from exc
 
-    def resolve_alias(self, alias: str) -> DeckDestination:
-        target = self._aliases.get(str(alias).casefold())
-        if target is None:
-            raise KeyError(f"unknown finite deck alias: {alias}")
-        return self.resolve(target)
 
     def rows(self) -> list[dict[str, Any]]:
         return _catalog_rows(self._entries, self.position_table_sha256)

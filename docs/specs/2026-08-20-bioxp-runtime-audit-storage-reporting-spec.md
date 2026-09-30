@@ -1014,26 +1014,12 @@ The evidence does not prove zero historical attempts, zero transport activity, o
 
 No package below authorizes tests, migration, deployment, service restart, hardware queries, CAN traffic, physical pipette action, or wet commissioning. Those actions require separate authority. Source implementation, verification, integration, deployment, live read-only acceptance, controller evidence, and physical acceptance remain separate gates.
 
-### RA-RW0: Freeze the final denominator and RED contract
+### RA-RW0: Historical denominator retired
 
-**Objective:** Produce the machine-generated current-runtime denominator before further implementation.
-
-**Primary files:**
-
-- create `docs/specs/evidence/bioxp-runtime-audit-entrypoint-denominator.json`;
-- create or update a deterministic inventory generator under `scripts/`;
-- update `tests/test_pipette_wp0_wp4_contracts.py`;
-- add focused route/protocol/lifecycle denominator tests under `tests/`.
-
-**Required result:**
-
-- inventory mounted `/liquid/*` routes, protocol handlers, operator aliases, application planners, constructor and Serial-206 lifecycle callers, callbacks, transport public methods, BMS relay routes, and cockpit actions;
-- classify control effect and durable-claim requirement for every row;
-- bind each row to its coordinator and verification ID;
-- fail on an unclassified, removed, duplicate, stale, or direct-transport row;
-- record the exact denominator SHA-256.
-
-**Exit gate:** RA-2 denominator portion passes with zero missing and zero bypass rows in the intended final design. RED tests demonstrate every currently known bypass.
+The historical denominator and its generator are retired under A7. They bound
+old revisions rather than the current executable route graph. This historical
+work package is not a current build/release consumer or an execution prerequisite.
+Canonical critical outcomes and hash-bound migration inputs remain unchanged.
 
 ### RA-RW1: Close universal claim and failure persistence
 

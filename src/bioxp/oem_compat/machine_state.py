@@ -80,11 +80,7 @@ class OemMachineState:
     def confirm_axis(self, axis: str) -> bool:
         return bool(dict(self.axis_confirmed).get(self._norm_axis(axis), False))
 
-    def with_force_to_high_home(self) -> "OemMachineState":
-        return self.with_default_parameters(self.default_parameters.force_to_high_home())
 
-    def with_gantry_load(self, *, tiploaded: Any = None, plateloaded: Any = None) -> "OemMachineState":
-        return self.with_default_parameters(self.default_parameters.gantry_load(tiploaded=tiploaded, plateloaded=plateloaded))
 
     def with_default_parameters(self, params: OemDefaultParameters) -> "OemMachineState":
         return OemMachineState(

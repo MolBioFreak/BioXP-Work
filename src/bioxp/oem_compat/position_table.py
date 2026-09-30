@@ -49,9 +49,6 @@ def tip_group_well_ids(group_index: int) -> tuple[int, ...]:
     return tuple(column + (row + 2 * channel) * 12 for channel in range(4))
 
 
-def well_label_from_id(value: int) -> str:
-    well_id = well_id_from_label(value)
-    return f"{chr(ord('A') + well_id // 12)}{well_id % 12 + 1}"
 
 
 @dataclass(frozen=True)
@@ -244,25 +241,7 @@ class PositionTable:
     def rows(self) -> list[dict[str, Any]]:
         return [target.to_payload() for target in self._targets]
 
-    def to_snapshot(self) -> dict[str, Any]:
-        return {"schema_version": "bioxp.oem_position_table.v2", "source": self.source, "source_sha256": self.source_sha256, "position_table_sha256": self.digest, "rows": self.rows(), "adjustment_ledger": [dict(row) for row in self.adjustment_ledger]}
 
-    def resolve_nearest(self, *, x: int, y: int) -> tuple[str, int]:
-        """Resolve the immutable position-table entry nearest to a live position.
-
-        Mirrors the OEM MachineStatus.updateLocation semantics for the operator
-        plane: the host model derives the current location from controller
-        truth (live axis positions) against the immutable OEM position table
-        instead of requiring the gated full startup pipeline to have run.
-        """
-        if not self._targets:
-            raise ValueError("OEM PositionTable is empty; nearest-location resolution unavailable")
-        best = min(
-            self._targets,
-            key=lambda target: (int(target.base_coordinates["x"]) - int(x)) ** 2
-            + (int(target.base_coordinates["y"]) - int(y)) ** 2,
-        )
-        return best.location_id, 0
 
     def resolve(self, *, location_id: str, well_id: str | None = None, plate_name: str | None = None) -> PositionTarget:
         candidates = [self._key(location_id, well_id, plate_name), self._key(location_id, well_id, None), self._key(location_id, None, plate_name), self._key(location_id, None, None)]

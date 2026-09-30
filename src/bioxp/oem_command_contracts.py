@@ -107,8 +107,6 @@ _CONTRACTS: tuple[OemCommandContract, ...] = (
 )
 
 
-def command_contracts() -> tuple[OemCommandContract, ...]:
-    return _CONTRACTS
 
 
 def get_command_contract(name: str) -> OemCommandContract:

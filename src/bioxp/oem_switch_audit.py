@@ -17,8 +17,6 @@ class OemHomePredicate:
     confidence: str = "unknown"
     source: str = "unproven"
 
-    def is_confident(self) -> bool:
-        return self.confidence in {"source_anchored", "live_verified", "high"}
 
     def to_payload(self) -> dict:
         return {
@@ -140,12 +138,3 @@ def run_switch_audit(hardware, *, axes: Iterable[str], mode: str = "status", art
         root.mkdir(parents=True, exist_ok=True)
         (root / "switch_audit.json").write_text(json.dumps(result, indent=2, sort_keys=True))
     return result
-
-
-def require_confident_predicates(predicates: dict[str, dict], axes: Iterable[str]) -> dict:
-    blockers = []
-    for axis in axes:
-        pred = predicates.get(axis) or unknown_predicate(axis)
-        if pred.get("confidence") not in {"source_anchored", "live_verified", "high"}:
-            blockers.append({"axis": axis, "reason": "home predicate not proven", "predicate": pred})
-    return {"ok": not blockers, "blockers": blockers}
