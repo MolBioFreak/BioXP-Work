@@ -101,7 +101,9 @@ def test_typed_nullable_enum_options_lossless_and_detached():
     assert saved == ProtocolDocument.from_payload(json.loads(json.dumps(saved))).to_payload()
 
 
-@pytest.mark.parametrize("operation", [raw("bogus"), raw("LOOP", ["2"]), raw("mov"),
+# Uppercase LOOP is a retained translator/dispatcher default in MotionOnly;
+# its source return is covered by test_debloat_oem_xml, not an unknown opcode.
+@pytest.mark.parametrize("operation", [raw("bogus"), raw("mov"),
     raw("led", ["1", "2"]), raw("wait", [1]), raw("ampmix", {"m_repeat": 1}, argument_type="ClassMix"),
     raw("ampmix", {"native_method": "arbitrary"}, argument_type="ClassAmpMix")])
 def test_late_invalid_operation_returns_no_partial_document(operation):
