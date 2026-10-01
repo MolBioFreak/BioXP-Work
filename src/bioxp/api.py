@@ -8250,6 +8250,26 @@ async def motion_gripper_status():
     return {**projection, "gripper": observed, **(observed or {})}
 
 
+def _with_live_interlock(tester: Any, operation: Callable[[], Any]) -> Any:
+    """Read 24 V, door and latch live, then run one gripper/thermal-door motion.
+
+    These motions have no provider lifecycle of their own, so the sensors are
+    read here at the moment of motion rather than taken from the shared
+    hardware snapshot (which a single missed reply could blank).
+    """
+    check = tester.motor_oem_verify_motion_interlock()
+    if not isinstance(check, Mapping) or check.get("ok") is not True:
+        raise HTTPException(status_code=409, detail={
+            "error": "motion_interlock_not_ready",
+            "message": "24 V, door closed and latch closed must all read OK before gripper or thermal door motion.",
+            "rail_24v": _json_safe(check.get("rail_24v")) if isinstance(check, Mapping) else None,
+            "door": _json_safe(check.get("door")) if isinstance(check, Mapping) else None,
+            "latch": _json_safe(check.get("latch")) if isinstance(check, Mapping) else None,
+            "physical_motion_commanded": False,
+        })
+    return operation()
+
+
 @app.post("/motion/gripper/restore_idle_current")
 async def motion_gripper_restore_idle_current(req: GripperRestoreIdleRequest):
     tester = _get_tester()
@@ -8266,12 +8286,12 @@ async def motion_gripper_clear():
     tester = _get_tester()
     return await _run_blocking(
         "OEM gripper clear",
-        lambda: gripper_clear(
+        lambda: _with_live_interlock(tester, lambda: gripper_clear(
             tester,
             operator_ack="GRIPPER_CLEAR",
             reason="oem_manual_gripper_clear",
             timeout_s=15.0,
-        ),
+        )),
         timeout_s=None,  # Native OEM source owns all waits; ordinary custody is retained.
     )
 
@@ -8282,12 +8302,12 @@ async def motion_gripper_home():
     tester = _get_tester()
     return await _run_blocking(
         "OEM gripper home",
-        lambda: gripper_home(
+        lambda: _with_live_interlock(tester, lambda: gripper_home(
             tester,
             operator_ack="GRIPPER_HOME",
             reason="oem_manual_gripper_home",
             timeout_s=15.0,
-        ),
+        )),
         timeout_s=None,  # Native OEM source owns all waits; ordinary custody is retained.
     )
 
@@ -8304,9 +8324,9 @@ async def motion_gripper_open():
     tester = _get_tester()
     return await _run_blocking(
         "OEM gripper open",
-        lambda: _gripper_success_or_409(
+        lambda: _with_live_interlock(tester, lambda: _gripper_success_or_409(
             gripper_open(tester, operator_ack="GRIPPER_OPEN", reason="oem_manual_gripper_open", timeout_s=20.0)
-        ),
+        )),
         # Source moveToAbs owns its wait; the catalog owns the caller deadline.
         # OpenGripper's recover flag is stallRecover, not G/Y home recovery.
         timeout_s=None,
@@ -8319,9 +8339,9 @@ async def motion_gripper_open_wide():
     tester = _get_tester()
     return await _run_blocking(
         "OEM gripper open wide",
-        lambda: _gripper_success_or_409(
+        lambda: _with_live_interlock(tester, lambda: _gripper_success_or_409(
             gripper_open_wide(tester, operator_ack="GRIPPER_OPEN_WIDE", reason="oem_manual_gripper_open_wide", timeout_s=20.0)
-        ),
+        )),
         timeout_s=None,
     )
 
@@ -8332,9 +8352,9 @@ async def motion_gripper_close():
     tester = _get_tester()
     return await _run_blocking(
         "OEM gripper close",
-        lambda: _gripper_success_or_409(
+        lambda: _with_live_interlock(tester, lambda: _gripper_success_or_409(
             gripper_close(tester, operator_ack="GRIPPER_CLOSE", reason="oem_manual_gripper_close", timeout_s=20.0)
-        ),
+        )),
         timeout_s=None,  # Native OEM source owns all waits; ordinary custody is retained.
     )
 
@@ -8392,7 +8412,8 @@ async def motion_thermal_door_home():
     def execute():
         ownership_epoch = hardware_state.ownership_epoch
         board_epoch = tester.oem_current_board_lifecycle_generation()
-        result = _thermal_door_source_call(lambda: tester.motor_oem_door_search_home(timeout_s=20.0, startup=False))
+        result = _with_live_interlock(tester, lambda: _thermal_door_source_call(
+            lambda: tester.motor_oem_door_search_home(timeout_s=20.0, startup=False)))
         return _thermal_door_success_or_409(_record_thermal_door_home_reference(
             result, result, tester=tester,
             ownership_epoch=ownership_epoch, board_epoch=board_epoch,
@@ -8408,9 +8429,9 @@ async def motion_thermal_door_open():
     tester = _get_tester()
     return await _run_blocking(
         "OEM thermal door open",
-        lambda: _thermal_door_success_or_409(
+        lambda: _with_live_interlock(tester, lambda: _thermal_door_success_or_409(
             _thermal_door_source_call(lambda: tester.motor_oem_open_thermal_door(timeout_s=20.0))
-        ),
+        )),
         timeout_s=None,
     )
 
@@ -8421,9 +8442,9 @@ async def motion_thermal_door_close():
     tester = _get_tester()
     return await _run_blocking(
         "OEM thermal door close",
-        lambda: _thermal_door_success_or_409(
+        lambda: _with_live_interlock(tester, lambda: _thermal_door_success_or_409(
             tester.motor_oem_close_thermal_door(timeout_s=20.0)
-        ),
+        )),
         timeout_s=None,
     )
 

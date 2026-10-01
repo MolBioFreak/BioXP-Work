@@ -1131,6 +1131,15 @@ _CAN_BOOTSTRAP_PATHS = {
 }
 
 
+# Gripper and thermal-door routes check 24 V, door and latch live (api
+# _with_live_interlock), like the X/Y/Z providers do inside each command.
+_LIVE_INTERLOCK_MOTION_PATHS = frozenset({
+    "/motion/gripper/clear", "/motion/gripper/home", "/motion/gripper/open",
+    "/motion/gripper/open_wide", "/motion/gripper/close",
+    "/motion/thermal_door/home", "/motion/thermal_door/open", "/motion/thermal_door/close",
+})
+
+
 def _operation_motion_dependency(machine_state: Mapping[str, Any]) -> dict[str, Any]:
     lifecycle_value = machine_state.get("lifecycle")
     lifecycle: Mapping[str, Any] = lifecycle_value if isinstance(lifecycle_value, Mapping) else {}
@@ -1347,6 +1356,10 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         )
         if provider_owned_x_motion:
             readiness = _provider_x_motion_readiness(machine_state)
+        elif path in _LIVE_INTERLOCK_MOTION_PATHS:
+            # The route reads 24 V/door/latch live at motion time; a missed
+            # reply in the shared snapshot must not grey these controls out.
+            readiness = _provider_z_motion_readiness(machine_state)
         elif (
             x_state_establishing
             or y_state_establishing
