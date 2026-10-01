@@ -1133,10 +1133,14 @@ _CAN_BOOTSTRAP_PATHS = {
 
 # Gripper and thermal-door routes check 24 V, door and latch live (api
 # _with_live_interlock), like the X/Y/Z providers do inside each command.
+# The generic manual move/home routes do the same for G/door
+# (motor_oem_verify_motion_interlock at motion time) and hand X/Z to their
+# providers. OEM manual buttons are never greyed out by a cached sensor read.
 _LIVE_INTERLOCK_MOTION_PATHS = frozenset({
     "/motion/gripper/clear", "/motion/gripper/home", "/motion/gripper/open",
     "/motion/gripper/open_wide", "/motion/gripper/close",
     "/motion/thermal_door/home", "/motion/thermal_door/open", "/motion/thermal_door/close",
+    "/motion/oem/manual/relative", "/motion/oem/manual/absolute", "/motion/oem/manual/home",
 })
 
 

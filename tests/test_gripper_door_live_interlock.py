@@ -26,6 +26,7 @@ def _action(path):
     "/motion/gripper/clear", "/motion/gripper/home", "/motion/gripper/open",
     "/motion/gripper/open_wide", "/motion/gripper/close",
     "/motion/thermal_door/home", "/motion/thermal_door/open", "/motion/thermal_door/close",
+    "/motion/oem/manual/relative", "/motion/oem/manual/absolute", "/motion/oem/manual/home",
 ])
 def test_blank_snapshot_keeps_gripper_and_door_enabled(path):
     assert _assess_action(_action(path), READY)["enabled"] is True
