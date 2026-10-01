@@ -54,28 +54,6 @@ def test_return_boundary_invalidation_cannot_restamp_sample(rig, monkeypatch):
         provider.deck_authority_cached_snapshot(expected_generation=3, target='LOC_OC')
 
 
-@pytest.mark.parametrize('boundary', [14.999, 15.0])
-def test_replacement_does_not_extend_sample_deadline(rig, monkeypatch, boundary):
-    from bioxp import oem_serial206_initialization as module
-    provider, _, _, _ = rig
-    clock = [100.0]
-    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
-    snapshot = provider.deck_authority_snapshot(expected_generation=3, target='LOC_OC')
-    original = provider._fresh_deck_latch_observation
-    def replacement():
-        clock[0] = 100.0 + boundary
-        if boundary < 15:
-            assert provider.deck_authority_cached_snapshot(expected_generation=3, target='LOC_OC') == snapshot
-        else:
-            with pytest.raises(RuntimeError, match='deck_authority_cache_stale'):
-                provider.deck_authority_cached_snapshot(expected_generation=3, target='LOC_OC')
-        return original()
-    monkeypatch.setattr(provider, '_fresh_deck_latch_observation', replacement)
-    clock[0] = 101.0
-    provider.deck_authority_snapshot(expected_generation=3, target='LOC_OC')
-    assert provider._deck_authority_scoped_cache['offset.v1'][0] == 101.0
-
-
 @pytest.mark.parametrize('end', ['success', 'yield', 'failure', 'owner_change'])
 def test_warm_catalog_survives_replacement_until_real_outcome(installed_retained, monkeypatch, end):
     from bioxp import api

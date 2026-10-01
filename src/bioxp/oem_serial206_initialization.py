@@ -8781,33 +8781,30 @@ class Serial206OemInitializationProvider:
                     if changed:
                         state, age, outcome = "missing", None, "invalidated"
                     else:
-                        available = state == "fresh" and snapshot.get("latch_status") is True and snapshot.get("machine_latch_closed") is True
+                        available = snapshot.get("latch_status") is True and snapshot.get("machine_latch_closed") is True
         return {"available": available, "outcome": outcome,
                 "freshness": {"state": state, "age_s": age, "fresh_for_s": 15.0}}
 
     def deck_authority_cached_snapshot(self, *, expected_generation: int, target: str | None = None) -> dict[str, Any]:
         """Passive availability projection of an actual successful active sample.
 
-        The existing operator freshness window is 15 seconds, not a controller
-        timeout. This read never renews captured_at and cannot authorize execution;
-        execution must still use deck_authority_snapshot under its admission lease.
-        External reference/board/semantic owners must invalidate on mutations.
+        A sample stays valid until a mutation invalidates the cache or the
+        ownership generation changes; age alone never expires it. This read
+        cannot authorize execution; execution still takes deck_authority_snapshot
+        under its admission lease. External reference/board/semantic owners must
+        invalidate on mutations.
         """
         scope = self._deck_dependency_scope(target)
         cached = getattr(self, "_deck_authority_scoped_cache", {}).get(scope)
         if cached is None:
             raise RuntimeError("deck_authority_cache_unavailable")
-        sampled_at, epoch, snapshot = cached
+        _sampled_at, epoch, snapshot = cached
         if epoch is not getattr(self, "_deck_authority_cache_epoch", None):
             raise RuntimeError("deck_authority_cache_unavailable")
         if isinstance(snapshot, Exception):
-            if time.monotonic() - sampled_at >= 15.0:
-                raise RuntimeError("deck_authority_cache_stale")
             raise snapshot
         if snapshot["ownership_generation"] != expected_generation:
             raise RuntimeError("ownership_generation_changed")
-        if time.monotonic() - sampled_at >= 15.0:
-            raise RuntimeError("deck_authority_cache_stale")
         if scope == "park.full" and snapshot.get("current_location_id") != "LOC_PARK":
             # Park consumes only TipExist; collection metadata never disables it.
             sampled = snapshot.get("collection_tip_state")

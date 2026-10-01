@@ -139,8 +139,7 @@ def test_full_failure_does_not_replace_offset_cache(rig):
     assert primitive.calls == before
     started, epoch, payload = provider._deck_authority_scoped_cache['offset.v1']
     provider._deck_authority_scoped_cache['offset.v1'] = (started - 16, epoch, payload)
-    with pytest.raises(RuntimeError, match='deck_authority_cache_stale'):
-        provider.deck_authority_cached_snapshot(expected_generation=3, target='LOC_OC')
+    assert provider.deck_authority_cached_snapshot(expected_generation=3, target='LOC_OC') == snapshot
 
 
 @pytest.fixture
