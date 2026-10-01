@@ -1188,14 +1188,6 @@ def _motion_readiness(machine_state: Mapping[str, Any], required_axes: list[str]
         "enclosure_ready", "Door closed and latched", enclosure_ok,
         "Robot door is not confirmed closed and latched.",
     ))
-    interlock_row = domains.get("interlock") if isinstance(domains.get("interlock"), Mapping) else {}
-    interlock = interlock_row.get("observation") if isinstance(interlock_row, Mapping) else None
-    motion_arm = interlock.get("motion_arm") if isinstance(interlock, Mapping) else None
-    dependencies.append(_dependency(
-        "motion_arm", "Motion arm confirmed",
-        isinstance(motion_arm, Mapping) and motion_arm.get("armed") is True,
-        "Motion arm is not confirmed.",
-    ))
     failed = next((row for row in dependencies if not row["met"]), None)
     return {
         "enabled": failed is None,
