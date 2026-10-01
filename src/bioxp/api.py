@@ -6141,6 +6141,23 @@ def _pipette_collection_state(*, ensure_constructor: bool = False):
                 "identity": snapshot["identity"], "channels": channels}
 
 
+def _start_oem_constructor_pipettes(reason: str) -> None:
+    """Build the four pipettes once CAN is ready, as the OEM app does at start.
+
+    ControlLib's constructor (ControlLib.cs:700,963-984) initializes the pipette
+    collection once per app start, so Park's TipExist read never waits on it.
+    No motion; runs in the background and leaves any failure to the existing
+    on-demand constructor path.
+    """
+    def run() -> None:
+        try:
+            _pipette_collection_state(ensure_constructor=True)
+        except Exception as exc:  # noqa: BLE001 - background start-up attempt
+            logging.getLogger(__name__).warning(
+                "OEM constructor pipette stage after %s did not complete: %s", reason, exc)
+    threading.Thread(target=run, name="oem-constructor-pipettes", daemon=True).start()
+
+
 def _collect_and_publish_hardware_snapshot(
     requested: list[str],
     *,
@@ -6221,6 +6238,8 @@ def _collect_and_publish_hardware_snapshot(
     if promotion.get("published"):
         result["snapshot"] = promotion["snapshot"]
         result["can_ready_published"] = True
+        if not promotion.get("already_ready"):
+            _start_oem_constructor_pipettes(reason)
     return result
 
 
@@ -6669,6 +6688,8 @@ def _prepare_operator_motion_state(tester, authority, *, before_publication=None
         reason="oem_prepare_without_motion_completed",
     )
     ready = bool(can_ready.get("published") is True)
+    if ready and not can_ready.get("already_ready"):
+        _start_oem_constructor_pipettes("oem_prepare_without_motion_completed")
     if ready:
         arm_confirm = getattr(tester, "motion_arm_confirm", None)
         arm_state = (
