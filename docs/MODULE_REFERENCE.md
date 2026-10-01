@@ -30,16 +30,6 @@ Primary dependencies:
 - `usb.core`, `usb.util` (PyUSB)
 - stdlib (`ctypes`, `fcntl`, `subprocess`, `signal`, `json`, etc.)
 
-## 2. `src/bioxp/diagnostic_24v.py`
-Status: Legacy targeted diagnostic utility.
-
-Purpose:
-- Earlier focused 24V/motor-power probing and broad IO enable attempts
-- Lower-level experiment script outside current structured menu runtime
-
-When to use:
-- only for exploratory diagnostics not already covered by `usb_driver.py`
-
 ## 3. `src/bioxp/can_driver.py`
 Status: Legacy/prototype SocketCAN driver.
 
@@ -74,8 +64,8 @@ Purpose:
 - useful for command-sequence context and reverse-engineering validation
 
 Examples:
-- `demo.xml`
-- `lifetest.xml`
+- `testdata/oem_xml/demo.xml` (canonical fixture, outside `scripts/`)
+- `testdata/oem_xml/lifetest.xml` (canonical fixture, outside `scripts/`)
 - `TP015 48 HOUR SYSTEM BURN-IN.xml`
 
 ## 7. Documentation and Data Dependencies
@@ -93,4 +83,4 @@ For active hardware control and operations:
 
 For reference only:
 
-- `can_driver.py`, `diagnostic_24v.py`
+- `can_driver.py`

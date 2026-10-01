@@ -30,8 +30,14 @@ def _payload(value: Any) -> Any:
     return value
 
 
-# ControlLib.scriptInterpretor's exact labels; default is not executable support.
+# Retained ControlLib.scriptInterpretor:6676-6678 default return, no locks/IO.
+# Only source-reviewed tokens; unknown opcodes remain unsupported.
+OEM_SOURCE_DEFAULT_NOOPS = frozenset({"SS", "RT", "ST", "SW", "TT", "ZW", "fon", "LOOP", "DWELL", "//"})
+OEM_BUILTIN_OPCODES = OEM_SOURCE_DEFAULT_NOOPS | {"step", "delaypoint", "wait"}
+
+# ControlLib.scriptInterpretor's exact labels.
 OEM_OPERATION_FORMS = MappingProxyType({
+    **dict.fromkeys(OEM_SOURCE_DEFAULT_NOOPS, "raw"),
     **dict.fromkeys((
         "aa", "catchPlate", "catch", "cc", "cutseal", "da", "delaypoint",
         "dopen", "dclose", "ejt", "iniPipette", "la", "ldtip", "led", "ms",

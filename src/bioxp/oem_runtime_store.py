@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import hashlib
 import fcntl
 import inspect
@@ -21,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .critical_logging import critical_receipt
-from .oem_runtime_types import OEMRuntimeSnapshot, utc_ts
+from .oem_runtime_types import utc_ts
 from .oem_deck_schema_v6 import (
     DECK_SCHEMA_V5_INDEXES,
     DECK_SCHEMA_V5_LEGACY_GLOBAL_TRIGGERS,
@@ -115,6 +114,7 @@ _RUNTIME_PHYSICAL_SCHEMA_SHA256_BY_VERSION = {
     11: "baf43668869172821e7a22baafd84f229cdab09c78540515fc0ae0d4151dabe4",
     12: "baf43668869172821e7a22baafd84f229cdab09c78540515fc0ae0d4151dabe4",  # decision trigger only
     13: "baf43668869172821e7a22baafd84f229cdab09c78540515fc0ae0d4151dabe4",  # decision trigger only (critical-images branch)
+    14: "baf43668869172821e7a22baafd84f229cdab09c78540515fc0ae0d4151dabe4",  # delivery/background triggers outside physical tables
 }
 _RUNTIME_PHYSICAL_TABLES = {
     "runtime_metadata", "runtime_retired_json_artifacts", "serial206_authority_snapshots",
@@ -2695,6 +2695,7 @@ def _verify_runtime_release_start(connection: sqlite3.Connection) -> None:
 
 from . import oem_deck_recovery_schema_v12 as _recovery_v12
 from . import oem_deck_recovery_schema_v13 as _recovery_v13
+from . import oem_deck_schema_v14 as _deck_v14
 
 WORKFLOW_SCHEMA_VERSION = 11
 _WORKFLOW_DDL = (
@@ -2812,6 +2813,7 @@ def canonical_runtime_migration_registry() -> tuple[RuntimeMigrationIdentity, ..
         workflow_migration_identity(),
         _recovery_v12.migration_identity(),
         _recovery_v13.migration_identity(),
+        _deck_v14.migration_identity(),
     )
     versions = tuple(item.version for item in registry)
     if versions != tuple(sorted(set(versions))):
@@ -3086,11 +3088,6 @@ def _verify_v2_schema(connection: sqlite3.Connection) -> None:
         raise RuntimeError(f"runtime physical schema fingerprint mismatch: {physical_schema_sha256}")
 
 
-def verify_runtime_database_v2(connection: sqlite3.Connection) -> None:
-    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    if version != SERIAL206_SCHEMA_VERSION:
-        raise RuntimeError(f"runtime schema v2 is not prepared (found {version})")
-    _verify_v2_schema(connection)
 
 
 def _verify_report_identity_metadata_v1(connection: sqlite3.Connection) -> None:
@@ -3133,18 +3130,9 @@ def _verify_report_identity_metadata_v1(connection: sqlite3.Connection) -> None:
         raise RuntimeError("runtime report identity trigger attestation failed")
 
 
-def _manifest_statement(statement: str) -> tuple[tuple[str, str], str]:
-    normalized = normalize_sql_definition(statement)
-    match = re.match(
-        r"^CREATE(?:UNIQUE)?(TABLE|INDEX|TRIGGER|VIEW)(?:IFNOTEXISTS)?([A-Z_][A-Z0-9_]*)",
-        normalized,
-    )
-    if match is None:
-        raise RuntimeError("canonical migration DDL contains an unclassifiable schema statement")
-    return (match.group(1).lower(), match.group(2).lower()), normalized
 
 
-def canonical_runtime_schema_manifest(*, version: int = _recovery_v13.VERSION) -> dict[tuple[str, str], str]:
+def canonical_runtime_schema_manifest(*, version: int = _deck_v14.VERSION) -> dict[tuple[str, str], str]:
     """Return the exact union of every registered non-SQLite schema object."""
     expected = _expected_foundation_connection()
     try:
@@ -3190,6 +3178,8 @@ def canonical_runtime_schema_manifest(*, version: int = _recovery_v13.VERSION) -
             _recovery_v12.apply(expected)
         if version >= _recovery_v13.VERSION:
             _recovery_v13.apply(expected)
+        if version >= _deck_v14.VERSION:
+            _deck_v14.apply(expected)
         expected.execute(f"PRAGMA user_version={version}")
         _reinstall_operator_global_triggers(expected)
         return {
@@ -3714,15 +3704,17 @@ def _migrate_oem_deck_schema_v7_locked(
 
 def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path) -> None:
     """Apply the canonical ordered registry under the process-wide owner fence."""
-    if int(connection.execute("PRAGMA user_version").fetchone()[0]) == _recovery_v13.VERSION:
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) == _deck_v14.VERSION:
         # An already-prepared database needs no migration, lifecycle-exclusive
         # lock, or data audit. Its size must not determine service startup time.
         verify_canonical_runtime_database(connection)
         return
     coordinator = runtime_write_coordinator(root)
     with coordinator.lock:
-        if int(connection.execute("PRAGMA user_version").fetchone()[0]) == _recovery_v12.VERSION:
-            _recovery_v13.migrate(connection, Path(root).expanduser().resolve(strict=False), canonical_runtime_migration_registry()[12])
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) in (_recovery_v12.VERSION, _recovery_v13.VERSION):
+            selected_root = Path(root).expanduser().resolve(strict=False)
+            _recovery_v13.migrate(connection, selected_root, canonical_runtime_migration_registry()[12])
+            _deck_v14.migrate(connection, selected_root, canonical_runtime_migration_registry()[13])
             return
         if int(connection.execute("PRAGMA user_version").fetchone()[0]) in (_deck_v8.VERSION, _deck_v9.VERSION, _pipette_v10.VERSION, WORKFLOW_SCHEMA_VERSION):
             selected_root = Path(root).expanduser().resolve(strict=False)
@@ -3732,6 +3724,7 @@ def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path
             _migrate_workflow_schema(connection, selected_root)
             _recovery_v12.migrate(connection, selected_root, canonical_runtime_migration_registry()[11])
             _recovery_v13.migrate(connection, selected_root, canonical_runtime_migration_registry()[12])
+            _deck_v14.migrate(connection, selected_root, canonical_runtime_migration_registry()[13])
         else:
             _migrate_runtime_database_v2_locked(connection, root)
 
@@ -3857,6 +3850,7 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
         _migrate_workflow_schema(connection, selected_root)
         _recovery_v12.migrate(connection, selected_root, registry[11])
         _recovery_v13.migrate(connection, selected_root, registry[12])
+        _deck_v14.migrate(connection, selected_root, registry[13])
         verify_canonical_runtime_database(connection)
         journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
         synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
@@ -3993,6 +3987,7 @@ def _migrate_runtime_database_v2_locked(connection: sqlite3.Connection, root: st
         _migrate_workflow_schema(connection, selected_root)
         _recovery_v12.migrate(connection, selected_root, registry[11])
         _recovery_v13.migrate(connection, selected_root, registry[12])
+        _deck_v14.migrate(connection, selected_root, registry[13])
         verify_canonical_runtime_database(connection)
     except Exception:
         if connection.in_transaction:
@@ -4081,7 +4076,7 @@ class OEMRuntimeStore:
         self._closed = False
         # A prepared database needs no writer fence or data audit. Only actual
         # schema preparation enters the authority fence (also supports new stores).
-        if int(self._db.execute("PRAGMA user_version").fetchone()[0]) == _recovery_v13.VERSION:
+        if int(self._db.execute("PRAGMA user_version").fetchone()[0]) == _deck_v14.VERSION:
             verify_canonical_runtime_database(self._db)
         else:
             with self._authority_write():
@@ -4667,7 +4662,7 @@ class OEMRuntimeStore:
             memo = self._projection_verified_state
             revision = (self._db.total_changes, self._db.execute("PRAGMA data_version").fetchone()[0]) if self._projection_read_depth else None
             if self._projection_read_depth and memo is not None and memo[0] == revision:
-                return json.loads(memo[1])
+                return self._project_deck_location_invalidation(json.loads(memo[1]))
             selected = self._db.execute(
                 "SELECT * FROM serial206_authority_snapshots ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
@@ -4714,6 +4709,19 @@ class OEMRuntimeStore:
                 self._projection_verified_state = (revision, state_json)
         if not isinstance(payload, dict):
             raise ValueError("serial-206 initialization state must be an object")
+        return self._project_deck_location_invalidation(payload)
+
+    def _project_deck_location_invalidation(self, payload):
+        # The latest immutable snapshot can predate standalone dispatch. The
+        # durable invalidation belongs to the semantic row; do not resurrect
+        # its old label through the restored ClassMachineStatus fallback.
+        from .deck_location_invalidation import location_is_invalidated
+        with self._lock:
+            semantic = self._db.execute(
+                "SELECT current_location FROM operator_plane_deck_semantic_state WHERE singleton=1").fetchone()
+        if (location_is_invalidated(self.root) or (semantic is not None and semantic[0] == "UNKNOWN")):
+            if isinstance(payload.get("machine_status"), dict):
+                payload["machine_status"]["current_location"] = 32
         return payload
 
     def _serial206_current_payload(self, state):
@@ -4933,17 +4941,6 @@ class OEMRuntimeStore:
             ).fetchone()
         return None if row is None else json.loads(row["receipt_json"])
 
-    def list_serial206_receipts(self, stream: str, limit: int = 50) -> list[dict[str, Any]]:
-        selected_limit = max(1, min(int(limit), 200))
-        with self._lock:
-            rows = self._db.execute(
-                """
-                SELECT receipt_json FROM serial206_receipts
-                WHERE stream=? ORDER BY observed_at DESC, receipt_id DESC LIMIT ?
-                """,
-                (str(stream).strip().lower(), selected_limit),
-            ).fetchall()
-        return [json.loads(row["receipt_json"]) for row in reversed(rows)]
 
     def _load_seq(self) -> int:
         row = self._db.execute(
@@ -5023,223 +5020,3 @@ class OEMRuntimeStore:
                 "INSERT INTO runtime_metadata(key,value,updated_at) VALUES(?,?,?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
                 ("calibration_run_v1:" + payload["run_id"], encoded, time.time()))
-
-    def next_seq(self) -> int:
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                row = self._db.execute(
-                    "SELECT value FROM runtime_metadata WHERE key='runtime_sequence'"
-                ).fetchone()
-                current = int(row[0]) if row is not None else 0
-                self._seq = max(int(self._seq), current) + 1
-                self._db.execute(
-                    "INSERT INTO runtime_metadata(key,value,updated_at) VALUES('runtime_sequence',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
-                    (str(self._seq), time.time()),
-                )
-                self._db.execute("COMMIT")
-            except Exception:
-                self._db.execute("ROLLBACK")
-                raise
-            return self._seq
-
-    def write_state(self, snapshot: OEMRuntimeSnapshot | dict[str, Any]) -> dict[str, Any]:
-        if isinstance(snapshot, OEMRuntimeSnapshot):
-            payload: dict[str, Any] = snapshot.to_dict()
-        else:
-            payload = dict(snapshot)
-        from .hardware_status import hardware_state
-        from .lifecycle_state import lifecycle_state
-
-        canonical = hardware_state.completed_snapshot()
-        payload["canonical_hardware_snapshot"] = {
-            "snapshot_id": None if canonical is None else canonical.get("snapshot_id"),
-            "ownership_epoch": hardware_state.ownership_epoch,
-            "available": canonical is not None,
-            "reference_only": True,
-        }
-        lifecycle = lifecycle_state.projection()
-        payload["runtime_state"] = lifecycle["operation_state"]
-        payload["operation_state"] = lifecycle["operation_state"]
-        payload["startup"] = lifecycle["startup"]
-        payload["lifecycle_revision"] = lifecycle["revision"]
-        sequence = self.next_seq()
-        payload["sequence"] = sequence
-        payload["updated_at"] = utc_ts()
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        with self._lock:
-            with self._authority_write():
-                self._db.execute(
-                    "INSERT INTO runtime_state_snapshots(sequence,state_json,state_sha256,created_at) VALUES(?,?,?,?)",
-                    (
-                        sequence,
-                        encoded,
-                        hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
-                        time.time(),
-                    ),
-                )
-        return payload
-
-    def read_state(self) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._db.execute(
-                "SELECT state_json,state_sha256 FROM runtime_state_snapshots ORDER BY sequence DESC LIMIT 1"
-            ).fetchone()
-        if row is None:
-            return None
-        encoded = str(row["state_json"])
-        if encoded != json.dumps(json.loads(encoded), sort_keys=True, separators=(",", ":"), allow_nan=False):
-            raise RuntimeError("runtime state snapshot JSON is not canonical")
-        if str(row["state_sha256"]) != hashlib.sha256(encoded.encode("utf-8")).hexdigest():
-            raise RuntimeError("runtime state snapshot digest mismatch")
-        return json.loads(encoded)
-
-
-    def create_oem_full_lifecycle_run_once(
-        self,
-        run: dict[str, Any],
-        *,
-        current_ownership_generation: Callable[[], int] | None = None,
-    ) -> dict[str, Any]:
-        """Atomically converge same-key creators within the single runtime owner."""
-        payload = dict(run)
-        key = payload.get("idempotency_key")
-        request = payload.get("request")
-        if not isinstance(key, str) or not key or len(key) > 128:
-            raise ValueError("valid bounded idempotency_key required")
-        with self._lock:
-            if current_ownership_generation is not None:
-                expected = request.get("expected_generation") if isinstance(request, dict) else None
-                if expected != current_ownership_generation():
-                    raise ValueError("expected_generation no longer matches current robot ownership generation")
-            existing_runs = self.list_oem_full_lifecycle_runs()
-            for existing in existing_runs:
-                if existing.get("idempotency_key") != key:
-                    continue
-                if existing.get("request") != request:
-                    raise ValueError("idempotency_key is already bound to a different request")
-                return existing
-            active_states = {"planned", "running", "admitted", "acknowledged", "blocked", "reconciliation_required"}
-            if any(existing.get("run_state") in active_states for existing in existing_runs):
-                raise ValueError("another active OEM lifecycle run already owns the robot lifecycle")
-            return self.write_oem_full_lifecycle_run(payload)
-
-    def write_oem_full_lifecycle_run(self, run: dict[str, Any]) -> dict[str, Any]:
-        """Persist one full OEM movement-lifecycle run in SQLite."""
-        payload = dict(run)
-        run_id = str(payload.get("run_id") or "").strip()
-        if not run_id or "/" in run_id or "\\" in run_id or run_id in {".", ".."}:
-            raise ValueError("valid robot-owned run_id required")
-        with self._lock, self._authority_write():
-            sequence = self.next_seq()
-            payload["sequence"] = sequence
-            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
-            self._db.execute(
-                """
-                INSERT INTO runtime_movement_runs(run_id,sequence,run_json,run_sha256,updated_at)
-                VALUES(?,?,?,?,?)
-                ON CONFLICT(run_id) DO UPDATE SET
-                    sequence=excluded.sequence,
-                    run_json=excluded.run_json,
-                    run_sha256=excluded.run_sha256,
-                    updated_at=excluded.updated_at
-                """,
-                (run_id, sequence, encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest(), time.time()),
-            )
-        return payload
-
-    def mutate_oem_full_lifecycle_run(
-        self,
-        run_id: str,
-        mutation: Callable[[dict[str, Any]], dict[str, Any]],
-    ) -> dict[str, Any]:
-        """Read, validate, and replace one run under the runtime-owner lock."""
-        with self._lock:
-            payload = self.read_oem_full_lifecycle_run(run_id)
-            if payload is None:
-                raise ValueError(f"full OEM lifecycle run {run_id!r} not found")
-            return self.write_oem_full_lifecycle_run(mutation(payload))
-
-    def read_oem_full_lifecycle_run(self, run_id: str) -> dict[str, Any] | None:
-        selected = str(run_id).strip()
-        if not selected or "/" in selected or "\\" in selected or selected in {".", ".."}:
-            raise ValueError("valid robot-owned run_id required")
-        with self._lock:
-            row = self._db.execute(
-                "SELECT run_json,run_sha256 FROM runtime_movement_runs WHERE run_id=?", (selected,)
-            ).fetchone()
-        if row is None:
-            return None
-        encoded = str(row["run_json"])
-        if encoded != json.dumps(json.loads(encoded), sort_keys=True, separators=(",", ":"), allow_nan=False):
-            raise RuntimeError("runtime movement run JSON is not canonical")
-        if str(row["run_sha256"]) != hashlib.sha256(encoded.encode("utf-8")).hexdigest():
-            raise RuntimeError("runtime movement run digest mismatch")
-        return json.loads(encoded)
-
-    def list_oem_full_lifecycle_runs(self) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._db.execute(
-                "SELECT run_json,run_sha256 FROM runtime_movement_runs ORDER BY sequence,run_id"
-            ).fetchall()
-        result = []
-        for row in rows:
-            encoded = str(row["run_json"])
-            if encoded != json.dumps(json.loads(encoded), sort_keys=True, separators=(",", ":"), allow_nan=False):
-                raise RuntimeError("runtime movement run JSON is not canonical")
-            if str(row["run_sha256"]) != hashlib.sha256(encoded.encode("utf-8")).hexdigest():
-                raise RuntimeError("runtime movement run digest mismatch")
-            result.append(json.loads(encoded))
-        return result
-
-    def append_journal(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        row = critical_receipt(payload)
-        row.setdefault("created_at", utc_ts())
-        sequence = self.next_seq()
-        row["sequence"] = sequence
-        encoded = json.dumps(row, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        with self._lock:
-            with self._authority_write():
-                self._db.execute(
-                    "INSERT INTO runtime_journal(sequence,stream,payload_json,payload_sha256,created_at) VALUES(?,?,?,?,?)",
-                    (sequence, str(name), encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest(), time.time()),
-                )
-        return row
-
-    def append_command_queue(self, command: dict[str, Any]) -> dict[str, Any]:
-        return self.append_journal("command_queue.jsonl", command)
-
-    def append_command_history(self, row: dict[str, Any]) -> dict[str, Any]:
-        return self.append_journal("command_history.jsonl", row)
-
-    def append_event(self, event: dict[str, Any]) -> dict[str, Any]:
-        return self.append_journal("event_journal.jsonl", event)
-
-    def append_error(self, error: dict[str, Any]) -> dict[str, Any]:
-        return self.append_journal("runtime_errors.jsonl", error)
-
-    def read_journal(self, name: str, limit: int = 50) -> list[dict[str, Any]]:
-        bounded = max(1, min(int(limit), 500))
-        with self._lock:
-            rows = self._db.execute(
-                "SELECT payload_json,payload_sha256 FROM runtime_journal WHERE stream=? ORDER BY sequence DESC LIMIT ?",
-                (str(name), bounded),
-            ).fetchall()
-        result = []
-        for row in reversed(rows):
-            encoded = str(row["payload_json"])
-            if encoded != json.dumps(json.loads(encoded), sort_keys=True, separators=(",", ":"), allow_nan=False):
-                raise RuntimeError("runtime journal JSON is not canonical")
-            if str(row["payload_sha256"]) != hashlib.sha256(encoded.encode("utf-8")).hexdigest():
-                raise RuntimeError("runtime journal digest mismatch")
-            result.append(json.loads(encoded))
-        return result
-
-    def recover_state(self) -> dict[str, Any]:
-        state = self.read_state()
-        if state is None:
-            return {"recovery": "fresh", "state": None, "recovery_required": False}
-        worker = state.get("worker") or {}
-        active = worker.get("active_command")
-        running = worker.get("state") == "running" or active is not None
-        return {"recovery": "active_command" if running else "idle", "state": state, "recovery_required": bool(running)}

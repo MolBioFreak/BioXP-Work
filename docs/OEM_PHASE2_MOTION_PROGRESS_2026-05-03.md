@@ -28,30 +28,10 @@ Targeted tests already verify:
 - Relative move responses expose controller-only motion truth metadata.
 - Prepared-motion reuse is disabled by default and still forces fresh interlock wake even in debug reuse mode.
 
-## Implemented in this slice
+## Historical helper workflow
 
-- Added static regression tests for supervised live helper scripts.
-- Hardened `scripts/bioxp_supervised_home_axis.sh` so it now requires explicit operator confirmation before any live homing command:
-  - default prompt requires typing `HOME`
-  - `--yes`/`-y` remains available only for deliberate scripted/supervised use
-- Confirmed `scripts/bioxp_supervised_relative_move.sh` preserves controller-only truth warnings and operator-watch language.
-- Shell syntax validated for:
-  - `scripts/bioxp_supervised_home_axis.sh`
-  - `scripts/bioxp_supervised_relative_move.sh`
-  - `scripts/bioxp_supervised_strict_startup.sh`
-  - `scripts/bioxp_motion_readiness_snapshot.sh`
-
-## Verification
-
-```text
-python3 -m pytest tests/test_bioxp_supervised_scripts.py tests/test_bioxp_oem_homing.py tests/test_motion_phase1.py tests/test_oem_compat_transport.py tests/test_oem_compat_api.py tests/test_oem_oracle_extractor.py tests/test_oem_binding_loader.py -q
-49 passed in 0.62s
-```
-
-```text
-python3 -m py_compile src/bioxp/api.py src/bioxp/oem_compat/transport.py src/bioxp/oem_compat/frames.py src/bioxp/oem_compat/api.py
-bash -n scripts/bioxp_supervised_home_axis.sh scripts/bioxp_supervised_relative_move.sh scripts/bioxp_supervised_strict_startup.sh scripts/bioxp_motion_readiness_snapshot.sh
-```
+The supervised shell helpers and their shell-only checks are retired; see
+[the surviving manual/recovery interfaces](TOOLING_RETIREMENT.md).
 
 ## Claim boundary
 

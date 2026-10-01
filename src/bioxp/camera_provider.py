@@ -99,6 +99,9 @@ class CameraFrame:
     provider_generation: int
     content_sha256: str
     identity: CameraIdentity
+    # V4L2 packet timestamp converted to UTC, not optical/sensor proof.
+    # captured_at remains the legacy host-publication timestamp.
+    source_captured_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -208,12 +211,14 @@ class CameraProvider:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._freshness_budget_seconds = budget
         self._lock = threading.RLock()
+        self._frame_ready = threading.Condition(self._lock)
         self._latest: CameraFrame | None = None
         self._sequence = 0
         self._dropped_frames = 0
         self._stream_owner: str | None = None
         self._stream_identity: CameraIdentity | None = None
         self._stream_accepting = False
+        self._preview_stopper = None
         self._led_fd: int | None = None
         self._led_leaf: Any = None
         self._led_binding: Any = None
@@ -326,8 +331,27 @@ class CameraProvider:
         """Read-only GET_LEN/INFO preflight; never register/bank writes."""
         return self._illumination("probe")
 
+    def bind_preview_stopper(self, stopper) -> None:
+        """Use the existing stream service to stop and reap its process."""
+        with self._lock:
+            self._preview_stopper = stopper
+
+    def _stop_inspection_preview(self) -> None:
+        # Reaping calls end_stream, which acquires our lock: never hold it
+        # while asking the event-loop-owned stream service to stop.
+        with self._lock:
+            stopper = self._preview_stopper if self._stream_owner is not None else None
+        if stopper is not None:
+            stopper()
+
+    def prepare_inspection(self) -> dict[str, Any]:
+        """Stop preview before discovery; preserve an initialized LED binding."""
+        self._stop_inspection_preview()
+        return self._illumination("ensure_initialized")
+
     def initialize_illumination(self) -> dict[str, Any]:
-        """Explicit source discovery for inspection or operator illumination."""
+        """Explicit source discovery after the existing preview owner is reaped."""
+        self._stop_inspection_preview()
         return self._illumination("initialize")
 
     def set_illumination(self, *, channel: int, on: bool) -> dict[str, Any]:
@@ -382,6 +406,7 @@ class CameraProvider:
                 self._close_illumination()
                 self._stream_accepting = False
                 self._latest = None
+                self._frame_ready.notify_all()
 
     def end_stream(self, owner: str) -> None:
         """Release only after the corresponding process is reaped."""
@@ -393,6 +418,7 @@ class CameraProvider:
                 self._stream_accepting = False
                 self._latest = None
                 self._generation = self._generation % MAX_PROVIDER_GENERATION + 1
+                self._frame_ready.notify_all()
 
     def drop_stream_frame(self, owner: str, *, invalid: bool = False, count: int = 1) -> None:
         with self._lock:
@@ -401,36 +427,46 @@ class CameraProvider:
                 if invalid:
                     self._latest = None
 
-    def publish_stream_frame(self, owner: str, content: bytes) -> CameraFrame:
+    def publish_stream_frame(
+        self, owner: str, content: bytes, *, source_captured_at: datetime | None = None,
+    ) -> CameraFrame:
         with self._lock:
             if self._stream_owner != owner or not self._stream_accepting:
                 raise CameraFrameUnavailable("obsolete camera stream owner")
             assert self._stream_identity is not None
             # Only exact immutable bytes from this owner's retained, validated
-            # frame qualify. Changed/untrusted payloads still receive full decode.
+            # frame qualify. Changed/untrusted payloads still receive decode.
             latest = self._latest
             if (type(content) is bytes and latest is not None
                     and type(latest.content) is bytes
                     and latest.provider_generation == self._generation
                     and latest.identity == self._stream_identity
                     and content == latest.content):
-                return self._publish(latest.content, self._stream_identity)
+                return self._publish(latest.content, self._stream_identity,
+                                     source_captured_at=source_captured_at)
             try:
-                self._validate_jpeg(content)
+                self._validate_jpeg(content, reduced_stream=type(content) is bytes)
             except CameraError:
                 self.drop_stream_frame(owner, invalid=True)
                 raise
-            return self._publish(content, self._stream_identity)
+            return self._publish(content, self._stream_identity,
+                                 source_captured_at=source_captured_at)
 
-    def _publish(self, content: bytes, identity: CameraIdentity) -> CameraFrame:
+    def _publish(
+        self, content: bytes, identity: CameraIdentity, *,
+        source_captured_at: datetime | None = None,
+    ) -> CameraFrame:
         captured_at = self._aware_now()
         self._sequence += 1
         frame = CameraFrame(
             content=content, sequence=self._sequence, captured_at=captured_at,
             provider_generation=self._generation,
             content_sha256=hashlib.sha256(content).hexdigest(), identity=identity,
+            source_captured_at=source_captured_at,
         )
         self._latest = frame
+        with self._frame_ready:
+            self._frame_ready.notify_all()
         return frame
 
     @property
@@ -470,9 +506,25 @@ class CameraProvider:
             return matches[0]
 
     def capture(self) -> CameraFrame:
+        requested_at = self._aware_now()
+        deadline = time.monotonic() + CAPTURE_TIMEOUT_SECONDS
         with self._lock:
             if self._stream_owner is not None:
-                return self.latest()
+                owner, generation = self._stream_owner, self._generation
+                # Old source packets can arrive after this request: neither
+                # sequence nor publication time is an acquisition boundary.
+                # The existing owner keeps reading; identical images are valid.
+                while (self._stream_owner == owner and self._stream_accepting
+                       and self._generation == generation):
+                    frame = self._latest
+                    if (frame is not None and frame.source_captured_at is not None
+                            and frame.source_captured_at > requested_at):
+                        return frame
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise CameraFrameUnavailable("camera post-request source frame timed out")
+                    self._frame_ready.wait(remaining)
+                raise CameraFrameUnavailable("camera stream ended during capture")
             identity = self.discover()
             argv = [
                 "ffmpeg",
@@ -493,6 +545,8 @@ class CameraProvider:
                 "image2pipe",
                 "-vcodec",
                 "mjpeg",
+                "-vsync",
+                "0",
                 "pipe:1",
             ]
             try:
@@ -773,7 +827,7 @@ class CameraProvider:
         return max(0.0, (self._aware_now() - frame.captured_at).total_seconds())
 
     @staticmethod
-    def _validate_jpeg(content: bytes) -> None:
+    def _validate_jpeg(content: bytes, *, reduced_stream: bool = False) -> None:
         if len(content) > MAX_JPEG_BYTES:
             raise CameraUnavailable("camera JPEG exceeds bounded frame size")
         if not content.startswith(b"\xff\xd8") or not content.endswith(b"\xff\xd9"):
@@ -782,6 +836,20 @@ class CameraProvider:
             with Image.open(io.BytesIO(content)) as image:
                 if image.format != "JPEG" or image.size != (640, 480):
                     raise CameraUnavailable("camera capture is not a 640x480 JPEG")
+                # Validate original dimensions/format before draft changes size.
+                # Only the qualified sequential YCbCr layouts use the discarded
+                # 80x60 grayscale raster. Still entropy-decode with the shipped
+                # Pillow tolerance; never replace decoding with header checks.
+                # Other encodings and capture/inspection retain full decoding.
+                if (reduced_stream and image.mode == "RGB"
+                        and not image.info.get("progressive")
+                        and "adobe" not in image.info
+                        and [(c, h, v) for c, h, v, _q in getattr(image, "layer", ())] in (
+                            [(1, 1, 1), (2, 1, 1), (3, 1, 1)],
+                            [(1, 2, 1), (2, 1, 1), (3, 1, 1)],
+                            [(1, 2, 2), (2, 1, 1), (3, 1, 1)],
+                        )):
+                    image.draft("L", (80, 60))
                 image.load()
         except CameraUnavailable:
             raise

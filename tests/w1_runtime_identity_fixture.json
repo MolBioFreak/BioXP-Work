@@ -1,0 +1,83 @@
+{
+  "provenance": "Synthetic offline infrastructure identity. Existing legal schema shape copied from retained reader, not deployed-source proof or controller evidence. All events/results are produced separately at the controlled exchange seam.",
+  "release_identity": {
+    "binding": {
+      "configuration_sha256": "3a00213b8dc2f48991c05bedce558668bd8af01ed0bcd931521bc259ac05e828",
+      "database_root": "/app/.oem_runtime_state",
+      "declared_listener": {
+        "host": "0.0.0.0",
+        "port": 8123
+      },
+      "launcher_cgroup_sha256": "a7754e4d2f7c64ba026e32c55e355477ca071d2cdee9fd1b1b344a08d50ca5ef",
+      "launcher_path": "/usr/local/libexec/bioxp-release-container-run",
+      "launcher_pid": 198931,
+      "launcher_sha256": "fc99bd12cc6b84c6af6290c9a1055246844a807937ee63141e09eac12e1f31a5",
+      "observed_listener": {
+        "host": "0.0.0.0",
+        "owner_cgroup_sha256": "a7754e4d2f7c64ba026e32c55e355477ca071d2cdee9fd1b1b344a08d50ca5ef",
+        "owner_pid": 199133,
+        "port": 8123,
+        "socket_inode": 858564
+      },
+      "oem_lock_path": "/var/lib/bioxp-oem-authority/OEM_EVIDENCE_LOCK.json",
+      "oem_lock_sha256": "a69454df24e9348fd34d8c89f2a2e089576587152bdcc20754f9d700ecbaf03c",
+      "service_unit": "bioxp-api.service",
+      "systemd_invocation_id": "950d4d904af6490b93790e02dfb42531",
+      "udocker_path": "/opt/bioxp/udocker-runtime/venv/bin/udocker",
+      "udocker_sha256": "7bea7bc7c2bf287171b31c1c57662846ee88188e4543519f72d98579f4fc413b",
+      "udocker_tree_sha256": null,
+      "unit_path": "/etc/systemd/system/bioxp-api.service",
+      "unit_sha256": "20ef2abc10f0053db35b778482816a137a0ac7d404b5589a40845667a6606fde"
+    },
+    "deployment": {
+      "installed_at": "2026-09-29T00:49:35Z",
+      "receipt_id": "controlled-w1-not-deployed",
+      "receipt_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "image": {
+      "id": "sha256:69196d38b74a752c9f3ad8aa91b7616b9ebcbb4af34509ca2cd6cbb8ef6f6aac",
+      "inspection_receipt_sha256": "2b4150fa146bb07f12bd2230afd86bf612321f10a6fce383055b3f5546a16017"
+    },
+    "observation": {
+      "cgroup": "0::/system.slice/bioxp-api.service",
+      "cgroup_sha256": "a7754e4d2f7c64ba026e32c55e355477ca071d2cdee9fd1b1b344a08d50ca5ef",
+      "database_root": "/app/.oem_runtime_state",
+      "listener": {
+        "host": "0.0.0.0",
+        "owner_cgroup_sha256": "a7754e4d2f7c64ba026e32c55e355477ca071d2cdee9fd1b1b344a08d50ca5ef",
+        "owner_pid": 199133,
+        "port": 8123,
+        "socket_inode": 858564
+      },
+      "pid": 199133,
+      "started_at": 1790643150.62
+    },
+    "reason": null,
+    "release_id": "controlled-w1-offline-fixture",
+    "runtime_release_receipt": {
+      "receipt_id": "runtime-release-847610a22780415cb7ae9b39ca264b52",
+      "receipt_sha256": "ae3855145e366507366bc37268ca25bbe31ffe1984deadfc53c52ae648df6f0b",
+      "recorded_at": 1790643174.7235563
+    },
+    "schema": "bioxp.runtime.release_identity.v1",
+    "source": {
+      "aggregate_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "commit": "e11351e282c9e2df35187aa704e73cd5ea0e0877",
+      "host_path": "/controlled-w1",
+      "manifest_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "mode": "exact_commit_materialization",
+      "root": "/controlled-w1",
+      "tree": "c09ddb6062cf1159e01b4aefb8ee85a706dbe611"
+    },
+    "status": "verified",
+    "verified": true
+  },
+  "evidence_authority": {
+    "acquisition_id": "20260719T024740Z-4a7fe6783205846c",
+    "evidence_lock_identity_verified": true,
+    "evidence_lock_path": "/app/.oem_lock/OEM_EVIDENCE_LOCK.json",
+    "evidence_lock_schema": "bioxp.oem_evidence_lock.v4",
+    "evidence_lock_sha256": "a69454df24e9348fd34d8c89f2a2e089576587152bdcc20754f9d700ecbaf03c"
+  },
+  "registry_sha256": "2eea910263c00f2b9f2edbb81112cea7054658205173623975e0699c12287dec"
+}

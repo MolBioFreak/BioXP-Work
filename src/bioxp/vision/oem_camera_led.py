@@ -219,10 +219,6 @@ class SmiUvcLed:
         self._query(UVC_SET_CUR, address_data)
         self._query(UVC_SET_CUR, value_data)
 
-    def read_register(self, address: int) -> int:
-        """Not GET-only: selecting a register sends SET_CUR first."""
-        with self._lock:
-            return self._read(address)
 
     def discover_dsp_type(self) -> int:
         """Source AC50 bank/0213 discovery, not complete CreateDeviceObject.

@@ -258,21 +258,6 @@ class BioXpCanDriver:
             return True
         return False
 
-    @staticmethod
-    def _command_lifecycle_ok(provenance: Any, *, wait_for_completion: bool) -> bool:
-        if not isinstance(provenance, dict) or provenance.get("immediate_ack_received") is not True:
-            return False
-        if wait_for_completion:
-            return bool(
-                provenance.get("ok") is True
-                and provenance.get("completion_received") is True
-                and provenance.get("completion_deferred") is not True
-            )
-        return bool(
-            provenance.get("ok") is True
-            and provenance.get("completion_received") is not True
-            and provenance.get("completion_deferred") is True
-        )
 
     def _receive_reply(self, *, timeout_s: float, ack_mode: str, expected_arbitration_id: int | None = None) -> dict[str, Any]:
         recv = getattr(self.bus, 'recv', None)

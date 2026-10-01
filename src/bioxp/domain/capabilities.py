@@ -91,12 +91,6 @@ class CapabilityRegistry:
             )
         return capability
 
-    def enabled_names(self) -> tuple[CapabilityName, ...]:
-        return tuple(
-            capability.name
-            for capability in self._capabilities.values()
-            if capability.enabled
-        )
 
     def as_dict(self) -> dict[str, dict[str, Any]]:
         return {

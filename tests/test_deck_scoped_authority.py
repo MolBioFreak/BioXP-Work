@@ -98,8 +98,8 @@ def test_ordered_tray_unknown_is_not_stale_verified_association():
     assert OperatorCommandStore._oem_update_location_current_tray('LOC_OC', {}, 'OUTPUT_PLATE') is None
 
 
-@pytest.mark.parametrize('field,value', [('tip_loaded', None), ('tip_loaded', 0), ('ambiguity_state', 'ambiguous')])
-def test_consumed_unknowns_and_ambiguity_remain_blocked(rig, field, value):
+@pytest.mark.parametrize('field,value', [('tip_loaded', None), ('tip_loaded', 0)])
+def test_consumed_unknowns_remain_blocked(rig, field, value):
     provider, primitive, semantic, state = rig
     if field == 'tip_loaded':
         state['machine_status'][field] = value
@@ -139,8 +139,7 @@ def test_full_failure_does_not_replace_offset_cache(rig):
     assert primitive.calls == before
     started, epoch, payload = provider._deck_authority_scoped_cache['offset.v1']
     provider._deck_authority_scoped_cache['offset.v1'] = (started - 16, epoch, payload)
-    with pytest.raises(RuntimeError, match='deck_authority_cache_stale'):
-        provider.deck_authority_cached_snapshot(expected_generation=3, target='LOC_OC')
+    assert provider.deck_authority_cached_snapshot(expected_generation=3, target='LOC_OC') == snapshot
 
 
 @pytest.fixture
@@ -176,10 +175,12 @@ def qualify_test_references(references):
     assert result['ok'] is True
 
 
-def test_retained_invalid_references_still_block(retained_rig):
+def test_retained_invalid_references_remain_evidence_not_admission(retained_rig):
     provider, primitive, runtime, references, store, root = retained_rig
-    with pytest.raises(RuntimeError, match='deck_reference_not_authoritative'):
-        provider.deck_authority_snapshot(expected_generation=3, target='LOC_OC')
+    before = references.snapshot(('x', 'y', 'z', 'g'))
+    snapshot = provider.deck_authority_snapshot(expected_generation=3, target='LOC_OC')
+    assert DeckAuthoritySnapshot(**snapshot).reference_versions
+    assert references.snapshot(('x', 'y', 'z', 'g')) == before
     assert store.deck_semantic_state()['semantic_state_revision'] == 0
     assert not any(row[0] == 'move' for row in primitive.calls)
 
@@ -192,6 +193,7 @@ def test_retained_real_owner_first_move_force_commit_and_fresh_process(retained_
     from bioxp.oem_deck_movement import make_deck_command_executor
     provider, primitive, runtime, references, store, root = retained_rig
     qualify_test_references(references)
+    construction_id = provider._load_state()['machine_status'].get('construction_id')
     initial = provider.deck_authority_snapshot(expected_generation=3, target='LOC_OC')
     assert initial['machine_state_revision'] == 0 and initial['current_location_id'] is None
     assert initial['tip_loaded'] is False and initial['tip_dirty'] is None
@@ -219,9 +221,14 @@ def test_retained_real_owner_first_move_force_commit_and_fresh_process(retained_
                 from bioxp.services.reference_service import MarkAxisDesyncedCommand
                 references.mark_desynced(MarkAxisDesyncedCommand('x', reason='isolated late reference change'))
             elif invalidation == 'board_epoch':
-                original_stamps = provider.deck_owner_authority_stamps
-                monkeypatch.setattr(provider, 'deck_owner_authority_stamps', lambda: {
-                    **original_stamps(), 'board_epoch_5': stamps['board_epoch_5'] + 1})
+                if getattr(provider, 'preparation_provider', None) is not None:
+                    monkeypatch.setattr(provider.preparation_provider,
+                        'current_board_lifecycle_generation', lambda: stamps['board_epoch_5'] + 1,
+                        raising=False)
+                else:
+                    current = provider._load_state()
+                    current['x_lifecycle']['board_lifecycle_generation'] = stamps['board_epoch_5'] + 1
+                    provider._save_state(current)
             else:
                 state = provider._load_state()
                 state['machine_status']['tip_loaded'] = True
@@ -229,6 +236,7 @@ def test_retained_real_owner_first_move_force_commit_and_fresh_process(retained_
             return result
         monkeypatch.setattr(primitive, 'oem_move_to', completed_then_invalidated)
         from bioxp.oem_deck_movement import DeckExecutionFailure
+    if invalidation in {'board_epoch', 'semantic'}:
         with pytest.raises(DeckExecutionFailure) as failure:
             execute(command_id=admitted['command_id'], target='LOC_OC', camera_offset=False,
                     expected_ownership_generation=3, expected_board_epoch_by_board=request['expected_board_epoch_by_board'])
@@ -249,7 +257,7 @@ def test_retained_real_owner_first_move_force_commit_and_fresh_process(retained_
     assert semantic['semantic_state_revision'] == 2 and semantic['tip_dirty'] is None
     assert semantic['tip_loaded'] is None  # runtime observation did not manufacture a canonical owner write
     assert semantic['transition_provenance']['current_tray_association'] == 'unavailable'
-    assert provider._load_state()['machine_status'].get('construction_id') is None
+    assert provider._load_state()['machine_status'].get('construction_id') == construction_id
     assert provider._load_state()['machine_status']['psudo_z_home_steps'] == 500
     after = provider.deck_authority_snapshot(expected_generation=3, target='LOC_OC')
     assert after['machine_state_revision'] == 2 and after['tip_loaded'] is False

@@ -11,7 +11,6 @@ import signal
 import json
 import concurrent.futures
 import threading
-from pathlib import Path
 from typing import Any, Mapping, cast
 
 try:
@@ -420,9 +419,6 @@ class BioXpTester:
         # false at source unlock/caught-plate solenoid-write boundaries.
         self._oem_latch_status = True
         self._oem_latch_status_generation = 0
-        self._usb_sniff_ledger_path = None
-        self._usb_sniff_ledger_run_id = None
-        self._usb_sniff_ledger_seq = 0
         self._libc = ctypes.CDLL(None, use_errno=True)
         self.UVCIOC_CTRL_QUERY = self._build_uvc_ioctl_query()
         self._motion_arm = {
@@ -458,12 +454,6 @@ class BioXpTester:
                 cleanup_report=cleanup_report,
             ) from exc
 
-    def receiver_audit_status(self):
-        """Internal logging health only; does not rewrite motion admission."""
-        audit = getattr(self, "_receiver_audit", None)
-        return {"setup_error": getattr(self, "_receiver_audit_setup_error", None),
-                "buffer": audit.status() if audit is not None else None,
-                "router": self.novo_router.audit_status() if self.novo_router is not None else None}
 
     def _transport_guard(self):
         """Return the per-device reentrant endpoint-ownership lock.
@@ -829,62 +819,9 @@ class BioXpTester:
             "observed_ms": int(time.time() * 1000),
         }
 
-    def _remember_bus_event(self, resp, source="usb_in"):
-        event = self._decode_bus_event_frame(resp, source=source)
-        if event is None:
-            return None
-        self._bus_event_sequence = int(getattr(self, "_bus_event_sequence", 0)) + 1
-        event["event_sequence"] = self._bus_event_sequence
-        self._bus_event_buffer.append(event)
-        overflow = len(self._bus_event_buffer) - int(self._bus_event_buffer_max)
-        if overflow > 0:
-            del self._bus_event_buffer[:overflow]
-        return event
 
-    def set_usb_sniff_ledger_path(self, path=None, run_id=None):
-        """Enable/disable JSONL TX/RX ledger recording for external USB capture runs.
 
-        This is observability-only and never commands hardware by itself.
-        """
-        if path:
-            path = os.path.abspath(str(path))
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            self._usb_sniff_ledger_path = path
-            self._usb_sniff_ledger_run_id = str(run_id or "")
-            self._usb_sniff_ledger_seq = 0
-            self._record_usb_sniff_ledger("meta", event="ledger_enabled")
-            return {"ok": True, "enabled": True, "path": path, "run_id": self._usb_sniff_ledger_run_id}
-        old = self._usb_sniff_ledger_path
-        self._record_usb_sniff_ledger("meta", event="ledger_disabled")
-        self._usb_sniff_ledger_path = None
-        self._usb_sniff_ledger_run_id = None
-        return {"ok": True, "enabled": False, "previous_path": old, "run_id": str(run_id or "")}
 
-    def usb_sniff_ledger_status(self):
-        return {"enabled": bool(self._usb_sniff_ledger_path), "path": self._usb_sniff_ledger_path, "run_id": self._usb_sniff_ledger_run_id, "seq": self._usb_sniff_ledger_seq}
-
-    def _record_usb_sniff_ledger(self, direction, frame=None, **extra):
-        path = getattr(self, "_usb_sniff_ledger_path", None)
-        if not path:
-            return None
-        try:
-            self._usb_sniff_ledger_seq = int(getattr(self, "_usb_sniff_ledger_seq", 0)) + 1
-            raw = list(frame) if frame is not None else None
-            row = {
-                "schema_version": "bioxp.usb_driver_ledger.v1",
-                "seq": self._usb_sniff_ledger_seq,
-                "run_id": getattr(self, "_usb_sniff_ledger_run_id", None),
-                "ts_ms": int(time.time() * 1000),
-                "direction": str(direction),
-                "frame_len": len(raw) if raw is not None else None,
-                "raw": raw,
-            }
-            row.update(extra)
-            with open(path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(row, sort_keys=True, default=str) + "\n")
-            return row
-        except Exception:
-            return None
 
     def clear_bus_event_buffer(self):
         current = list(getattr(self, "_bus_event_buffer", []))
@@ -987,7 +924,6 @@ class BioXpTester:
         ordinary_motor_retry=False,
     ):
         frame = self._build_frame(board_id, command, cmd_type, motor, value)
-        self._record_usb_sniff_ledger("OUT", frame, source="send_tmcl", board=int(board_id), command=int(command), cmd_type=int(cmd_type), motor=int(motor), value=int(value), wait_reply=bool(wait_reply), write_timeout_ms=int(write_timeout_ms))
         router = getattr(self, "novo_router", None)
         if router is None:
             return None
@@ -1025,15 +961,10 @@ class BioXpTester:
             if ordinary_motor_retry:
                 time.sleep(0.010)
         except usb.core.USBTimeoutError:
-            self._record_usb_sniff_ledger("error", None, source="send_tmcl", error="usb_write_timeout", board=int(board_id), command=int(command), write_timeout_ms=int(write_timeout_ms))
             return None
         except usb.core.USBError as exc:
             # USB disconnect / ENODEV / EPIPE — return None so
             # _motor_noresp_streak increments and reconnect() fires.
-            self._record_usb_sniff_ledger("error", None,
-                source="send_tmcl", error=f"usb_error_{exc.errno}",
-                errno=exc.errno, errmsg=str(exc), board=int(board_id),
-                command=int(command), write_timeout_ms=int(write_timeout_ms))
             return None
 
         if not wait_reply:
@@ -1064,9 +995,6 @@ class BioXpTester:
             "provenance": transaction,
         }
 
-    def _wait_for_reply(self, board_id, command, strict_match, read_timeout_ms, max_reads):
-        del board_id, command, strict_match, read_timeout_ms, max_reads
-        raise RuntimeError("direct Novo receive is forbidden; use send_tmcl router transaction")
 
     def collect_bus_events(self, duration_s=0.50, timeout_ms=20, max_events=96):
         """Capture asynchronous TMCL frames without competing for endpoint ownership."""
@@ -1113,16 +1041,6 @@ class BioXpTester:
                 return r
         return None
 
-    def enable_motor_power(self):
-        """Reject the removed non-OEM command-14 "ESM relay" shim.
-
-        Decompiled ``ClassControlInterface.ESM`` delegates directly to the
-        selected board's ``activateBoard()``.  That method sends command 64;
-        it never writes command 14 type 0/1 on deck IO bank 2.
-        """
-        raise RuntimeError(
-            "non-OEM command-14 motor-power shim is disabled; use OEM board activation"
-        )
 
     def _record_oem_board_activation(self, board_id, *, active, ack):
         """Own IsInitialized evidence only at the OEM activate/deactivate boundary."""
@@ -1232,6 +1150,34 @@ class BioXpTester:
             "deactivation_complete": True,
             "activation_complete": True,
             "source_order": ["cmd64=0", "cmd64=1"],
+        }
+
+    def oem_bind_initialized_board_lifecycle_generation(self, *, transport_generation):
+        """Bind current accepted initialization, without claiming an off/on cycle.
+
+        Conditional activation invalidates the old profile/generation itself.
+        With no activation, retain the existing native generation; a new host
+        binding needs no deactivation and supplies no historical reference proof.
+        """
+        current_transport = int(getattr(self, "_oem_transport_generation", 0))
+        initialized = self._oem_board_state()
+        if (current_transport != transport_generation
+                or not all(initialized.get(int(board)) is True for board in self.BOARDS)):
+            self._oem_active_board_lifecycle_generation = None
+            return {"ok": False, "failure": "current_board_initialization_incomplete_or_transport_changed"}
+        generation = self.oem_current_board_lifecycle_generation()
+        reused = generation is not None
+        if not reused:
+            generation = int(getattr(self, "_oem_board_lifecycle_generation", 0)) + 1
+            self._oem_board_lifecycle_generation = generation
+            self._oem_active_board_lifecycle_generation = generation
+        return {
+            "ok": True,
+            "board_lifecycle_generation": generation,
+            "transport_generation": current_transport,
+            "reused": reused,
+            "initialized_boards": sorted(int(board) for board in self.BOARDS),
+            "binding_source": "current_oem_initialized_state",
         }
 
     def oem_current_board_lifecycle_generation(self):
@@ -2062,52 +2008,14 @@ class BioXpTester:
             "elapsed_ms": int((time.time() - t0) * 1000),
         }
 
-    def bus_health(self, cycles=20, interval_s=0.30):
-        stats = {bid: {"ok": 0, "noresp": 0, "last": "n/a"} for bid in self.BOARDS}
-        all_dead_streak = 0
-        for i in range(cycles):
-            line = [f"{i+1:02d}/{cycles}"]
-            cycle_ok = 0
-            for bid in self.BOARDS:
-                r = self.send_tmcl_retry(
-                    bid,
-                    64,
-                    0,
-                    0,
-                    1,
-                    attempts=1,
-                    wait_reply=True,
-                    write_timeout_ms=35,
-                    read_timeout_ms=30,
-                    max_reads=10,
-                    strict_match=True,
-                )
-                if r is None:
-                    stats[bid]["noresp"] += 1
-                    stats[bid]["last"] = "no resp"
-                    line.append(f"0x{bid:02X}:NR")
-                else:
-                    stats[bid]["ok"] += 1
-                    stats[bid]["last"] = r["status_str"]
-                    line.append(f"0x{bid:02X}:{r['status_str'][:3]}")
-                    cycle_ok += 1
-                time.sleep(0.003)
-            print("  " + " ".join(line))
-            if cycle_ok == 0:
-                all_dead_streak += 1
-            else:
-                all_dead_streak = 0
-            if all_dead_streak >= 2:
-                print("  [auto] all boards no-response streak; reconnecting USB interface...")
-                self.reconnect()
-                all_dead_streak = 0
-            time.sleep(interval_s)
-        return stats
 
-    def latch_oem(self, locked):
+    def latch_oem(self, locked, *, activate_first=True):
         state = 1 if locked else 0
         t0 = time.time()
-        self.activate_boards(expect_reply=False)
+        # Recovery's shared preparation already owns board activation. Preserve
+        # standalone callers without reactivating prepared boards behind it.
+        if activate_first:
+            self.activate_boards(expect_reply=False)
 
         # OEM-equivalent write: board 0x05, cmd14, type2, motor0, value {0|1}
         ack = self.send_tmcl_retry(
@@ -2145,63 +2053,6 @@ class BioXpTester:
             "elapsed_ms": int((time.time() - t0) * 1000),
         }
 
-    def latch_compat(self, locked):
-        state = 1 if locked else 0
-        t0 = time.time()
-        sent = 0
-        got = 0
-
-        # Compatibility mode: long timeouts + broad SIO path.
-        self.activate_boards(expect_reply=False)
-
-        primary = self.send_tmcl(
-            self.BOARD_DECK,
-            14,
-            2,
-            0,
-            state,
-            wait_reply=True,
-            write_timeout_ms=120,
-            read_timeout_ms=120,
-            max_reads=24,
-            strict_match=False,
-        )
-        sent += 1
-        if primary is not None:
-            got += 1
-
-        for bid in self.BOARDS:
-            self.send_tmcl(bid, 14, 2, 0, state, wait_reply=False, write_timeout_ms=40)
-            sent += 1
-            time.sleep(0.01)
-
-        for bid in self.BOARDS:
-            for port in range(8):
-                r = self.send_tmcl(
-                    bid,
-                    14,
-                    port,
-                    0,
-                    state,
-                    wait_reply=True,
-                    write_timeout_ms=120,
-                    read_timeout_ms=100,
-                    max_reads=20,
-                    strict_match=False,
-                )
-                sent += 1
-                if r is not None:
-                    got += 1
-                time.sleep(0.03)
-
-        snap = self.io_snapshot(self.BOARD_DECK)
-        return {
-            "primary": primary,
-            "snapshot": snap,
-            "sent": sent,
-            "got": got,
-            "elapsed_ms": int((time.time() - t0) * 1000),
-        }
 
     def latch_oneshot(self, locked, broad=False):
         """
@@ -2323,39 +2174,6 @@ class BioXpTester:
             "elapsed_ms": int((time.time() - t0) * 1000),
         }
 
-    def led_mask_scaled(self, mask, intensity, broad=False):
-        val = self._led_scale_to_tmcl(intensity)
-        out = self.led_write(mask=int(mask), value=val, broad=broad, retries=2)
-        out["intensity"] = self._clamp_u8(intensity)
-        out["tmcl_value"] = val
-        return out
-
-    def led_logo_pwm_raw(self, pwm_raw, broad=False):
-        # setLogoPWM forwards user integer directly to setLED(mask=3, intensity=pwm_raw)
-        out = self.led_write(mask=3, value=int(pwm_raw), broad=broad, retries=2)
-        out["pwm_raw"] = int(pwm_raw)
-        return out
-
-    def led_rgb_scaled(self, r, g, b, broad=False):
-        t0 = time.time()
-        rr = self.led_mask_scaled(0, r, broad=broad)
-        gg = self.led_mask_scaled(1, g, broad=broad)
-        bb = self.led_mask_scaled(2, b, broad=broad)
-        sent = rr["sent"] + gg["sent"] + bb["sent"]
-        acks = {}
-        for bid in (self.BOARDS if broad else [self.BOARD_DECK]):
-            acks[bid] = {
-                "r": rr["acks"].get(bid),
-                "g": gg["acks"].get(bid),
-                "b": bb["acks"].get(bid),
-            }
-        return {
-            "rgb": (self._clamp_u8(r), self._clamp_u8(g), self._clamp_u8(b)),
-            "board_mode": "broad" if broad else f"0x{self.BOARD_DECK:02X}",
-            "acks": acks,
-            "sent": sent,
-            "elapsed_ms": int((time.time() - t0) * 1000),
-        }
 
     def led_firstpath_restart(self, leave_on=True):
         """
@@ -2405,34 +2223,6 @@ class BioXpTester:
             time.sleep(0.35)
         return {"status": st, "steps": out}
 
-    def led_firstpath_matrix(self):
-        """
-        Exhaustive but bounded probe for OEM cmd50 across boards/masks/values.
-        """
-        self.reconnect()
-        st = self.activate_boards(expect_reply=True)
-        values = [0, 64, 255, 1024, 4095]
-        masks = [3, 0, 1, 2]
-        rows = []
-        for bid in self.BOARDS:
-            for mask in masks:
-                for value in values:
-                    ack = self.send_tmcl_retry(
-                        bid,
-                        50,
-                        0,
-                        mask,
-                        value,
-                        attempts=2,
-                        wait_reply=True,
-                        write_timeout_ms=55,
-                        read_timeout_ms=65,
-                        max_reads=16,
-                        strict_match=True,
-                    )
-                    rows.append({"board": bid, "mask": mask, "value": value, "ack": ack})
-                    time.sleep(0.03)
-        return {"status": st, "rows": rows}
 
     def strip_set_rgb(
         self,
@@ -2982,53 +2772,7 @@ class BioXpTester:
             "speed_source": speed_source,
         }
 
-    def motor_x_terminal_status(self):
-        """Return one fresh, ACK-qualified serial-206 X controller snapshot."""
-        board = int(self.BOARD_DECK)
-        motor = 0
-        readbacks = {}
-        failures = []
-        for parameter in (1, 3, 4, 5, 6, 9, 10, 12, 13, 205):
-            row = self.motor_get_axis_param(board, parameter, motor=motor)
-            value = row.get("value") if isinstance(row, dict) else None
-            valid = bool(
-                isinstance(row, dict)
-                and self._tmcl_success(row.get("ack"))
-                and type(value) is int
-            )
-            readbacks[str(parameter)] = {**row, "valid": valid}
-            if not valid:
-                failures.append(parameter)
-        return {
-            "schema_version": "bioxp.serial206_x_terminal_status.v1",
-            "board": board,
-            "motor": motor,
-            "readbacks": readbacks,
-            "position": readbacks["1"].get("value"),
-            "speed": readbacks["3"].get("value"),
-            "max_speed": readbacks["4"].get("value"),
-            "max_acceleration": readbacks["5"].get("value"),
-            "max_current": readbacks["6"].get("value"),
-            "left_switch": readbacks["9"].get("value"),
-            "right_switch": readbacks["10"].get("value"),
-            "right_switch_disabled": readbacks["12"].get("value"),
-            "left_switch_disabled": readbacks["13"].get("value"),
-            "stall_guard": readbacks["205"].get("value"),
-            "failures": failures,
-            "ok": not failures,
-        }
 
-    def motor_x_reconcile_switch_masks(self):
-        """Retired replacement repair; recovered OEM X initialization emits no mask writes."""
-        return {
-            "ok": False,
-            "retired": True,
-            "axis": "x",
-            "source_exact": False,
-            "physical_motion_commanded": False,
-            "physical_effect_verified": False,
-            "failure": "recovered_oem_x_initialization_has_no_switch_mask_reconciliation",
-        }
 
     def motor_oem_set_xy_current_mode(self, enabled, *, sleep_fn=time.sleep):
         """Execute exact ClassControlInterface.enableXY current ordering."""
@@ -3531,8 +3275,6 @@ class BioXpTester:
             "warning": "commissioning override only; independent physical clearance/operator watch required before any motion",
         }
 
-    def motion_last_strict_init_report(self):
-        return self._motion_last_strict_init
 
     def motion_disarm(self, reason="manual", note=None):
         prev_seq = 0
@@ -5191,30 +4933,6 @@ class BioXpTester:
             "ok": self._tmcl_success(ack),
         }
 
-    def motor_move_right(self, board_id, speed=250, motor=0):
-        # TMCL rotate-right counterpart retained only as an explicitly non-OEM
-        # diagnostic direction primitive; OEM Z authority never selects it.
-        vel = max(1, abs(int(speed)))
-        ack = self._send_motor(
-            int(board_id),
-            1,
-            0,
-            int(motor),
-            vel,
-            attempts=1,
-            wait_reply=True,
-            write_timeout_ms=55,
-            read_timeout_ms=70,
-            max_reads=18,
-            strict_match=True,
-        )
-        return {
-            "board": int(board_id),
-            "motor": int(motor),
-            "speed": vel,
-            "ack": ack,
-            "ok": self._tmcl_success(ack),
-        }
 
     def motor_query_home_switch(self, board_id, motor=0):
         row = self.motor_get_axis_param(board_id, 9, motor=motor)
@@ -5909,6 +5627,14 @@ class BioXpTester:
             "set_home": go_home.get("set_home") if isinstance(go_home, dict) else None,
             "source_return_code": go_home.get("source_return_code") if isinstance(go_home, dict) else None,
             "switch_transition": go_home.get("switch_transition") if isinstance(go_home, dict) else None,
+            # OEM axisSearchHome returns goHome's result; carry its controller
+            # facts up so callers see the same proof the inner goHome reported.
+            "controller_command_acknowledged": bool(
+                isinstance(go_home, dict) and go_home.get("controller_command_acknowledged") is True),
+            "controller_terminal_state_verified": bool(
+                isinstance(go_home, dict) and go_home.get("controller_terminal_state_verified") is True),
+            "controller_home_proof_verified": bool(
+                isinstance(go_home, dict) and go_home.get("controller_home_proof_verified") is True),
         }
 
 
@@ -6721,25 +6447,6 @@ class BioXpTester:
             "ok": ok,
         }
 
-    def motor_capture_thermal_door_state(self) -> dict:
-        from .oem_initialization import classify_thermal_door_state
-
-        status = self.motor_thermal_door_status()
-        return {
-            "status": status,
-            "classified": classify_thermal_door_state(status),
-            "source_mode": "ControlLib.rehome door_state_capture",
-        }
-
-    def motor_plan_thermal_door_restore(self, *, restore_requested=True) -> dict:
-        from .oem_initialization import build_thermal_door_state_restore_plan
-
-        capture = self.motor_capture_thermal_door_state()
-        plan = build_thermal_door_state_restore_plan(capture["status"], restore_requested=restore_requested)
-        return {
-            "capture": capture,
-            "restore_plan": plan,
-        }
 
     def motor_oem_confirm_thermal_door_closed(self) -> dict:
         """Only confirmAxis(tcDoorClosed), not the diagnostic status sweep."""
@@ -7531,180 +7238,6 @@ class BioXpTester:
             "restore_current": None,
         }
 
-    def motor_oem_home_xy(self, *, timeout_s=30.0):
-        """Direct source-mode surface for OEM HomeXY.
-
-        OEM HomeXY sets X/Y speed+acc to 200, launches X and Y goHome(false,
-        axis, 200, true) concurrently via Task.Run/WaitAll semantics, then
-        restores the normal axis profiles.
-        """
-        t0 = time.time()
-        px = self._motion_oem_axis_profile("x")
-        py = self._motion_oem_axis_profile("y")
-        board_presence = {
-            "x": self._oem_board_present(int(px["board"])),
-            "y": self._oem_board_present(int(py["board"])),
-        }
-        if not all(board_presence.values()):
-            return {
-                "ok": True,
-                "source_mode": "HomeXY",
-                "source_noop": True,
-                "source_return": None,
-                "source_return_semantics": "null_when_either_board_absent",
-                "board_presence": board_presence,
-                "command_issued": False,
-                "physical_motion_commanded": False,
-                "controller_command_acknowledged": False,
-                "elapsed_ms": int((time.time() - t0) * 1000),
-            }
-        out = {
-            "ok": False,
-            "source_mode": "HomeXY",
-            "oem_reference": "ClassControlInterface.HomeXY lines 5054-5067",
-            "implementation_note": "oem_task_run_waitall_parallel_goHome_false_speed200",
-            "parallel_oem_semantics": True,
-            "live_parallel_execution": True,
-            "set_xy_speedacc_200": {},
-            "homes": {},
-            "home_errors": {},
-            "restore_xy_speedacc": {},
-        }
-        for axis, preset in (("x", px), ("y", py)):
-            board = int(preset["board"])
-            motor = int(preset["motor"])
-            out["set_xy_speedacc_200"][axis] = {
-                "speed": self.motor_set_axis_param(board, 4, 200, motor=motor),
-                "acc": self.motor_set_axis_param(board, 5, 200, motor=motor),
-            }
-        # Preserve OEM Task.Run/WaitAll at the axis-operation layer. Shared
-        # endpoint ownership is independently serialized per complete TMCL
-        # transaction by `_transport_lock`, so the tasks cannot steal replies.
-        out["live_parallel_execution"] = True
-        out["implementation_note"] = "oem_task_run_waitall_with_transaction_serialized_usb"
-        home_exceptions = []
-
-        def _run_home(axis):
-            return self.motor_oem_go_home(
-                axis,
-                speed=200,
-                rehome=False,
-                timeout_s=30.0,
-                require_switch_transition=False,
-            )
-
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix="bioxp-homexy",
-        ) as pool:
-            futures = {axis: pool.submit(_run_home, axis) for axis in ("x", "y")}
-            for axis in ("x", "y"):
-                try:
-                    out["homes"][axis] = futures[axis].result()
-                except Exception as exc:
-                    home_exceptions.append(exc)
-                    out["home_errors"][axis] = {
-                        "type": type(exc).__name__,
-                        "message": str(exc),
-                    }
-
-        if home_exceptions:
-            raise home_exceptions[0]
-
-        home_tasks_ok = bool(
-            not out["home_errors"]
-            and all(axis in out["homes"] for axis in ("x", "y"))
-        )
-        if not home_tasks_ok:
-            out["failure"] = "HomeXY_task_failure"
-            out["elapsed_ms"] = int((time.time() - t0) * 1000)
-            return out
-
-        # OEM performs these writes only after Task.WaitAll returns normally.
-        for axis, preset in (("x", px), ("y", py)):
-            preset = dict(preset)
-            board = int(preset["board"])
-            motor = int(preset["motor"])
-            out["restore_xy_speedacc"][axis] = {
-                "speed": self.motor_set_axis_param(board, 4, int(preset.get("speed", 1700 if axis == "x" else 1800)), motor=motor),
-                "acc": self.motor_set_axis_param(board, 5, int(preset.get("acc", 350 if axis == "x" else 400)), motor=motor),
-            }
-
-        out["ok"] = True
-        out["elapsed_ms"] = int((time.time() - t0) * 1000)
-        return out
-
-
-
-
-
-
-
-    def motor_oem_axis_already_home(self, axis_key, *, tolerance_steps=2):
-        """Return a no-motion OEM reference proof when an axis is already on home.
-
-        This is intentionally conservative.  It exists for the live-observed Z case
-        where the axis can start at the active top/home predicate near 0/-1 and a
-        forced re-search would trip the false-home transition guard.
-        """
-        preset = self._motion_oem_axis_profile(axis_key, startup=True)
-        board = int(preset["board"])
-        motor = int(preset["motor"])
-        key = str(axis_key).strip().lower()
-        active_value = int(self.MOTOR_SWITCH_ACTIVE_VALUE)
-        position = self.motor_get_position(board, motor=motor)
-        speed = self.motor_get_speed(board, motor=motor)
-        home = self.motor_query_home_switch(board, motor=motor)
-        switches = self.motor_get_switch_activity(board, motor=motor)
-        pos_value = position.get("position") if isinstance(position, dict) else None
-        speed_value = speed.get("speed") if isinstance(speed, dict) else None
-        home_value = home.get("value") if isinstance(home, dict) else None
-        near_reference = bool(
-            isinstance(position, dict)
-            and self._tmcl_success(position.get("ack"))
-            and type(pos_value) is int
-            and abs(int(pos_value)) <= int(tolerance_steps)
-        )
-        stopped = bool(
-            isinstance(speed, dict)
-            and self._tmcl_success(speed.get("ack"))
-            and type(speed_value) is int
-            and int(speed_value) == 0
-        )
-        predicate_active = bool(
-            isinstance(home, dict)
-            and self._tmcl_success(home.get("ack"))
-            and type(home_value) is int
-            and int(home_value) == active_value
-        )
-        # GAP10/right is diagnostic telemetry only for Z. It must never
-        # establish or supplement the authoritative GAP9 home predicate.
-        live_z_reference_active = False
-        ok = bool(stopped and near_reference and predicate_active)
-        return {
-            "axis": key,
-            "board": board,
-            "motor": motor,
-            "ok": ok,
-            "already_home": ok,
-            "physical_motion_commanded": False,
-            "home_active_value": active_value,
-            "tolerance_steps": int(tolerance_steps),
-            "position": position,
-            "speed": speed,
-            "home": home,
-            "switches": switches,
-            "predicate_active": bool(predicate_active),
-            "live_z_reference_active": bool(live_z_reference_active),
-            "stopped": bool(stopped),
-            "near_reference": bool(near_reference),
-            "source_intent": "safe_reference_established_before_downstream_initialization",
-            "z_reference_contract": {
-                "accepted": bool(ok),
-                "reason": "Only acknowledged GAP9/home plus controller zero and speed zero can satisfy Z already-home proof; GAP10/right is diagnostic-only",
-            } if key == "z" else None,
-        }
-
 
 
     def motor_wait_stopped(
@@ -8032,32 +7565,6 @@ class BioXpTester:
             "elapsed_ms": int((time.time() - t0) * 1000),
         }
 
-    def motor_rotate(self, board_id, velocity, motor=0):
-        vel = int(abs(int(velocity)))
-        if vel == 0:
-            return self.motor_stop(board_id, motor=motor)
-        cmd = 1 if int(velocity) > 0 else 2  # ROR / ROL
-        ack = self._send_motor(
-            int(board_id),
-            cmd,
-            0,
-            int(motor),
-            vel,
-            attempts=1,
-            wait_reply=True,
-            write_timeout_ms=55,
-            read_timeout_ms=70,
-            max_reads=18,
-            strict_match=True,
-        )
-        return {
-            "board": int(board_id),
-            "motor": int(motor),
-            "cmd": cmd,
-            "velocity": int(velocity),
-            "ack": ack,
-            "ok": self._tmcl_success(ack),
-        }
 
     def motor_oem_stop_exact(self, board_id, motor=0):
         first = self._send_motor(
@@ -8135,26 +7642,6 @@ class BioXpTester:
     def motor_stop(self, board_id, motor=0):
         return self.motor_oem_stop_exact(board_id, motor=motor)
 
-    def motor_spin_test(self, board_id, velocity, seconds=2.0, motor=0):
-        dur = max(0.2, min(8.0, float(seconds)))
-        pre = self.motor_get_position(board_id, motor=motor)
-        start = self.motor_rotate(board_id, velocity, motor=motor)
-        time.sleep(dur)
-        stop = self.motor_stop(board_id, motor=motor)
-        post = self.motor_get_position(board_id, motor=motor)
-        return {
-            "board": int(board_id),
-            "motor": int(motor),
-            "velocity": int(velocity),
-            "seconds": dur,
-            "pre": pre,
-            "start": start,
-            "stop": stop,
-            "post": post,
-            "delta": None
-            if pre.get("position") is None or post.get("position") is None
-            else int(post["position"]) - int(pre["position"]),
-        }
 
     @staticmethod
     def _probe_switch_direction_guard(pre_left, pre_right, steps):
@@ -10382,46 +9869,7 @@ class BioXpTester:
     def _ffmpeg_available():
         return shutil.which("ffmpeg") is not None
 
-    @staticmethod
-    def _start_ffmpeg_keepalive(device="/dev/video0"):
-        if shutil.which("ffmpeg") is None:
-            return None
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "v4l2",
-            "-i",
-            device,
-            "-f",
-            "null",
-            "-",
-        ]
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            time.sleep(0.20)
-            return proc
-        except Exception:
-            return None
 
-    @staticmethod
-    def _stop_process(proc):
-        if proc is None:
-            return
-        try:
-            proc.terminate()
-            proc.wait(timeout=1.0)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
 
     @staticmethod
     def camera_usb_sysfs_paths(device="/dev/video0"):
@@ -11175,11 +10623,6 @@ def print_status(tester):
     print(f"Deck IO snapshot (0x05): {snap}")
 
 
-def fmt_ack_map(acks):
-    parts = []
-    for bid in sorted(acks):
-        parts.append(f"0x{bid:02X}:{fmt_resp(acks[bid])}")
-    return " ".join(parts)
 
 
 def fmt_rgb_acks(acks):
@@ -11535,53 +10978,6 @@ def _print_motion_gate_status(tester, refresh=True, snapshot=None):
     )
 
 
-def _print_strict_startup_report(out):
-    if not isinstance(out, dict):
-        print("No strict startup report.")
-        return
-    print(
-        f"strict startup init: ok={out.get('ok')} "
-        f"error_code={out.get('error_code')} "
-        f"time={out.get('elapsed_ms')}ms"
-    )
-    st = out.get("board_status", {})
-    print(
-        "board status:"
-        f" HEAD={fmt_resp(st.get(BioXpTester.BOARD_HEAD))}"
-        f" DECK={fmt_resp(st.get(BioXpTester.BOARD_DECK))}"
-        f" THERMAL={fmt_resp(st.get(BioXpTester.BOARD_THERMAL))}"
-    )
-    for key in ("pre_gate", "post_lock_gate", "final_gate"):
-        g = out.get(key, {})
-        rail = g.get("rail_24v", {})
-        print(
-            f"  {key}: ok={g.get('ok')} errors={g.get('error_keys')} "
-            f"io={g.get('io')} 24V_raw={rail.get('raw')} no24v={rail.get('no24v')}"
-        )
-    print("checks:")
-    for row in out.get("checks", []):
-        if row.get("ok"):
-            tag = "PASS"
-        elif bool(row.get("critical", True)):
-            tag = "FAIL"
-        else:
-            tag = "WARN"
-        print(f"  {tag} {row.get('name')}: {row.get('detail')}")
-    h = out.get("homing")
-    if isinstance(h, dict):
-        for label, key in (("Z", "z_home"), ("G", "g_home"), ("X", "x_home"), ("Y", "y_home"), ("DOOR", "door_home")):
-            hr = h.get(key, {})
-            print(
-                f"  home {label}: move={fmt_resp(hr.get('move_left', {}).get('ack'))} "
-                f"wait={hr.get('wait', {}).get('stopped')} "
-                f"set={fmt_resp(hr.get('sethome_final', {}).get('ack'))} "
-                f"home_after={hr.get('home_after', {}).get('value')}"
-            )
-    arm = out.get("arm_state", {})
-    print(
-        f"arm state: armed={arm.get('armed')} reason={arm.get('reason')} "
-        f"note={arm.get('note')} seq={arm.get('arm_seq')}"
-    )
 
 
 def _run_motor_clear_lock_action(tester):

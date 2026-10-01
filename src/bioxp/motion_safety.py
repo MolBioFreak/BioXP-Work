@@ -77,23 +77,6 @@ def _ack_status(value: Any) -> int | None:
     return int(status) if type(status) is int else None
 
 
-def _board_cycle_status(rows: Any, board: int) -> int | None:
-    row = rows.get(int(board)) if isinstance(rows, Mapping) else None
-    if isinstance(row, Mapping) and isinstance(row.get("ack"), Mapping):
-        row = row["ack"]
-    status = row.get("status") if isinstance(row, Mapping) else None
-    return int(status) if type(status) is int else None
-
-
-def _board_cycle_ok(rows: Any, boards: tuple[int, ...]) -> bool:
-    if not isinstance(rows, Mapping) or any(int(board) not in rows for board in boards):
-        return False
-    return all(
-        _board_cycle_status(rows, board) == 100
-        or (int(board) == 7 and _board_cycle_status(rows, board) == 2)
-        for board in boards
-    )
-
 
 def _stage(stage_id: str, status: str, source_anchor: str, evidence: Any) -> dict[str, Any]:
     return {
@@ -255,11 +238,9 @@ def prepare_motion_without_motion(
                 time.sleep(0.300)
         return _preparation_result(authority, ledger)
 
-    # A component refresh inside an already established lifecycle must not run
-    # initialCheck's machine-wide cmd64 cycle. In particular, X is on board 5
-    # while the gravity-loaded Z head is on board 4. Cycling every board and
-    # then restoring only X removes Z holding current. OEM initialCheck avoids
-    # that incomplete state by following the cycle with full motor setup.
+    # Normal preparation follows conditional ClassControlInterface.activateBoard,
+    # not initialCheck's explicit off/on cycle. Component refresh keeps its
+    # existing no-activation and no-latch-actuation semantics.
     cycle_boards = tuple(int(board) for board in authority.activation_boards)
     if reuse_current_board_lifecycle:
         generation_fn = getattr(driver, "oem_current_board_lifecycle_generation", None)
@@ -284,52 +265,29 @@ def prepare_motion_without_motion(
             "failure": None if lifecycle_ok else "current_board_lifecycle_unavailable_or_incomplete",
         }
     else:
-        # Normal production initialCheck is a complete ESM(false) -> ESM(true)
-        # transition over all four constructed OEM boards. Activation-only
-        # recovery is not equivalent and must not preserve a stale profile.
+        transport_generation = int(getattr(driver, "_oem_transport_generation", 0))
         try:
-            deactivation = driver.deactivate_boards(expect_reply=True, fail_fast=True)
-        except Exception as exc:
-            deactivation = {"error": f"{type(exc).__name__}: {exc}"}
-        deactivation_ok = _board_cycle_ok(deactivation, cycle_boards)
-        ledger.append(_stage(
-            "deactivateBoard",
-            "passed" if deactivation_ok else "failed",
-            "ControlLib.initialCheck ESM(head,false) -> Class*Board.deactivateBoard cmd64=0",
-            deactivation,
-        ))
-        if not deactivation_ok:
-            return _preparation_result(authority, ledger)
-
-        try:
-            activation = driver.activate_boards(expect_reply=True, fail_fast=True)
-        except Exception as exc:
-            activation = {"error": f"{type(exc).__name__}: {exc}"}
-        activation_ok = _board_cycle_ok(activation, cycle_boards)
-        ledger.append(_stage(
-            "activateBoard",
-            "passed" if activation_ok else "failed",
-            "ControlLib.initialCheck ESM(head,true) -> Class*Board.activateBoard cmd64=1",
-            activation,
-        ))
-        if not activation_ok:
-            return _preparation_result(authority, ledger)
-
-        try:
-            lifecycle = driver.oem_begin_board_lifecycle_generation(
-                deactivation=deactivation,
-                activation=activation,
+            activation = driver.oem_activate_uninitialized_boards()
+            lifecycle = driver.oem_bind_initialized_board_lifecycle_generation(
+                transport_generation=transport_generation,
             )
         except Exception as exc:
-            lifecycle = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            activation = {"error": f"{type(exc).__name__}: {exc}"}
+            lifecycle = {"ok": False, "error": activation["error"]}
         lifecycle_ok = isinstance(lifecycle, Mapping) and lifecycle.get("ok") is True
+        ledger.append(_stage(
+            "activateBoard",
+            "passed" if lifecycle_ok else "failed",
+            "ClassControlInterface.activateBoard:3474-3494; only uninitialized boards",
+            activation,
+        ))
     ledger.append(_stage(
         "boardLifecycleGeneration",
         "passed" if lifecycle_ok else "failed",
         (
             "Existing complete acknowledged OEM board lifecycle; component profile refresh emits no cmd64"
             if reuse_current_board_lifecycle
-            else "Linux evidence binding after complete acknowledged OEM cmd64=0 -> cmd64=1"
+            else "Linux binding to current initialized OEM boards; no deactivation"
         ),
         lifecycle,
     ))

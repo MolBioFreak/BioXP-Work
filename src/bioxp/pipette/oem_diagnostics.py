@@ -6,7 +6,7 @@ buttons consume m_PipetteHasTip, not observation age/provenance/generation.
 """
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Literal, Union
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .models import PipetteDiagnosticCommand, PipetteErrorLogCommand, PipetteInitCommand

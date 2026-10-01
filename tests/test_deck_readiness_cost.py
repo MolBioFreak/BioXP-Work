@@ -219,7 +219,7 @@ def test_api_preserves_base_publication_when_deck_yields_inside_lease(installed_
     assert result['deck_authority'] == {'available': False, 'reason': 'operator_action_pending'}
 
 
-def test_shared_scopes_keep_original_expiry(retained_rig, monkeypatch):
+def test_shared_scopes_do_not_expire_with_age(retained_rig, monkeypatch):
     from bioxp import oem_serial206_initialization as module
     provider, primitive, _, _, _, _ = retained_rig
     qualify_full_predecessor(retained_rig)
@@ -234,6 +234,5 @@ def test_shared_scopes_keep_original_expiry(retained_rig, monkeypatch):
     assert all(isinstance(row, dict) for row in snapshots.values())
     assert provider._deck_authority_scoped_cache['offset.v1'][0] == 100.0
     clock[0] = 115.0
-    for target in snapshots:
-        with pytest.raises(RuntimeError, match='deck_authority_cache_stale'):
-            provider.deck_authority_cached_snapshot(expected_generation=3, target=target)
+    for target, snapshot in snapshots.items():
+        assert provider.deck_authority_cached_snapshot(expected_generation=3, target=target) == snapshot

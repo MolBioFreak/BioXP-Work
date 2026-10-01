@@ -36,7 +36,7 @@ Deck-side latch/solenoid and IO sensor channels.
 Main strip RGB channels via deck board LED command path.
 
 ### Primary Methods
-- `led_write`, `led_mask_scaled`, `led_rgb_scaled`
+- `led_write`, `led_mask_scaled`
 - `strip_set_rgb`, `strip_set_pct`, `strip_on`, `strip_off`
 - `strip_rainbow_cycle`, `led_firstpath_restart`
 - `save_led_state`, `apply_saved_led_state`

@@ -91,11 +91,13 @@ def settle(rig, command_id):
 
 @pytest.mark.parametrize("endpoint", ["/operator/v2/actions/oem.z.clear", "/operator/actions/oem.z.clear"])
 @pytest.mark.parametrize("epochs", [{"4": 9}, {"5": 19}, {"6": 1}])
-def test_stale_or_unknown_supplied_epoch_rejected_before_leaf(direct_rig, endpoint, epochs):
+def test_stale_or_unknown_epoch_observation_does_not_deny_leaf(direct_rig, endpoint, epochs):
     r = direct_rig.client.post(endpoint, json=request(epochs))
-    assert r.status_code == 409, r.text
-    assert r.json()["detail"]["error"] == "board_epoch_mismatch"
-    assert direct_rig.delivered == []
+    assert r.status_code == 200, r.text
+    row = settle(direct_rig, r.json()["command_id"])
+    assert row["status"] == "completed", row
+    assert row["expected_board_epoch_by_board"] == epochs
+    assert direct_rig.delivered == ["clear"]
 
 
 def test_epochs_survive_durable_receipt_and_replay(direct_rig):
@@ -118,13 +120,13 @@ def test_epochs_survive_durable_receipt_and_replay(direct_rig):
     assert direct_rig.delivered == ["clear"]
 
 
-def test_drift_after_admission_is_rejected_by_dispatch_hook(direct_rig):
+def test_display_epoch_drift_after_admission_does_not_deny_dispatch(direct_rig):
     direct_rig.before_leaf[0] = lambda: direct_rig.epochs.update({"4": 11})
     r = direct_rig.client.post("/operator/v2/actions/oem.z.clear", json=request())
     assert r.status_code == 200, r.text
     row = settle(direct_rig, r.json()["command_id"])
-    assert row["status"] != "completed", row
-    assert direct_rig.delivered == []
+    assert row["status"] == "completed", row
+    assert direct_rig.delivered == ["clear"]
 
 
 def test_empty_map_remains_compatible(direct_rig):

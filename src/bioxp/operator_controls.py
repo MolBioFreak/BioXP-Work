@@ -571,8 +571,8 @@ def make_workflow_lifecycle_control_executor(
                             if writer is not None:
                                 writer.close()
                         with command_store._lock:
-                            if command_store._workflow_child_waiters.get(command_id) is completion:
-                                command_store._workflow_child_waiters.pop(command_id)
+                            if command_store._workflow_child_waiters.get((command_id, False)) is completion:
+                                command_store._workflow_child_waiters.pop((command_id, False))
                         if not completion.done():
                             completion.set_result(resolved)
 
@@ -927,8 +927,6 @@ def _input_spec(name: str, schema: Mapping[str, Any], *, required: bool, locatio
 
 
 _IMPLICIT_OPERATOR_ACK_BY_PATH = {
-    "/diagnostics/usb-sniff/start": "USB_SNIFF",
-    "/diagnostics/usb-sniff/stop": "USB_SNIFF",
     "/maintenance/usb/recover_motion": "RECOVER",
     "/motion/oem/x/set_home": "SET_HOME_CURRENT_POSITION",
     "/motion/arm/strict_startup": "RECOVER_MOTION",
@@ -1124,7 +1122,6 @@ _LOCAL_ONLY_PATH_PREFIXES = (
 )
 
 _OPERATOR_SEMANTIC_QUARANTINE_PATHS = {
-    "/motion/interlock/prepare": "Quarantined: this legacy route performs inferred latch/power writes and is not the source-grounded serial-206 preparation provider.",
     "/motion/power/diag": "Quarantined: this diagnostic can enter the same unverified power-enable sequence and lacks truthful aggregate acknowledgment/readback.",
 }
 
@@ -1132,6 +1129,19 @@ _CAN_BOOTSTRAP_PATHS = {
     "/hardware/snapshot/collect",
     "/motion/oem/prepare_without_motion",
 }
+
+
+# Gripper and thermal-door routes check 24 V, door and latch live (api
+# _with_live_interlock), like the X/Y/Z providers do inside each command.
+# The generic manual move/home routes do the same for G/door
+# (motor_oem_verify_motion_interlock at motion time) and hand X/Z to their
+# providers. OEM manual buttons are never greyed out by a cached sensor read.
+_LIVE_INTERLOCK_MOTION_PATHS = frozenset({
+    "/motion/gripper/clear", "/motion/gripper/home", "/motion/gripper/open",
+    "/motion/gripper/open_wide", "/motion/gripper/close",
+    "/motion/thermal_door/home", "/motion/thermal_door/open", "/motion/thermal_door/close",
+    "/motion/oem/manual/relative", "/motion/oem/manual/absolute", "/motion/oem/manual/home",
+})
 
 
 def _operation_motion_dependency(machine_state: Mapping[str, Any]) -> dict[str, Any]:
@@ -1161,24 +1171,7 @@ def _motion_readiness(machine_state: Mapping[str, Any], required_axes: list[str]
         "can_ready", "Same-epoch CAN ready", ownership.get("CAN_READY") is True,
         "Same-epoch CAN readiness has not been established.",
     ))
-    snapshot_present = isinstance(machine_state.get("snapshot_id"), str) and bool(machine_state.get("snapshot_id"))
-    dependencies.append(_dependency(
-        "canonical_snapshot", "Canonical hardware snapshot", snapshot_present,
-        "Fresh canonical hardware snapshot is unavailable.",
-    ))
-    # Admission needs current motion evidence, not unrelated thermal/pipette
-    # telemetry. project(independent_domains=True) preserves each domain's age
-    # even when the combined display projection is incomplete.
     domains = machine_state.get("domains") if isinstance(machine_state.get("domains"), Mapping) else {}
-    motion_domains = [domains.get(name) or {} for name in ("axes", "power", "latch", "interlock")]
-    motion_freshness = [row.get("freshness") or {} for row in motion_domains]
-    freshness_reason = "Canonical motion snapshot is stale." if any(row.get("state") == "stale" for row in motion_freshness) else "Fresh motion hardware observations are unavailable."
-    dependencies.append(_dependency(
-        "snapshot_fresh", "Motion observations fresh",
-        all(row.get("status") == "observed" for row in motion_domains)
-        and all(row.get("state") == "fresh" for row in motion_freshness),
-        freshness_reason,
-    ))
     maintenance_value = machine_state.get("maintenance")
     maintenance: Mapping[str, Any] = maintenance_value if isinstance(maintenance_value, Mapping) else {}
     motion_enabled = maintenance.get("motion_blocked") is False and maintenance.get("recovery_required") is False
@@ -1208,23 +1201,6 @@ def _motion_readiness(machine_state: Mapping[str, Any], required_axes: list[str]
         "enclosure_ready", "Door closed and latched", enclosure_ok,
         "Robot door is not confirmed closed and latched.",
     ))
-    interlock_row = domains.get("interlock") if isinstance(domains.get("interlock"), Mapping) else {}
-    interlock = interlock_row.get("observation") if isinstance(interlock_row, Mapping) else None
-    motion_arm = interlock.get("motion_arm") if isinstance(interlock, Mapping) else None
-    dependencies.append(_dependency(
-        "motion_arm", "Motion arm confirmed",
-        isinstance(motion_arm, Mapping) and motion_arm.get("armed") is True,
-        "Motion arm is not confirmed.",
-    ))
-    references = machine_state.get("references") if isinstance(machine_state.get("references"), Mapping) else {}
-    rows = references.get("rows") if isinstance(references.get("rows"), Mapping) else {}
-    for axis in required_axes:
-        row = rows.get(axis) if isinstance(rows, Mapping) else None
-        referenced = isinstance(row, Mapping) and row.get("state") == "referenced"
-        dependencies.append(_dependency(
-            f"axis_{axis}_referenced", f"{axis.upper()} axis homed", referenced,
-            f"{axis.upper()} axis is not homed.",
-        ))
     failed = next((row for row in dependencies if not row["met"]), None)
     return {
         "enabled": failed is None,
@@ -1242,12 +1218,6 @@ def _provider_z_motion_readiness(machine_state: Mapping[str, Any]) -> dict[str, 
     """
     ownership = machine_state.get("ownership") if isinstance(machine_state.get("ownership"), Mapping) else {}
     maintenance = machine_state.get("maintenance") if isinstance(machine_state.get("maintenance"), Mapping) else {}
-    provider = (
-        machine_state.get("serial206_initialization_provider")
-        if isinstance(machine_state.get("serial206_initialization_provider"), Mapping)
-        else {}
-    )
-    z_authority = provider.get("z_authority") if isinstance(provider.get("z_authority"), Mapping) else {}
     dependencies = [
         _operation_motion_dependency(machine_state),
         _dependency(
@@ -1261,12 +1231,6 @@ def _provider_z_motion_readiness(machine_state: Mapping[str, Any]) -> dict[str, 
             "Motion enabled",
             maintenance.get("motion_blocked") is False and maintenance.get("recovery_required") is False,
             "Motion is inactive. Activate motion before moving this motor.",
-        ),
-        _dependency(
-            "z_board_lifecycle_fresh",
-            "Serial-206 Z board lifecycle current",
-            z_authority.get("board_lifecycle_generation_fresh") is True,
-            "Z board lifecycle changed; activate motion again.",
         ),
     ]
     failed = next((row for row in dependencies if not row["met"]), None)
@@ -1282,16 +1246,10 @@ def _provider_x_motion_readiness(machine_state: Mapping[str, Any]) -> dict[str, 
     ownership: Mapping[str, Any] = ownership_value if isinstance(ownership_value, Mapping) else {}
     maintenance_value = machine_state.get("maintenance")
     maintenance: Mapping[str, Any] = maintenance_value if isinstance(maintenance_value, Mapping) else {}
-    provider_value = machine_state.get("serial206_initialization_provider")
-    provider: Mapping[str, Any] = provider_value if isinstance(provider_value, Mapping) else {}
-    x_authority_value = provider.get("x_authority")
-    x_authority: Mapping[str, Any] = x_authority_value if isinstance(x_authority_value, Mapping) else {}
-    board_fresh = x_authority.get("board_generation_fresh")
     dependencies = [
         _operation_motion_dependency(machine_state),
         _dependency("can_ready", "Same-epoch CAN ready", ownership.get("CAN_READY") is True, "Same-epoch CAN readiness has not been established."),
         _dependency("motion_enabled", "Motion enabled", maintenance.get("motion_blocked") is False and maintenance.get("recovery_required") is False, "Motion is inactive. Activate motion before moving this motor."),
-        _dependency("x_board_lifecycle_fresh", "Serial-206 X board lifecycle current", board_fresh is True, "X board lifecycle is unavailable or changed; prepare X again."),
     ]
     failed = next((row for row in dependencies if not row["met"]), None)
     return {"enabled": failed is None, "disabled_reason": None if failed is None else failed["reason"], "dependencies": dependencies}
@@ -1319,20 +1277,6 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
     dependencies.append(_dependency("provider_available", "Provider available", provider_available, provider_reason))
 
     action_id = str(action.get("action_id") or "")
-    if action_id == "oem.xy.move_absolute":
-        provider = machine_state.get("serial206_initialization_provider")
-        y_projection = provider.get("y_authority") if isinstance(provider, Mapping) else None
-        y = y_projection.get("authority") if isinstance(y_projection, Mapping) else None
-        board = y_projection.get("board_authority") if isinstance(y_projection, Mapping) else None
-        current_y = bool(isinstance(y, Mapping) and isinstance(board, Mapping)
-            and y.get("lifecycle_state") in {"prepared_unreferenced", "referenced_ready"}
-            and y.get("ownership_generation") == machine_state.get("ownership_generation")
-            and board.get("state") == "active"
-            and type(y.get("prepared_board_epoch")) is int
-            and y.get("prepared_board_epoch") == board.get("active_board_epoch")
-            and y.get("pending_ticket") is None)
-        dependencies.append(_dependency("xy_y_authority_current", "Current Y board authority",
-            current_y, "Y preparation is not current for board 4; reconcile Y before XY movement."))
     x_provider_action = action_id.startswith("oem.x.") or action_id.startswith("oem.xy.") or action_id.startswith("oem.xyz.") or action_id == "oem.abort_all"
     y_provider_action = action_id.startswith("oem.y.") or action_id.startswith("oem.xy.") or action_id.startswith("oem.xyz.") or action_id == "oem.abort_all"
     method = str(action.get("informational_method") or "GET")
@@ -1416,6 +1360,10 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         )
         if provider_owned_x_motion:
             readiness = _provider_x_motion_readiness(machine_state)
+        elif path in _LIVE_INTERLOCK_MOTION_PATHS:
+            # The route reads 24 V/door/latch live at motion time; a missed
+            # reply in the shared snapshot must not grey these controls out.
+            readiness = _provider_z_motion_readiness(machine_state)
         elif (
             x_state_establishing
             or y_state_establishing
@@ -1844,8 +1792,6 @@ _NON_OPERATOR_COMPAT_PATHS = {
     "/motion/axis/absolute",
     "/motion/axis/home",
     "/motion/axis/zero",
-    "/motion/oem/z/live_right_reference",
-    "/motion/oem/z/abort",
 }
 _SERIAL206_PROVIDER_CAPABILITIES = {
     "/motion/oem/initialization/initialize_motors": "initialize_motors",
@@ -2429,12 +2375,12 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
     meta = [
         {
             "action_id": "meta.activate_motion",
-            "label": "Activate 24 V / Prepare Motion (OEM, No Movement)",
+            "label": "Activate 24 V / Prepare Motion (OEM, No Motion Commands)",
             "subsystem": "meta",
             "category": "activation",
             "kind": "meta",
             "safety_class": "service",
-            "description": "Prepare the serial-206 motion path using the OEM safety check, cmd64=0→1 board cycle, and initializeMotorsWithoutMotion sequence. This does not home or move an axis.",
+            "description": "Prepare the serial-206 motion path using the OEM safety check, conditional activation of uninitialized boards, and initializeMotorsWithoutMotion. Already initialized boards are not cycled. No homing or movement commands are issued; physical immobility and motor torque are not verified.",
             "source_anchor": "ClassIOControl.query24VSensor:92-110; ClassControlInterface.initializeMotorsWithoutMotion:3181-3265; activateBoard:3474-3493",
             "informational_method": "POST",
             "informational_path": "/motion/oem/prepare_without_motion",
@@ -2448,7 +2394,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "requires_confirmation": True,
             "timeout_seconds": 120.0,
             "inputs": list(prepare_provider.get("inputs", [])) if prepare_provider else [],
-            "stages": ["serial-206 authority", "24 V/door/latch query", "cmd64=0 boards 4/5/6/7", "cmd64=1 boards 4/5/6/7", "mint board generation", "initializeMotorsWithoutMotion", "exact parameter readback"],
+            "stages": ["serial-206 authority", "24 V/door/latch query", "activate uninitialized boards", "bind current board lifecycle", "initializeMotorsWithoutMotion", "exact parameter readback"],
         },
         {
             "action_id": "meta.recover_motion_non_homing",
@@ -2457,7 +2403,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "category": "recovery",
             "kind": "meta",
             "safety_class": "service",
-            "description": "Run the existing robot-owned strict startup recovery with homing disabled. This action is available only while the maintenance latch requires recovery.",
+            "description": "Run shared OEM motion preparation with the existing strict recovery physical checks and no homing. This action is available only while the maintenance latch requires recovery.",
             "source_anchor": "Motion strict startup; run_homing=false",
             "informational_method": "POST",
             "informational_path": "/motion/arm/strict_startup",
@@ -3227,7 +3173,6 @@ def install_operator_control_plane(
     app.state.operator_command_plane = command_plane
     if oem_deck_provider is not None and oem_deck_position_table_provider is not None:
         from .oem_deck_movement import (
-            compile_finite_plate_operation,
             make_deck_command_executor,
             make_wp8_operation_executor,
         )
@@ -3252,7 +3197,7 @@ def install_operator_control_plane(
             collection_binder = getattr(current_provider, "bind_pipette_collection_state_reader", None)
             if callable(collection_binder):
                 from .api import _pipette_collection_state
-                collection_binder(_pipette_collection_state)
+                collection_binder(lambda: _pipette_collection_state(ensure_constructor=True))
             semantic_binder = getattr(current_provider, "bind_deck_semantic_state_reader", None)
             if callable(semantic_binder):
                 semantic_binder(command_plane.store.deck_semantic_state)
@@ -3320,20 +3265,8 @@ def install_operator_control_plane(
             inputs: Mapping[str, Any],
             idempotency_key: str | None = None,
         ) -> dict[str, Any]:
-            current_provider = refresh_deck_provider()
-            snapshot_reader = getattr(current_provider, "wp8_operation_machine_state", None)
-            if not callable(snapshot_reader):
-                raise RuntimeError("source_authority_missing:wp8_operation_machine_state")
-            machine_inputs = snapshot_reader(operation, dict(inputs))
-            if not isinstance(machine_inputs, Mapping):
-                raise RuntimeError("source_authority_invalid:wp8_operation_machine_state")
-            compile_finite_plate_operation(
-                operation,
-                source_leaf_available=callable(
-                    getattr(current_provider, "execute_wp8_child", None)
-                ),
-                **{**dict(machine_inputs), **dict(inputs)},
-            )
+            # The store validates intent; dispatch consumes current source state.
+            refresh_deck_provider()
             return command_plane.store.admit_internal_wp8_operation(
                 operation,
                 inputs=inputs,
@@ -3356,8 +3289,16 @@ def install_operator_control_plane(
             workflow = state.workflow
             if workflow is not None and command_id not in workflow.child_command_ids:
                 workflow.child_command_ids.append(command_id)
+            from concurrent.futures import TimeoutError as FutureTimeoutError
+            wake = command_plane.store.workflow_child_completion(command_id, include_issued_pending=True)
             while True:
-                receipt = command_plane.store.get_command(command_id)
+                try:
+                    receipt = wake.result(timeout=0.25)["receipt"]
+                except FutureTimeoutError:
+                    # Bounded only to observe owner stop; no receipt polling.
+                    if command_plane.store._stop.is_set():
+                        raise RuntimeError("workflow_child_owner_lost")
+                    continue
                 if receipt is None:
                     raise RuntimeError("workflow_child_receipt_missing")
                 status = receipt["status"]
@@ -3371,11 +3312,7 @@ def install_operator_control_plane(
                                 domains=("Gripper",), command_id=command_id),)}
                 if status in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"}:
                     return _workflow_terminal_result(receipt)
-                if command_plane.store._stop.is_set():
-                    raise RuntimeError("workflow_child_owner_lost")
-                # The existing dispatcher renews/executes; this is only the
-                # source handler's wait for its original admitted child.
-                command_plane.store._stop.wait(0.02)
+                raise RuntimeError(f"workflow_child_unexpected_status:{status}")
 
         def workflow_initial_check(state: Any, *, validate_current: Callable[[str], bool]) -> Mapping[str, Any]:
             callback = getattr(app.state, "oem_workflow_initial_check", None)
@@ -3500,18 +3437,8 @@ def install_operator_control_plane(
                     if _PASSIVE_OPERATOR_POLL.get() and isinstance(snapshot, Mapping):
                         # Compare existing owner projections, not fresh device queries.
                         # An external owner change must not inherit a 15s ready cache.
-                        refs = state.get("references") or {}
-                        rows = refs.get("rows") or {}
                         real_semantic_authority = snapshot.get("semantic_state_provenance_digest") is not None
-                        changed = any(
-                            (axis not in rows and real_semantic_authority) or (
-                                axis in rows and (
-                                    rows[axis].get("state") != "referenced"
-                                    or rows[axis].get("state_version") != version
-                                )
-                            )
-                            for axis, version in (snapshot.get("reference_versions") or {}).items()
-                        )
+                        changed = False
                         if scoped:
                             # Compare the actual independent operational owners,
                             # not diagnostic API projections whose fields differ.
@@ -3578,40 +3505,12 @@ def install_operator_control_plane(
             ({"4": int(snapshot["board_epoch_4"]), "5": int(snapshot["board_epoch_5"])}
              if isinstance(snapshot, Mapping) else {})
         )
-        if intent_only and set(board_epochs) != {"4", "5"}:
-            # A transiently busy or mid-reset initialization projection must not
-            # blank the deck lane. Fill any missing board epoch from the durable
-            # last deck-authority snapshot (cache-local; no device reads, so this
-            # never queues behind authority work). The dispatch path re-validates
-            # epochs against the live boards, so a genuinely stale fallback fails
-            # fast there with a named receipt instead of greying the controls
-            # here (epoch-blank feedback, 2026-09-21).
-            cached_reader = getattr(provider, "deck_authority_cached_snapshot", None)
-            if callable(cached_reader):
-                try:
-                    reader_arguments: dict[str, Any] = {
-                        "expected_generation": int(state.get("ownership_generation") or 0)}
-                    if getattr(provider, "deck_scoped_authority_version", None) == 1:
-                        reader_arguments["target"] = "LOC_MS"
-                    cached_snapshot = cached_reader(**reader_arguments)
-                except Exception:
-                    cached_snapshot = None
-                if isinstance(cached_snapshot, Mapping):
-                    filled = dict(board_epochs)
-                    for board, key in (("4", "board_epoch_4"), ("5", "board_epoch_5")):
-                        value = cached_snapshot.get(key)
-                        if board not in filled and type(value) is int and value >= 0:
-                            filled[board] = value
-                    board_epochs = filled
-        if intent_only and set(board_epochs) != {"4", "5"}:
-            disabled_reason = disabled_reason or "deck_board_epochs_not_authoritative"
-            options = [{**row, "enabled": False, "disabled_reason": disabled_reason} for row in options]
         return {
             "enabled": disabled_reason is None,
             "disabled_reason": disabled_reason,
             "required_boards": [4, 5],
             "expected_board_epoch_by_board": board_epochs,
-            "required_references": ["x", "y", "z", "g"],
+            "required_references": [],
             "position_table_revision": table.digest if table is not None else None,
             "destination_catalog_revision": catalog.revision if catalog is not None else None,
             "destination_options": options,
@@ -3705,18 +3604,6 @@ def install_operator_control_plane(
         if retained != expected:
             raise HTTPException(409, detail="idempotency receipt board epoch binding mismatch")
 
-    def check_direct_board_epochs(state: Mapping[str, Any], expected: Mapping[str, int] | None) -> None:
-        if not expected:
-            return  # Compatibility: no new mandatory epoch fields in this fix.
-        from .operator_command_plane import _active_board_epochs
-        # Read the existing composite projection: board 5's current X lifecycle
-        # and board 4's own authority, never an axis cache or caller replacement.
-        observed = _active_board_epochs(state, "oem.deck._finite_operation")
-        if any(type(observed.get(board)) is not int or observed[board] != epoch
-               for board, epoch in expected.items()):
-            raise HTTPException(409, detail={"error": "board_epoch_mismatch",
-                "requested": dict(expected), "observed": observed})
-
     def verify_replay_source_identity(receipt: Mapping[str, Any]) -> None:
         stored = receipt.get("source_identity")
         if not isinstance(stored, Mapping):
@@ -3758,7 +3645,6 @@ def install_operator_control_plane(
         if (state["ownership_generation"] != expected_generation
                 or int(hardware_state.ownership_epoch) != expected_generation):
             raise HTTPException(409, detail="ownership generation mismatch at motion dispatch")
-        check_direct_board_epochs(state, expected_board_epochs)
         if not check_snapshot:
             return
         assessment = _assess_action(action, state, inputs)
@@ -4159,13 +4045,11 @@ def install_operator_control_plane(
 
     @router.get("/v2/actions/receipts/{command_id}")
     async def action_receipt_v2(command_id: str, detail: bool = False) -> dict[str, Any]:
-        # Match the single history reader's identity precedence. Never show a
-        # retained projection for a command whose direct receipt is authoritative.
-        row = await asyncio.to_thread(
-            store.by_command,
-            command_id,
-            include_evidence=detail,
-        )
+        # Plane-owned movement claims share the canonical typed reader. Direct
+        # native receipts retain precedence for every other identity.
+        row = await asyncio.to_thread(store.canonical_receipt, command_id, detail=detail)
+        if row is None:
+            row = await asyncio.to_thread(store.by_command, command_id, include_evidence=detail)
         source_receipt = row if detail else None
         if row is not None and not detail and str(row.get("status") or "") in {"failed", "blocked", "rejected", "outcome_unknown", "ambiguous"}:
             detailed_row = await asyncio.to_thread(store.by_command, command_id, include_evidence=True)
@@ -4563,35 +4447,23 @@ def install_operator_control_plane(
         interrupt_attempt_id: str | None = None
         interrupt_surface: str | None = None
         interrupt_journal_error: str | None = None
+        interrupt_admission: dict[str, Any] = {}
         if is_safety_interrupt:
-            # RCA F1: the press becomes durable BEFORE any lock is taken and
-            # before any physical delivery. The attempt id minted here is the
-            # identity the provider, the projection rows and the cockpit all use.
+            # The Stop is sent first, as in the OEM app; nothing is written to
+            # disk before delivery. The attempt id minted here is the identity
+            # the provider, the projection rows and the cockpit all use, and the
+            # admission facts are journaled with the outcome after delivery.
             interrupt_surface = interrupt_surface_key(action_id, target, effective_inputs)
             interrupt_attempt_id = uuid.uuid4().hex
-            journal = getattr(command_plane, "interrupt_journal", None)
-            if journal is not None:
-                try:
-                    journal.record(
-                        interrupt_attempt_id=interrupt_attempt_id,
-                        action_id=action_id,
-                        phase="admitted",
-                        idempotency_key=payload.idempotency_key,
-                        surface=interrupt_surface,
-                        caller_class="operator_interrupt",
-                        observed_ownership_generation=int(payload.expected_generation),
-                        observed_board_epoch_by_board=dict(
-                            payload.expected_board_epoch_by_board or {}
-                        ),
-                        physical_delivery_started=False,
-                        request_received_at=request_received_at,
-                    )
-                except Exception as exc:
-                    # A recording failure is not evidence that the Stop cannot be
-                    # sent: deliver anyway, but say plainly that it is unrecorded.
-                    interrupt_journal_error = f"{type(exc).__name__}: {exc}"[:300]
-            else:
-                interrupt_journal_error = "interrupt_journal_unavailable"
+            interrupt_admission = {
+                "idempotency_key": payload.idempotency_key,
+                "caller_class": "operator_interrupt",
+                "observed_ownership_generation": int(payload.expected_generation),
+                "observed_board_epoch_by_board": dict(
+                    payload.expected_board_epoch_by_board or {}
+                ),
+                "request_received_at": request_received_at,
+            }
         action_lock = invoke_lock
         # From this check through acquisition there is no scheduling suspension:
         # AsyncExitStack.__aenter__ and an uncontended asyncio.Lock.acquire return
@@ -4628,8 +4500,6 @@ def install_operator_control_plane(
             if not is_safety_interrupt and payload.expected_generation != locked_expected:
                 raise HTTPException(status_code=409, detail="ownership generation mismatch")
             effective_inputs = {**dict(target.get("fixed_inputs") or {}), **dict(payload.inputs)}
-            if not is_safety_interrupt:
-                check_direct_board_epochs(locked_state or {}, payload.expected_board_epoch_by_board)
             current_authority_fingerprint = replay_authority_fingerprint(locked_state or {})
             existing = None
             if not is_safety_interrupt:
@@ -4724,42 +4594,6 @@ def install_operator_control_plane(
                 else _assess_action(action, locked_state or {}, effective_inputs)
             )
             dependency_state = {row["key"]: row["met"] for row in assessment["dependencies"]}
-            if (motion_snapshot_collector is not None
-                    and dependency_state.get("snapshot_fresh") is False
-                    and all(dependency_state.get(key) is True for key in (
-                        "provider_available", "transport_live", "can_ready",
-                        "operation_allows_motion", "motion_enabled"))):
-                # One query-only full collection under the existing invocation
-                # owner, before source entry. Automatic collection would yield
-                # to this very owner. This never retries a physical command.
-                published = False
-                try:
-                    collection = await motion_snapshot_collector()
-                    published = collection.get("ok") is True and collection.get("published") is True
-                except Exception:
-                    # Failed/ambiguous observation is not authority. Retain the
-                    # rejected claim below, even if another collector publishes.
-                    pass
-                locked_state = await invoke_state_reader.read()
-                assessment = _assess_action(action, locked_state, effective_inputs)
-                same_epoch = (locked_state["ownership_generation"] == locked_expected
-                              and int(hardware_state.ownership_epoch) == locked_expected)
-                if not published or not same_epoch:
-                    reason = ("ownership generation changed during motion observation collection"
-                              if not same_epoch else "Motion observation collection did not publish.")
-                    assessment["dependencies"].append(_dependency(
-                        "motion_observation_collection", "Current motion observation collection", False, reason))
-                    assessment.update(enabled=False, disabled_reason=reason)
-                receipt["authority_fingerprint"] = replay_authority_fingerprint(locked_state)
-            if not is_safety_interrupt:
-                try:
-                    check_direct_board_epochs(locked_state or {}, payload.expected_board_epoch_by_board)
-                except HTTPException as exc:
-                    # A claim already exists. Retain a rejected outcome rather
-                    # than abandoning a reservation after refreshed-state drift.
-                    assessment["dependencies"].append(_dependency(
-                        "expected_board_epochs", "Requested board epochs", False, str(exc.detail)))
-                    assessment.update(enabled=False, disabled_reason="board_epoch_mismatch")
             if not assessment["enabled"]:
                 detail = {
                     "error": "action_unavailable",
@@ -4783,6 +4617,9 @@ def install_operator_control_plane(
                     )
                 raise HTTPException(status_code=409, detail=detail)
             receipt["status"] = "queued"
+            from .deck_location_invalidation import STANDALONE_ACTIONS, standalone_xyz_route
+            invalidate_location = (action_id in STANDALONE_ACTIONS
+                                   or standalone_xyz_route(str(target["path"]), effective_inputs))
             receipt["queued_at"] = time.time()
             queued = receipt
             if not is_safety_interrupt:
@@ -4790,6 +4627,7 @@ def install_operator_control_plane(
                     store.put,
                     receipt,
                     _expected_status=claim_expected_status,
+                    _invalidate_deck_location=invalidate_location and _admitted is None,
                 )
                 claim_expected_status = str(queued["status"])
             receipt["admission_completed_at"] = time.time()
@@ -4851,7 +4689,8 @@ def install_operator_control_plane(
                 if not is_safety_interrupt and _admitted is not None:
                     # Durable dispatch intent precedes the controller call. A
                     # disconnected waiter/restart never turns it into a retry.
-                    dispatched = await asyncio.to_thread(store.put, receipt, _expected_status=claim_expected_status)
+                    dispatched = await asyncio.to_thread(store.put, receipt, _expected_status=claim_expected_status,
+                                                        _invalidate_deck_location=invalidate_location)
                     claim_expected_status = str(dispatched["status"])
                     if claim_expected_status != "dispatched":
                         return dispatched
@@ -5146,6 +4985,19 @@ def install_operator_control_plane(
             receipt["reconciliation_pending"] = reconciliation_pending
             if reconciliation_pending:
                 receipt["reconciliation_required"] = True
+            if journal is None:
+                interrupt_journal_error = "interrupt_journal_unavailable"
+            elif interrupt_attempt_id:
+                try:
+                    journal.record(
+                        interrupt_attempt_id=interrupt_attempt_id,
+                        action_id=action_id,
+                        phase="admitted",
+                        surface=interrupt_surface,
+                        **interrupt_admission,
+                    )
+                except Exception as exc:
+                    interrupt_journal_error = f"{type(exc).__name__}: {exc}"[:300]
             if interrupt_journal_error:
                 receipt["interrupt_journal_error"] = interrupt_journal_error
             if journal is not None and interrupt_attempt_id:

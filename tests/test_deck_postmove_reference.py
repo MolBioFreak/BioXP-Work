@@ -127,13 +127,13 @@ def test_real_named_primitive_postmove_fence(retained_rig, monkeypatch, invalida
         assert exc.delivery_attempted is True
         assert exc.controller_command_acknowledged is True
         assert exc.provider_results[-1]['controller_completion_verified'] is True
-        assert invalidation is not None, cause
+        assert invalidation in {'generation', 'semantic'}, cause
         assert store.deck_semantic_state()['current_location'] is None
         assert store.deck_semantic_state()['pseudo_z_home'] == 500
         assert cause.endswith('_changed')
         assert not isinstance(exc.__cause__, DeckExecutionFailure)
         return
-    assert invalidation is None, 'independent authority change was not fenced'
+    assert invalidation in {None, 'desync', 'rereference'}, 'owner/source-state change was not fenced'
     assert result['ok'] and result['semantic_state_committed'] and result['controller_completion_verified']
     assert result['physical_effect_verified'] is False
     assert leaf.positions == {(5, 0): 26213, (4, 0): 42413, (4, 1): 0}
@@ -141,7 +141,11 @@ def test_real_named_primitive_postmove_fence(retained_rig, monkeypatch, invalida
     assert raw[-1]['branch'] == 'confirmed_gripper_no_tip_moveXY'
     for axis in ('x', 'y'):
         row = references.snapshot(('x', 'y', 'z', 'g'))['rows'][axis]
-        assert row['last_motion_kind'] == 'move_xy' and row['state_version'] == versions[axis]
+        if axis == 'x' and invalidation in {'desync', 'rereference'}:
+            assert row['state_version'] > versions[axis]
+            assert row['state'] == ('desynced' if invalidation == 'desync' else 'referenced')
+        else:
+            assert row['last_motion_kind'] == 'move_xy' and row['state_version'] == versions[axis]
     store.finish(admitted['command_id'], status='completed', payload=result, claimed=claimed,
         controller_acknowledged=True, full_response=result)
     semantic = store.deck_semantic_state()

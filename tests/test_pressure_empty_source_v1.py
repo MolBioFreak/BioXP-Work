@@ -132,14 +132,10 @@ def test_manual_empty_query_policy_unchanged(query_rig):
         (result['command_id'],)).fetchone()[0] == 'failed'
 
 
-@pytest.mark.parametrize('fault', ['unknown', 'stale', 'owner', 'reader', 'interrupt', 'uncommitted'])
+@pytest.mark.parametrize('fault', ['stale', 'owner', 'reader', 'interrupt', 'uncommitted'])
 def test_empty_source_requires_current_committed_owner(query_rig, fault):
     rig = query_rig
-    if fault == 'unknown':
-        rig[7]['data'][0] = [32, 96, 50]
-        with pytest.raises(AssertionError):
-            query(rig)
-    elif fault != 'uncommitted':
+    if fault != 'uncommitted':
         query(rig)
     if fault == 'stale': async_set(rig, 0, 48)
     if fault == 'owner': rig[8]._collection_source_owner = 'changed-owner'
@@ -149,6 +145,53 @@ def test_empty_source_requires_current_committed_owner(query_rig, fault):
     with pytest.raises(HTTPException):
         issue(rig, source)
     assert rig[6] == calls
+
+
+def test_unknown_hardware_query_keeps_oem_boolean_and_empty_pressure_source_return(query_rig):
+    # Exact-e113 image control also completes this source return. Unknown query
+    # proof is not an extra prohibition on the current OEM in-memory Boolean.
+    from fastapi.testclient import TestClient
+    rig = query_rig
+    rig[7]['data'][0] = [32, 96, 50]
+    response = TestClient(rig[0]).post('/liquid/tip-status',
+        headers={'Idempotency-Key': 'pressure-unknown-source-query'})
+    assert response.status_code == 502, response.text
+    detail = response.json()['detail']
+    assert detail['ok'] is False
+    assert detail['semantic_query_response_verified'] is False
+    collection = api._pipette_collection_state()
+    assert collection['tip_exists'] is False
+    assert collection['hardware_tip_exists'] is None
+    query_row = rig[5].connection.execute(
+        'SELECT status FROM pipette_operations WHERE command_id=?',
+        (detail['command_id'],)).fetchone()
+    assert query_row['status'] == 'failed'
+    calls = list(rig[6])
+    result = issue(rig, source, key='pressure-after-unknown-source-query')
+    assert result['ok'] is True and result['source_noop'] is True
+    assert result['source_return_completed'] is True
+    assert result['source_return'] == [0.0] * 4
+    assert result['channels'] == [] and result['channel_count'] == 0
+    assert result['hardware_truth_level'] == 'source_model_default'
+    assert result['semantic_query_response_verified'] is False
+    assert rig[6] == calls
+    for field in ('delivery_verified', 'controller_acknowledged',
+                  'completion_verified', 'hardware_postcondition_verified',
+                  'physical_effect_verified'):
+        assert result['receipt_truth'][field] is False
+    row = rig[5].connection.execute(
+        'SELECT status FROM pipette_operations WHERE command_id=?',
+        (result['command_id'],)).fetchone()
+    assert row['status'] == 'completed'
+    script = ('import json,sys;from tests.test_pressure_empty_source_v1 import fresh_receipt;'
+              'print(json.dumps(fresh_receipt(sys.argv[1],sys.argv[2])))')
+    reopened = json.loads(subprocess.check_output([sys.executable, '-c', script,
+        str(rig[4]), result['receipt_id']], text=True, timeout=20))
+    assert reopened['status'] == 'completed'
+    assert reopened['receipt']['result']['source_return'] == [0.0] * 4
+    assert reopened['receipt']['result']['channels'] == []
+    assert reopened['receipt']['truth'] == result['receipt_truth']
+    assert api._pipette_collection_state() == collection
 
 
 def test_owner_changes_during_predicate_read_refused(query_rig):

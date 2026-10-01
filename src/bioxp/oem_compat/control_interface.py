@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .boards import AXIS_PROFILES, BioXPBoards
-from .transport import DryRunTransport
 
 
 @dataclass(frozen=True)

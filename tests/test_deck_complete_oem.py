@@ -165,7 +165,7 @@ def test_park_native_source_z_and_already_parked(query_rig, monkeypatch):
         current_location_id='LOC_OC', current_well_id=0, machine_state_revision=1,
         semantic_state_provenance_digest='a'*64, plate_on_gantry=None, gripper_confirmed=True,
         collection_tip_state=provider._park_collection_state())
-    result = provider.parkGantry(authority_snapshot=authority)
+    result = provider.parkGantry(authority_snapshot=authority, source_context=None)
     table = load_bound_oem_position_table()
     target = table.resolve(location_id='LOC_PARK')
     assert result['ok'] and result['controller_completion_verified']

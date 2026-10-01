@@ -98,7 +98,7 @@ def test_overlapping_continuing_native_fifo(installed_retained, retained_rig, mo
     assert plane.store.wait_for_command_workers(ids, timeout=3)
     assert plane.store.queue()['items'] == []
     assert all(name.startswith('bioxp-operator-command-') for name in samples)
-    assert len(samples) == 2 * len(ids), 'only leased planning and final pre-TX samples per ordinary move'
+    assert len(samples) == len(ids), 'one leased planning sample; final live fences do not resweep'
     # Read the same canonical results through a fresh SQLite process.
     plane.stop()
     code = ('import json,sys; from tests.test_deck_scoped_integration import fresh_process_receipts; '
@@ -152,8 +152,13 @@ def test_execution_rechecks_actual_authority(installed_retained, retained_rig, m
         references.mark_desynced(MarkAxisDesyncedCommand('x', reason='offline drift'))
     app.state.operator_command_plane.start()
     row = finish(client, cid)
-    assert row['status'] == 'failed', row
-    assert not leaf.moves and not raw
+    if drift == 'reference':
+        assert row['status'] == 'completed', row
+        assert leaf.moves and raw
+        assert references.snapshot(('x',))['rows']['x']['state'] == 'desynced'
+    else:
+        assert row['status'] == 'failed', row
+        assert not leaf.moves and not raw
     # Even after owner/readiness changes the original key resolves without sampling.
     monkeypatch.setattr(app.state.operator_admission_state_reader, '_collect', lambda: pytest.fail('replay sampled state'))
     replay = client.post(URL, json=body)

@@ -68,7 +68,7 @@ def test_canonical_special_and_camera(query_rig, retained_rig, monkeypatch, targ
     monkeypatch.setattr(leaf, 'begin_bus_event_window', lambda **kwargs: {
         'after_sequence': 0, 'receive_owner': 'offline-usb', 'owner_generation': generation})
     def many(axes, **kwargs):
-        assert kwargs['sta_sequential'] is (target != 'LOC_PARK')
+        assert kwargs['sta_sequential'] is True  # all are manual btnLOC callers, including Park
         return {'ok': True, 'per_axis': {a: wait(b) for a, b in [('x', 5), ('y', 4)]}}
     monkeypatch.setattr(leaf, 'motor_wait_target_reached_many', many)
     monkeypatch.setattr(adapter, 'generation_provider', lambda: generation)
@@ -76,6 +76,9 @@ def test_canonical_special_and_camera(query_rig, retained_rig, monkeypatch, targ
     monkeypatch.setattr(observations, 'oem_initialize_motion_scriptmove_to_waste',
         adapter.oem_initialize_motion_scriptmove_to_waste, raising=False)
     if target == 'LOC_PARK':
+        from tests.test_r1_constructor_owner_connected import prepare_constructor
+        prepare_constructor(query_rig, monkeypatch)
+        provider._park_collection_state()
         seal_park_fixture(provider, store, monkeypatch)
         observed = query(query_rig, key='park-fixture-source-query')
         assert observed['source_tip_exists'] is False

@@ -208,7 +208,6 @@ class ProtocolSourceModel:
         facts = {key: payload.get(key) for key in ("logical_tip_present", "carried_plate_present", "allow_to_stop")}
         if any(value is not None and type(value) is not bool for value in facts.values()):
             raise ValueError("Source model facts must be boolean or unknown")
-        from copy import deepcopy
         return cls(**facts,
                    fluid_name=payload.get("fluid_name"),
                    tip_zone_index=payload.get("tip_zone_index"),

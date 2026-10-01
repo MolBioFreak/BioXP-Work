@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .models import OEM_BUILTIN_OPCODES
+
 from typing import Any, Mapping, Iterable
 
 from ..domain.capabilities import CapabilityName
@@ -243,7 +245,7 @@ def validate_protocol_support(
                 raise ValueError("Unexpanded OEM macro is not executable prepared input")
             if action.kind == ProtocolActionKind.OEM_OPERATION:
                 # These are source markers/gates owned by the sole executor.
-                if action.oem_opcode not in {"step", "delaypoint", "wait"} and not callable(oem_handlers.get(action.oem_opcode or "")):
+                if action.oem_opcode not in OEM_BUILTIN_OPCODES and not callable(oem_handlers.get(action.oem_opcode or "")):
                     missing.append(f"{action.source_occurrence_id}:{action.oem_opcode}")
                 selected_preflight = getattr(oem_handlers.get(action.oem_opcode or ""), "preflight", None)
                 if callable(selected_preflight):

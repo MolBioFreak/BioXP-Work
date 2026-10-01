@@ -1,8 +1,8 @@
 """Exercise actual producer argv/reader using finite FFmpeg, never a device.
 
 Run with the existing camera rig inside a route-free, device-free sandbox.
-The sole input substitution is synthetic lavfi at a known capture cadence;
-all output/filter/encoder arguments come from the real production caller.
+The input is synthetic lavfi encoded to MJPEG at a known capture cadence;
+the source-copy output arguments and packet sideband are production's own.
 """
 import asyncio
 import os
@@ -80,14 +80,34 @@ def test_real_encoder_does_not_invent_capture_progress(rig, monkeypatch, tmp_pat
     async def synthetic_input(*argv, **kwargs):
         argv_seen.append(argv)
         output_args = list(argv[argv.index("-i") + 2:])
-        completed = subprocess.run(
-            [os.environ["CAMERA_TEST_FFMPEG"], "-hide_banner", "-loglevel", "error",
+        ffmpeg = os.environ.get("CAMERA_TEST_FFMPEG", "ffmpeg")
+        # The device supplies MJPEG, not lavfi's raw pixels. Encode the fixture
+        # first; never alter the production copy/synchronization/muxer options.
+        source = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error",
              "-f", "lavfi", "-i", f"{scene}=size=640x480:rate={capture_fps}:duration=2",
+             "-threads", "1", "-c:v", "mjpeg", "-q:v", "7", "-f", "mjpeg", "pipe:1"],
+            capture_output=True, timeout=15, check=True,
+        )
+        source_frames = list(CameraJpegBuffer().feed(source.stdout))
+        assert len(source_frames) == capture_fps * 2
+        assert output_args[output_args.index("-c:v") + 1] == "copy"
+        completed = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-copyts",
+             "-f", "mjpeg", "-framerate", str(capture_fps), "-i", "pipe:0",
              *output_args],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=True,
+            input=source.stdout, capture_output=True, timeout=15, check=True,
         )
         encoded.extend(CameraJpegBuffer().feed(completed.stdout))
-        return await spawn(*argv, **kwargs)
+        assert encoded == source_frames, "source packets were changed, dropped or duplicated"
+        records = [line for line in completed.stderr.splitlines()
+                   if line.startswith(b"0,")]
+        assert len(records) == len(encoded)
+        process = await spawn(*argv, **kwargs)
+        # Feed real framecrc metadata too, so publication exercises the packet
+        # reader rather than falling back to legacy JPEG-boundary parsing.
+        process.stderr.feed_data(completed.stderr)
+        return process
 
     monkeypatch.setattr(api.asyncio, "create_subprocess_exec", synthetic_input)
 
@@ -106,6 +126,10 @@ def test_real_encoder_does_not_invent_capture_progress(rig, monkeypatch, tmp_pat
                    "delivered_parts": len(delivered), "output_args": list(argv_seen[0][argv_seen[0].index("-i")+2:])})
             assert len(encoded) == capture_fps * 2, "fps filter invented fresh capture frames"
             assert status["frame_sequence"] == len(encoded)
+            # This finite MJPEG fixture starts PTS at zero. It proves packet
+            # cadence/preview delivery, not a recognizable kernel clock.
+            # Native-clock snapshot evidence is covered by test_camera_native_pts.
+            assert provider.latest().source_captured_at is None
             expected_decodes = 1 + sum(a != b for a, b in zip(encoded, encoded[1:]))
             print({"scene": scene, "published": len(encoded), "full_decodes": validation.call_count,
                    "expected_decodes": expected_decodes})

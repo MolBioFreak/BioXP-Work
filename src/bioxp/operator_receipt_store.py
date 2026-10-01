@@ -412,6 +412,9 @@ class OperatorReceiptStore:
             self.reconcile_nonterminal_receipts()
 
     def _configure(self) -> None:
+        from .runtime_audit_store import canonical_json
+        self.connection.create_function('canonical_json', 1,
+            lambda value: canonical_json(json.loads(str(value))), deterministic=True)
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=FULL")
         self.connection.execute("PRAGMA foreign_keys=ON")
@@ -620,228 +623,7 @@ class OperatorReceiptStore:
             "actor": actor,
         }
 
-    def assess_evidence_legal_hold(
-        self,
-        command_id: str,
-        *,
-        legal_hold: bool,
-        actor: str,
-        assessment: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Append a governed legal-hold assessment and update its projection."""
-        if type(legal_hold) is not bool:
-            raise TypeError("legal_hold must be an exact boolean")
-        named_actor = str(actor).strip()
-        if not named_actor:
-            raise ValueError("legal-hold assessment requires a named actor")
-        with self.lock:
-            self.connection.execute("BEGIN IMMEDIATE")
-            try:
-                result = self._apply_legal_hold_assessment_locked(
-                    str(command_id),
-                    legal_hold=legal_hold,
-                    actor=named_actor,
-                    assessment=assessment,
-                    observed_at=time.time(),
-                )
-                self.connection.execute("COMMIT")
-                return result
-            except Exception:
-                if self.connection.in_transaction:
-                    self.connection.execute("ROLLBACK")
-                raise
 
-    def expire_evidence(
-        self,
-        command_id: str | None = None,
-        *,
-        evidence_artifact_id: str | None = None,
-    ) -> dict[str, Any]:
-        if (command_id is None) == (evidence_artifact_id is None):
-            raise ValueError("select exactly one evidence expiry identity")
-        current_time = time.time()
-        with self.lock:
-            if evidence_artifact_id is None:
-                row = self.connection.execute(
-                    """
-                    SELECT o.*
-                    FROM runtime_evidence_objects o
-                    JOIN runtime_evidence_links l
-                      ON l.evidence_artifact_id=o.evidence_artifact_id
-                    WHERE l.target_kind='command' AND l.target_identity=?
-                    ORDER BY o.created_at DESC,o.evidence_artifact_id DESC LIMIT 1
-                    """,
-                    (str(command_id),),
-                ).fetchone()
-            else:
-                row = self.connection.execute(
-                    "SELECT * FROM runtime_evidence_objects WHERE evidence_artifact_id=?",
-                    (str(evidence_artifact_id),),
-                ).fetchone()
-            if row is None:
-                return {
-                    "state": "no_evidence",
-                    "command_id": None if command_id is None else str(command_id),
-                    "evidence_artifact_id": evidence_artifact_id,
-                }
-            artifact_id = str(row["evidence_artifact_id"])
-            state = str(row["expiry_state"])
-            if state in {"expired", "missing", "integrity_failed", "orphan_cleaned"}:
-                return {
-                    "state": state,
-                    "command_id": None if command_id is None else str(command_id),
-                    "evidence_artifact_id": artifact_id,
-                    "expiry_receipt_id": row["expiry_receipt_id"],
-                }
-            if row["retention_deadline"] is None:
-                raise RuntimeError("evidence retention authority is missing")
-            deadline = float(row["retention_deadline"])
-            if bool(row["legal_hold"]):
-                return {
-                    "state": "legal_hold",
-                    "command_id": None if command_id is None else str(command_id),
-                    "evidence_artifact_id": artifact_id,
-                }
-            if state != "expiry_pending" and current_time < deadline:
-                return {
-                    "state": "retained",
-                    "command_id": None if command_id is None else str(command_id),
-                    "evidence_artifact_id": artifact_id,
-                }
-            relpath = row["active_relpath"]
-            if state != "expiry_pending":
-                if not relpath:
-                    raise RuntimeError("active evidence is missing its retained path")
-                self.connection.execute("BEGIN IMMEDIATE")
-                try:
-                    updated = self.connection.execute(
-                        "UPDATE runtime_evidence_objects SET expiry_state='expiry_pending',updated_at=? "
-                        "WHERE evidence_artifact_id=? AND expiry_state IN ('active','retained') AND legal_hold=0",
-                        (current_time, artifact_id),
-                    )
-                    if updated.rowcount != 1:
-                        raise RuntimeError("evidence expiry-pending compare-and-swap failed")
-                    self.connection.execute(
-                        "INSERT INTO runtime_evidence_events(evidence_artifact_id,event_kind,observed_at,detail_json) VALUES(?,?,?,?)",
-                        (artifact_id, "expiry_pending", current_time, _json_text({"command_id": command_id})),
-                    )
-                    self.connection.execute("COMMIT")
-                except Exception:
-                    if self.connection.in_transaction:
-                        self.connection.execute("ROLLBACK")
-                    raise
-
-        with self.lock:
-            current = self.connection.execute(
-                "SELECT active_relpath,sha256,byte_count,legal_hold,expiry_state "
-                "FROM runtime_evidence_objects WHERE evidence_artifact_id=?",
-                (artifact_id,),
-            ).fetchone()
-            if current is None:
-                raise RuntimeError("evidence authority disappeared during expiry")
-            if bool(current["legal_hold"]):
-                return {
-                    "state": "legal_hold",
-                    "command_id": None if command_id is None else str(command_id),
-                    "evidence_artifact_id": artifact_id,
-                }
-            if str(current["expiry_state"]) != "expiry_pending":
-                raise RuntimeError("evidence expiry state changed before deletion")
-            active_relpath = current["active_relpath"]
-            already_absent = False
-            if active_relpath:
-                try:
-                    _unlink_confined_evidence(
-                        self.root,
-                        str(active_relpath),
-                        expected_sha256=str(current["sha256"]),
-                        expected_bytes=int(current["byte_count"]),
-                    )
-                except FileNotFoundError:
-                    already_absent = True
-                except Exception as exc:
-                    failure_time = time.time()
-                    self.connection.execute("BEGIN IMMEDIATE")
-                    try:
-                        self.connection.execute(
-                            "UPDATE runtime_evidence_objects SET expiry_state='integrity_failed',updated_at=? "
-                            "WHERE evidence_artifact_id=? AND expiry_state='expiry_pending'",
-                            (failure_time, artifact_id),
-                        )
-                        self.connection.execute(
-                            "UPDATE operator_commands SET evidence_state='integrity_failed',updated_at=? "
-                            "WHERE command_id IN (SELECT target_identity FROM runtime_evidence_links "
-                            "WHERE evidence_artifact_id=? AND target_kind='command')",
-                            (failure_time, artifact_id),
-                        )
-                        self.connection.execute(
-                            "INSERT INTO runtime_evidence_events(evidence_artifact_id,event_kind,observed_at,detail_json) VALUES(?,?,?,?)",
-                            (artifact_id, "integrity_failure", failure_time, _json_text({"reason_code": "expiry_delete_integrity_failure"})),
-                        )
-                        self.connection.execute("COMMIT")
-                    except Exception:
-                        if self.connection.in_transaction:
-                            self.connection.execute("ROLLBACK")
-                    raise RuntimeError("evidence expiry integrity failure") from exc
-
-            expiry_receipt_id = uuid.uuid4().hex
-            completed_at = time.time()
-            self.connection.execute("BEGIN IMMEDIATE")
-            try:
-                updated = self.connection.execute(
-                    "UPDATE runtime_evidence_objects SET active_relpath=NULL,expiry_state='expired',"
-                    "expiry_receipt_id=?,updated_at=? WHERE evidence_artifact_id=? "
-                    "AND expiry_state='expiry_pending' AND legal_hold=0",
-                    (expiry_receipt_id, completed_at, artifact_id),
-                )
-                if updated.rowcount != 1:
-                    raise RuntimeError("evidence expiry final compare-and-swap failed")
-                self.connection.execute(
-                    "UPDATE operator_commands SET evidence_relpath=NULL,evidence_state='expired',updated_at=? "
-                    "WHERE command_id IN (SELECT target_identity FROM runtime_evidence_links "
-                    "WHERE evidence_artifact_id=? AND target_kind='command')",
-                    (completed_at, artifact_id),
-                )
-                for event_kind in ("deleted", "expired"):
-                    self.connection.execute(
-                        "INSERT INTO runtime_evidence_events(evidence_artifact_id,event_kind,observed_at,detail_json) VALUES(?,?,?,?)",
-                        (artifact_id, event_kind, completed_at, _json_text({"expiry_receipt_id": expiry_receipt_id, "already_absent": already_absent})),
-                    )
-                self.connection.execute("COMMIT")
-            except Exception:
-                if self.connection.in_transaction:
-                    self.connection.execute("ROLLBACK")
-                raise
-        return {
-            "state": "expired",
-            "command_id": None if command_id is None else str(command_id),
-            "evidence_artifact_id": artifact_id,
-            "expiry_receipt_id": expiry_receipt_id,
-        }
-
-    def sweep_expired_evidence(self, *, limit: int = 1000) -> dict[str, Any]:
-        selected_limit = int(limit)
-        if selected_limit < 1 or selected_limit > 1000:
-            raise ValueError("retention sweep limit must be between 1 and 1000")
-        with self.lock:
-            rows = self.connection.execute(
-                "SELECT evidence_artifact_id FROM runtime_evidence_objects "
-                "WHERE expiry_state='expiry_pending' OR "
-                "(expiry_state IN ('active','retained') AND legal_hold=0 "
-                "AND retention_deadline IS NOT NULL AND retention_deadline<=?) "
-                "ORDER BY COALESCE(retention_deadline,0),evidence_artifact_id LIMIT ?",
-                (time.time(), selected_limit),
-            ).fetchall()
-        outcomes = [
-            self.expire_evidence(evidence_artifact_id=str(row["evidence_artifact_id"]))
-            for row in rows
-        ]
-        return {
-            "selected": len(rows),
-            "expired": sum(item.get("state") == "expired" for item in outcomes),
-            "retained": sum(item.get("state") == "retained" for item in outcomes),
-            "legal_hold": sum(item.get("state") == "legal_hold" for item in outcomes),
-        }
 
     @staticmethod
     def _compact_receipt(receipt: Mapping[str, Any]) -> tuple[dict[str, Any], Any]:
@@ -1063,270 +845,6 @@ class OperatorReceiptStore:
                 if nonblocking:
                     self.connection.execute(f"PRAGMA busy_timeout={busy_timeout}")
 
-    def _remove_orphan_evidence(self) -> None:
-        """Classify every unbound object durably before confined cleanup."""
-        interrupted = self.connection.execute(
-            "SELECT evidence_artifact_id,active_relpath,sha256,byte_count FROM runtime_evidence_objects WHERE expiry_state='orphan_quarantined' AND legal_hold=0 ORDER BY evidence_artifact_id"
-        ).fetchall()
-        for row in interrupted:
-            relpath = str(row["active_relpath"] or "")
-            if not relpath:
-                raise RuntimeError("orphan quarantine row is missing its active relpath")
-            try:
-                _unlink_confined_evidence(
-                    self.root,
-                    relpath,
-                    expected_sha256=str(row["sha256"]),
-                    expected_bytes=int(row["byte_count"]),
-                )
-            except FileNotFoundError:
-                pass
-            receipt_id = str(uuid.uuid4())
-            self.connection.execute("BEGIN IMMEDIATE")
-            try:
-                updated = self.connection.execute(
-                    "UPDATE runtime_evidence_objects SET active_relpath=NULL,expiry_state='orphan_cleaned',expiry_receipt_id=?,updated_at=? WHERE evidence_artifact_id=? AND active_relpath=? AND expiry_state='orphan_quarantined' AND legal_hold=0",
-                    (receipt_id, time.time(), str(row["evidence_artifact_id"]), relpath),
-                )
-                if updated.rowcount != 1:
-                    raise RuntimeError("orphan cleanup compare-and-swap failed")
-                self.connection.execute(
-                    "INSERT INTO runtime_evidence_events(evidence_artifact_id,event_kind,observed_at,detail_json) VALUES(?,?,?,?)",
-                    (
-                        str(row["evidence_artifact_id"]), "orphan_deleted", time.time(),
-                        _json_text({"receipt_id": receipt_id, "relpath": relpath, "reason": "orphan_cleanup"}),
-                    ),
-                )
-                self.connection.execute(
-                    "INSERT INTO runtime_evidence_events(evidence_artifact_id,event_kind,observed_at,detail_json) VALUES(?,?,?,?)",
-                    (
-                        str(row["evidence_artifact_id"]), "orphan_cleaned", time.time(),
-                        _json_text({
-                            "receipt_id": receipt_id,
-                            "sha256": str(row["sha256"]),
-                            "byte_count": int(row["byte_count"]),
-                            "reason": "orphan_cleanup",
-                        }),
-                    ),
-                )
-                self.connection.execute("COMMIT")
-            except Exception:
-                if self.connection.in_transaction:
-                    self.connection.execute("ROLLBACK")
-                raise
-        referenced = {
-            str(row["active_relpath"])
-            for row in self.connection.execute(
-                "SELECT active_relpath FROM runtime_evidence_objects WHERE active_relpath IS NOT NULL"
-            ).fetchall()
-        }
-        regular: list[tuple[str, str, int]] = []
-        special: list[tuple[str, str]] = []
-        for directory, directory_names, file_names in os.walk(
-            self.evidence_root,
-            topdown=True,
-            followlinks=False,
-        ):
-            selected_directory = Path(directory)
-            for name in list(directory_names):
-                candidate = selected_directory / name
-                mode = candidate.lstat().st_mode
-                if stat.S_ISLNK(mode):
-                    directory_names.remove(name)
-                    relpath = candidate.relative_to(self.root).as_posix()
-                    if relpath not in referenced:
-                        special.append((relpath, "symlink"))
-            for name in file_names:
-                candidate = selected_directory / name
-                relpath = candidate.relative_to(self.root).as_posix()
-                if relpath in referenced:
-                    continue
-                mode = candidate.lstat().st_mode
-                if not stat.S_ISREG(mode):
-                    special.append((relpath, "symlink" if stat.S_ISLNK(mode) else "non_regular"))
-                    continue
-                _, digest, size = _read_confined_evidence(self.root, relpath)
-                regular.append((relpath, digest, size))
-
-        classified_at = time.time()
-        classified: list[tuple[str, str, str, int]] = []
-        self.connection.execute("BEGIN IMMEDIATE")
-        try:
-            for relpath, digest, size in regular:
-                artifact_id = "orphan:" + hashlib.sha256(
-                    f"{relpath}\0{digest}\0{size}".encode("utf-8")
-                ).hexdigest()
-                self.connection.execute(
-                    """
-                    INSERT OR IGNORE INTO runtime_evidence_objects(
-                        evidence_artifact_id,command_id,pipette_operation_id,original_relpath,
-                        active_relpath,sha256,byte_count,created_at,retention_deadline,
-                        legal_hold,expiry_state,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        artifact_id,
-                        None,
-                        None,
-                        relpath,
-                        relpath,
-                        digest,
-                        size,
-                        classified_at,
-                        self._five_calendar_year_deadline(classified_at),
-                        0,
-                        "orphan_quarantined",
-                        classified_at,
-                    ),
-                )
-                authority = self.connection.execute(
-                    """
-                    SELECT active_relpath,sha256,byte_count,expiry_state
-                    FROM runtime_evidence_objects WHERE evidence_artifact_id=?
-                    """,
-                    (artifact_id,),
-                ).fetchone()
-                if (
-                    authority is None
-                    or str(authority["active_relpath"]) != relpath
-                    or str(authority["sha256"]) != digest
-                    or int(authority["byte_count"]) != size
-                    or str(authority["expiry_state"]) != "orphan_quarantined"
-                ):
-                    raise RuntimeError("orphan evidence classification identity conflict")
-                self.connection.execute(
-                    """
-                    INSERT INTO runtime_evidence_events(
-                        evidence_artifact_id,event_kind,observed_at,detail_json
-                    ) VALUES(?,?,?,?)
-                    """,
-                    (
-                        artifact_id,
-                        "orphan_classified",
-                        classified_at,
-                        _json_text({"relpath": relpath, "sha256": digest, "byte_count": size}),
-                    ),
-                )
-                classified.append((artifact_id, relpath, digest, size))
-            for relpath, object_kind in special:
-                digest = hashlib.sha256(
-                    f"{relpath}\0{object_kind}".encode("utf-8")
-                ).hexdigest()
-                artifact_id = f"orphan-integrity:{digest}"
-                self.connection.execute(
-                    """
-                    INSERT OR IGNORE INTO runtime_evidence_objects(
-                        evidence_artifact_id,command_id,pipette_operation_id,original_relpath,
-                        active_relpath,sha256,byte_count,created_at,retention_deadline,
-                        legal_hold,expiry_state,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        artifact_id,
-                        None,
-                        None,
-                        relpath,
-                        relpath,
-                        digest,
-                        0,
-                        classified_at,
-                        self._five_calendar_year_deadline(classified_at),
-                        0,
-                        "integrity_failed",
-                        classified_at,
-                    ),
-                )
-                self.connection.execute(
-                    """
-                    INSERT INTO runtime_evidence_events(
-                        evidence_artifact_id,event_kind,observed_at,detail_json
-                    ) VALUES(?,?,?,?)
-                    """,
-                    (
-                        artifact_id,
-                        "integrity_failure",
-                        classified_at,
-                        _json_text({"relpath": relpath, "object_kind": object_kind}),
-                    ),
-                )
-            self.connection.execute("COMMIT")
-        except Exception:
-            if self.connection.in_transaction:
-                self.connection.execute("ROLLBACK")
-            raise
-
-        for artifact_id, relpath, digest, size in classified:
-            try:
-                _unlink_confined_evidence(
-                    self.root,
-                    relpath,
-                    expected_sha256=digest,
-                    expected_bytes=size,
-                )
-            except Exception as exc:
-                failed_at = time.time()
-                self.connection.execute("BEGIN IMMEDIATE")
-                try:
-                    self.connection.execute(
-                        "UPDATE runtime_evidence_objects SET expiry_state='integrity_failed',updated_at=? WHERE evidence_artifact_id=?",
-                        (failed_at, artifact_id),
-                    )
-                    self.connection.execute(
-                        "INSERT INTO runtime_evidence_events(evidence_artifact_id,event_kind,observed_at,detail_json) VALUES(?,?,?,?)",
-                        (
-                            artifact_id,
-                            "integrity_failure",
-                            failed_at,
-                            _json_text({"relpath": relpath, "error": str(exc)[:500]}),
-                        ),
-                    )
-                    self.connection.execute("COMMIT")
-                except Exception:
-                    if self.connection.in_transaction:
-                        self.connection.execute("ROLLBACK")
-                raise
-            cleaned_at = time.time()
-            cleanup_receipt = uuid.uuid4().hex
-            self.connection.execute("BEGIN IMMEDIATE")
-            try:
-                cleaned = self.connection.execute(
-                    """
-                    UPDATE runtime_evidence_objects
-                    SET active_relpath=NULL,expiry_state='orphan_cleaned',
-                        expiry_receipt_id=?,updated_at=?
-                    WHERE evidence_artifact_id=? AND active_relpath=? AND expiry_state='orphan_quarantined'
-                    """,
-                    (cleanup_receipt, cleaned_at, artifact_id, relpath),
-                )
-                if cleaned.rowcount != 1:
-                    raise RuntimeError("orphan cleanup compare-and-swap failed")
-                for event_kind in ("orphan_deleted", "orphan_cleaned"):
-                    self.connection.execute(
-                        "INSERT INTO runtime_evidence_events(evidence_artifact_id,event_kind,observed_at,detail_json) VALUES(?,?,?,?)",
-                        (
-                            artifact_id,
-                            event_kind,
-                            cleaned_at,
-                            _json_text({"cleanup_receipt_id": cleanup_receipt}),
-                        ),
-                    )
-                self.connection.execute("COMMIT")
-            except Exception:
-                if self.connection.in_transaction:
-                    self.connection.execute("ROLLBACK")
-                raise
-
-        directories = sorted(
-            (path for path in self.evidence_root.rglob("*") if path.is_dir() and not path.is_symlink()),
-            key=lambda path: len(path.parts),
-            reverse=True,
-        )
-        for directory in directories:
-            try:
-                directory.rmdir()
-            except OSError:
-                continue
-            _fsync_directory(directory.parent)
 
     def _import_legacy_once(self) -> None:
         self.connection.execute("BEGIN IMMEDIATE")
@@ -1643,58 +1161,6 @@ class OperatorReceiptStore:
                 normalized=dict(normalized),
             )
 
-    @staticmethod
-    def _merge_transport_evidence(target: dict[str, Any], evidence: Mapping[str, Any]) -> None:
-        """Union only attempt evidence; existing identities are immutable."""
-        for key in ("transport_exchanges", "transport_retention_errors"):
-            if key not in target and key not in evidence:
-                continue
-            rows = list(target.get(key) or [])
-            # A checkpoint contains the whole observer snapshot. Index once,
-            # rather than comparing every incoming row against every old row.
-            by_identity = {item["exchange_id"]: item for item in rows} if key == "transport_exchanges" else {}
-            for row in evidence.get(key) or []:
-                if key == "transport_exchanges":
-                    identity = row["exchange_id"]
-                    if identity in by_identity:
-                        if by_identity[identity] != row:
-                            raise ValueError("transport evidence identity collision")
-                        continue
-                    by_identity[identity] = row
-                elif row in rows:
-                    continue
-                rows.append(dict(row))
-            target[key] = rows
-
-    def merge_transport_evidence(self, command_id: str, evidence: Mapping[str, Any]) -> dict[str, Any]:
-        """Evidence-only current-JSON update, including after terminalization.
-
-        Uses the existing runtime coordinator/connection ownership. No command,
-        transition, timestamp, authority or response artifact is created here.
-        Storage errors propagate to the owner's explicit retention-error channel.
-        """
-        with self.lock:
-            self.connection.execute("BEGIN IMMEDIATE")
-            try:
-                existing = self.connection.execute(
-                    "SELECT receipt_json FROM operator_commands WHERE command_id=?", (command_id,),
-                ).fetchone()
-                if existing is None:
-                    raise KeyError("transport evidence requires an existing operator command")
-                current = json.loads(existing["receipt_json"])
-                for row in evidence.get("transport_exchanges") or []:
-                    if row.get("command_id") != command_id:
-                        raise ValueError("transport evidence command identity mismatch")
-                self._merge_transport_evidence(current, evidence)
-                self.connection.execute(
-                    "UPDATE operator_commands SET receipt_json=? WHERE command_id=?",
-                    (_json_text(current), command_id),
-                )
-                self.connection.execute("COMMIT")
-                return current
-            except Exception:
-                self.connection.execute("ROLLBACK")
-                raise
 
     def put(
         self,
@@ -1703,6 +1169,7 @@ class OperatorReceiptStore:
         _expected_status: str | None = None,
         _reconciliation_transition: bool = False,
         _linked_pipette_finalization: Mapping[str, Any] | None = None,
+        _invalidate_deck_location: bool = False,
     ) -> dict[str, Any]:
         row = critical_receipt(receipt)
         with self.lock:
@@ -1732,6 +1199,15 @@ class OperatorReceiptStore:
                 if artifact_id is not None:
                     compact.update({"evidence_artifact_id": artifact_id, "evidence_relpath": evidence[0], "evidence_sha256": evidence[1], "evidence_bytes": evidence[2]})
                 pruned = self._prune_locked()
+                if _invalidate_deck_location:
+                    from .deck_location_invalidation import invalidate_at_dispatch
+                    prior_authority_write = self._audit_database._claim_resource_write
+                    self._audit_database._claim_resource_write = True
+                    try:
+                        invalidate_at_dispatch(self.connection, root=self.root,
+                                               command_id=str(row["command_id"]))
+                    finally:
+                        self._audit_database._claim_resource_write = prior_authority_write
                 self.connection.execute("COMMIT")
                 if (
                     previous is not None
@@ -1862,7 +1338,76 @@ class OperatorReceiptStore:
                     self.connection.execute("ROLLBACK")
                 raise
 
+    def _canonical_receipt(self, row: sqlite3.Row, *, detail: bool, compact: bool = False) -> dict[str, Any] | None:
+        # Only plane-owned movement claims are duplicates. Direct native and
+        # protocol receipts keep their own contract and evidence authority.
+        if (row["entrypoint_id"] != "operator_command_plane" or row["command_kind"] != "operator"
+                or row["action_id"] != "oem.deck.move_to_location"):
+            return None
+        tables = {item[0] for item in self.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('operator_plane_commands','serial206_movement_commands')"
+        )}
+        if len(tables) != 2:
+            return None
+        exists = self.connection.execute(
+            "SELECT 1 FROM operator_plane_commands p JOIN serial206_movement_commands c USING(command_id) "
+            "WHERE p.command_id=? AND p.action_id=? AND c.action_id=p.action_id",
+            (row["command_id"], row["action_id"]),
+        ).fetchone()
+        if exists is None:
+            return None
+        from .operator_command_receipts import CommandReceiptReader
+        reader = CommandReceiptReader(self.connection, self.lock)
+        receipt = (reader.get_command_summary(row["command_id"]) if compact else
+                   reader.command_detail_v2(row["command_id"]) if detail else
+                   reader.get_command(row["command_id"]))
+        assert receipt is not None
+        # The legacy public envelope's sequence belongs to its SQL claim, not
+        # the movement stream. Preserve pagination/idempotency identities.
+        receipt["sequence"] = int(row["sequence"])
+        # Preserve the legacy envelope's separate SQL flags (including explicit
+        # operator assessment). Native/controller truth remains in terminal and
+        # typed deck evidence exactly as rendered by the canonical owner.
+        receipt["controller_acknowledged"] = bool(row["controller_acknowledged"])
+        receipt["physical_effect_verified"] = bool(row["physical_effect_verified"])
+        if receipt["status"] not in TERMINAL_STATES:
+            receipt["retry_forbidden"] = True
+            receipt.setdefault("outcome", "in_progress")
+        for key in ("outcome", "failure_code"):
+            if row[key] is not None:
+                receipt[key] = row[key]
+        receipt["response"] = (None if row["response_summary_json"] is None else
+                               json.loads(row["response_summary_json"]))
+        receipt["stage_receipts"] = []
+        # Older receipts can carry an assessment predating the transition
+        # reader. Retain that fallback without decoding the duplicated body.
+        saved = self.connection.execute(
+            "SELECT json_extract(receipt_json,'$.operator_assessment'),"
+            "json_extract(receipt_json,'$.operator_note'),"
+            "json_extract(receipt_json,'$.operator_assessment_idempotency_key'),"
+            "json_extract(receipt_json,'$.operator_assessed_at') "
+            "FROM operator_commands WHERE command_id=?", (row["command_id"],),
+        ).fetchone()
+        if saved is not None:
+            for key, value in zip(("operator_assessment", "operator_note",
+                                   "operator_assessment_idempotency_key", "operator_assessed_at"), saved):
+                if value is not None:
+                    receipt[key] = value
+        return self._with_assessment(row, receipt)
+
+    def canonical_receipt(self, command_id: str, *, detail: bool = False) -> dict[str, Any] | None:
+        """Typed route projection, preserving assessments and legacy identity."""
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT * FROM operator_commands WHERE command_id=?", (command_id,),
+            ).fetchone()
+            return None if row is None else self._canonical_receipt(row, detail=detail, compact=not detail)
+
     def _row_receipt(self, row: sqlite3.Row, *, include_evidence: bool) -> dict[str, Any]:
+        canonical = self._canonical_receipt(row, detail=False)
+        if canonical is not None:
+            return canonical
         receipt = json.loads(row["receipt_json"])
         # Historical receipt JSON can predate sequence publication. The SQL
         # ordering key is authoritative for both projection and pagination.
@@ -1915,6 +1460,9 @@ class OperatorReceiptStore:
             receipt["authority_receipt_id"] = receipt.get("authority_receipt_id") or receipt["command_id"]
             if not isinstance(receipt.get("authority_receipt_status"), str):
                 receipt["authority_receipt_status"] = receipt.get("status")
+        return self._with_assessment(row, receipt)
+
+    def _with_assessment(self, row: sqlite3.Row, receipt: dict[str, Any]) -> dict[str, Any]:
         assessment = self.connection.execute(
             """
             SELECT detail_json FROM operator_transitions
@@ -1974,7 +1522,7 @@ class OperatorReceiptStore:
                 """,
                 (key,),
             ).fetchone()
-        return None if row is None else self._row_receipt(row, include_evidence=include_evidence)
+            return None if row is None else self._row_receipt(row, include_evidence=include_evidence)
 
 
 _LEGACY_COMMAND_COLUMNS = frozenset({
@@ -2130,30 +1678,6 @@ class OperatorHistoryReader:
         return self.get_command(command_id)
 
 
-    def list_commands(
-        self, *, limit: int = 100, before_sequence: int | None = None,
-        exclude_command_ids: set[str] | frozenset[str] | None = None,
-    ) -> list[dict[str, Any]]:
-        bounded = min(max(int(limit), 1), 200)
-        excluded = {str(value) for value in (exclude_command_ids or set())}
-        with self.lock:
-            if self.connection is None or not self._require_schema("operator_plane_commands", _LEGACY_COMMAND_COLUMNS):
-                return []
-            clauses: list[str] = []
-            parameters: list[Any] = []
-            if before_sequence is not None:
-                clauses.append("stream_sequence<?")
-                parameters.append(int(before_sequence))
-            if excluded:
-                clauses.append(f"command_id NOT IN ({','.join('?' for _ in excluded)})")
-                parameters.extend(sorted(excluded))
-            where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-            parameters.append(bounded)
-            rows = self.connection.execute(
-                f"SELECT * FROM operator_plane_commands{where} ORDER BY stream_sequence DESC LIMIT ?",
-                tuple(parameters),
-            ).fetchall()
-            return [self._command_projection(row) for row in rows]
 
     def command_detail_v2(self, command_id: str) -> dict[str, Any] | None:
         projection = self.get_command(command_id)

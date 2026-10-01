@@ -9,7 +9,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 import threading
-import time
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
@@ -22,7 +21,6 @@ from .oem_compat.machine_state import OemDefaultParameters, OemMachineState
 from .oem_compat.pathing import OemPathPlanner
 from .oem_compat.movement_readiness import build_movement_readiness_comparison
 from .oem_compat.position_table import load_bound_oem_position_table
-from .oem_shadow_readback_live import build_shadow_readback_artifact
 from .runtime_state import OemRuntimeStateError, get_active_oem_runtime_state_store
 
 router = APIRouter(tags=["OEM homing parity dry-run"])
@@ -312,47 +310,6 @@ def _execution_preview_for_step(step: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-class _ApiPathMotionExecutor:
-    """Adapter from OEM path-plan steps to existing guarded API motion primitives."""
-
-    def __init__(self, api_mod):
-        self._api = api_mod
-        self._tester = api_mod._get_tester()
-
-    def absolute(self, axis: str, position_steps: int, *, speed: int | None = None, acc: int | None = None, wait_timeout_s: float = 12.0) -> dict[str, Any]:
-        axis_enum = self._api.AxisName(str(axis))
-        if axis_enum is self._api.AxisName.X and self._api._serial206_oem_initialization_provider is not None:
-            return self._api._execute_serial206_motion_intent("move_absolute", {"position_steps": int(position_steps), "wait_timeout_s": float(wait_timeout_s), "source_mode": "oem_path.moveX"})
-        return self._api._execute_absolute_move(
-            self._tester,
-            axis_enum,
-            int(position_steps),
-            float(wait_timeout_s),
-            speed=speed,
-            acc=acc,
-        )
-
-    def move_xy(self, x: int, y: int, *, wait_timeout_s: float = 12.0) -> dict[str, Any]:
-        if self._api._serial206_oem_initialization_provider is not None:
-            return self._api._execute_serial206_motion_intent("move_xy", {"x": int(x), "y": int(y), "wait_timeout_s": float(wait_timeout_s)})
-        return self._tester.oem_move_xy(int(x), int(y), wait_timeout_s=float(wait_timeout_s))
-
-    def relative(self, axis: str, steps: int, *, speed: int | None = None, acc: int | None = None, wait_timeout_s: float = 12.0) -> dict[str, Any]:
-        axis_enum = self._api.AxisName(str(axis))
-        return self._api._execute_relative_move(
-            self._tester,
-            axis_enum,
-            int(steps),
-            float(wait_timeout_s),
-            speed=speed,
-            acc=acc,
-            reuse_prepared=False,
-        )
-
-    def sleep(self, milliseconds: int) -> dict[str, Any]:
-        delay_s = max(0.0, min(float(milliseconds) / 1000.0, 30.0))
-        time.sleep(delay_s)
-        return {"ok": True, "milliseconds": int(milliseconds), "slept_s": delay_s}
 
 
 def _step_result_failed(result: Any) -> bool:
@@ -368,6 +325,7 @@ def _execute_oem_step_live(
     acc: int | None,
     path: str,
     pseudo_z_home_steps: int | None = None,
+    source_context: str | None = None,
 ) -> dict[str, Any]:
     op = str(step.get("op") or "")
     result: dict[str, Any] = {"ok": True, "path": path, "op": op, "source_step": dict(step), "results": []}
@@ -431,6 +389,7 @@ def _execute_oem_step_live(
                         tip_loaded=authority["tip_loaded"],
                         plate_on_gantry=authority.get("plate_on_gantry"),
                         location19_y=authority.get("location19_y"),
+                        source_context=source_context,
                     )
                     result["results"].append({"command": "moveTo", "result": sub})
                     if _step_result_failed(sub):
@@ -445,7 +404,8 @@ def _execute_oem_step_live(
             if x is None or y is None:
                 result.update({"ok": False, "error": "moveXY missing x/y target"})
             else:
-                sub = move_xy(int(x), int(y), wait_timeout_s=wait_timeout_s)
+                sub = move_xy(int(x), int(y), wait_timeout_s=wait_timeout_s,
+                              source_context=source_context)
                 result["results"].append({"command": "moveXY", "result": sub})
                 if _step_result_failed(sub):
                     result.update({"ok": False, "error": "moveXY step failed"})
@@ -499,6 +459,7 @@ def _execute_oem_step_live(
                         acc=acc,
                         path=f"{path}.parallel[{index}]",
                         pseudo_z_home_steps=pseudo_z_home_steps,
+                        source_context=source_context,
                     )
                 except Exception as exc:
                     child_errors.append(f"{index}:{type(exc).__name__}:{exc}")
@@ -538,6 +499,7 @@ def _execute_oem_steps_live(
     speed: int | None,
     acc: int | None,
     pseudo_z_home_steps: int | None = None,
+    source_context: str | None = None,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     motion_commanded = False
@@ -551,6 +513,7 @@ def _execute_oem_steps_live(
             acc=acc,
             path=str(idx),
             pseudo_z_home_steps=pseudo_z_home_steps,
+            source_context=source_context,
         )
         results.append(step_result)
         if op != "sleep":
@@ -835,55 +798,6 @@ async def dry_run_oem_homing_program(program_name: str, payload: dict[str, Any] 
     )
 
 
-class _ApiShadowReadbackProvider:
-    """Query-only adapter over existing passive API helpers.
-
-    This adapter intentionally calls status/readback helpers only. It must not
-    call motion, current-set, switch-mask, arm, home, or prepare-interlock paths.
-    """
-
-    def __init__(self, api_mod):
-        self._api = api_mod
-        self._tester = api_mod._get_tester()
-
-    def axis_snapshot(self, axis: str) -> dict[str, Any]:
-        axis_enum = self._api.AxisName(axis)
-        payload = self._api._axis_status_payload(self._tester, axis_enum, include_current=True)
-        status = payload.get("status", {}) if isinstance(payload, dict) else {}
-        switches = payload.get("switch_activity", {}) if isinstance(payload, dict) else {}
-        speed_row = status.get("speed") if isinstance(status, dict) else None
-        pos_row = status.get("position") if isinstance(status, dict) else None
-        run_row = status.get("max_current") if isinstance(status, dict) else None
-        standby_row = status.get("standby_current") if isinstance(status, dict) else None
-        return {
-            "position": pos_row.get("position") if isinstance(pos_row, dict) else pos_row,
-            "speed": speed_row.get("speed") if isinstance(speed_row, dict) else speed_row,
-            "gap9_left_raw": switches.get("left_raw_active"),
-            "gap10_right_raw": switches.get("right_raw_active"),
-            "left_disabled": switches.get("left_disabled"),
-            "right_disabled": switches.get("right_disabled"),
-            "run_current": run_row.get("value") if isinstance(run_row, dict) else None,
-            "standby_current": standby_row.get("value") if isinstance(standby_row, dict) else None,
-            "raw_status": payload,
-        }
-
-    def interlocks(self) -> dict[str, Any]:
-        power = self._api._motion_power_status_payload(self._tester)
-        return {
-            "rail_24v": power.get("rail_24v"),
-            "motion_arm": power.get("motion_arm"),
-            "latch_override": power.get("latch_override"),
-            "hardware_connected": power.get("hardware_connected"),
-        }
-
-    def reference_state(self) -> dict[str, Any]:
-        return self._api._reference_state_store.snapshot([
-            self._api.AxisName.X,
-            self._api.AxisName.Y,
-            self._api.AxisName.Z,
-            self._api.AxisName.GRIPPER,
-            self._api.AxisName.THERMAL_DOOR,
-        ])
 
 
 @router.get("/motion/oem/shadow_readback")
@@ -909,17 +823,3 @@ async def oem_shadow_readback(axes: str = "x,y,z,g,door") -> dict[str, Any]:
         "switch_mask_mutation_commanded": False,
         "error": None if observed is not None else "canonical shadow_readback observation unavailable",
     }
-
-
-@router.post("/motion/oem/shadow_readback/capture")
-async def oem_shadow_readback_capture(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    del payload
-    raise HTTPException(
-        status_code=409,
-        detail={
-            "error": "shadow_readback_collection_moved",
-            "required_route": "POST /hardware/snapshot/collect",
-            "required_domain": "shadow_readback",
-            "hardware_queried": False,
-        },
-    )

@@ -1,12 +1,10 @@
-"""Write-ahead journal for operator interrupt (stop/abort) requests — RCA F1.
+"""Append-only journal of operator interrupt (stop/abort) attempts.
 
-A stop that was pressed is a fact that can never be erased by a dead process.
-Every operator stop/abort attempt is therefore appended to this fsync'd,
-append-only journal *before* any lock is taken and before any physical
-delivery is attempted.  The SQLite projections
+The Stop is delivered first, as in the OEM app; nothing is written before the
+motor command goes out. Each attempt's admission facts and outcome are then
+appended to this fsync'd journal. The SQLite projections
 (``operator_plane_interrupt_attempts`` / ``..._evidence`` / ``..._history`` /
-``interrupt_reconciliation_events``) remain the queryable projections, but the
-journal is the authority that survives a crash between admission and delivery.
+``interrupt_reconciliation_events``) remain the queryable projections.
 
 Record shape (one canonical JSON object per line)::
 
@@ -16,8 +14,8 @@ Record shape (one canonical JSON object per line)::
      "phase": "admitted", "recorded_at": 1789961411.497,
      "recorded_monotonic": 12345.6, ...}
 
-Phases: ``admitted`` -> (``delivery_attempted`` -> ``delivered`` | ``failed``)
-with terminal phases ``terminal`` / ``rejected`` / ``materialized``.  A ``terminal``
+Phases: ``delivered`` | ``failed`` (written by the delivery lane), then
+``admitted`` and the terminal phases ``terminal`` / ``rejected`` / ``materialized``.  A ``terminal``
 or ``rejected`` record ends the lineage for that attempt; ``materialized`` marks
 that startup reconciliation turned an orphaned journal attempt into a durable
 projection row.
@@ -30,14 +28,14 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Mapping
 
 INTERRUPT_JOURNAL_SCHEMA = "bioxp.operator_interrupt_journal_event.v1"
 INTERRUPT_JOURNAL_FILENAME = "operator_interrupt_journal.v1.jsonl"
 
 #: Phases that end an attempt's lineage (no further work may be pending for it).
 INTERRUPT_JOURNAL_TERMINAL_PHASES = frozenset({"terminal", "rejected", "materialized"})
-#: Phases that only the write-ahead admission path may write.
+#: Phases the journal accepts.
 INTERRUPT_JOURNAL_PHASES = frozenset(
     {
         "admitted",
@@ -74,7 +72,7 @@ def _journal_safe(value: Any, *, depth: int = 0) -> Any:
 
 
 class InterruptJournal:
-    """Append-only, fsync'd journal of interrupt admission/delivery facts."""
+    """Append-only, fsync'd journal of interrupt delivery facts."""
 
     def __init__(self, root: str | os.PathLike[str] | None = None, *,
                  filename: str = INTERRUPT_JOURNAL_FILENAME) -> None:
@@ -293,19 +291,3 @@ class InterruptJournal:
                     os.close(self._fd)
                 finally:
                     self._fd = None
-
-
-def journal_events_for_attempt(
-    journal: InterruptJournal | None, interrupt_attempt_id: str | None,
-) -> list[dict[str, Any]]:
-    if journal is None or not interrupt_attempt_id:
-        return []
-    return [
-        row
-        for row in journal.events()
-        if str(row.get("interrupt_attempt_id")) == str(interrupt_attempt_id)
-    ]
-
-
-def iter_phases(rows: Iterable[Mapping[str, Any]]) -> list[str]:
-    return [str(row.get("phase")) for row in rows]

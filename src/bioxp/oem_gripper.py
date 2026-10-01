@@ -257,21 +257,6 @@ def restore_gripper_idle_current(tester: Any, *, reason: str = "operator_restore
     return result
 
 
-def _apply_profile(tester: Any, profile: dict[str, Any]) -> dict[str, Any]:
-    return tester.motor_prepare_axis(
-        int(profile["board"]),
-        motor=int(profile["motor"]),
-        run_current=int(profile.get("run_current", GRIPPER_ACTION_CURRENT)),
-        standby_current=int(profile.get("standby_current", OEM_IDLE_CURRENT)),
-        speed=int(profile.get("speed", 600)),
-        acc=int(profile.get("acc", 5)),
-        stall_guard=profile.get("stall_guard"),
-        rdiv=profile.get("rdiv", 6),
-        pdiv=profile.get("pdiv", 2),
-        disable_right=bool(profile.get("disable_right", False)),
-        disable_left=bool(profile.get("disable_left", False)),
-        warm_enable=bool(profile.get("warm_enable", False)),
-    )
 
 
 def _preflight_for_motion(tester: Any) -> dict[str, Any]:

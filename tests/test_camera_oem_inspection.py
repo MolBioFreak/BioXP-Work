@@ -199,13 +199,47 @@ def test_readback_drift_refuses_result_but_auto_time_changes_are_observed(rig):
     assert not p.status().available
 
 
-def test_generic_capture_still_uses_preview_cache(rig):
+def test_generic_capture_waits_for_preview_owner_post_request_frame(rig, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import datetime, timedelta, timezone
+    import threading
+
     p, state = rig
     p.begin_stream("preview")
-    frame = p.publish_stream_frame("preview", jpeg())
+    old_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+    frame = p.publish_stream_frame("preview", jpeg(), source_captured_at=old_at)
     state.calls.clear()
-    assert p.capture() is frame
-    assert not state.calls
+    requested = threading.Event()
+    now = p._aware_now
+
+    def request_clock():
+        timestamp = now()
+        requested.set()
+        return timestamp
+
+    monkeypatch.setattr(p, "_aware_now", request_clock)
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        pending = workers.submit(p.capture)
+        try:
+            assert requested.wait(1)
+            with pytest.raises(TimeoutError):
+                pending.result(timeout=0.05)
+            # A newly published but pre-request source packet is still stale.
+            p.publish_stream_frame("preview", frame.content, source_captured_at=old_at)
+            with pytest.raises(TimeoutError):
+                pending.result(timeout=0.05)
+            fresh = p.publish_stream_frame(
+                "preview", frame.content, source_captured_at=datetime.now(timezone.utc))
+            assert pending.result(timeout=1) is fresh
+            assert fresh.content == frame.content  # Stationary scenes remain valid.
+            assert fresh.sequence > frame.sequence
+            assert fresh.provider_generation == frame.provider_generation
+            assert p._stream_owner == "preview"
+            assert not state.calls  # No second process, discovery, or control writes.
+        finally:
+            p.end_stream("preview")
+    assert p._stream_owner is None
+    assert not p.status().available
 
 
 def test_inspection_and_stream_reservation_share_the_provider_lock(rig):

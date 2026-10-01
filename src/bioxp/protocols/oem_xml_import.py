@@ -473,18 +473,18 @@ def _compile_supported_action(
         description = f"Thermal setpoint {target_c:g} C for {duration_s:g} s"
     elif verb == "DWELL" and args:
         seconds = _as_float(args[0])
-        kind = ProtocolActionKind.WAIT
-        params = {"duration_s": seconds, "oem_marker": "DWELL"}
-        description = f"Dwell for {seconds:g} seconds"
+        kind = ProtocolActionKind.LOOP_MARKER
+        params = {"dwell_increment_s": seconds, "oem_marker": "DWELL"}
+        description = f"Accumulate {seconds:g} seconds for next loop SP (not a wait)"
     elif verb == "LOOP":
         count = _as_int(args[0]) if args else None
         kind = ProtocolActionKind.LOOP_MARKER
         params = {"count": count, "loop_role": "start" if count is not None else "end"}
         description = "Start OEM loop" if count is not None else "End OEM loop"
-    elif verb == "SS":
-        kind = ProtocolActionKind.SEAL_SEPARATE
-        params = {}
-        description = "Separate OEM seals"
+    elif verb in {"SS", "RT", "ST", "SW", "TT", "ZW"}:
+        kind = ProtocolActionKind.NOTE
+        params = {"source_noop": "ControlLib.scriptInterpretor.default", "tokens": list(args)}
+        description = f"Retained OEM default no-op ({verb})"
     elif verb == "LA" and len(args) >= 3:
         kind = ProtocolActionKind.LIQUID_ADJUST
         params = {

@@ -7,15 +7,29 @@ from dataclasses import dataclass
 from threading import Condition
 from typing import Any, Callable, Mapping
 
-from .models import ProtocolAction, ProtocolActionKind, ProtocolDocument, normalize_action_kind
+from .models import ProtocolAction, ProtocolActionKind, ProtocolDocument, normalize_action_kind, OEM_SOURCE_DEFAULT_NOOPS, OEM_BUILTIN_OPCODES
 from .runtime_state import ProtocolRuntimeState, ProtocolStageState, ProtocolWorkflowState, ProtocolSourceModel, StageExecutionStatus
 from .validators import validate_protocol_document, validate_protocol_support
 
 ActionHandler = Callable[[ProtocolAction, ProtocolRuntimeState], Mapping[str, Any] | Future]
 
+
+def source_default_return(action: ProtocolAction, state: ProtocolRuntimeState) -> Mapping[str, Any]:
+    """Retained dispatcher default: source line return only, no locks or IO."""
+    if action.oem_opcode not in OEM_SOURCE_DEFAULT_NOOPS:
+        raise ValueError("Not a reviewed retained source default")
+    return {"ok": True, "source_noop": "ControlLib.scriptInterpretor.default",
+            "source_return": [int(str(action.source_key))], "host_only": True}
+
+
+def oem_source_default_handlers() -> dict[str, ActionHandler]:
+    """Advertise actual builtin bodies to the existing service binding contract."""
+    return dict.fromkeys(OEM_SOURCE_DEFAULT_NOOPS, source_default_return)
+
 # Core.scriptInterpretor source event domains: predecessor joins, NOT
 # physical resource grants (which remain in the canonical command owner).
 SOURCE_DOMAINS = {
+    **dict.fromkeys(OEM_SOURCE_DEFAULT_NOOPS, ()),
     **{op: ("General",) for op in (
         "catchPlate", "catch", "cc", "delaypoint", "dopen", "dclose", "la",
         "led", "mov", "ms", "park", "pressp", "releasePlate", "release",
@@ -293,7 +307,7 @@ class ProtocolExecutor:
                     opcode = action.oem_opcode
                     if opcode not in SOURCE_DOMAINS:
                         missing.append("opcode:" + str(opcode))
-                    elif opcode not in {"step", "delaypoint", "wait"} and opcode not in self._oem_handlers:
+                    elif opcode not in OEM_BUILTIN_OPCODES and opcode not in self._oem_handlers:
                         missing.append("opcode:" + str(opcode))
                 elif action.kind not in {ProtocolActionKind.NOTE, ProtocolActionKind.PAUSE_REVIEW} and action.kind not in self._handlers:
                     missing.append("kind:" + action.kind.value)
@@ -497,13 +511,6 @@ class ProtocolExecutor:
             self._condition.notify_all()
             return {"ok": True, "delivery_attempted": False, "source_script_finalized": True}
 
-    def register_child(self, command_id: str) -> None:
-        """Canonical owner calls at actual admission, preserving admission order."""
-        if not isinstance(command_id, str) or not command_id:
-            raise ValueError("Child requires actual canonical identity")
-        with self._condition:
-            if command_id not in self._state.workflow.child_command_ids:
-                self._state.workflow.child_command_ids.append(command_id)
 
     def _notify(self) -> None:
         with self._condition:
@@ -879,6 +886,8 @@ class ProtocolExecutor:
         state.action_results.append(result)
         if action.kind in {ProtocolActionKind.NOTE, ProtocolActionKind.PAUSE_REVIEW}:
             value = {"ok": True, "host_only": True}
+        elif opcode in OEM_SOURCE_DEFAULT_NOOPS:
+            value = source_default_return(action, state)
         elif opcode == "step":
             value = {"ok": True, "source_marker": True}
         elif opcode == "delaypoint":

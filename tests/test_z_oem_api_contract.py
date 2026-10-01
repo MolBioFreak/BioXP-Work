@@ -7,11 +7,9 @@ from fastapi import HTTPException
 def test_live_right_reference_route_is_retired():
     import src.bioxp.api as api
 
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(api.motion_oem_z_live_right_reference())
-
-    assert exc.value.status_code == 410
-    assert exc.value.detail["error"] == "z_live_right_reference_retired"
+    assert not hasattr(api, "motion_oem_z_live_right_reference")
+    assert not any(getattr(route, "path", None) == "/motion/oem/z/live_right_reference" for route in api.app.routes)
+    assert any(getattr(route, "path", None) == "/motion/oem/z/status" for route in api.app.routes)
 
 
 def test_diagnostic_home_stays_separate_without_non_oem_confirmation_gate(monkeypatch):

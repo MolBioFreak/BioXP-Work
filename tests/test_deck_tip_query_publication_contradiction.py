@@ -150,7 +150,39 @@ def assert_park_unready(rig, match):
     return str(refused.value)
 
 
+def assert_source_park(rig, *, tip_exists, hardware_tip_exists):
+    """Real OEM reader/semantic selection; durable uncertainty is not a gate."""
+    from bioxp import api
+    calls = list(rig[6])
+    source = api._pipette_collection_state(ensure_constructor=True)
+    assert source['tip_exists'] is tip_exists
+    assert source['hardware_tip_exists'] is hardware_tip_exists
+    authority = park_authority(rig)
+    assert authority['collection_tip_state'] == source
+    # ClassMachineStatus tip_loaded is a separate owner; Park consumes TipExist
+    # from collection without forcing those two observations to agree.
+    rig[1]._deck_execution_semantics(authority, no_tip_park=True)
+    assert rig[6] == calls  # No extra query, retry or canonical prerequisite.
+    return source
+
+
 def warm_no_tip(rig):
+    # The retained motor fixture does not establish process-local CAN constructor
+    # ownership. Establish it through the real source owner, at the offline wire
+    # seam, before a cached collection reader requests ensure_constructor.
+    from bioxp import api
+    from bioxp.lifecycle_state import CanonicalLifecycleOwner
+    from tests.test_pipette_constructor_collection import constructor
+    with pytest.MonkeyPatch.context() as setup:
+        owner = CanonicalLifecycleOwner()
+        owner.transport_changed(True, reason='offline collection fixture CAN owner')
+        setup.setattr(api, 'lifecycle_state', owner)
+        def action():
+            attempt = owner.projection()['startup']['stages']['constructor_pipette_stage']['attempt_id']
+            return constructor(rig, setup, key=attempt)[0]
+        projection = owner.run_stage('constructor_pipette_stage', action)
+        assert projection['startup']['stages']['constructor_pipette_stage']['state'] == 'passed'
+        assert rig[8]._constructor_started  # Set by the real producer, not fixture intent.
     named_move(rig)
     query(rig)
     authority = park_authority(rig)
@@ -210,11 +242,13 @@ def test_failed_positive_prefix_is_durable_not_complete_and_recovers_only_on_new
     for key in ('current_location', 'current_well', 'ambiguity_state', 'clean_path', 'movable_plate_locations'):
         assert after[key] == before[key]
     assert after['transition_provenance']['upstream_source_command_id'] == detail['command_id']
-    assert_park_unready(rig, 'deck_semantic_state_not_authoritative:tip_dirty')
-    assert_worker_refused(rig, 'failed-prefix-'+fault, 'deck_semantic_state_not_authoritative:tip_dirty')
+    source = assert_source_park(rig, tip_exists=True, hardware_tip_exists=True)
+    assert [c['tip_loaded'] for c in source['channels']] == [True, False, False, False]
     opened = reopen(rig, detail['receipt_id'])
     assert opened['semantic'] == after
-    assert isinstance(opened['park_blocker'], str) and 'tip_dirty' in opened['park_blocker']
+    # Reopened historical semantics may lack dirty truth; current Park selects
+    # process-local source state instead. Neither reader manufactures proof.
+    assert opened['semantic']['tip_dirty'] is None
     assert opened['receipt']['result']['ok'] is False
     for key in ('delivery_verified', 'controller_acknowledged', 'completion_verified',
                 'semantic_query_response_verified', 'physical_effect_verified'):
@@ -275,12 +309,20 @@ def test_warm_invalid_prefix_never_overwrites_current_owner(query_rig, monkeypat
         assert after['transition_provenance']['upstream_source_command_id'] == 'later-owned-mutation'
     else:
         assert after == before
-    if fault in ('false_prefix', 'missing_first', 'malformed_first', 'uncorrelated', 'stale', 'reader', 'reader_replaced', 'interrupt'):
-        # MachineStatus stays unchanged; distinct collection source cannot
-        # manufacture verified absence from malformed/default channel returns.
-        assert_park_unready(rig, 'pipette_collection_reader_or_stop_changed'
-                            if fault in ('reader', 'reader_replaced', 'interrupt')
-                            else 'pipette_collection_state_not_authoritative')
+    if fault in ('reader', 'reader_replaced', 'interrupt'):
+        assert_source_park(rig, tip_exists=True,
+            hardware_tip_exists=True if fault == 'interrupt' else None)
+    elif fault in ('false_prefix', 'missing_first', 'malformed_first', 'uncorrelated', 'stale'):
+        # Literal QueryTipStatus/processMessage setters still update the OEM
+        # Boolean. Missing physical proof is evidence, not a new Park gate.
+        from bioxp import api
+        durable = api._pipette_collection_state()
+        assert durable['hardware_tip_exists'] is None
+        collection = assert_source_park(rig,
+            tip_exists=fault in ('uncorrelated', 'stale'), hardware_tip_exists=None)
+        assert collection['tip_exists'] is (fault in ('uncorrelated', 'stale'))
+        assert collection['hardware_tip_exists'] is None
+        assert park_authority(rig)['collection_tip_state'] == collection
 
 
 @pytest.mark.parametrize('failure', ['publisher', 'receipt'])
@@ -308,10 +350,16 @@ def test_recording_failure_is_not_motor_reference_recovery(query_rig, monkeypatc
         assert detail['deck_state_publication']['status'] == 'blocked'
         opened = reopen(rig, detail['receipt_id'])
         assert opened['receipt']['result']['ok'] is False
-    # No motor reset/latch: collection presence or unresolved receipt owns
-    # this refusal independently of the unchanged MachineStatus mirror.
-    assert_park_unready(rig, 'deck_semantic_state_not_authoritative:clean_path'
-                        if failure == 'publisher' else 'pipette_collection_receipt_pending')
+    # Source setters ran despite failed recording; physical proof stays unknown
+    # for the malformed channel. Current Park must still execute its reader.
+    assert_source_park(rig, tip_exists=True, hardware_tip_exists=True)
+    if failure == 'receipt':
+        row = receipts.connection.execute('SELECT status,receipt_json FROM pipette_operations ORDER BY rowid DESC LIMIT 1').fetchone()
+        assert row['status'] in ('reserved', 'queued', 'dispatched', 'issued_pending')
+        from bioxp.pipette.receipts import PipetteReceiptError
+        with pytest.raises(PipetteReceiptError, match='pending'):
+            receipts.collection_state(identity=rig[8].collection_source_identity(),
+                ownership_generation=provider.generation_provider())
 
 
 def submit_named(rig, target, key, *, expected_status='completed'):
@@ -430,15 +478,18 @@ def test_sqlite_publication_failure_rolls_back_without_motor_reset(query_rig):
     assert reopen(rig, result['receipt_id'])['semantic'] == before
     assert not provider._deck_authority_scoped_cache
     assert calls == [0,1,2,3] * 2
-    refusal = assert_park_unready(rig, 'deck_semantic_state_not_authoritative:clean_path')
-    prior_motion = len(primitive.calls)
-    admitted = assert_worker_refused(rig, 'storage-limit-active-worker', refusal)
-    leaf_calls = primitive.calls[prior_motion:]
-    assert not any(row[0] == 'move' for row in leaf_calls)
+    source = assert_source_park(rig, tip_exists=True, hardware_tip_exists=True)
+    assert [c['tip_loaded'] for c in source['channels']] == [True, False, False, False]
+    durable = reopen(rig, result['receipt_id'])['receipt']
+    # Publication follows recording; the durable query remains verified while
+    # the refused deck update stays absent and source RAM remains current.
+    assert durable['result']['semantic_query_response_verified'] is True
+    assert durable['result']['source_tip_exists'] is True
+    assert durable['truth']['physical_effect_verified'] is False
     assert app.state.operator_command_plane.store.deck_semantic_state() == before
     assert references.snapshot(('x', 'y', 'z', 'g'))['rows'] == reference_before
 
     if os.environ.get('DECK_TEST_OUTPUT'):
         Path(os.environ['DECK_TEST_OUTPUT'] + '.storage-limit.json').write_text(json.dumps({
-            'query': result, 'retained_owner': before, 'physical_refusal': refusal, 'worker_receipt': admitted, 'leaf_calls': leaf_calls,
-            'references_unchanged': True, 'park_executed': False}, indent=2))
+            'query': result, 'retained_owner': before, 'source_park_collection': source,
+            'references_unchanged': True, 'no_recordkeeping_gate': True}, indent=2))

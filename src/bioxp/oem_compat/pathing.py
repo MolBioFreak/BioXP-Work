@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 from .machine_state import OemMachineState
 from .position_table import PositionTable, OEM_X_INCREMENT, OEM_Y_INCREMENT

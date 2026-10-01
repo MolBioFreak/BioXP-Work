@@ -157,10 +157,6 @@ def check_biosecurity_cover(image: bytes | np.ndarray, *, file_mode: bool = Fals
     return bool(count > 10000)
 
 
-def label_dark_frame_valid(image: bytes | np.ndarray) -> bool:
-    """checkLabel first stage: histogram max-min >=2000 (not intensity range)."""
-    minimum, maximum, _, _ = cv2.minMaxLoc(_hist(_gray(image)))
-    return maximum - minimum >= 2000.0
 
 
 def check_label(led2_off: bytes | np.ndarray, led2_on: bytes | np.ndarray) -> bool:

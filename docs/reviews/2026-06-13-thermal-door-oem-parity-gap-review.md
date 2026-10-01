@@ -1,5 +1,10 @@
 # BioXP Thermal Door OEM-Parity Code Review / Gap Analysis
 
+> The redundant executable historical homing model is retired. This source-mode
+> matrix remains historical evidence; the supported program definitions are in
+> `src/bioxp/oem_homing_spec.py`. No source mode or physical provider was removed.
+
+
 Date: 2026-06-13
 Scope: thermal-door motion/homing/open/close parity against the OEM SSD/decompiled source.
 

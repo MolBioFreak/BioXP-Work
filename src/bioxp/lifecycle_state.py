@@ -170,8 +170,10 @@ class CanonicalLifecycleOwner:
             return attempt_id
 
     def _finish_stage(self, name: str, attempt_id: str, result: Mapping[str, Any]) -> dict[str, Any]:
-        evidence = copy.deepcopy(dict(result))
-        ok = bool(evidence.get("ok"))
+        # Constructor detail already belongs to the canonical pipette attempt.
+        # Other startup stages retain their unique evidence and initial-check history.
+        evidence = None if name == "constructor_pipette_stage" else copy.deepcopy(dict(result))
+        ok = bool(result.get("ok"))
         with self._lock:
             row = self._stages[name]
             if row["attempt_id"] != attempt_id or row["state"] != "running":
@@ -180,7 +182,7 @@ class CanonicalLifecycleOwner:
                 "state": "passed" if ok else "failed",
                 "completed_at": _utc_now(),
                 "evidence": evidence,
-                "error": None if ok else str(evidence.get("error") or evidence.get("outcome") or f"{name}_failed"),
+                "error": None if ok else str(result.get("error") or result.get("outcome") or f"{name}_failed"),
             })
             successor_index = STARTUP_STAGES.index(name) + 1
             if ok and successor_index < len(STARTUP_STAGES):
@@ -398,35 +400,6 @@ class CanonicalLifecycleOwner:
             "trace": trace,
         }
 
-    def initialize_system_camera_dependency(self) -> dict[str, Any]:
-        """Evaluate the OEM camera gate at its initializeSystem boundary."""
-        result = self._camera_dependency()
-        return {
-            **result,
-            "stage": "initializeSystem_after_initializeMotion_before_inspectCover",
-            "source_anchor": "BioXPMainWindow.initializeSystem lines 1172-1181",
-        }
-
-    def _camera_dependency(self) -> dict[str, Any]:
-        if not self._check_camera:
-            return {"required": False, "ok": True, "source": "OperationParameters.CheckCamera"}
-        with self._lock:
-            evidence = copy.deepcopy(self._camera_evidence)
-        ok = bool(
-            isinstance(evidence, dict)
-            and evidence.get("available") is True
-            and evidence.get("ok", True) is True
-            and (evidence.get("probe_id") or evidence.get("session_id"))
-        )
-        return {
-            "required": True,
-            "ok": ok,
-            "source": "explicit POST /camera/probe or POST /camera/stream/start evidence",
-            "evidence": evidence,
-            "lazy_camera_open_performed": False,
-            "error": None if ok else "explicit_camera_probe_or_session_evidence_missing_or_failed",
-        }
-
     def _check_door_status(
         self,
         hardware: Any,
@@ -609,8 +582,20 @@ class CanonicalLifecycleOwner:
             provenance={"raw": copy.deepcopy(result)},
         )
 
-    def projection(self) -> dict[str, Any]:
+    def projection(self, *, compact_startup: bool = False) -> dict[str, Any]:
         with self._lock:
+            # Constructor transport detail is already in the canonical pipette
+            # receipt, bound by lifecycle_attempt_id. Do not copy that dump for
+            # polling. Other stages retain their sole evidence here.
+            stages = {
+                name: {
+                    key: copy.deepcopy(value)
+                    for key, value in row.items()
+                    if not (compact_startup and name == "constructor_pipette_stage"
+                            and key in {"evidence", "history"})
+                }
+                for name, row in self._stages.items()
+            }
             return {
                 "schema_version": "bioxp.canonical_lifecycle.v1",
                 "revision": self._revision,
@@ -625,7 +610,7 @@ class CanonicalLifecycleOwner:
                 "startup": {
                     "state": _aggregate_startup_state(self._stages),
                     "active_stage": next((name for name in STARTUP_STAGES if self._stages[name]["state"] == "running"), None),
-                    "stages": copy.deepcopy(self._stages),
+                    "stages": stages,
                 },
             }
 

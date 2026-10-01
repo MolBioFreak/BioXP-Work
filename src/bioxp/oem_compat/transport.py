@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .frames import OemCommandFrame, OemReplyFrame
@@ -19,16 +19,10 @@ class ReplyMismatch(RuntimeError):
     pass
 
 
-class AmbiguousReply(ReplyMismatch):
-    pass
 
 
-class MutatingCommandBlocked(RuntimeError):
-    pass
 
 
-class LiveTransportNotArmed(RuntimeError):
-    pass
 
 
 class SafetyContractViolation(RuntimeError):
@@ -43,28 +37,6 @@ def assert_transport_safety(*, mode: str, opened_usb: bool, physical_motion: boo
         raise SafetyContractViolation(f"{mode_text} transport must not report physical motion")
 
 
-def match_tmcl_reply(
-    raw_responses: list[bytes | bytearray | list[int]],
-    *,
-    expected: OemCommandFrame,
-    require_success: bool = True,
-) -> OemReplyFrame:
-    matches = [
-        reply
-        for reply in (OemReplyFrame.from_tmcl_response(raw) for raw in raw_responses)
-        if reply.matches_command(expected)
-    ]
-    if not matches:
-        raise ReplyMismatch(f"No matching reply for board={expected.sidh} command={expected.command}")
-    if len(matches) > 1:
-        raise AmbiguousReply(f"Ambiguous replies for board={expected.sidh} command={expected.command}: {len(matches)} matches")
-    reply = matches[0]
-    if require_success and reply.status != 100:
-        raise ReplyMismatch(
-            f"Non-success reply for board={expected.sidh} command={expected.command}: "
-            f"{reply.status} {reply.status_str}"
-        )
-    return reply
 
 
 @dataclass
@@ -102,22 +74,6 @@ def _frame_to_json(frame: OemCommandFrame) -> dict:
     }
 
 
-@dataclass
-class RecordingTransport(DryRunTransport):
-    artifact_path: Path | str | None = None
-    mode: str = "dry_run"
-
-    def close(self) -> None:
-        if self.artifact_path is None:
-            return
-        path = Path(self.artifact_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "format": "bioxp-oem-compat-trace-v1",
-            "mode": self.mode,
-            "frames": [_frame_to_json(f) for f in self.frames],
-        }
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True))
 
 
 @dataclass
@@ -145,54 +101,3 @@ class ReplayTransport(DryRunTransport):
     def assert_complete(self) -> None:
         if self.position != len(self.expected):
             raise ReplayMismatch(f"Replay has {len(self.expected) - self.position} unconsumed expected frame(s)")
-
-
-READ_ONLY_TMCL_COMMANDS = {6, 138}
-
-
-@dataclass
-class ShadowTransport:
-    """Status/query-only transport for correlating live replies without motion.
-
-    The adapter is the live robot/USB seam. Shadow mode may open USB for reads,
-    but it must reject mutating TMCL frames before they reach that adapter.
-    """
-
-    adapter: object
-    frames: list[OemCommandFrame] = field(default_factory=list)
-    opened_usb: bool = True
-    mode: str = "shadow"
-
-    def transmit(self, frame: OemCommandFrame) -> OemReplyFrame:
-        if frame.command not in READ_ONLY_TMCL_COMMANDS:
-            raise MutatingCommandBlocked(f"Shadow mode blocks mutating command {frame.command} for {frame!r}")
-        raw_responses = self.adapter.transmit(frame)
-        reply = match_tmcl_reply(raw_responses, expected=frame)
-        self.frames.append(frame)
-        assert_transport_safety(mode=self.mode, opened_usb=self.opened_usb, physical_motion=False)
-        return reply
-
-
-@dataclass
-class LiveTransport:
-    """Operator-armed live transport wrapper with strict reply matching."""
-
-    adapter: object
-    operator_ack: bool
-    artifact_root: Path | str | None
-    frames: list[OemCommandFrame] = field(default_factory=list)
-    opened_usb: bool = True
-    mode: str = "live"
-
-    def _assert_armed(self) -> None:
-        if not self.operator_ack:
-            raise LiveTransportNotArmed("live transport requires explicit operator acknowledgement")
-        if self.artifact_root is None:
-            raise LiveTransportNotArmed("live transport requires an artifact root")
-
-    def transmit(self, frame: OemCommandFrame) -> OemReplyFrame:
-        self._assert_armed()
-        raw_responses = self.adapter.transmit(frame)
-        reply = match_tmcl_reply(raw_responses, expected=frame)
-        self.frames.append(frame)
-        return reply

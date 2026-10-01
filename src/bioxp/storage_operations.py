@@ -2385,7 +2385,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description="Verify BioXP runtime storage and recovery evidence")
-    parser.add_argument("operation", choices=("backup", "restore", "capacity", "checkpoint", "health"))
+    parser.add_argument("operation", choices=("backup", "restore", "capacity", "checkpoint", "health", "retention"))
+    parser.add_argument("--as-of", type=float, help="Fixed epoch for deterministic 14-day retention")
+    parser.add_argument("--apply", action="store_true", help="Apply retention transaction (service must be stopped; separate backup required)")
     parser.add_argument("--root", default=os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT", "/var/lib/bioxp-oem-runtime"))
     parser.add_argument("--unit")
     parser.add_argument("--target")
@@ -2393,7 +2395,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--allocation-bytes", type=int)
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
-        if args.operation == "backup":
+        if args.operation == "retention":
+            if args.as_of is None:
+                parser.error("retention requires --as-of (fixed epoch)")
+            from .runtime_retention import retain_runtime_rows
+            result = retain_runtime_rows(args.root, as_of=args.as_of, apply=args.apply)
+        elif args.operation == "backup":
             result = create_backup_unit(args.root, label=args.label, phase="scheduled")
         elif args.operation == "restore":
             if not args.unit:

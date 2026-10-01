@@ -34,6 +34,7 @@ from .operator_controls import (
     _MAX_INPUT_BYTES,
 )
 from .operator_receipt_store import runtime_state_root
+from .operator_command_receipts import CommandReceiptReader
 from .runtime_audit_store import open_runtime_connection, runtime_write_coordinator
 from .oem_runtime_store import (
     LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256,
@@ -317,10 +318,6 @@ def _json_load(value: str | None, default: Any = None) -> Any:
         return default
 
 
-def _positive_int(value: Any, *, name: str) -> int:
-    if type(value) is not int or value <= 0:
-        raise HTTPException(status_code=422, detail={"error": "invalid_integer", "field": name})
-    return int(value)
 
 
 def _validate_inputs(action_id: str, inputs: Any) -> dict[str, Any]:
@@ -543,70 +540,6 @@ def _state_value(state: Mapping[str, Any], *keys: str) -> Any:
     return None
 
 
-def _axis_position(state: Mapping[str, Any], axis: str) -> int | None:
-    provider = state.get("serial206_initialization_provider") if isinstance(state, Mapping) else None
-    if isinstance(provider, Mapping):
-        authority_key = {"x": "x_authority", "y": "y_authority", "z": "z_authority"}.get(axis, "z_authority")
-        authority = provider.get(authority_key)
-        if isinstance(authority, Mapping):
-            live = authority.get("live_status")
-            terminal = authority.get("terminal_state")
-            for row in (live, terminal, authority):
-                if isinstance(row, Mapping):
-                    for key in ("position_steps", "current_position_steps", "position"):
-                        value = row.get(key)
-                        if type(value) is int:
-                            return value
-    domains = state.get("domains") if isinstance(state, Mapping) else None
-    if isinstance(domains, Mapping):
-        axes = domains.get("axes")
-        observation = axes.get("observation") if isinstance(axes, Mapping) else None
-        rows = observation.get("rows") if isinstance(observation, Mapping) else None
-        row = rows.get(axis) if isinstance(rows, Mapping) else None
-        status = row.get("status") if isinstance(row, Mapping) else None
-        if isinstance(status, Mapping):
-            position = status.get("position")
-            if isinstance(position, Mapping):
-                position = position.get("value")
-            if type(position) is int:
-                return position
-            if type(position) is float and position.is_integer():
-                return int(position)
-    return None
-
-
-def _axis_reference(state: Mapping[str, Any], axis: str) -> tuple[str, int]:
-    references = state.get("references") if isinstance(state, Mapping) else None
-    rows = references.get("rows") if isinstance(references, Mapping) else None
-    row = rows.get(axis) if isinstance(rows, Mapping) else None
-    row_state = "unknown"
-    row_version = 0
-    if isinstance(row, Mapping):
-        row_state = str(row.get("state") or "unknown")
-        version = row.get("version")
-        row_version = int(version) if type(version) is int else 0
-    provider = state.get("serial206_initialization_provider") if isinstance(state, Mapping) else None
-    authority_key = {"x": "x_authority", "y": "y_authority", "z": "z_authority"}.get(axis, "z_authority")
-    authority = provider.get(authority_key) if isinstance(provider, Mapping) else None
-    if isinstance(authority, Mapping):
-        authority_state = str(authority.get("reference_state") or authority.get("state") or row_state)
-        authority_version = max(
-            int(authority.get("current_generation") or 0),
-            int(authority.get("board_lifecycle_generation") or 0),
-        )
-        return (authority_state if authority_state != "unknown" else row_state), max(row_version, authority_version)
-    return row_state, row_version
-
-
-def _z_home_valid(state: Mapping[str, Any]) -> bool:
-    reference, _ = _axis_reference(state, "z")
-    if reference in {"referenced", "home", "valid", "homed"}:
-        return True
-    provider = state.get("serial206_initialization_provider") if isinstance(state, Mapping) else None
-    authority = provider.get("z_authority") if isinstance(provider, Mapping) else None
-    if isinstance(authority, Mapping):
-        return str(authority.get("state") or "") == "referenced_ready" and str(authority.get("reference_state") or "") == "referenced"
-    return False
 
 
 def _z_pseudo_home(state: Mapping[str, Any]) -> int:
@@ -658,7 +591,7 @@ def _active_board_epochs(state: Mapping[str, Any], action_id: str) -> dict[str, 
     if axis == "x" and isinstance(provider, Mapping):
         authority = provider.get("x_authority")
         if isinstance(authority, Mapping):
-            value = authority.get("active_board_epoch", authority.get("board_lifecycle_generation"))
+            value = authority.get("current_board_lifecycle_generation", authority.get("active_board_epoch", authority.get("board_lifecycle_generation")))
             if type(value) is int and value >= 0:
                 return {"5": value}
     candidates: list[Any] = []
@@ -680,30 +613,6 @@ def _active_board_epochs(state: Mapping[str, Any], action_id: str) -> dict[str, 
             return {"4": value}
     return {}
 
-
-def _axis_limit(state: Mapping[str, Any], axis: str) -> int | None:
-    provider = state.get("serial206_initialization_provider") if isinstance(state, Mapping) else None
-    if isinstance(provider, Mapping):
-        authority_key = {"x": "x_authority", "y": "y_authority", "z": "z_authority"}.get(axis, "z_authority")
-        authority = provider.get(authority_key)
-        if isinstance(authority, Mapping):
-            for key in ("source_max_steps", "axis_max_steps", "max_steps"):
-                value = authority.get(key)
-                if type(value) is int:
-                    return value
-    domains = state.get("domains") if isinstance(state, Mapping) else None
-    axes = domains.get("axes") if isinstance(domains, Mapping) else None
-    observation = axes.get("observation") if isinstance(axes, Mapping) else None
-    rows = observation.get("rows") if isinstance(observation, Mapping) else None
-    row = rows.get(axis) if isinstance(rows, Mapping) else None
-    if isinstance(row, Mapping):
-        preset = row.get("preset")
-        if isinstance(preset, Mapping):
-            for key in ("axis_max_steps", "max_steps"):
-                value = preset.get(key)
-                if type(value) is int:
-                    return value
-    return None
 
 
 def _home_completion_proven(response: Any) -> bool:
@@ -754,20 +663,6 @@ def _addressed_event_proven(response: Any) -> bool:
     return False
 
 
-def _y_absolute_terminal_disposition(
-    *,
-    completion_class: Any,
-    event_128: bool,
-    target_steps: Any,
-    observed_position_steps: Any,
-    terminal_speed_zero: bool,
-) -> str:
-    target_equal = type(target_steps) is int and type(observed_position_steps) is int and observed_position_steps == target_steps
-    if target_equal and terminal_speed_zero and (
-        event_128 or completion_class == "oem_timeout_target_equal"
-    ):
-        return "completed"
-    return "failed"
 
 
 def _position_readback_proven(response: Any) -> bool:
@@ -822,28 +717,6 @@ def _terminal_position_steps(response: Any) -> int | None:
     return _terminal_position_steps(nested) if isinstance(nested, Mapping) else None
 
 
-def _source_noop(action_id: str, requested: Mapping[str, Any], effective: Mapping[str, Any], state: Mapping[str, Any]) -> tuple[bool, str | None]:
-    axis = AXIS_BY_ACTION.get(action_id)
-    if axis is None:
-        return False, None
-    current = _axis_position(state, axis)
-    if action_id.endswith("move_steps") and not action_id.startswith("oem.y.") and int(requested.get("steps", 1)) == 0:
-        return True, "zero_relative_steps"
-    if action_id.endswith("move_absolute") and not action_id.startswith("oem.y."):
-        target = effective.get("position_steps")
-        if type(target) is int and current is not None and current == target:
-            return True, "same_effective_absolute_target"
-    if action_id == "oem.z.manual_home" and current == 0 and bool(_state_value(state, "MotorHome", "motor_home", "home_latched")):
-        return True, "already_home"
-    if action_id == "oem.x.manual_panel_home" and current == 0 and bool(_state_value(state, "MotorHome", "motor_home", "home_latched")):
-        return True, "already_home"
-    if action_id.endswith("move_absolute") and not action_id.startswith("oem.y.") and current is not None:
-        target = effective.get("position_steps")
-        if type(target) is int and target > current:
-            maximum = _axis_limit(state, axis)
-            if type(maximum) is int and abs(maximum - current) < 10:
-                return True, "source_high_limit_suppression"
-    return False, None
 
 
 def _find_event(value: Any, *, code: int | None = None, name: str | None = None) -> bool:
@@ -1046,7 +919,7 @@ def _interrupt_invocation_evidence(action_id: str, *, attempted: bool) -> dict[s
     }
 
 
-class OperatorCommandStore:
+class OperatorCommandStore(CommandReceiptReader):
     """SQLite authority for command order and lifecycle projections."""
 
     def __init__(self, root: str | Path | None = None) -> None:
@@ -1164,8 +1037,24 @@ class OperatorCommandStore:
                 if worker.is_alive()
             }
 
+    def _current_deck_board_epochs(self, state: Mapping[str, Any], action_id: str) -> dict[str, int]:
+        """Read owner bindings, not caller/presentation epoch expectations.
+
+        Call under the provider-before-writer scope. Missing epochs stay absent;
+        downstream immutable ledger constraints are not weakened or fabricated.
+        """
+        reader = self._deck_owner_authority_reader
+        if not callable(reader):
+            return _active_board_epochs(state, action_id)
+        stamps = reader()
+        return {
+            board: stamps[key] for board, key in (("4", "board_epoch_4"), ("5", "board_epoch_5"))
+            if type(stamps.get(key)) is int and stamps[key] >= 0
+        }
+
     def _validate_deck_owner_authority(
-        self, *, ownership_generation: int, board_epoch_4: int, board_epoch_5: int
+        self, *, ownership_generation: int, board_epoch_4: int, board_epoch_5: int,
+        current: Mapping[str, Any] | None = None,
     ) -> None:
         supplied = (ownership_generation, board_epoch_4, board_epoch_5)
         if any(type(value) is not int or value < 0 for value in supplied):
@@ -1173,7 +1062,8 @@ class OperatorCommandStore:
         reader = self._deck_owner_authority_reader
         if not callable(reader):
             return
-        current = reader()
+        if current is None:
+            current = reader()
         observed = (
             current.get("ownership_generation"),
             current.get("board_epoch_4"),
@@ -1182,9 +1072,6 @@ class OperatorCommandStore:
         if observed != supplied:
             raise RuntimeError("deck_owner_authority_changed")
 
-    def append_y_interrupt_fallback(self, receipt: Mapping[str, Any], *, reason: str) -> dict[str, Any]:
-        """Compatibility wrapper for the original Y-only caller."""
-        return self.append_interrupt_fallback(receipt, reason=reason)
 
     def _import_interrupt_fallback(self) -> None:
         lock_descriptor = os.open(self._y_interrupt_fallback_lock_path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -1588,8 +1475,13 @@ class OperatorCommandStore:
                 request=request,
                 interrupt_attempt_id=attempt_id,
             )
+            # Current send-first journals have no pre-delivery phase. Their
+            # post-delivery phases prove an attempt, not an ACK or physical Stop.
+            # Keep legacy journals readable and reconcile without resending.
             attempted = any(
-                str(row.get("phase")) == "delivery_attempted" for row in records
+                str(row.get("phase")) in {
+                    "delivery_attempted", "delivered", "failed", "reconciliation_pending",
+                } for row in records
             )
             if attempted:
                 self.mark_interrupt_attempted(idempotency_key=idempotency_key)
@@ -1706,1123 +1598,6 @@ class OperatorCommandStore:
         CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_background_tasks_no_delete BEFORE DELETE ON operator_plane_wp8_background_tasks BEGIN SELECT RAISE(ABORT,'wp8 background tasks are durable'); END;
         """)
 
-    def _schema(self) -> None:
-        with self._lock:
-            required_trigger_names = (
-                "operator_plane_transitions_no_delete",
-                "operator_plane_transitions_no_update",
-                "operator_plane_evidence_no_delete",
-                "operator_plane_evidence_no_update",
-                "operator_plane_interrupt_evidence_no_delete",
-                "operator_plane_interrupt_evidence_no_update",
-                "operator_plane_commands_no_terminal_delete",
-                "operator_plane_methods_no_terminal_delete",
-                "operator_plane_idempotency_no_update_v2",
-                "operator_plane_idempotency_no_delete_v2",
-                "operator_plane_commands_identity_immutable_v2",
-                "operator_plane_commands_terminal_no_update_v2",
-                "operator_plane_methods_identity_immutable_v2",
-                "operator_plane_methods_terminal_no_update_v2",
-                "serial206_movement_commands_identity_immutable_v2",
-                "serial206_movement_commands_terminal_no_update_v2",
-                "serial206_movement_commands_no_terminal_delete_v2",
-                "serial206_movement_methods_identity_immutable_v2",
-                "serial206_movement_methods_terminal_no_update_v2",
-                "serial206_movement_methods_no_terminal_delete_v2",
-                "serial206_command_resources_no_update_v2",
-                "serial206_command_resources_no_delete_v2",
-                "serial206_command_dependencies_no_update_v2",
-                "serial206_command_dependencies_no_delete_v2",
-                "operator_plane_interrupt_attempts_no_update_v2",
-                "operator_plane_interrupt_attempts_no_delete_v2",
-                "serial206_command_resources_sealed_insert_v3",
-                "serial206_command_dependencies_sealed_insert_v3",
-                "operator_plane_evidence_coherence_insert_v1",
-                "operator_plane_interrupt_evidence_coherence_insert_v1",
-                "operator_plane_interrupt_attempts_lineage_insert_v1",
-                "operator_plane_commands_recoverable_terminal_no_update_v3",
-                "serial206_movement_commands_ambiguous_no_update_v3",
-                "operator_plane_recovery_acknowledgements_no_update_v1",
-                "operator_plane_recovery_acknowledgements_no_delete_v1",
-                "operator_plane_recovery_acknowledgements_authorized_insert_v2",
-                "operator_plane_commands_authorized_insert_v4",
-                "operator_plane_commands_authorized_update_v4",
-                "serial206_movement_commands_authorized_insert_v4",
-                "serial206_movement_commands_authorized_update_v4",
-                "serial206_movement_commands_authorized_delete_v4",
-                "serial206_command_resources_authorized_insert_v4",
-                "serial206_command_dependencies_authorized_insert_v4",
-                "operator_plane_methods_authorized_insert_v4",
-                "operator_plane_methods_authorized_update_v4",
-                "operator_plane_methods_authorized_delete_v4",
-                "serial206_movement_methods_authorized_insert_v4",
-                "serial206_movement_methods_authorized_update_v4",
-                "serial206_movement_methods_authorized_delete_v4",
-                "operator_plane_idempotency_authorized_insert_v4",
-                "operator_plane_commands_authorized_delete_v4",
-                "operator_plane_interrupt_history_authorized_insert_v4",
-                "operator_plane_interrupt_history_no_update_v4",
-                "operator_plane_interrupt_history_no_delete_v4",
-                "operator_plane_interrupt_history_coherence_insert_v4",
-                "operator_plane_transitions_authorized_coherent_insert_v4",
-                "operator_plane_deck_commands_authorized_insert_v1",
-                "operator_plane_deck_commands_identity_immutable_v1",
-                "operator_plane_deck_commands_evidence_coherence_v1",
-                "operator_plane_deck_commands_no_delete_v1",
-                "operator_plane_deck_stages_authorized_insert_v1",
-                "operator_plane_deck_stages_identity_immutable_v1",
-                "operator_plane_deck_stages_terminal_immutable_v1",
-                "operator_plane_deck_stages_no_delete_v1",
-                "operator_plane_deck_semantic_state_coherence_v1",
-                "operator_plane_deck_semantic_state_no_delete_v1",
-                "operator_plane_deck_semantic_transitions_coherence_v1",
-                "operator_plane_deck_semantic_transitions_no_update_v1",
-                "operator_plane_deck_semantic_transitions_no_delete_v1",
-                "operator_plane_tip_tray_state_coherence_v1",
-                "operator_plane_tip_tray_state_no_delete_v1",
-                "operator_plane_tip_tray_transitions_coherence_v1",
-                "operator_plane_tip_tray_transitions_no_update_v1",
-                "operator_plane_tip_tray_transitions_no_delete_v1",
-            )
-            for trigger_name in required_trigger_names:
-                self.connection.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
-            self.connection.executescript(
-                """
-                BEGIN IMMEDIATE;
-                CREATE TABLE IF NOT EXISTS operator_plane_metadata (
-                    key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL NOT NULL
-                ) WITHOUT ROWID;
-                CREATE TABLE IF NOT EXISTS operator_plane_idempotency (
-                    operation_kind TEXT NOT NULL,
-                    idempotency_key TEXT NOT NULL,
-                    fingerprint TEXT NOT NULL,
-                    command_id TEXT,
-                    method_id TEXT,
-                    response_json TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    PRIMARY KEY(operation_kind, idempotency_key)
-                ) WITHOUT ROWID;
-                CREATE TABLE IF NOT EXISTS operator_plane_methods (
-                    method_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    source_json TEXT NOT NULL,
-                    digest TEXT NOT NULL,
-                    failure_policy TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    version INTEGER NOT NULL,
-                    ownership_generation INTEGER NOT NULL,
-                    expanded_count INTEGER NOT NULL,
-                    first_stream_sequence INTEGER,
-                    last_stream_sequence INTEGER,
-                    queued_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    recovery_outcome_pending INTEGER NOT NULL DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS operator_plane_commands (
-                    command_id TEXT PRIMARY KEY,
-                    stream_sequence INTEGER NOT NULL UNIQUE,
-                    method_id TEXT,
-                    method_sequence INTEGER,
-                    action_id TEXT NOT NULL,
-                    requested_json TEXT NOT NULL,
-                    effective_json TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    version INTEGER NOT NULL,
-                    ownership_generation INTEGER NOT NULL,
-                    dispatch_attempt_id TEXT,
-                    dispatcher_epoch INTEGER,
-                    dispatch_global_safety_epoch INTEGER,
-                    dispatch_axis_safety_epoch INTEGER,
-                    interrupt_id TEXT,
-                    interrupt_global_safety_epoch INTEGER,
-                    interrupt_axis_safety_epoch INTEGER,
-                    source_noop INTEGER NOT NULL DEFAULT 0,
-                    source_noop_reason TEXT,
-                    controller_acknowledged INTEGER NOT NULL DEFAULT 0,
-                    remote_acknowledged INTEGER NOT NULL DEFAULT 0,
-                    physical_effect_verified INTEGER NOT NULL DEFAULT 0,
-                    terminal_json TEXT,
-                    queued_at REAL NOT NULL,
-                    dispatched_at REAL,
-                    finished_at REAL,
-                    updated_at REAL NOT NULL,
-                    FOREIGN KEY(method_id) REFERENCES operator_plane_methods(method_id)
-                );
-                CREATE INDEX IF NOT EXISTS operator_plane_commands_ready_idx
-                    ON operator_plane_commands(status, stream_sequence);
-                CREATE INDEX IF NOT EXISTS operator_plane_commands_method_idx
-                    ON operator_plane_commands(method_id, method_sequence);
-                CREATE TABLE IF NOT EXISTS operator_plane_transitions (
-                    transition_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_kind TEXT NOT NULL,
-                    command_id TEXT,
-                    method_id TEXT,
-                    state TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS operator_plane_evidence (
-                    evidence_id TEXT PRIMARY KEY,
-                    command_id TEXT NOT NULL REFERENCES operator_plane_commands(command_id),
-                    evidence_kind TEXT NOT NULL,
-                    content_sha256 TEXT NOT NULL CHECK(length(content_sha256)=64),
-                    payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
-                    payload_bytes INTEGER NOT NULL CHECK(payload_bytes>=0),
-                    created_at REAL NOT NULL,
-                    UNIQUE(command_id,evidence_kind,content_sha256)
-                );
-                CREATE TABLE IF NOT EXISTS operator_plane_interrupt_evidence (
-                    evidence_id TEXT PRIMARY KEY,
-                    interrupt_attempt_id TEXT NOT NULL,
-                    action_id TEXT NOT NULL,
-                    evidence_kind TEXT NOT NULL,
-                    content_sha256 TEXT NOT NULL CHECK(length(content_sha256)=64),
-                    payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
-                    payload_bytes INTEGER NOT NULL CHECK(payload_bytes>=0),
-                    created_at REAL NOT NULL,
-                    UNIQUE(interrupt_attempt_id,evidence_kind,content_sha256)
-                ) WITHOUT ROWID;
-                CREATE TABLE IF NOT EXISTS operator_plane_interrupt_attempts (
-                    attempt_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    interrupt_attempt_id TEXT NOT NULL,
-                    idempotency_key TEXT NOT NULL,
-                    fingerprint TEXT NOT NULL CHECK(length(fingerprint)=64),
-                    action_id TEXT NOT NULL,
-                    phase TEXT NOT NULL CHECK(phase IN ('admitted','attempted','terminal')),
-                    receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
-                    created_at REAL NOT NULL,
-                    UNIQUE(interrupt_attempt_id,phase)
-                );
-                CREATE INDEX IF NOT EXISTS operator_plane_interrupt_attempts_key_idx
-                    ON operator_plane_interrupt_attempts(idempotency_key,attempt_sequence DESC);
-                CREATE TABLE IF NOT EXISTS operator_plane_lane (
-                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                    active_command_id TEXT,
-                    active_attempt_id TEXT,
-                    dispatcher_epoch INTEGER NOT NULL,
-                    owner_id TEXT,
-                    owner_lease_until REAL,
-                    updated_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS operator_plane_safety (
-                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                    global_epoch INTEGER NOT NULL,
-                    x_epoch INTEGER NOT NULL,
-                    y_epoch INTEGER NOT NULL DEFAULT 0,
-                    z_epoch INTEGER NOT NULL,
-                    recovery_epoch INTEGER NOT NULL,
-                    recovery_version INTEGER NOT NULL,
-                    recovery_hold INTEGER NOT NULL,
-                    updated_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS operator_plane_z_home_authority (
-                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                    state TEXT NOT NULL CHECK(state IN ('invalid','valid')),
-                    command_id TEXT,
-                    ownership_generation INTEGER NOT NULL DEFAULT 0 CHECK(ownership_generation>=0),
-                    board_lifecycle_generation INTEGER,
-                    authority_version INTEGER NOT NULL DEFAULT 0 CHECK(authority_version>=0),
-                    invalidation_reason TEXT,
-                    updated_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS operator_plane_board_authority (
-                    board_id INTEGER PRIMARY KEY CHECK(board_id=5),
-                    state TEXT NOT NULL CHECK(state IN ('active','faulted')),
-                    active_board_epoch INTEGER,
-                    state_version INTEGER NOT NULL DEFAULT 1,
-                    updated_at REAL NOT NULL
-                ) WITHOUT ROWID;
-                CREATE TABLE IF NOT EXISTS operator_plane_snapshots (
-                    token TEXT PRIMARY KEY,
-                    method_id TEXT NOT NULL,
-                    watermark INTEGER NOT NULL,
-                    expires_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS operator_plane_outbox (
-                    outbox_id TEXT PRIMARY KEY,
-                    command_id TEXT NOT NULL,
-                    transition_sequence INTEGER NOT NULL,
-                    state TEXT NOT NULL,
-                    payload_json TEXT,
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    updated_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS operator_plane_recovery_acknowledgements (
-                    acknowledgement_id TEXT PRIMARY KEY,
-                    command_id TEXT NOT NULL REFERENCES operator_plane_commands(command_id),
-                    recovery_epoch INTEGER NOT NULL CHECK(recovery_epoch>=0),
-                    operation TEXT NOT NULL CHECK(operation IN ('resume_undispatched','cancel_pending')),
-                    receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
-                    created_at REAL NOT NULL,
-                    UNIQUE(command_id,recovery_epoch)
-                ) WITHOUT ROWID;
-                CREATE TABLE IF NOT EXISTS operator_plane_interrupt_history (
-                    record_sha256 TEXT PRIMARY KEY,
-                    stream TEXT NOT NULL CHECK(stream IN ('x','y','z')),
-                    interrupt_attempt_id TEXT NOT NULL,
-                    receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
-                    source_wrapper_json TEXT NOT NULL CHECK(json_valid(source_wrapper_json)),
-                    imported_at REAL NOT NULL,
-                    UNIQUE(stream,interrupt_attempt_id)
-                ) WITHOUT ROWID;
-                INSERT OR IGNORE INTO operator_plane_lane(singleton, dispatcher_epoch, updated_at) VALUES(1, 1, strftime('%s','now'));
-                INSERT OR IGNORE INTO operator_plane_safety(singleton, global_epoch, x_epoch, z_epoch, recovery_epoch, recovery_version, recovery_hold, updated_at)
-                    VALUES(1, 0, 0, 0, 0, 1, 0, strftime('%s','now'));
-                INSERT OR IGNORE INTO operator_plane_z_home_authority(singleton,state,updated_at)
-                    VALUES(1, 'invalid', strftime('%s','now'));
-                INSERT OR IGNORE INTO operator_plane_board_authority(board_id,state,active_board_epoch,updated_at)
-                    VALUES(5, 'faulted', NULL, strftime('%s','now'));
-                COMMIT;
-                """
-            )
-            self.connection.executescript(
-                """
-                BEGIN IMMEDIATE;
-                CREATE TABLE IF NOT EXISTS operator_plane_deck_commands (
-                    command_id TEXT PRIMARY KEY REFERENCES operator_plane_commands(command_id),
-                    target TEXT NOT NULL,
-                    target_label TEXT NOT NULL,
-                    resolved_location_id INTEGER NOT NULL,
-                    destination_catalog_revision TEXT NOT NULL CHECK(length(destination_catalog_revision)=64),
-                    position_table_revision TEXT NOT NULL CHECK(length(position_table_revision)=64),
-                    authority_snapshot_digest TEXT NOT NULL CHECK(length(authority_snapshot_digest)=64),
-                    complete_authority_digest TEXT NOT NULL CHECK(length(complete_authority_digest)=64),
-                    plan_digest TEXT NOT NULL CHECK(length(plan_digest)=64),
-                    source_branch TEXT NOT NULL,
-                    source_anchors_json TEXT NOT NULL CHECK(json_valid(source_anchors_json)),
-                    source_hazards_json TEXT NOT NULL CHECK(json_valid(source_hazards_json)),
-                    delivery_attempted INTEGER NOT NULL DEFAULT 0 CHECK(delivery_attempted IN (0,1)),
-                    controller_command_acknowledged INTEGER NOT NULL DEFAULT 0 CHECK(controller_command_acknowledged IN (0,1)),
-                    controller_completion_verified INTEGER NOT NULL DEFAULT 0 CHECK(controller_completion_verified IN (0,1)),
-                    hardware_postcondition_verified INTEGER NOT NULL DEFAULT 0 CHECK(hardware_postcondition_verified IN (0,1)),
-                    semantic_state_committed INTEGER NOT NULL DEFAULT 0 CHECK(semantic_state_committed IN (0,1)),
-                    physical_observation_verified INTEGER NOT NULL DEFAULT 0 CHECK(physical_observation_verified IN (0,1)),
-                    transition_revision INTEGER,
-                    ambiguity_state TEXT NOT NULL DEFAULT 'none' CHECK(ambiguity_state IN ('none','blocked','ambiguous','recovery_required')),
-                    provider_evidence_json TEXT CHECK(provider_evidence_json IS NULL OR json_valid(provider_evidence_json)),
-                    planned_at REAL NOT NULL,
-                    committed_at REAL,
-                    CHECK(controller_command_acknowledged<=delivery_attempted),
-                    CHECK(hardware_postcondition_verified<=controller_completion_verified),
-                    CHECK((semantic_state_committed=0 AND transition_revision IS NULL) OR (semantic_state_committed=1 AND transition_revision IS NOT NULL)),
-                    CHECK((semantic_state_committed=0 AND committed_at IS NULL) OR (semantic_state_committed=1 AND committed_at IS NOT NULL))
-                ) WITHOUT ROWID;
-                CREATE INDEX IF NOT EXISTS operator_plane_deck_commands_plan_idx
-                    ON operator_plane_deck_commands(plan_digest);
-                CREATE TABLE IF NOT EXISTS operator_plane_deck_stages (
-                    command_id TEXT NOT NULL REFERENCES operator_plane_deck_commands(command_id) ON DELETE RESTRICT,
-                    stage_order INTEGER NOT NULL CHECK(stage_order>=0),
-                    operation TEXT NOT NULL CHECK(length(operation)>0),
-                    source_anchor TEXT NOT NULL CHECK(length(source_anchor)>0),
-                    resources_json TEXT NOT NULL CHECK(json_valid(resources_json) AND json_type(resources_json)='array'),
-                    arguments_json TEXT NOT NULL CHECK(json_valid(arguments_json) AND json_type(arguments_json)='object'),
-                    dependency_order_json TEXT NOT NULL CHECK(json_valid(dependency_order_json) AND json_type(dependency_order_json)='array'),
-                    terminal_evidence_json TEXT CHECK(terminal_evidence_json IS NULL OR json_valid(terminal_evidence_json)),
-                    terminal_state TEXT NOT NULL DEFAULT 'planned' CHECK(terminal_state IN ('planned','completed','failed','ambiguous','stopped','aborted')),
-                    PRIMARY KEY(command_id,stage_order)
-                ) WITHOUT ROWID;
-                CREATE INDEX IF NOT EXISTS operator_plane_deck_stages_terminal_idx
-                    ON operator_plane_deck_stages(command_id,terminal_state,stage_order);
-                CREATE TABLE IF NOT EXISTS operator_plane_wp8_operations (
-                    command_id TEXT PRIMARY KEY,
-                    operation TEXT NOT NULL,
-                    plan_digest TEXT NOT NULL CHECK(length(plan_digest)=64),
-                    authority_digest TEXT NOT NULL CHECK(length(authority_digest)=64),
-                    authority_stamps_json TEXT NOT NULL CHECK(json_valid(authority_stamps_json)),
-                    plan_json TEXT NOT NULL CHECK(json_valid(plan_json)),
-                    terminal_result_json TEXT CHECK(terminal_result_json IS NULL OR json_valid(terminal_result_json)),
-                    created_at REAL NOT NULL,
-                    finished_at REAL
-                ) WITHOUT ROWID;
-                CREATE TABLE IF NOT EXISTS operator_plane_wp8_children (
-                    command_id TEXT NOT NULL REFERENCES operator_plane_wp8_operations(command_id) ON DELETE RESTRICT,
-                    child_order INTEGER NOT NULL CHECK(child_order>=0), operation TEXT NOT NULL,
-                    dependency_order_json TEXT NOT NULL CHECK(json_valid(dependency_order_json)),
-                    arguments_json TEXT NOT NULL CHECK(json_valid(arguments_json)),
-                    ignored_return INTEGER NOT NULL CHECK(ignored_return IN (0,1)),
-                    awaited INTEGER NOT NULL CHECK(awaited IN (0,1)), exception_policy TEXT NOT NULL,
-                    state_mutation_json TEXT NOT NULL CHECK(json_valid(state_mutation_json)),
-                    terminal_state TEXT NOT NULL DEFAULT 'planned' CHECK(terminal_state IN ('planned','completed','failed','ambiguous')),
-                    terminal_evidence_json TEXT CHECK(terminal_evidence_json IS NULL OR json_valid(terminal_evidence_json)),
-                    PRIMARY KEY(command_id,child_order)
-                ) WITHOUT ROWID;
-                CREATE TABLE IF NOT EXISTS operator_plane_wp8_state_transitions (
-                    command_id TEXT NOT NULL, child_order INTEGER NOT NULL,
-                    transition_json TEXT NOT NULL CHECK(json_valid(transition_json)),
-                    authority_stamps_json TEXT NOT NULL CHECK(json_valid(authority_stamps_json)), created_at REAL NOT NULL,
-                    PRIMARY KEY(command_id,child_order),
-                    FOREIGN KEY(command_id,child_order) REFERENCES operator_plane_wp8_children(command_id,child_order) ON DELETE RESTRICT
-                ) WITHOUT ROWID;
-                CREATE TABLE IF NOT EXISTS operator_plane_deck_semantic_state (
-                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                    current_location TEXT,
-                    current_well INTEGER CHECK(current_well IS NULL OR current_well BETWEEN 0 AND 95),
-                    current_tray TEXT,
-                    tip_loaded INTEGER CHECK(tip_loaded IS NULL OR tip_loaded IN (0,1)),
-                    tip_dirty INTEGER CHECK(tip_dirty IS NULL OR tip_dirty IN (0,1)),
-                    tip_location INTEGER,
-                    clean_path INTEGER CHECK(clean_path IS NULL OR clean_path IN (0,1)),
-                    plate_on_gantry TEXT,
-                    movable_plate_locations_json TEXT NOT NULL CHECK(json_valid(movable_plate_locations_json)),
-                    pseudo_z_home INTEGER CHECK(pseudo_z_home IN (500,65000)),
-                    semantic_state_revision INTEGER NOT NULL CHECK(semantic_state_revision>=0),
-                    producer_operation TEXT,
-                    producer_command_id TEXT,
-                    ownership_generation INTEGER,
-                    board_epoch_4 INTEGER,
-                    board_epoch_5 INTEGER,
-                    transition_provenance_json TEXT NOT NULL CHECK(json_valid(transition_provenance_json) AND json_type(transition_provenance_json)='object'),
-                    ambiguity_state TEXT NOT NULL DEFAULT 'none' CHECK(ambiguity_state IN ('none','ambiguous','recovery_required')),
-                    updated_at REAL NOT NULL,
-                    FOREIGN KEY(producer_command_id) REFERENCES operator_plane_commands(command_id) ON DELETE RESTRICT
-                );
-                CREATE TABLE IF NOT EXISTS operator_plane_deck_semantic_transitions (
-                    transition_revision INTEGER PRIMARY KEY AUTOINCREMENT,
-                    command_id TEXT NOT NULL REFERENCES operator_plane_commands(command_id) ON DELETE RESTRICT,
-                    source_operation TEXT NOT NULL CHECK(length(source_operation)>0),
-                    before_revision INTEGER NOT NULL CHECK(before_revision>=0),
-                    after_revision INTEGER NOT NULL CHECK(after_revision=before_revision+1),
-                    transition_json TEXT NOT NULL CHECK(json_valid(transition_json) AND json_type(transition_json)='object'),
-                    created_at REAL NOT NULL,
-                    UNIQUE(command_id,after_revision)
-                );
-                CREATE INDEX IF NOT EXISTS operator_plane_deck_transitions_command_idx
-                    ON operator_plane_deck_semantic_transitions(command_id,transition_revision);
-                CREATE TABLE IF NOT EXISTS operator_plane_tip_tray_state (
-                    tray_id INTEGER PRIMARY KEY CHECK(tray_id BETWEEN 0 AND 4),
-                    occupancy_json TEXT CHECK(occupancy_json IS NULL OR (json_valid(occupancy_json) AND json_type(occupancy_json)='array' AND json_array_length(occupancy_json)=96)),
-                    tip_available INTEGER CHECK(tip_available IS NULL OR tip_available IN (0,1)),
-                    available_count INTEGER CHECK(available_count IS NULL OR available_count BETWEEN 0 AND 24),
-                    revision INTEGER NOT NULL DEFAULT 0 CHECK(revision>=0),
-                    operation_id TEXT,
-                    command_id TEXT,
-                    ownership_generation INTEGER,
-                    board_epoch_4 INTEGER,
-                    board_epoch_5 INTEGER,
-                    produced_at REAL,
-                    provenance_json TEXT CHECK(provenance_json IS NULL OR (json_valid(provenance_json) AND json_type(provenance_json)='object')),
-                    provenance_sha256 TEXT CHECK(provenance_sha256 IS NULL OR length(provenance_sha256)=64),
-                    CHECK((revision=0 AND occupancy_json IS NULL AND tip_available IS NULL AND available_count IS NULL AND operation_id IS NULL AND command_id IS NULL AND ownership_generation IS NULL AND board_epoch_4 IS NULL AND board_epoch_5 IS NULL AND produced_at IS NULL AND provenance_json IS NULL AND provenance_sha256 IS NULL) OR (revision>0 AND occupancy_json IS NOT NULL AND tip_available IS NOT NULL AND operation_id IS NOT NULL AND command_id IS NOT NULL AND ownership_generation IS NOT NULL AND board_epoch_4 IS NOT NULL AND board_epoch_5 IS NOT NULL AND produced_at IS NOT NULL AND provenance_json IS NOT NULL AND provenance_sha256 IS NOT NULL))
-                ) WITHOUT ROWID;
-                CREATE TABLE IF NOT EXISTS operator_plane_tip_tray_transitions (
-                    transition_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tray_id INTEGER NOT NULL CHECK(tray_id BETWEEN 0 AND 4),
-                    revision INTEGER NOT NULL CHECK(revision>0),
-                    transition TEXT NOT NULL CHECK(transition IN ('construct','reset','load_all','remove_well','remove_group','remove_all','camera_missing','add_tip','retip')),
-                    occupancy_json TEXT NOT NULL CHECK(json_valid(occupancy_json) AND json_type(occupancy_json)='array' AND json_array_length(occupancy_json)=96),
-                    tip_available INTEGER NOT NULL CHECK(tip_available IN (0,1)),
-                    available_count INTEGER CHECK(available_count IS NULL OR available_count BETWEEN 0 AND 24),
-                    operation_id TEXT NOT NULL CHECK(length(operation_id)>0),
-                    command_id TEXT NOT NULL CHECK(length(command_id)>0),
-                    ownership_generation INTEGER NOT NULL CHECK(ownership_generation>=0),
-                    board_epoch_4 INTEGER NOT NULL CHECK(board_epoch_4>=0),
-                    board_epoch_5 INTEGER NOT NULL CHECK(board_epoch_5>=0),
-                    produced_at REAL NOT NULL,
-                    provenance_json TEXT NOT NULL CHECK(json_valid(provenance_json) AND json_type(provenance_json)='object'),
-                    provenance_sha256 TEXT NOT NULL CHECK(length(provenance_sha256)=64),
-                    UNIQUE(tray_id,revision)
-                );
-                CREATE INDEX IF NOT EXISTS operator_plane_tip_tray_transitions_revision_idx
-                    ON operator_plane_tip_tray_transitions(tray_id,revision);
-                INSERT OR IGNORE INTO operator_plane_tip_tray_state(tray_id)
-                    VALUES(0),(1),(2),(3),(4);
-                INSERT OR IGNORE INTO operator_plane_deck_semantic_state(
-                    singleton,movable_plate_locations_json,pseudo_z_home,semantic_state_revision,
-                    transition_provenance_json,updated_at
-                ) VALUES(1,'{}',65000,0,'{}',strftime('%s','now'));
-                CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_operations_guard_insert
-                BEFORE INSERT ON operator_plane_wp8_operations WHEN authority_write_allowed()<>1
-                BEGIN SELECT RAISE(ABORT,'wp8 writer is not authoritative'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_operations_no_delete
-                BEFORE DELETE ON operator_plane_wp8_operations BEGIN SELECT RAISE(ABORT,'wp8 plan is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_operations_identity_immutable
-                BEFORE UPDATE ON operator_plane_wp8_operations WHEN authority_write_allowed()<>1 OR NEW.command_id IS NOT OLD.command_id OR NEW.operation IS NOT OLD.operation OR NEW.plan_digest IS NOT OLD.plan_digest OR NEW.authority_digest IS NOT OLD.authority_digest OR NEW.authority_stamps_json IS NOT OLD.authority_stamps_json OR NEW.plan_json IS NOT OLD.plan_json
-                BEGIN SELECT RAISE(ABORT,'wp8 plan identity is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_children_guard_insert
-                BEFORE INSERT ON operator_plane_wp8_children WHEN authority_write_allowed()<>1 OR NEW.child_order<>(SELECT COUNT(*) FROM operator_plane_wp8_children WHERE command_id=NEW.command_id) OR NEW.dependency_order_json<>CASE WHEN NEW.child_order=0 THEN '[]' ELSE '['||(NEW.child_order-1)||']' END
-                BEGIN SELECT RAISE(ABORT,'wp8 child order is not authoritative'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_children_terminal_immutable
-                BEFORE UPDATE ON operator_plane_wp8_children WHEN authority_write_allowed()<>1 OR OLD.terminal_state<>'planned' OR NEW.command_id IS NOT OLD.command_id OR NEW.child_order IS NOT OLD.child_order OR NEW.operation IS NOT OLD.operation OR NEW.dependency_order_json IS NOT OLD.dependency_order_json OR NEW.arguments_json IS NOT OLD.arguments_json OR NEW.ignored_return IS NOT OLD.ignored_return OR NEW.awaited IS NOT OLD.awaited OR NEW.exception_policy IS NOT OLD.exception_policy OR NEW.state_mutation_json IS NOT OLD.state_mutation_json
-                BEGIN SELECT RAISE(ABORT,'wp8 child evidence is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_children_no_delete
-                BEFORE DELETE ON operator_plane_wp8_children BEGIN SELECT RAISE(ABORT,'wp8 children are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_state_guard_insert
-                BEFORE INSERT ON operator_plane_wp8_state_transitions WHEN authority_write_allowed()<>1 OR NOT EXISTS(SELECT 1 FROM operator_plane_wp8_children c WHERE c.command_id=NEW.command_id AND c.child_order=NEW.child_order AND c.terminal_state='completed' AND c.state_mutation_json=NEW.transition_json)
-                BEGIN SELECT RAISE(ABORT,'wp8 state transition is not terminal-child-owned'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_state_no_update
-                BEFORE UPDATE ON operator_plane_wp8_state_transitions BEGIN SELECT RAISE(ABORT,'wp8 state transitions are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_wp8_state_no_delete
-                BEFORE DELETE ON operator_plane_wp8_state_transitions BEGIN SELECT RAISE(ABORT,'wp8 state transitions are immutable'); END;
-                COMMIT;
-                """
-            )
-            for column, declaration in (("owner_id", "TEXT"), ("owner_lease_until", "REAL")):
-                try:
-                    self.connection.execute(f"ALTER TABLE operator_plane_lane ADD COLUMN {column} {declaration}")
-                except sqlite3.OperationalError as exc:
-                    if "duplicate column name" not in str(exc).lower():
-                        raise
-            try:
-                self.connection.execute("ALTER TABLE operator_plane_safety ADD COLUMN y_epoch INTEGER NOT NULL DEFAULT 0")
-            except sqlite3.OperationalError as exc:
-                if "duplicate column name" not in str(exc).lower():
-                    raise
-            interrupt_history_columns = tuple(
-                str(row[1])
-                for row in self.connection.execute(
-                    "PRAGMA table_info(operator_plane_interrupt_history)"
-                ).fetchall()
-            )
-            canonical_interrupt_history_columns = (
-                "record_sha256", "stream", "interrupt_attempt_id", "receipt_json",
-                "source_wrapper_json", "imported_at",
-            )
-            additive_interrupt_history_columns = (
-                "record_sha256", "stream", "interrupt_attempt_id", "receipt_json",
-                "imported_at", "source_wrapper_json",
-            )
-            if interrupt_history_columns == additive_interrupt_history_columns:
-                invalid_history = self.connection.execute(
-                    """
-                    SELECT COUNT(*) FROM operator_plane_interrupt_history
-                    WHERE source_wrapper_json IS NULL
-                       OR source_wrapper_json<>canonical_json(source_wrapper_json)
-                       OR record_sha256<>sha256_utf8(source_wrapper_json)
-                       OR json_extract(source_wrapper_json,'$.stream') IS NOT stream
-                       OR json_extract(source_wrapper_json,'$.receipt.interrupt_attempt_id') IS NOT interrupt_attempt_id
-                       OR canonical_json(json_extract(source_wrapper_json,'$.receipt'))<>receipt_json
-                    """
-                ).fetchone()
-                if invalid_history is not None and int(invalid_history[0]) > 0:
-                    raise RuntimeError(
-                        "operator interrupt history requires exact-wrapper recovery from archived fallback bytes"
-                    )
-                try:
-                    self.connection.execute("BEGIN IMMEDIATE")
-                    self.connection.execute(
-                        "ALTER TABLE operator_plane_interrupt_history "
-                        "RENAME TO operator_plane_interrupt_history_additive_v4"
-                    )
-                    self.connection.execute(
-                        """
-                        CREATE TABLE operator_plane_interrupt_history (
-                            record_sha256 TEXT PRIMARY KEY,
-                            stream TEXT NOT NULL CHECK(stream IN ('x','y','z')),
-                            interrupt_attempt_id TEXT NOT NULL,
-                            receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
-                            source_wrapper_json TEXT NOT NULL CHECK(json_valid(source_wrapper_json)),
-                            imported_at REAL NOT NULL,
-                            UNIQUE(stream,interrupt_attempt_id)
-                        ) WITHOUT ROWID
-                        """
-                    )
-                    self.connection.execute(
-                        """
-                        INSERT INTO operator_plane_interrupt_history(
-                            record_sha256,stream,interrupt_attempt_id,receipt_json,
-                            source_wrapper_json,imported_at
-                        )
-                        SELECT record_sha256,stream,interrupt_attempt_id,receipt_json,
-                               source_wrapper_json,imported_at
-                        FROM operator_plane_interrupt_history_additive_v4
-                        """
-                    )
-                    self.connection.execute(
-                        "DROP TABLE operator_plane_interrupt_history_additive_v4"
-                    )
-                    self.connection.execute("COMMIT")
-                except Exception:
-                    if self.connection.in_transaction:
-                        self.connection.execute("ROLLBACK")
-                    raise
-                interrupt_history_columns = canonical_interrupt_history_columns
-            elif "source_wrapper_json" not in interrupt_history_columns:
-                self.connection.execute(
-                    "ALTER TABLE operator_plane_interrupt_history ADD COLUMN source_wrapper_json TEXT"
-                )
-                interrupt_history_columns = tuple(
-                    str(row[1])
-                    for row in self.connection.execute(
-                        "PRAGMA table_info(operator_plane_interrupt_history)"
-                    ).fetchall()
-                )
-            incomplete_history = self.connection.execute(
-                "SELECT COUNT(*) FROM operator_plane_interrupt_history WHERE source_wrapper_json IS NULL"
-            ).fetchone()
-            if incomplete_history is not None and int(incomplete_history[0]) > 0:
-                raise RuntimeError("operator interrupt history requires exact-wrapper recovery from archived fallback bytes")
-            self.connection.executescript(
-                """
-                CREATE TRIGGER IF NOT EXISTS operator_plane_transitions_no_delete
-                BEFORE DELETE ON operator_plane_transitions
-                BEGIN SELECT RAISE(ABORT, 'operator transitions are append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_transitions_no_update
-                BEFORE UPDATE ON operator_plane_transitions
-                BEGIN SELECT RAISE(ABORT, 'operator transitions are append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_evidence_no_delete
-                BEFORE DELETE ON operator_plane_evidence
-                BEGIN SELECT RAISE(ABORT, 'operator evidence is append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_evidence_no_update
-                BEFORE UPDATE ON operator_plane_evidence
-                BEGIN SELECT RAISE(ABORT, 'operator evidence is append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_interrupt_evidence_no_delete
-                BEFORE DELETE ON operator_plane_interrupt_evidence
-                BEGIN SELECT RAISE(ABORT, 'operator interrupt evidence is append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_interrupt_evidence_no_update
-                BEFORE UPDATE ON operator_plane_interrupt_evidence
-                BEGIN SELECT RAISE(ABORT, 'operator interrupt evidence is append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_commands_no_terminal_delete
-                BEFORE DELETE ON operator_plane_commands
-                WHEN OLD.status IN ('completed','failed','ambiguous','stopped','aborted','cancelled','cleared','interrupted')
-                BEGIN SELECT RAISE(ABORT, 'terminal operator commands are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_methods_no_terminal_delete
-                BEFORE DELETE ON operator_plane_methods
-                WHEN OLD.status IN ('completed','failed','cancelled','stopped','aborted','interrupted')
-                BEGIN SELECT RAISE(ABORT, 'terminal operator methods are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_idempotency_no_update_v2
-                BEFORE UPDATE ON operator_plane_idempotency
-                BEGIN SELECT RAISE(ABORT, 'operator idempotency receipts are append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_idempotency_no_delete_v2
-                BEFORE DELETE ON operator_plane_idempotency
-                BEGIN SELECT RAISE(ABORT, 'operator idempotency receipts are append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_commands_identity_immutable_v2
-                BEFORE UPDATE ON operator_plane_commands
-                WHEN NEW.command_id IS NOT OLD.command_id
-                  OR NEW.stream_sequence IS NOT OLD.stream_sequence
-                  OR NEW.method_id IS NOT OLD.method_id
-                  OR NEW.method_sequence IS NOT OLD.method_sequence
-                  OR NEW.action_id IS NOT OLD.action_id
-                  OR NEW.requested_json IS NOT OLD.requested_json
-                  OR NEW.effective_json IS NOT OLD.effective_json
-                  OR NEW.ownership_generation IS NOT OLD.ownership_generation
-                  OR NEW.queued_at IS NOT OLD.queued_at
-                BEGIN SELECT RAISE(ABORT, 'operator command identity is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_commands_terminal_no_update_v2
-                BEFORE UPDATE ON operator_plane_commands
-                WHEN OLD.status IN ('completed','failed','stopped','aborted','cancelled','cleared')
-                BEGIN SELECT RAISE(ABORT, 'terminal operator commands are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_methods_identity_immutable_v2
-                BEFORE UPDATE ON operator_plane_methods
-                WHEN NEW.method_id IS NOT OLD.method_id
-                  OR NEW.name IS NOT OLD.name
-                  OR NEW.source_json IS NOT OLD.source_json
-                  OR NEW.digest IS NOT OLD.digest
-                  OR NEW.failure_policy IS NOT OLD.failure_policy
-                  OR NEW.ownership_generation IS NOT OLD.ownership_generation
-                  OR NEW.expanded_count IS NOT OLD.expanded_count
-                  OR NEW.first_stream_sequence IS NOT OLD.first_stream_sequence
-                  OR NEW.last_stream_sequence IS NOT OLD.last_stream_sequence
-                  OR NEW.queued_at IS NOT OLD.queued_at
-                BEGIN SELECT RAISE(ABORT, 'operator method identity is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_methods_terminal_no_update_v2
-                BEFORE UPDATE ON operator_plane_methods
-                WHEN OLD.status IN ('completed','failed','cancelled','stopped','aborted','interrupted')
-                BEGIN SELECT RAISE(ABORT, 'terminal operator methods are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_movement_commands_identity_immutable_v2
-                BEFORE UPDATE ON serial206_movement_commands
-                WHEN NEW.sequence IS NOT OLD.sequence
-                  OR NEW.command_id IS NOT OLD.command_id
-                  OR NEW.idempotency_key IS NOT OLD.idempotency_key
-                  OR NEW.action_id IS NOT OLD.action_id
-                  OR NEW.method_id IS NOT OLD.method_id
-                  OR NEW.method_order IS NOT OLD.method_order
-                  OR NEW.parallel_group IS NOT OLD.parallel_group
-                  OR NEW.axis_scope IS NOT OLD.axis_scope
-                  OR NEW.board_scope_json IS NOT OLD.board_scope_json
-                  OR NEW.ownership_generation IS NOT OLD.ownership_generation
-                  OR NEW.expected_board_epochs_json IS NOT OLD.expected_board_epochs_json
-                  OR NEW.canonical_inputs_sha256 IS NOT OLD.canonical_inputs_sha256
-                  OR NEW.admitted_interrupt_epochs_json IS NOT OLD.admitted_interrupt_epochs_json
-                  OR NEW.accepted_at IS NOT OLD.accepted_at
-                  OR NEW.queued_at IS NOT OLD.queued_at
-                BEGIN SELECT RAISE(ABORT, 'canonical movement command identity is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_movement_commands_terminal_no_update_v2
-                BEFORE UPDATE ON serial206_movement_commands
-                WHEN OLD.state IN ('completed','failed','cleared','interrupted','rejected')
-                BEGIN SELECT RAISE(ABORT, 'terminal canonical movement commands are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_movement_commands_no_terminal_delete_v2
-                BEFORE DELETE ON serial206_movement_commands
-                WHEN OLD.state IN ('completed','failed','cleared','interrupted','ambiguous','rejected')
-                BEGIN SELECT RAISE(ABORT, 'terminal canonical movement commands are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_movement_methods_identity_immutable_v2
-                BEFORE UPDATE ON serial206_movement_methods
-                WHEN NEW.method_id IS NOT OLD.method_id
-                  OR NEW.idempotency_key IS NOT OLD.idempotency_key
-                  OR NEW.action_id IS NOT OLD.action_id
-                  OR NEW.canonical_inputs_sha256 IS NOT OLD.canonical_inputs_sha256
-                  OR NEW.failure_policy IS NOT OLD.failure_policy
-                  OR NEW.child_count IS NOT OLD.child_count
-                  OR NEW.accepted_at IS NOT OLD.accepted_at
-                BEGIN SELECT RAISE(ABORT, 'canonical movement method identity is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_movement_methods_terminal_no_update_v2
-                BEFORE UPDATE ON serial206_movement_methods
-                WHEN OLD.state IN ('completed','completed_partial','failed','cleared','interrupted')
-                BEGIN SELECT RAISE(ABORT, 'terminal canonical movement methods are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_movement_methods_no_terminal_delete_v2
-                BEFORE DELETE ON serial206_movement_methods
-                WHEN OLD.state IN ('completed','completed_partial','failed','cleared','interrupted','ambiguous')
-                BEGIN SELECT RAISE(ABORT, 'terminal canonical movement methods are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_command_resources_no_update_v2
-                BEFORE UPDATE ON serial206_command_resources
-                BEGIN SELECT RAISE(ABORT, 'command resource authority is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_command_resources_no_delete_v2
-                BEFORE DELETE ON serial206_command_resources
-                BEGIN SELECT RAISE(ABORT, 'command resource authority is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_command_dependencies_no_update_v2
-                BEFORE UPDATE ON serial206_command_dependencies
-                BEGIN SELECT RAISE(ABORT, 'command dependency authority is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_command_dependencies_no_delete_v2
-                BEFORE DELETE ON serial206_command_dependencies
-                BEGIN SELECT RAISE(ABORT, 'command dependency authority is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_interrupt_attempts_no_update_v2
-                BEFORE UPDATE ON operator_plane_interrupt_attempts
-                BEGIN SELECT RAISE(ABORT, 'interrupt attempt history is append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_interrupt_attempts_no_delete_v2
-                BEFORE DELETE ON operator_plane_interrupt_attempts
-                BEGIN SELECT RAISE(ABORT, 'interrupt attempt history is append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_command_resources_sealed_insert_v3
-                BEFORE INSERT ON serial206_command_resources
-                WHEN EXISTS(SELECT 1 FROM operator_plane_transitions WHERE command_id=NEW.command_id)
-                BEGIN SELECT RAISE(ABORT, 'command resource authority is sealed at admission'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_command_dependencies_sealed_insert_v3
-                BEFORE INSERT ON serial206_command_dependencies
-                WHEN EXISTS(SELECT 1 FROM operator_plane_transitions WHERE command_id=NEW.command_id)
-                  OR EXISTS(
-                    WITH RECURSIVE ancestors(command_id) AS (
-                      SELECT NEW.depends_on_command_id
-                      UNION
-                      SELECT dependency.depends_on_command_id
-                      FROM serial206_command_dependencies AS dependency
-                      JOIN ancestors ON dependency.command_id=ancestors.command_id
-                    )
-                    SELECT 1 FROM ancestors WHERE command_id=NEW.command_id
-                  )
-                BEGIN SELECT RAISE(ABORT, 'command dependency authority is sealed or cyclic'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_evidence_coherence_insert_v1
-                BEFORE INSERT ON operator_plane_evidence
-                WHEN authority_write_allowed()<>1
-                  OR NEW.content_sha256 <> sha256_utf8(NEW.payload_json)
-                  OR NEW.payload_bytes <> length(CAST(NEW.payload_json AS BLOB))
-                  OR NEW.payload_json <> canonical_json(NEW.payload_json)
-                  OR NEW.evidence_id <> NEW.command_id || ':' || NEW.evidence_kind || ':' || NEW.content_sha256
-                BEGIN SELECT RAISE(ABORT, 'operator evidence bytes and identity are incoherent'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_interrupt_evidence_coherence_insert_v1
-                BEFORE INSERT ON operator_plane_interrupt_evidence
-                WHEN authority_write_allowed()<>1
-                  OR NEW.content_sha256 <> sha256_utf8(NEW.payload_json)
-                  OR NEW.payload_bytes <> length(CAST(NEW.payload_json AS BLOB))
-                  OR NEW.payload_json <> canonical_json(NEW.payload_json)
-                  OR NEW.evidence_id <> NEW.interrupt_attempt_id || ':' || NEW.evidence_kind || ':' || NEW.content_sha256
-                BEGIN SELECT RAISE(ABORT, 'interrupt evidence bytes and identity are incoherent'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_interrupt_attempts_lineage_insert_v1
-                BEFORE INSERT ON operator_plane_interrupt_attempts
-                WHEN authority_write_allowed()<>1
-                  OR NEW.receipt_json <> canonical_json(NEW.receipt_json)
-                  OR json_extract(NEW.receipt_json,'$.interrupt_attempt_id') IS NOT NEW.interrupt_attempt_id
-                  OR json_extract(NEW.receipt_json,'$.action_id') IS NOT NEW.action_id
-                  OR (NEW.phase='admitted' AND EXISTS(SELECT 1 FROM operator_plane_interrupt_attempts WHERE interrupt_attempt_id=NEW.interrupt_attempt_id))
-                  OR (NEW.phase<>'admitted' AND NOT EXISTS(SELECT 1 FROM operator_plane_interrupt_attempts WHERE interrupt_attempt_id=NEW.interrupt_attempt_id AND phase='admitted'))
-                  OR (NEW.phase<>'admitted' AND EXISTS(SELECT 1 FROM operator_plane_interrupt_attempts WHERE interrupt_attempt_id=NEW.interrupt_attempt_id AND phase='terminal'))
-                  OR (NEW.phase<>'admitted' AND EXISTS(
-                      SELECT 1 FROM operator_plane_interrupt_attempts
-                      WHERE interrupt_attempt_id=NEW.interrupt_attempt_id AND phase='admitted'
-                        AND (idempotency_key IS NOT NEW.idempotency_key OR fingerprint IS NOT NEW.fingerprint OR action_id IS NOT NEW.action_id)
-                  ))
-                BEGIN SELECT RAISE(ABORT, 'interrupt attempt lineage or receipt identity is incoherent'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_commands_recoverable_terminal_no_update_v3
-                BEFORE UPDATE ON operator_plane_commands
-                WHEN OLD.status IN ('ambiguous','interrupted')
-                BEGIN SELECT RAISE(ABORT, 'recoverable terminal operator commands are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_movement_commands_ambiguous_no_update_v3
-                BEFORE UPDATE ON serial206_movement_commands
-                WHEN OLD.state='ambiguous'
-                BEGIN SELECT RAISE(ABORT, 'ambiguous canonical movement commands are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_recovery_acknowledgements_no_update_v1
-                BEFORE UPDATE ON operator_plane_recovery_acknowledgements
-                BEGIN SELECT RAISE(ABORT, 'recovery acknowledgements are append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_recovery_acknowledgements_no_delete_v1
-                BEFORE DELETE ON operator_plane_recovery_acknowledgements
-                BEGIN SELECT RAISE(ABORT, 'recovery acknowledgements are append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_recovery_acknowledgements_authorized_insert_v2
-                BEFORE INSERT ON operator_plane_recovery_acknowledgements
-                WHEN authority_write_allowed()<>1
-                BEGIN SELECT RAISE(ABORT, 'recovery acknowledgement writer is not authoritative'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_commands_authorized_insert_v4
-                BEFORE INSERT ON operator_plane_commands
-                WHEN authority_write_allowed()<>1
-                  OR NEW.status NOT IN ('queued','dispatched','issued_pending','stop_requested','abort_requested','completed','failed','ambiguous','stopped','aborted','cancelled','cleared','interrupted','rejected')
-                BEGIN SELECT RAISE(ABORT, 'operator command writer or state is not authoritative'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_commands_authorized_update_v4
-                BEFORE UPDATE ON operator_plane_commands
-                WHEN authority_write_allowed()<>1
-                  OR NEW.status NOT IN ('queued','dispatched','issued_pending','stop_requested','abort_requested','completed','failed','ambiguous','stopped','aborted','cancelled','cleared','interrupted','rejected')
-                BEGIN SELECT RAISE(ABORT, 'operator command writer or state is not authoritative'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_movement_commands_authorized_insert_v4
-                BEFORE INSERT ON serial206_movement_commands
-                WHEN authority_write_allowed()<>1
-                BEGIN SELECT RAISE(ABORT, 'canonical command writer is not authoritative'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_movement_commands_authorized_update_v4
-                BEFORE UPDATE ON serial206_movement_commands
-                WHEN authority_write_allowed()<>1
-                BEGIN SELECT RAISE(ABORT, 'canonical command writer is not authoritative'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_movement_commands_authorized_delete_v4
-                BEFORE DELETE ON serial206_movement_commands
-                WHEN authority_write_allowed()<>1
-                BEGIN SELECT RAISE(ABORT, 'canonical command delete requires authoritative writer'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_command_resources_authorized_insert_v4
-                BEFORE INSERT ON serial206_command_resources
-                WHEN authority_write_allowed()<>1
-                BEGIN SELECT RAISE(ABORT, 'command resource writer is not authoritative'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_command_dependencies_authorized_insert_v4
-                BEFORE INSERT ON serial206_command_dependencies
-                WHEN authority_write_allowed()<>1
-                BEGIN SELECT RAISE(ABORT, 'dependency insert requires authoritative writer'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_methods_authorized_insert_v4
-                BEFORE INSERT ON operator_plane_methods
-                WHEN authority_write_allowed()<>1
-                BEGIN SELECT RAISE(ABORT, 'method insert requires authoritative writer'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_methods_authorized_update_v4
-                BEFORE UPDATE ON operator_plane_methods
-                WHEN authority_write_allowed()<>1
-                BEGIN SELECT RAISE(ABORT, 'method update requires authoritative writer'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_methods_authorized_delete_v4
-                BEFORE DELETE ON operator_plane_methods
-                WHEN authority_write_allowed()<>1
-                BEGIN SELECT RAISE(ABORT, 'method delete requires authoritative writer'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_movement_methods_authorized_insert_v4
-                BEFORE INSERT ON serial206_movement_methods
-                WHEN authority_write_allowed()<>1
-                BEGIN SELECT RAISE(ABORT, 'movement method insert requires authoritative writer'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_movement_methods_authorized_update_v4
-                BEFORE UPDATE ON serial206_movement_methods
-                WHEN authority_write_allowed()<>1
-                BEGIN SELECT RAISE(ABORT, 'movement method update requires authoritative writer'); END;
-                CREATE TRIGGER IF NOT EXISTS serial206_movement_methods_authorized_delete_v4
-                BEFORE DELETE ON serial206_movement_methods
-                WHEN authority_write_allowed()<>1
-                BEGIN SELECT RAISE(ABORT, 'movement method delete requires authoritative writer'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_idempotency_authorized_insert_v4
-                BEFORE INSERT ON operator_plane_idempotency
-                WHEN authority_write_allowed()<>1
-                BEGIN SELECT RAISE(ABORT, 'idempotency insert requires authoritative writer'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_commands_authorized_delete_v4
-                BEFORE DELETE ON operator_plane_commands
-                WHEN authority_write_allowed()<>1
-                BEGIN SELECT RAISE(ABORT, 'command delete requires authoritative writer'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_interrupt_history_authorized_insert_v4
-                BEFORE INSERT ON operator_plane_interrupt_history
-                WHEN authority_write_allowed()<>1
-                BEGIN SELECT RAISE(ABORT, 'interrupt history insert requires authoritative writer'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_interrupt_history_no_update_v4
-                BEFORE UPDATE ON operator_plane_interrupt_history
-                BEGIN SELECT RAISE(ABORT, 'interrupt history is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_interrupt_history_no_delete_v4
-                BEFORE DELETE ON operator_plane_interrupt_history
-                BEGIN SELECT RAISE(ABORT, 'interrupt history is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_interrupt_history_coherence_insert_v4
-                BEFORE INSERT ON operator_plane_interrupt_history
-                WHEN NEW.source_wrapper_json IS NULL
-                  OR NEW.source_wrapper_json<>canonical_json(NEW.source_wrapper_json)
-                  OR NEW.record_sha256<>sha256_utf8(NEW.source_wrapper_json)
-                  OR json_extract(NEW.source_wrapper_json,'$.stream') IS NOT NEW.stream
-                  OR json_extract(NEW.source_wrapper_json,'$.receipt.interrupt_attempt_id') IS NOT NEW.interrupt_attempt_id
-                  OR canonical_json(json_extract(NEW.source_wrapper_json,'$.receipt'))<>NEW.receipt_json
-                BEGIN SELECT RAISE(ABORT, 'interrupt history wrapper is incoherent'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_transitions_authorized_coherent_insert_v4
-                BEFORE INSERT ON operator_plane_transitions
-                WHEN authority_write_allowed()<>1
-                  OR (NEW.command_id IS NOT NULL AND NOT EXISTS(
-                    SELECT 1
-                    FROM operator_plane_commands AS operator
-                    JOIN serial206_movement_commands AS canonical ON canonical.command_id=operator.command_id
-                    WHERE operator.command_id=NEW.command_id AND (
-                      operator.status=canonical.state
-                      OR (operator.status='cancelled' AND canonical.state='cleared')
-                      OR (operator.status='interrupted' AND canonical.state='ambiguous')
-                      OR (operator.status IN ('stop_requested','abort_requested') AND canonical.state='interrupting')
-                      OR (operator.status IN ('stopped','aborted') AND canonical.state='interrupted')
-                    )
-                  ))
-                BEGIN SELECT RAISE(ABORT, 'operator and canonical command authority is incoherent'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_commands_authorized_insert_v1
-                BEFORE INSERT ON operator_plane_deck_commands
-                WHEN authority_write_allowed()<>1
-                  OR NOT EXISTS(SELECT 1 FROM operator_plane_commands WHERE command_id=NEW.command_id AND action_id='oem.deck.move_to_location')
-                  OR NEW.source_anchors_json<>canonical_json(NEW.source_anchors_json)
-                  OR json_type(NEW.source_anchors_json)<>'array'
-                  OR NEW.source_hazards_json<>canonical_json(NEW.source_hazards_json)
-                  OR json_type(NEW.source_hazards_json)<>'array'
-                  OR NEW.delivery_attempted<>0
-                  OR NEW.controller_command_acknowledged<>0
-                  OR NEW.controller_completion_verified<>0
-                  OR NEW.hardware_postcondition_verified<>0
-                  OR NEW.semantic_state_committed<>0
-                  OR NEW.physical_observation_verified<>0
-                  OR NEW.transition_revision IS NOT NULL
-                  OR NEW.provider_evidence_json IS NOT NULL
-                  OR NEW.committed_at IS NOT NULL
-                BEGIN SELECT RAISE(ABORT, 'deck plan insert is unauthorized or incoherent'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_commands_identity_immutable_v1
-                BEFORE UPDATE ON operator_plane_deck_commands
-                WHEN NEW.command_id IS NOT OLD.command_id
-                  OR NEW.target IS NOT OLD.target
-                  OR NEW.target_label IS NOT OLD.target_label
-                  OR NEW.resolved_location_id IS NOT OLD.resolved_location_id
-                  OR NEW.destination_catalog_revision IS NOT OLD.destination_catalog_revision
-                  OR NEW.position_table_revision IS NOT OLD.position_table_revision
-                  OR NEW.authority_snapshot_digest IS NOT OLD.authority_snapshot_digest
-                  OR NEW.complete_authority_digest IS NOT OLD.complete_authority_digest
-                  OR NEW.plan_digest IS NOT OLD.plan_digest
-                  OR NEW.source_branch IS NOT OLD.source_branch
-                  OR NEW.source_anchors_json IS NOT OLD.source_anchors_json
-                  OR NEW.source_hazards_json IS NOT OLD.source_hazards_json
-                  OR NEW.planned_at IS NOT OLD.planned_at
-                BEGIN SELECT RAISE(ABORT, 'deck plan identity is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_commands_evidence_coherence_v1
-                BEFORE UPDATE ON operator_plane_deck_commands
-                WHEN authority_write_allowed()<>1
-                  OR NEW.delivery_attempted<OLD.delivery_attempted
-                  OR NEW.controller_command_acknowledged<OLD.controller_command_acknowledged
-                  OR NEW.controller_completion_verified<OLD.controller_completion_verified
-                  OR NEW.hardware_postcondition_verified<OLD.hardware_postcondition_verified
-                  OR NEW.semantic_state_committed<OLD.semantic_state_committed
-                  OR NEW.physical_observation_verified<OLD.physical_observation_verified
-                  OR (OLD.semantic_state_committed=1 AND (
-                       NEW.transition_revision IS NOT OLD.transition_revision
-                       OR NEW.provider_evidence_json IS NOT OLD.provider_evidence_json
-                       OR NEW.committed_at IS NOT OLD.committed_at))
-                  OR (NEW.provider_evidence_json IS NOT NULL AND NEW.provider_evidence_json<>canonical_json(NEW.provider_evidence_json))
-                BEGIN SELECT RAISE(ABORT, 'deck evidence is unauthorized or incoherent'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_commands_no_delete_v1
-                BEFORE DELETE ON operator_plane_deck_commands
-                BEGIN SELECT RAISE(ABORT, 'deck plans are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_stages_authorized_insert_v1
-                BEFORE INSERT ON operator_plane_deck_stages
-                WHEN authority_write_allowed()<>1
-                  OR NEW.resources_json<>canonical_json(NEW.resources_json)
-                  OR NEW.arguments_json<>canonical_json(NEW.arguments_json)
-                  OR NEW.dependency_order_json<>canonical_json(NEW.dependency_order_json)
-                  OR NEW.terminal_state<>'planned'
-                  OR NEW.terminal_evidence_json IS NOT NULL
-                  OR NEW.stage_order<>COALESCE((SELECT MAX(stage_order)+1 FROM operator_plane_deck_stages WHERE command_id=NEW.command_id),0)
-                  OR NEW.dependency_order_json<>CASE WHEN NEW.stage_order=0 THEN '[]' ELSE '[' || (NEW.stage_order-1) || ']' END
-                BEGIN SELECT RAISE(ABORT, 'deck stage insert is unauthorized or incoherent'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_stages_identity_immutable_v1
-                BEFORE UPDATE ON operator_plane_deck_stages
-                WHEN authority_write_allowed()<>1
-                  OR NEW.command_id IS NOT OLD.command_id
-                  OR NEW.stage_order IS NOT OLD.stage_order
-                  OR NEW.operation IS NOT OLD.operation
-                  OR NEW.source_anchor IS NOT OLD.source_anchor
-                  OR NEW.resources_json IS NOT OLD.resources_json
-                  OR NEW.arguments_json IS NOT OLD.arguments_json
-                  OR NEW.dependency_order_json IS NOT OLD.dependency_order_json
-                BEGIN SELECT RAISE(ABORT, 'deck stage identity is immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_stages_terminal_immutable_v1
-                BEFORE UPDATE ON operator_plane_deck_stages
-                WHEN OLD.terminal_state<>'planned'
-                  OR NEW.terminal_state='planned'
-                  OR NEW.terminal_evidence_json IS NULL
-                  OR NEW.terminal_evidence_json<>canonical_json(NEW.terminal_evidence_json)
-                BEGIN SELECT RAISE(ABORT, 'deck stage terminal evidence is immutable or incoherent'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_stages_no_delete_v1
-                BEFORE DELETE ON operator_plane_deck_stages
-                BEGIN SELECT RAISE(ABORT, 'deck stages are immutable'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_semantic_state_coherence_v1
-                BEFORE UPDATE ON operator_plane_deck_semantic_state
-                WHEN authority_write_allowed()<>1
-                  OR NEW.singleton<>1
-                  OR NEW.semantic_state_revision<>OLD.semantic_state_revision+1
-                  OR NEW.transition_provenance_json<>canonical_json(NEW.transition_provenance_json)
-                  OR NEW.producer_command_id IS NULL
-                  OR NOT EXISTS(SELECT 1 FROM operator_plane_commands WHERE command_id=NEW.producer_command_id)
-                  OR (NEW.tip_loaded=1 AND (NEW.tip_location IS NULL OR NEW.tip_location NOT BETWEEN 0 AND 3))
-                BEGIN SELECT RAISE(ABORT, 'deck semantic state update is unauthorized or incoherent'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_semantic_state_no_delete_v1
-                BEFORE DELETE ON operator_plane_deck_semantic_state
-                BEGIN SELECT RAISE(ABORT, 'deck semantic state cannot be deleted'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_semantic_transitions_coherence_v1
-                BEFORE INSERT ON operator_plane_deck_semantic_transitions
-                WHEN authority_write_allowed()<>1
-                  OR NEW.after_revision<>NEW.before_revision+1
-                  OR NEW.transition_json<>canonical_json(NEW.transition_json)
-                  OR json_extract(NEW.transition_json,'$.command_id') IS NOT NEW.command_id
-                  OR json_extract(NEW.transition_json,'$.source_operation') IS NOT NEW.source_operation
-                  OR json_extract(NEW.transition_json,'$.before_revision') IS NOT NEW.before_revision
-                  OR json_extract(NEW.transition_json,'$.after_revision') IS NOT NEW.after_revision
-                  OR NOT EXISTS(
-                      SELECT 1 FROM operator_plane_deck_semantic_state
-                      WHERE singleton=1 AND semantic_state_revision=NEW.after_revision
-                        AND producer_command_id=NEW.command_id AND producer_operation=NEW.source_operation
-                  )
-                BEGIN SELECT RAISE(ABORT, 'deck semantic transition is unauthorized or incoherent'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_semantic_transitions_no_update_v1
-                BEFORE UPDATE ON operator_plane_deck_semantic_transitions
-                BEGIN SELECT RAISE(ABORT, 'deck semantic transitions are append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_deck_semantic_transitions_no_delete_v1
-                BEFORE DELETE ON operator_plane_deck_semantic_transitions
-                BEGIN SELECT RAISE(ABORT, 'deck semantic transitions are append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_tip_tray_state_coherence_v1
-                BEFORE UPDATE ON operator_plane_tip_tray_state
-                WHEN authority_write_allowed()<>1
-                  OR NEW.tray_id IS NOT OLD.tray_id
-                  OR NEW.revision<>OLD.revision+1
-                  OR NEW.occupancy_json IS NULL
-                  OR NEW.occupancy_json<>canonical_json(NEW.occupancy_json)
-                  OR EXISTS(SELECT 1 FROM json_each(NEW.occupancy_json) WHERE type NOT IN ('true','false'))
-                  OR NEW.tip_available IS NULL
-                  OR NEW.operation_id IS NULL OR length(NEW.operation_id)=0
-                  OR NEW.command_id IS NULL OR length(NEW.command_id)=0
-                  OR NEW.ownership_generation IS NULL OR NEW.ownership_generation<0
-                  OR NEW.board_epoch_4 IS NULL OR NEW.board_epoch_4<0
-                  OR NEW.board_epoch_5 IS NULL OR NEW.board_epoch_5<0
-                  OR NEW.produced_at IS NULL
-                  OR NEW.provenance_json IS NULL
-                  OR NEW.provenance_json<>canonical_json(NEW.provenance_json)
-                  OR NEW.provenance_sha256<>sha256_utf8(NEW.provenance_json)
-                BEGIN SELECT RAISE(ABORT, 'tip tray projection update is unauthorized or incoherent'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_tip_tray_state_no_delete_v1
-                BEFORE DELETE ON operator_plane_tip_tray_state
-                BEGIN SELECT RAISE(ABORT, 'tip tray projection cannot be deleted'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_tip_tray_transitions_coherence_v1
-                BEFORE INSERT ON operator_plane_tip_tray_transitions
-                WHEN authority_write_allowed()<>1
-                  OR NEW.occupancy_json<>canonical_json(NEW.occupancy_json)
-                  OR EXISTS(SELECT 1 FROM json_each(NEW.occupancy_json) WHERE type NOT IN ('true','false'))
-                  OR NEW.provenance_json<>canonical_json(NEW.provenance_json)
-                  OR NEW.provenance_sha256<>sha256_utf8(NEW.provenance_json)
-                  OR NOT EXISTS(
-                      SELECT 1 FROM operator_plane_tip_tray_state
-                      WHERE tray_id=NEW.tray_id AND revision=NEW.revision
-                        AND occupancy_json=NEW.occupancy_json
-                        AND tip_available=NEW.tip_available
-                        AND available_count IS NEW.available_count
-                        AND operation_id=NEW.operation_id
-                        AND command_id=NEW.command_id
-                        AND ownership_generation=NEW.ownership_generation
-                        AND board_epoch_4=NEW.board_epoch_4
-                        AND board_epoch_5=NEW.board_epoch_5
-                        AND produced_at=NEW.produced_at
-                        AND provenance_json=NEW.provenance_json
-                        AND provenance_sha256=NEW.provenance_sha256
-                  )
-                BEGIN SELECT RAISE(ABORT, 'tip tray transition insert is unauthorized or incoherent'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_tip_tray_transitions_no_update_v1
-                BEFORE UPDATE ON operator_plane_tip_tray_transitions
-                BEGIN SELECT RAISE(ABORT, 'tip tray transitions are append-only'); END;
-                CREATE TRIGGER IF NOT EXISTS operator_plane_tip_tray_transitions_no_delete_v1
-                BEFORE DELETE ON operator_plane_tip_tray_transitions
-                BEGIN SELECT RAISE(ABORT, 'tip tray transitions are append-only'); END;
-                """
-            )
-            installed_trigger_names = {
-                str(row[0])
-                for row in self.connection.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall()
-            }
-            missing_trigger_names = sorted(set(required_trigger_names) - installed_trigger_names)
-            if missing_trigger_names:
-                raise RuntimeError(f"operator command schema missing triggers: {','.join(missing_trigger_names)}")
-            trigger_placeholders = ",".join("?" for _ in required_trigger_names)
-            governed_tables = {
-                str(row[0])
-                for row in self.connection.execute(
-                    f"SELECT DISTINCT tbl_name FROM sqlite_master WHERE type='trigger' AND name IN ({trigger_placeholders})",
-                    tuple(required_trigger_names),
-                ).fetchall()
-            }
-            table_placeholders = ",".join("?" for _ in governed_tables)
-            actual_governed_triggers = {
-                str(row[0])
-                for row in self.connection.execute(
-                    f"SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name IN ({table_placeholders})",
-                    tuple(sorted(governed_tables)),
-                ).fetchall()
-            }
-            if actual_governed_triggers != set(required_trigger_names):
-                raise RuntimeError("operator command schema trigger set is not exact")
-            expected_table_fragments = {
-                "operator_plane_idempotency": "primary key(operation_kind, idempotency_key)",
-                "operator_plane_methods": "method_id text primary key",
-                "operator_plane_commands": "command_id text primary key",
-                "operator_plane_deck_commands": "command_id text primary key references operator_plane_commands(command_id)",
-                "operator_plane_deck_stages": "primary key(command_id,stage_order)",
-                "operator_plane_deck_semantic_state": "singleton integer primary key check(singleton=1)",
-                "operator_plane_deck_semantic_transitions": "transition_revision integer primary key autoincrement",
-                "operator_plane_tip_tray_state": "tray_id integer primary key check(tray_id between 0 and 4)",
-                "operator_plane_tip_tray_transitions": "transition_sequence integer primary key autoincrement",
-                "serial206_movement_methods": "method_id text primary key",
-                "operator_plane_interrupt_history": "record_sha256 text primary key",
-            }
-            for table_name, fragment in expected_table_fragments.items():
-                row = self.connection.execute(
-                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
-                    (table_name,),
-                ).fetchone()
-                normalized_sql = " ".join(str(row[0] if row else "").lower().split())
-                if fragment not in normalized_sql:
-                    raise RuntimeError(f"operator command schema table attestation failed: {table_name}")
-            expected_column_names = {
-                "operator_plane_idempotency": ("operation_kind","idempotency_key","fingerprint","command_id","method_id","response_json","created_at"),
-                "operator_plane_methods": ("method_id","name","source_json","digest","failure_policy","status","version","ownership_generation","expanded_count","first_stream_sequence","last_stream_sequence","queued_at","updated_at","recovery_outcome_pending"),
-                "operator_plane_commands": ("command_id","stream_sequence","method_id","method_sequence","action_id","requested_json","effective_json","status","version","ownership_generation","dispatch_attempt_id","dispatcher_epoch","dispatch_global_safety_epoch","dispatch_axis_safety_epoch","interrupt_id","interrupt_global_safety_epoch","interrupt_axis_safety_epoch","source_noop","source_noop_reason","controller_acknowledged","remote_acknowledged","physical_effect_verified","terminal_json","queued_at","dispatched_at","finished_at","updated_at"),
-                "operator_plane_deck_commands": ("command_id","target","target_label","resolved_location_id","destination_catalog_revision","position_table_revision","authority_snapshot_digest","complete_authority_digest","plan_digest","source_branch","source_anchors_json","source_hazards_json","delivery_attempted","controller_command_acknowledged","controller_completion_verified","hardware_postcondition_verified","semantic_state_committed","physical_observation_verified","transition_revision","ambiguity_state","provider_evidence_json","planned_at","committed_at"),
-                "operator_plane_deck_stages": ("command_id","stage_order","operation","source_anchor","resources_json","arguments_json","dependency_order_json","terminal_evidence_json","terminal_state"),
-                "operator_plane_deck_semantic_state": ("singleton","current_location","current_well","current_tray","tip_loaded","tip_dirty","tip_location","clean_path","plate_on_gantry","movable_plate_locations_json","pseudo_z_home","semantic_state_revision","producer_operation","producer_command_id","ownership_generation","board_epoch_4","board_epoch_5","transition_provenance_json","ambiguity_state","updated_at"),
-                "operator_plane_deck_semantic_transitions": ("transition_revision","command_id","source_operation","before_revision","after_revision","transition_json","created_at"),
-                "operator_plane_tip_tray_state": ("tray_id","occupancy_json","tip_available","available_count","revision","operation_id","command_id","ownership_generation","board_epoch_4","board_epoch_5","produced_at","provenance_json","provenance_sha256"),
-                "operator_plane_tip_tray_transitions": ("transition_sequence","tray_id","revision","transition","occupancy_json","tip_available","available_count","operation_id","command_id","ownership_generation","board_epoch_4","board_epoch_5","produced_at","provenance_json","provenance_sha256"),
-                "operator_plane_transitions": ("transition_sequence","event_kind","command_id","method_id","state","payload_json","created_at"),
-                "serial206_movement_methods": ("method_id","idempotency_key","action_id","canonical_inputs_sha256","state","state_version","failure_policy","child_count","accepted_at","started_at","finished_at"),
-                "serial206_movement_commands": ("sequence","command_id","idempotency_key","action_id","method_id","method_order","parallel_group","axis_scope","board_scope_json","ownership_generation","expected_board_epochs_json","canonical_inputs_sha256","state","state_version","admitted_interrupt_epochs_json","accepted_at","queued_at","dispatched_at","finished_at","terminal_receipt_id"),
-                "serial206_command_resources": ("command_id","resource_key"),
-                "serial206_command_dependencies": ("command_id","depends_on_command_id","required_terminal"),
-                "operator_plane_interrupt_history": ("record_sha256","stream","interrupt_attempt_id","receipt_json","source_wrapper_json","imported_at"),
-            }
-            for table_name, expected_names in expected_column_names.items():
-                actual_info = self.connection.execute(f"PRAGMA table_info({table_name})").fetchall()
-                actual_names = tuple(str(row[1]) for row in actual_info)
-                if actual_names != expected_names or any(str(row[2]).upper() not in {"TEXT", "INTEGER", "REAL"} for row in actual_info):
-                    raise RuntimeError(f"operator command schema columns are not exact: {table_name}")
-            expected_foreign_keys = {
-                "operator_plane_commands": {("method_id","operator_plane_methods","method_id","NO ACTION","NO ACTION","NONE")},
-                "operator_plane_deck_commands": {("command_id","operator_plane_commands","command_id","NO ACTION","NO ACTION","NONE")},
-                "operator_plane_deck_stages": {("command_id","operator_plane_deck_commands","command_id","NO ACTION","RESTRICT","NONE")},
-                "operator_plane_deck_semantic_state": {("producer_command_id","operator_plane_commands","command_id","NO ACTION","RESTRICT","NONE")},
-                "operator_plane_deck_semantic_transitions": {("command_id","operator_plane_commands","command_id","NO ACTION","RESTRICT","NONE")},
-                "serial206_movement_commands": {("method_id","serial206_movement_methods","method_id","NO ACTION","CASCADE","NONE")},
-                "serial206_command_resources": {("command_id","serial206_movement_commands","command_id","NO ACTION","CASCADE","NONE")},
-                "serial206_command_dependencies": {
-                    ("command_id","serial206_movement_commands","command_id","NO ACTION","CASCADE","NONE"),
-                    ("depends_on_command_id","serial206_movement_commands","command_id","NO ACTION","CASCADE","NONE"),
-                },
-            }
-            for table_name, expected in expected_foreign_keys.items():
-                actual = {
-                    (str(row[3]),str(row[2]),str(row[4]),str(row[5]).upper(),str(row[6]).upper(),str(row[7]).upper())
-                    for row in self.connection.execute(f"PRAGMA foreign_key_list({table_name})").fetchall()
-                }
-                if actual != expected:
-                    raise RuntimeError(f"operator command schema foreign keys are not exact: {table_name}")
-            expected_deck_indexes = {
-                "operator_plane_deck_commands_plan_idx": ("operator_plane_deck_commands", ("plan_digest",)),
-                "operator_plane_deck_stages_terminal_idx": ("operator_plane_deck_stages", ("command_id","terminal_state","stage_order")),
-                "operator_plane_deck_transitions_command_idx": ("operator_plane_deck_semantic_transitions", ("command_id","transition_revision")),
-                "operator_plane_tip_tray_transitions_revision_idx": ("operator_plane_tip_tray_transitions", ("tray_id","revision")),
-            }
-            for index_name, (table_name, expected_columns) in expected_deck_indexes.items():
-                index_row = self.connection.execute(
-                    "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?", (index_name,)
-                ).fetchone()
-                actual_columns = tuple(
-                    str(row[2]) for row in self.connection.execute(f'PRAGMA index_info("{index_name}")').fetchall()
-                )
-                if index_row is None or str(index_row[0]) != table_name or actual_columns != expected_columns:
-                    raise RuntimeError(f"operator command schema index attestation failed: {index_name}")
-            physical_schema_sha256 = _operator_physical_schema_sha256(self.connection)
-            if physical_schema_sha256 != _OPERATOR_PHYSICAL_SCHEMA_SHA256:
-                raise RuntimeError(
-                    f"operator command physical schema fingerprint mismatch: {physical_schema_sha256}"
-                )
 
     @contextmanager
     def _authority_write(self):
@@ -2879,12 +1654,26 @@ class OperatorCommandStore:
         ).fetchone()
         assert row is not None
         if command_id:
-            movement = conn.execute("SELECT 1 FROM serial206_movement_commands WHERE command_id=?", (command_id,)).fetchone()
-            plane = conn.execute("SELECT * FROM operator_plane_commands WHERE command_id=?", (command_id,)).fetchone()
-            if movement is not None and plane is not None:
-                receipt = self._command_response(plane, transition_sequence=int(row[0]))
-                conn.execute("UPDATE operator_commands SET status=?,receipt_json=?,updated_at=?,finished_at=? WHERE command_id=?",
-                             (receipt["status"], _canonical(receipt), _now(), receipt["finished_at"], command_id))
+            # Keep SQL claim/report lineage current, not a second rendered
+            # receipt. Readers use the canonical owner on their own connection.
+            command = conn.execute(
+                "SELECT c.state,p.action_id,p.finished_at FROM serial206_movement_commands c "
+                "JOIN operator_plane_commands p USING(command_id) WHERE c.command_id=?",
+                (command_id,),
+            ).fetchone()
+            if command is not None:
+                if command["action_id"] == "oem.deck.move_to_location":
+                    conn.execute(
+                        "UPDATE operator_commands SET status=?,updated_at=?,finished_at=? WHERE command_id=?",
+                        (command["state"], _now(), command["finished_at"], command_id),
+                    )
+                else:
+                    # Other movement receipt producers are outside D1 named
+                    # moves; preserve their existing stored envelope unchanged.
+                    plane = conn.execute("SELECT * FROM operator_plane_commands WHERE command_id=?", (command_id,)).fetchone()
+                    receipt = self._command_response(plane, transition_sequence=int(row[0]))
+                    conn.execute("UPDATE operator_commands SET status=?,receipt_json=?,updated_at=?,finished_at=? WHERE command_id=?",
+                                 (receipt["status"], _canonical(receipt), _now(), receipt["finished_at"], command_id))
         return int(row[0])
 
     def _store_evidence(
@@ -3212,52 +2001,7 @@ class OperatorCommandStore:
         byte_count = int(conn.execute("SELECT COALESCE(SUM(length(CAST(requested_json AS BLOB))+length(CAST(effective_json AS BLOB))),0) FROM operator_plane_commands WHERE status NOT IN ('completed','failed','ambiguous','stopped','aborted','cancelled','cleared','interrupted')").fetchone()[0])
         return count, byte_count
 
-    def _z_home_authority_row(self, conn: sqlite3.Connection) -> sqlite3.Row:
-        row = conn.execute("SELECT * FROM operator_plane_z_home_authority WHERE singleton=1").fetchone()
-        if row is None:
-            raise RuntimeError("operator-plane Z Home authority row is missing")
-        return row
 
-    @staticmethod
-    def _provider_z_authority(state: Mapping[str, Any]) -> Mapping[str, Any] | None:
-        provider = state.get("serial206_initialization_provider") if isinstance(state, Mapping) else None
-        authority = provider.get("z_authority") if isinstance(provider, Mapping) else None
-        return authority if isinstance(authority, Mapping) else None
-
-    def _sync_z_home_authority(self, conn: sqlite3.Connection, state: Mapping[str, Any]) -> sqlite3.Row:
-        row = self._z_home_authority_row(conn)
-        if str(row["state"]) != "valid":
-            return row
-        authority = self._provider_z_authority(state)
-        current_generation = int(state.get("ownership_generation") or 0)
-        provider_state = str(authority.get("state") or "") if authority is not None else ""
-        provider_reference = str(authority.get("reference_state") or "") if authority is not None else ""
-        provider_board_generation = authority.get("board_lifecycle_generation") if authority is not None else None
-        stale = (
-            int(row["ownership_generation"]) != current_generation
-            or provider_state != "referenced_ready"
-            or provider_reference != "referenced"
-            or (
-                provider_board_generation is not None
-                and row["board_lifecycle_generation"] is not None
-                and int(provider_board_generation) != int(row["board_lifecycle_generation"])
-            )
-        )
-        if stale:
-            conn.execute(
-                "UPDATE operator_plane_z_home_authority SET state='invalid',authority_version=authority_version+1,invalidation_reason=?,updated_at=? WHERE singleton=1 AND state='valid'",
-                ("provider_generation_or_reference_changed", _now()),
-            )
-            row = self._z_home_authority_row(conn)
-        return row
-
-    def _z_home_authority_valid(self, conn: sqlite3.Connection, state: Mapping[str, Any]) -> bool:
-        row = self._sync_z_home_authority(conn, state)
-        return str(row["state"]) == "valid" and int(row["ownership_generation"]) == int(state.get("ownership_generation") or 0)
-
-    def z_home_authority_valid(self, state: Mapping[str, Any]) -> bool:
-        with self._transaction() as conn:
-            return self._z_home_authority_valid(conn, state)
 
     @staticmethod
     def _payload_board_generation(payload: Mapping[str, Any]) -> int | None:
@@ -3716,17 +2460,21 @@ class OperatorCommandStore:
                 with self._transaction() as conn:
                     conn.execute("UPDATE operator_commands SET status='completed',updated_at=? WHERE command_id=?", (_now(), command_id))
 
-    def workflow_child_completion(self, command_id: str):
+    def workflow_child_completion(self, command_id: str, *, include_issued_pending: bool = False):
+        # Terminal-only and issued_pending waiters are separate identities, so
+        # an issued_pending wake never settles a terminal-only waiter.
         from concurrent.futures import Future
         with self._lock:
-            future = self._workflow_child_waiters.setdefault(command_id, Future())
+            future = self._workflow_child_waiters.setdefault(
+                (command_id, bool(include_issued_pending)), Future())
         self._wake.set()
         return future
 
     def _settle_workflow_child_waiters(self) -> None:
         ready = []
         with self._lock:
-            for command_id, future in list(self._workflow_child_waiters.items()):
+            for key, future in list(self._workflow_child_waiters.items()):
+                command_id, include_issued_pending = key
                 # Pending children need only a durable status check. Building
                 # the full receipt here repeatedly defeats completion wakeups.
                 row = self.connection.execute(
@@ -3734,11 +2482,14 @@ class OperatorCommandStore:
                     "LEFT JOIN serial206_movement_commands m ON m.command_id=p.command_id "
                     "WHERE p.command_id=?", (command_id,),
                 ).fetchone()
-                if row is not None and row["status"] in COMMAND_TERMINAL | {"rejected"}:
+                settled = COMMAND_TERMINAL | {"rejected"}
+                if include_issued_pending:
+                    settled = settled | {"issued_pending"}
+                if row is not None and row["status"] in settled:
                     receipt = self.get_command(command_id)
                     ready.append((future, {"ok": receipt["status"] == "completed", "command_id": command_id,
                                            "status": receipt["status"], "receipt": receipt}))
-                    del self._workflow_child_waiters[command_id]
+                    del self._workflow_child_waiters[key]
         for future, result in ready:
             future.set_result(result)
 
@@ -3911,19 +2662,6 @@ class OperatorCommandStore:
             [(command_id, resource) for resource in resources],
         )
 
-    def _sync_board_authority(self, conn: sqlite3.Connection, epochs: Mapping[str, int]) -> None:
-        now = _now()
-        if "4" in epochs:
-            conn.execute(
-                "UPDATE serial206_board_authority SET state='active',active_board_epoch=?,state_version=state_version+1,updated_at=? WHERE board_id=4",
-                (int(epochs["4"]), now),
-            )
-        if "5" in epochs:
-            conn.execute(
-                "INSERT INTO operator_plane_board_authority(board_id,state,active_board_epoch,state_version,updated_at) VALUES(5,'active',?,1,?) "
-                "ON CONFLICT(board_id) DO UPDATE SET state='active',active_board_epoch=excluded.active_board_epoch,state_version=operator_plane_board_authority.state_version+1,updated_at=excluded.updated_at",
-                (int(epochs["5"]), now),
-            )
 
     @staticmethod
     def _deck_recovery_blocker(conn: sqlite3.Connection) -> str | None:
@@ -4161,6 +2899,7 @@ class OperatorCommandStore:
         return self.tip_tray_state(tray_id)
 
     def deck_semantic_state(self) -> dict[str, Any]:
+        from .deck_location_invalidation import location_is_invalidated
         with self._lock:
             row = self.connection.execute(
                 "SELECT * FROM operator_plane_deck_semantic_state WHERE singleton=1"
@@ -4175,7 +2914,7 @@ class OperatorCommandStore:
         provenance = _json_load(row["transition_provenance_json"], {})
         return {
             **({"thermal_door_open": _json_load(door[0], {})["updates"]["thermal_door_open"]} if door else {}),
-            "current_location": row["current_location"],
+            "current_location": "UNKNOWN" if location_is_invalidated(self.root) else row["current_location"],
             "current_well": row["current_well"],
             "current_tray": row["current_tray"],
             "tip_loaded": None if row["tip_loaded"] is None else bool(row["tip_loaded"]),
@@ -4316,6 +3055,9 @@ class OperatorCommandStore:
                 source_command_id=source_command_id, updates=updates,
                 ownership_generation=ownership_generation,
                 board_epoch_4=board_epoch_4, board_epoch_5=board_epoch_5)
+        if source_operation == "updateLocation" and updates.get("current_location") != "UNKNOWN":
+            from .deck_location_invalidation import named_location_published
+            named_location_published(self.root)
         return self.deck_semantic_state()
 
     def _publish_deck_owner_state(
@@ -4533,11 +3275,9 @@ class OperatorCommandStore:
     ) -> dict[str, Any]:
         with self._deck_owner_authority_scope(), self._transaction() as conn:
             command = conn.execute(
-                "SELECT c.dispatch_attempt_id,c.ownership_generation,m.state,m.expected_board_epochs_json,"
-                "s.board_epoch_4,s.board_epoch_5 "
+                "SELECT c.dispatch_attempt_id,c.ownership_generation,m.state,m.expected_board_epochs_json "
                 "FROM operator_plane_commands AS c "
                 "JOIN serial206_movement_commands AS m ON m.command_id=c.command_id "
-                "JOIN operator_plane_deck_semantic_state AS s ON s.singleton=1 "
                 "WHERE c.command_id=? AND c.status='dispatched' AND m.state='dispatched'",
                 (str(command_id),),
             ).fetchone()
@@ -4551,7 +3291,7 @@ class OperatorCommandStore:
             if not isinstance(current_stamps, Mapping):
                 raise RuntimeError("deck_execution_owner_authority_not_bound")
             supplied = dict(authority_stamps or current_stamps)
-            self._validate_deck_owner_authority(**supplied)
+            self._validate_deck_owner_authority(**supplied, current=current_stamps)
             generation = int(supplied.get("ownership_generation", -1))
             if generation != int(command["ownership_generation"]):
                 raise RuntimeError("delivery attempt ownership generation mismatch")
@@ -4576,40 +3316,7 @@ class OperatorCommandStore:
 
     def create_wp8_background_task(self, command_id: str, child_order: int, *, task_id: str, task_kind: str, plan_digest: str, authority_stamps: Mapping[str, Any]) -> dict[str, Any]:
         with self._deck_owner_authority_scope(), self._transaction() as conn:
-            command = conn.execute(
-                """
-                SELECT c.dispatch_attempt_id,c.ownership_generation,m.state,m.expected_board_epochs_json,
-                       lane.owner_id,lane.owner_lease_until,
-                       semantic.ownership_generation AS current_ownership,
-                       semantic.board_epoch_4,semantic.board_epoch_5
-                FROM operator_plane_commands AS c
-                JOIN serial206_movement_commands AS m ON m.command_id=c.command_id
-                JOIN operator_plane_lane AS lane ON lane.singleton=1
-                JOIN operator_plane_deck_semantic_state AS semantic ON semantic.singleton=1
-                WHERE c.command_id=? AND c.status='dispatched'
-                """,
-                (str(command_id),),
-            ).fetchone()
             supplied = dict(authority_stamps)
-            expected_epochs = _json_load(
-                command["expected_board_epochs_json"], {},
-            ) if command is not None else {}
-            if (
-                command is None
-                or not command["dispatch_attempt_id"]
-                or str(command["state"]) != "dispatched"
-                or str(command["owner_id"] or "") != self.owner_id
-                or float(command["owner_lease_until"] or 0.0) <= _now()
-                or int(command["ownership_generation"]) != int(command["current_ownership"])
-                or int(supplied.get("ownership_generation", -1)) != int(command["current_ownership"])
-                or int(supplied.get("board_epoch_4", -1)) != int(command["board_epoch_4"])
-                or int(supplied.get("board_epoch_5", -1)) != int(command["board_epoch_5"])
-                or expected_epochs != {
-                    "4": int(command["board_epoch_4"]),
-                    "5": int(command["board_epoch_5"]),
-                }
-            ):
-                raise RuntimeError("wp8 background task dispatch authority is stale")
             marker = self.record_delivery_attempt(
                 str(command_id),
                 work_kind="wp8_background_task",
@@ -4624,7 +3331,7 @@ class OperatorCommandStore:
                 "VALUES(?,?,?,?,?,?,?,?,'created','{}',?,?)",
                 (
                     str(command_id), int(child_order), str(task_id), str(task_kind),
-                    str(plan_digest), str(command["dispatch_attempt_id"]),
+                    str(plan_digest), str(marker["dispatch_attempt_id"]),
                     int(marker["attempt_sequence"]), _canonical(supplied), now, now,
                 ),
             )
@@ -4646,7 +3353,7 @@ class OperatorCommandStore:
     def settle_wp8_background_task(self, task_id: str, *, state: str, evidence: Mapping[str, Any]) -> None:
         if state not in {"completed", "failed", "ambiguous"}:
             raise ValueError("invalid WP8 background terminal state")
-        with self._transaction() as conn:
+        with self._deck_owner_authority_scope(), self._transaction() as conn:
             now = _now()
             changed = conn.execute(
                 """
@@ -4658,7 +3365,6 @@ class OperatorCommandStore:
                     JOIN operator_plane_commands AS command ON command.command_id=attempt.command_id
                     JOIN serial206_movement_commands AS movement ON movement.command_id=command.command_id
                     JOIN operator_plane_lane AS lane ON lane.singleton=1
-                    JOIN operator_plane_deck_semantic_state AS semantic ON semantic.singleton=1
                     WHERE attempt.attempt_sequence=operator_plane_wp8_background_tasks.delivery_attempt_sequence
                       AND attempt.command_id=operator_plane_wp8_background_tasks.command_id
                       AND attempt.dispatch_attempt_id=operator_plane_wp8_background_tasks.dispatch_attempt_id
@@ -4669,9 +3375,7 @@ class OperatorCommandStore:
                       AND movement.state IN ('dispatched','issued_pending')
                       AND command.dispatch_attempt_id=attempt.dispatch_attempt_id
                       AND command.ownership_generation=attempt.ownership_generation
-                      AND semantic.ownership_generation=attempt.ownership_generation
-                      AND semantic.board_epoch_4=attempt.board_epoch_4
-                      AND semantic.board_epoch_5=attempt.board_epoch_5
+                      AND deck_owner_authority_current(attempt.ownership_generation,attempt.board_epoch_4,attempt.board_epoch_5)=1
                       AND CAST(json_extract(movement.expected_board_epochs_json,'$.4') AS INTEGER)=attempt.board_epoch_4
                       AND CAST(json_extract(movement.expected_board_epochs_json,'$.5') AS INTEGER)=attempt.board_epoch_5
                   )
@@ -4684,6 +3388,32 @@ class OperatorCommandStore:
                     (str(task_id),),
                 ).fetchone()
                 if current is not None and str(current["state"]) == state:
+                    return
+                # A source worker can return after an addressed interrupt has
+                # already settled its command. Preserve that durable outcome;
+                # the late return is evidence, not renewed completion authority.
+                interrupted = conn.execute(
+                    "SELECT t.state,c.terminal_json FROM operator_plane_wp8_background_tasks t "
+                    "JOIN operator_plane_commands c ON c.command_id=t.command_id "
+                    "JOIN serial206_movement_commands m ON m.command_id=c.command_id "
+                    "JOIN operator_plane_delivery_attempts a ON a.attempt_sequence=t.delivery_attempt_sequence "
+                    "JOIN operator_plane_lane l ON l.singleton=1 "
+                    "WHERE t.task_id=? AND t.state IN ('created','running') "
+                    "AND c.status IN ('stopped','aborted','interrupted') AND m.state='interrupted' "
+                    "AND json_extract(c.terminal_json,'$.interrupt_id') IS NOT NULL "
+                    "AND a.owner_id=? AND l.owner_id=a.owner_id AND l.owner_lease_until>? "
+                    "AND a.command_id=t.command_id AND a.dispatch_attempt_id=t.dispatch_attempt_id "
+                    "AND c.dispatch_attempt_id=a.dispatch_attempt_id AND a.plan_digest=t.plan_digest",
+                    (str(task_id), self.owner_id, now),
+                ).fetchone()
+                if interrupted is not None:
+                    conn.execute(
+                        "UPDATE operator_plane_wp8_background_tasks SET state='interrupted',evidence_json=?,updated_at=? "
+                        "WHERE task_id=? AND state IN ('created','running')",
+                        (_canonical({"interrupt": _json_load(interrupted["terminal_json"], {}),
+                                     "late_source_state": state, "late_source_evidence": dict(evidence)}),
+                         now, str(task_id)),
+                    )
                     return
                 raise RuntimeError("wp8 background task terminal authority is stale")
             owner = conn.execute(
@@ -4780,36 +3510,43 @@ class OperatorCommandStore:
     ) -> None:
         if state not in {"completed", "failed", "ambiguous"}:
             raise ValueError("invalid WP8 terminal state")
-        evidence = {"result": _bounded_json(result, 131072), "terminalized_at": _now()}
-        with self._transaction() as conn:
+        if isinstance(result, Mapping) and "relocations" in result:
+            # RT-036: relocation facts are consumed after SQLite readback.
+            # A nested diagnostic tree must not displace these terminal facts.
+            from .oem_vision_acceptance import inspection_transfer_outcome
+            bounded = {
+                **inspection_transfer_outcome(result),
+                **{key: result[key] for key in (
+                    "cover_count", "error_status", "detected", "relocations",
+                    "final_cover_locations", "door_open_verified", "inspection_log_only",
+                    "source_anchor", "relocation_receipts",
+                ) if key in result},
+            }
+        else:
+            bounded = _bounded_json(result, 131072)
+        evidence = {"result": bounded, "terminalized_at": _now()}
+        with self._deck_owner_authority_scope(), self._transaction() as conn:
             active = conn.execute(
                 """
                 SELECT c.dispatch_attempt_id,c.ownership_generation,
                        m.state,m.expected_board_epochs_json,
                        lane.owner_id,lane.owner_lease_until,
-                       semantic.ownership_generation AS current_ownership,
-                       semantic.board_epoch_4,semantic.board_epoch_5
+                       deck_owner_authority_current(c.ownership_generation,
+                           CAST(json_extract(m.expected_board_epochs_json,'$.4') AS INTEGER),
+                           CAST(json_extract(m.expected_board_epochs_json,'$.5') AS INTEGER)) AS owner_current
                 FROM operator_plane_commands AS c
                 JOIN serial206_movement_commands AS m ON m.command_id=c.command_id
                 JOIN operator_plane_lane AS lane ON lane.singleton=1
-                JOIN operator_plane_deck_semantic_state AS semantic ON semantic.singleton=1
                 WHERE c.command_id=? AND c.status='dispatched'
                 """,
                 (str(command_id),),
             ).fetchone()
-            expected_epochs = _json_load(
-                active["expected_board_epochs_json"], {},
-            ) if active is not None else {}
             if (
                 active is None
                 or str(active["state"]) != "dispatched"
                 or str(active["owner_id"] or "") != self.owner_id
                 or float(active["owner_lease_until"] or 0.0) <= _now()
-                or int(active["ownership_generation"]) != int(active["current_ownership"])
-                or expected_epochs != {
-                    "4": int(active["board_epoch_4"]),
-                    "5": int(active["board_epoch_5"]),
-                }
+                or active["owner_current"] != 1
                 or (
                     dispatch_attempt_id is not None
                     and str(active["dispatch_attempt_id"] or "") != str(dispatch_attempt_id)
@@ -4830,7 +3567,7 @@ class OperatorCommandStore:
         dispatch_attempt_id: str | None = None,
     ) -> None:
         """CAS-complete one WP8 child and publish its mutation in one transaction."""
-        with self._transaction():
+        with self._deck_owner_authority_scope(), self._transaction():
             self.terminalize_wp8_child(
                 command_id, child_order, state="completed", result=result,
                 dispatch_attempt_id=dispatch_attempt_id,
@@ -4941,35 +3678,28 @@ class OperatorCommandStore:
             ]
             evidence["join"] = getattr(step, "join", None)
         stage_evidence = self._deck_stage_evidence(step, evidence, reason=reason)
-        with self._transaction() as conn:
+        with self._deck_owner_authority_scope(), self._transaction() as conn:
             active = conn.execute(
                 """
                 SELECT c.dispatch_attempt_id,c.ownership_generation,
                        m.state,m.expected_board_epochs_json,
                        lane.owner_id,lane.owner_lease_until,
-                       semantic.ownership_generation AS current_ownership,
-                       semantic.board_epoch_4,semantic.board_epoch_5
+                       deck_owner_authority_current(c.ownership_generation,
+                           CAST(json_extract(m.expected_board_epochs_json,'$.4') AS INTEGER),
+                           CAST(json_extract(m.expected_board_epochs_json,'$.5') AS INTEGER)) AS owner_current
                 FROM operator_plane_commands AS c
                 JOIN serial206_movement_commands AS m ON m.command_id=c.command_id
                 JOIN operator_plane_lane AS lane ON lane.singleton=1
-                JOIN operator_plane_deck_semantic_state AS semantic ON semantic.singleton=1
                 WHERE c.command_id=? AND c.status='dispatched'
                 """,
                 (str(command_id),),
             ).fetchone()
-            expected_epochs = _json_load(
-                active["expected_board_epochs_json"], {},
-            ) if active is not None else {}
             if (
                 active is None
                 or str(active["state"]) != "dispatched"
                 or str(active["owner_id"] or "") != self.owner_id
                 or float(active["owner_lease_until"] or 0.0) <= _now()
-                or int(active["ownership_generation"]) != int(active["current_ownership"])
-                or expected_epochs != {
-                    "4": int(active["board_epoch_4"]),
-                    "5": int(active["board_epoch_5"]),
-                }
+                or active["owner_current"] != 1
                 or (
                     dispatch_attempt_id is not None
                     and str(active["dispatch_attempt_id"] or "") != str(dispatch_attempt_id)
@@ -5003,7 +3733,7 @@ class OperatorCommandStore:
         dispatch_attempt_id: str | None = None,
     ) -> int:
         """CAS-complete one WP7 stage and publish semantics in one transaction."""
-        with self._transaction():
+        with self._deck_owner_authority_scope(), self._transaction():
             self.terminalize_mov_execution_stage(
                 command_id, step, state="completed", result=result,
                 source_return_disposition=source_return_disposition,
@@ -5187,26 +3917,6 @@ class OperatorCommandStore:
                 (state, _canonical(evidence), str(command_id), int(step.order)),
             )
 
-    def finalize_deck_stages(self, command_id: str, *, state: str, reason: str) -> None:
-        if state not in {"completed", "failed", "ambiguous", "stopped", "aborted"}:
-            raise ValueError(state)
-        with self._transaction() as conn:
-            rows = conn.execute(
-                "SELECT * FROM operator_plane_deck_stages WHERE command_id=? AND terminal_state='planned' ORDER BY stage_order",
-                (str(command_id),),
-            ).fetchall()
-            for row in rows:
-                evidence = {
-                    "operation": str(row["operation"]), "source_anchor": str(row["source_anchor"]),
-                    "arguments_digest": _digest(_json_load(row["arguments_json"], {})),
-                    "delivery_attempted": False, "controller_command_acknowledged": False,
-                    "controller_completion_verified": False, "hardware_postcondition_verified": False,
-                    "provider_evidence": {}, "reason": str(reason),
-                }
-                conn.execute(
-                    "UPDATE operator_plane_deck_stages SET terminal_state=?,terminal_evidence_json=? WHERE command_id=? AND stage_order=? AND terminal_state='planned'",
-                    (state, _canonical(evidence), str(command_id), int(row["stage_order"])),
-                )
 
     @staticmethod
     def _oem_update_location_current_tray(
@@ -5298,19 +4008,32 @@ class OperatorCommandStore:
                         and child_receipt.get("result", {}).get("hardware_query_verified") is True
                         and child_receipt.get("truth", {}).get("semantic_query_response_verified") is True
                     )
-                if semantic["ambiguity_state"] != "none" or (changed and not owned_tip_child):
+                if changed and not owned_tip_child:
                     raise RuntimeError("deck_semantic_authority_changed_before_commit")
+            pending_orders = {
+                row[0] for row in conn.execute(
+                    "SELECT stage_order FROM operator_plane_deck_stages WHERE command_id=? AND terminal_state='planned'",
+                    (str(command_id),),
+                )
+            }
             result_index = 0
             for step in plan.steps:
                 result = None
                 if step.operation not in {"ForceToHighHome", "check_latch_status", "check_machine_latch_closed"}:
                     result = results[result_index]
                     result_index += 1
+                if step.order not in pending_orders:
+                    continue
                 evidence = self._deck_stage_evidence(step, result)
                 conn.execute(
                     "UPDATE operator_plane_deck_stages SET terminal_state='completed',terminal_evidence_json=? WHERE command_id=? AND stage_order=? AND terminal_state='planned'",
                     (_canonical(evidence), str(command_id), int(step.order)),
                 )
+            if plan.target == "LOC_PARK" and all(row.get("source_noop") is True for row in results):
+                # Source Park returned before updateLocation or tray access.
+                # An axis-level no-op at another named target still runs the
+                # source caller's updateLocation and must commit that location.
+                return
             current = conn.execute(
                 "SELECT semantic_state_revision,movable_plate_locations_json,current_tray FROM operator_plane_deck_semantic_state WHERE singleton=1"
             ).fetchone()
@@ -5342,12 +4065,12 @@ class OperatorCommandStore:
                 "authority_snapshot_digest": str(plan.semantic_transition["authority_snapshot_digest"]),
                 "position_table_revision": str(plan.semantic_transition["position_table_revision"]),
                 "destination_catalog_revision": str(plan.semantic_transition["destination_catalog_revision"]),
-                "latch_status": bool(plan.semantic_transition["latch_status"]),
-                "machine_latch_closed": bool(plan.semantic_transition["machine_latch_closed"]),
-                "latch_observation_id": str(plan.semantic_transition["latch_observation_id"]),
+                "latch_status": bool((expected_authority or plan.semantic_transition)["latch_status"]),
+                "machine_latch_closed": bool((expected_authority or plan.semantic_transition)["machine_latch_closed"]),
+                "latch_observation_id": str((expected_authority or plan.semantic_transition)["latch_observation_id"]),
             }
             conn.execute(
-                "UPDATE operator_plane_deck_semantic_state SET current_location=?,current_well=?,current_tray=?,semantic_state_revision=?,producer_operation='updateLocation',producer_command_id=?,ownership_generation=?,board_epoch_4=?,board_epoch_5=?,transition_provenance_json=?,ambiguity_state='none',updated_at=? WHERE singleton=1",
+                "UPDATE operator_plane_deck_semantic_state SET current_location=?,current_well=?,current_tray=?,semantic_state_revision=?,producer_operation='updateLocation',producer_command_id=?,ownership_generation=?,board_epoch_4=?,board_epoch_5=?,transition_provenance_json=?,updated_at=? WHERE singleton=1",
                 (
                     canonical_location, int(plan.semantic_transition["current_well_id"]), current_tray,
                     after, str(command_id),
@@ -5379,187 +4102,8 @@ class OperatorCommandStore:
                 ),
             )
 
-    def _deck_command_detail(self, command_id: str) -> dict[str, Any] | None:
-        row = self.connection.execute(
-            "SELECT * FROM operator_plane_deck_commands WHERE command_id=?", (str(command_id),)
-        ).fetchone()
-        if row is None:
-            return None
-        stages = self.connection.execute(
-            "SELECT * FROM operator_plane_deck_stages WHERE command_id=? ORDER BY stage_order",
-            (str(command_id),),
-        ).fetchall()
-        # A process can stop after durable native stage completion but before
-        # final semantic publication. Project those motor facts without editing
-        # failed history or treating source-only ForceToHighHome as motor I/O.
-        parsed_stages = [(stage, _json_load(stage["terminal_evidence_json"], None)) for stage in stages]
-        motor_stages = [
-            (str(stage["terminal_state"]), evidence or {})
-            for stage, evidence in parsed_stages
-            if str(stage["operation"]) not in {
-                "ForceToHighHome", "check_latch_status", "check_machine_latch_closed"
-            }
-        ]
-        stage_delivery = any(evidence.get("delivery_attempted") is True
-                             for _, evidence in motor_stages)
-        motor_facts = {"delivery_attempted": bool(row["delivery_attempted"]) or stage_delivery}
-        for fact in ("controller_command_acknowledged", "controller_completion_verified"):
-            # One completed child cannot attest a later planned/failed motor
-            # stage. A genuine source no-op adds no controller claim itself.
-            stage_proven = stage_delivery and all(
-                (fact == "controller_command_acknowledged" or state == "completed") and (
-                    evidence.get(fact) is True
-                    or (isinstance(evidence.get("provider_evidence"), Mapping)
-                        and evidence["provider_evidence"].get("source_noop") is True)
-                )
-                for state, evidence in motor_stages
-            )
-            motor_facts[fact] = bool(row[fact]) or stage_proven
-        recovery_resolution = None
-        resolution = self.connection.execute(
-            "SELECT decision_id,command_id,decision_json,receipt_json FROM operator_plane_deck_recovery_decisions WHERE command_id=?",
-            (str(command_id),),
-        ).fetchone()
-        if resolution is not None:
-            decision = _json_load(resolution["decision_json"], {})
-            receipt = _json_load(resolution["receipt_json"], {})
-            if (isinstance(decision, dict) and isinstance(receipt, dict)
-                and decision.get("command_id") == receipt.get("command_id") == str(command_id)
-                and decision.get("decision_id") == resolution["decision_id"]
-                and isinstance(receipt.get("reconciliation_decision"), dict)
-                and receipt["reconciliation_decision"].get("decision_id") == resolution["decision_id"]
-                and all(type(receipt.get(k)) is int and receipt[k] >= 1 for k in ("semantic_state_revision", "transition_sequence"))):
-                recovery_resolution = {"command_id": str(command_id), "decision_id": str(resolution["decision_id"]),
-                    "semantic_state_revision": receipt["semantic_state_revision"],
-                    "transition_sequence": receipt["transition_sequence"]}
-        return {
-            "recovery_resolution": recovery_resolution,
-            "target": str(row["target"]), "target_label": str(row["target_label"]),
-            "source_branch": str(row["source_branch"]), "resolved_location_id": int(row["resolved_location_id"]),
-            "destination_catalog_revision": str(row["destination_catalog_revision"]),
-            "position_table_revision": str(row["position_table_revision"]),
-            "authority_snapshot_digest": str(row["authority_snapshot_digest"]),
-            "complete_authority_digest": str(row["complete_authority_digest"]),
-            "plan_digest": str(row["plan_digest"]), "source_anchors": _json_load(row["source_anchors_json"], []),
-            **motor_facts,
-            "hardware_postcondition_verified": bool(row["hardware_postcondition_verified"]),
-            "semantic_state_committed": bool(row["semantic_state_committed"]),
-            "physical_observation_verified": bool(row["physical_observation_verified"]),
-            "transition_revision": row["transition_revision"], "ambiguity_state": str(row["ambiguity_state"]),
-            "stages": [
-                {
-                    "order": int(stage["stage_order"]), "operation": str(stage["operation"]),
-                    "source_anchor": str(stage["source_anchor"]),
-                    "resources": _json_load(stage["resources_json"], []),
-                    "arguments": _json_load(stage["arguments_json"], {}),
-                    "dependencies": _json_load(stage["dependency_order_json"], []),
-                    "terminal_state": str(stage["terminal_state"]),
-                    "terminal_evidence": evidence,
-                }
-                for stage, evidence in parsed_stages
-            ],
-        }
-
-    def _wp8_finite_recovery_detail(self, command_id: str) -> dict[str, Any] | None:
-        """Surface the governed recovery resolution for WP8 finite receipts.
-
-        WP8 first-Park / critical-image children never capture a named-deck
-        command row, so the named-deck detail returns None for them even after
-        a reconcile wrote a decision.  Expose the same validated resolution
-        shape the deck detail would carry so consumers (the cockpit
-        reconciliation gate) can see the retained ambiguity disposed.  Read
-        only; the terminal receipt and its outcome are never rewritten.
-        """
-        decision = self.connection.execute(
-            "SELECT decision_id,command_id,decision_json,receipt_json FROM operator_plane_deck_recovery_decisions WHERE command_id=?",
-            (str(command_id),),
-        ).fetchone()
-        if decision is None:
-            return None
-        wp8 = self.connection.execute(
-            "SELECT 1 FROM operator_plane_wp8_operations WHERE command_id=?", (str(command_id),)
-        ).fetchone()
-        if wp8 is None:
-            return None
-        resolution_decision = _json_load(decision["decision_json"], {})
-        resolution_receipt = _json_load(decision["receipt_json"], {})
-        if (isinstance(resolution_decision, dict) and isinstance(resolution_receipt, dict)
-            and resolution_decision.get("command_id") == resolution_receipt.get("command_id") == str(command_id)
-            and resolution_decision.get("decision_id") == decision["decision_id"]
-            and isinstance(resolution_receipt.get("reconciliation_decision"), dict)
-            and resolution_receipt["reconciliation_decision"].get("decision_id") == decision["decision_id"]
-            and all(type(resolution_receipt.get(k)) is int and resolution_receipt[k] >= 1
-                    for k in ("semantic_state_revision", "transition_sequence"))):
-            return {"recovery_resolution": {
-                "command_id": str(command_id),
-                "decision_id": str(decision["decision_id"]),
-                "semantic_state_revision": resolution_receipt["semantic_state_revision"],
-                "transition_sequence": resolution_receipt["transition_sequence"],
-            }}
-        return None
-
-    def _command_response(self, row: sqlite3.Row, *, transition_sequence: int | None = None, compact: bool = False) -> dict[str, Any]:
-        if transition_sequence is None:
-            transition_row = self.connection.execute("SELECT MAX(transition_sequence) FROM operator_plane_transitions WHERE command_id=?", (str(row["command_id"]),)).fetchone()
-            transition_sequence = transition_row[0] if transition_row and transition_row[0] is not None else None
-        canonical = self.connection.execute(
-            "SELECT sequence,state,state_version,expected_board_epochs_json,terminal_receipt_id FROM serial206_movement_commands WHERE command_id=?",
-            (str(row["command_id"]),),
-        ).fetchone()
-        terminal = _json_load(row["terminal_json"], None)
-        response = {
-            "schema_version": RECEIPT_SCHEMA,
-            "robot_identity": ROBOT_IDENTITY,
-            "command_id": str(row["command_id"]),
-            "method_id": row["method_id"],
-            "method_sequence": row["method_sequence"],
-            "stream_sequence": int(row["stream_sequence"]),
-            "action_id": str(row["action_id"]),
-            "status": str(canonical["state"]) if canonical is not None else str(row["status"]),
-            "ownership_generation": int(row["ownership_generation"]),
-            "requested_inputs": _json_load(row["requested_json"], {}),
-            "effective_inputs": _json_load(row["effective_json"], {}),
-            "accepted_at": float(row["queued_at"]),
-            "queued_at": float(row["queued_at"]),
-            "dispatched_at": row["dispatched_at"],
-            "finished_at": row["finished_at"],
-            "source_noop": bool(row["source_noop"]),
-            "source_noop_reason": row["source_noop_reason"],
-            "remote_acknowledged": bool(row["remote_acknowledged"]),
-            "controller_acknowledged": bool(row["controller_acknowledged"]),
-            "physical_effect_verified": bool(row["physical_effect_verified"]),
-            "terminal_evidence": terminal,
-            "sequence": int(canonical["sequence"]) if canonical is not None else int(row["stream_sequence"]),
-            "state_version": int(canonical["state_version"]) if canonical is not None else int(row["version"]),
-            "expected_board_epoch_by_board": _json_load(canonical["expected_board_epochs_json"], {}) if canonical is not None else {},
-            "terminal_receipt_id": canonical["terminal_receipt_id"] if canonical is not None else None,
-            "completion_class": terminal.get("completion_class") if isinstance(terminal, Mapping) else None,
-            "transition_sequence": transition_sequence,
-        }
-        if compact:
-            # Compact V2 receipts consume only the completion-class correction,
-            # never stage bodies. Keep the same historical recovery semantics.
-            deck_row = self.connection.execute(
-                "SELECT ambiguity_state FROM operator_plane_deck_commands WHERE command_id=?",
-                (str(row["command_id"]),),
-            ).fetchone()
-            deck_detail = None if deck_row is None else {"ambiguity_state": deck_row[0]}
-        else:
-            deck_detail = self._deck_command_detail(str(row["command_id"]))
-            if deck_detail is None:
-                deck_detail = self._wp8_finite_recovery_detail(str(row["command_id"]))
-        if deck_detail is not None:
-            response["deck_movement"] = deck_detail
-            # A retained post-delivery exception can lack the outer class even
-            # though the canonical deck row records ambiguous recovery. Expose
-            # that existing disposition; never turn it into completion or alter
-            # the saved terminal evidence / recovery hold.
-            if (response["completion_class"] is None
-                    and response["status"] == "ambiguous"
-                    and response["finished_at"] is not None
-                    and deck_detail.get("ambiguity_state") == "recovery_required"):
-                response["completion_class"] = "recovery_required"
-        return response
+        from .deck_location_invalidation import named_location_published
+        named_location_published(self.root)
 
     def _method_response(self, row: sqlite3.Row) -> dict[str, Any]:
         transition_row = self.connection.execute("SELECT MAX(transition_sequence) FROM operator_plane_transitions WHERE method_id=?", (str(row["method_id"]),)).fetchone()
@@ -5630,12 +4174,14 @@ class OperatorCommandStore:
             if schema_version != ACTION_REQUEST_SCHEMA:
                 raise HTTPException(status_code=422, detail={"error": "deck_action_requires_v2"})
             raw_board_epochs = request.get("expected_board_epoch_by_board")
-            if (not isinstance(raw_board_epochs, Mapping) or set(raw_board_epochs) != {"4", "5"}
-                    or any(type(value) is not int or value < 0 for value in raw_board_epochs.values())):
-                raise HTTPException(status_code=409, detail={"error": "board_epoch_mismatch"})
+            if (raw_board_epochs is not None and (not isinstance(raw_board_epochs, Mapping)
+                    or not set(raw_board_epochs) <= {"4", "5"}
+                    or any(type(value) is not int or value < 0 for value in raw_board_epochs.values()))):
+                raise HTTPException(status_code=422, detail={"error": "invalid_board_epoch_observation"})
             expected_board_epochs = dict(requested_board_epochs)
-            # A valid original admission observed exactly the requested epochs.
-            # Reconstruct that immutable binding, not today's owner, for replay.
+            # Retain the historical request fingerprint shape for replay. These
+            # values describe the caller's request, not current board observations;
+            # the actual new-command binding is read separately below.
             observed_board_epochs = dict(requested_board_epochs)
         canonical_request = {
             "schema_version": schema_version,
@@ -5656,7 +4202,11 @@ class OperatorCommandStore:
             replay_response = current or saved
             replay_response["idempotent_replay"] = True
             return replay_response
-        with self._transaction() as conn:
+        # Provider -> runtime writer is the established lock order. Resolving
+        # live bindings under a writer alone deadlocks passive provider readers.
+        owner_scope = (self._deck_owner_authority_scope()
+                       if action_id.startswith("oem.deck.") else nullcontext())
+        with owner_scope, self._transaction() as conn:
             replay = self._saved_idempotency(conn, "command", key, fingerprint)
             if replay is not None:
                 current_row = conn.execute(
@@ -5670,9 +4220,11 @@ class OperatorCommandStore:
                 actual_generation = int(state.get("ownership_generation") or -1)
                 if expected_generation != actual_generation:
                     raise HTTPException(status_code=409, detail={"error": "ownership_generation_mismatch", "actual": actual_generation})
-                observed_board_epochs = _active_board_epochs(state, action_id)
-                if set(requested_board_epochs) != {"4", "5"} or requested_board_epochs != observed_board_epochs:
-                    raise HTTPException(status_code=409, detail={"error": "board_epoch_mismatch", "requested": requested_board_epochs, "observed": observed_board_epochs})
+                # Bind this new command to the actual owner, never the caller's
+                # cached catalog. Keep the original requested map in the request
+                # fingerprint so replay cannot change its immutable identity.
+                observed_board_epochs = self._current_deck_board_epochs(state, action_id)
+                expected_board_epochs = dict(observed_board_epochs)
             count, bytes_used = self._capacity(conn)
             proposed_bytes = len(_canonical(inputs).encode("utf-8")) + len(_canonical(canonical_request).encode("utf-8"))
             if count >= COMMAND_CAPACITY or bytes_used + proposed_bytes > COMMAND_BYTES_CAPACITY:
@@ -5738,8 +4290,6 @@ class OperatorCommandStore:
             "continuation": intent.continuation,
         }
         epochs = _active_board_epochs(state, "oem.deck._mov_execution")
-        if set(epochs) != {"4", "5"}:
-            raise RuntimeError("mov_execution_board_authority_unavailable")
         request = {
             "schema_version": ACTION_REQUEST_SCHEMA,
             "action_id": "oem.deck._mov_execution",
@@ -5792,8 +4342,6 @@ class OperatorCommandStore:
             else {**dict(state), "serial206_initialization_provider": dict(state)}
         )
         epochs = _active_board_epochs(epoch_state, "oem.deck._finite_operation")
-        if set(epochs) != {"4", "5"}:
-            raise RuntimeError("finite_deck_operation_board_authority_unavailable")
         request = {
             "schema_version": ACTION_REQUEST_SCHEMA,
             "action_id": "oem.deck._finite_operation",
@@ -5860,16 +4408,6 @@ class OperatorCommandStore:
                     status_code=409,
                     detail={"error": "ownership_generation_mismatch", "actual": actual_generation},
                 )
-            observed_board_epochs = _active_board_epochs(state, method_action_id)
-            if set(requested_board_epochs) != {"4", "5"} or requested_board_epochs != observed_board_epochs:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "error": "board_epoch_mismatch",
-                        "requested": requested_board_epochs,
-                        "observed": observed_board_epochs,
-                    },
-                )
             expected_board_epochs = dict(requested_board_epochs)
         source = {
             "schema_version": METHOD_SCHEMA,
@@ -5893,7 +4431,9 @@ class OperatorCommandStore:
             replay_response = current or saved
             replay_response["idempotent_replay"] = True
             return replay_response
-        with self._transaction() as conn:
+        owner_scope = (self._deck_owner_authority_scope()
+                       if method_action_id in STRICT_METHOD_ACTIONS else nullcontext())
+        with owner_scope, self._transaction() as conn:
             replay = self._saved_idempotency(conn, "method", key, fingerprint)
             if replay is not None:
                 current_row = conn.execute(
@@ -5903,6 +4443,10 @@ class OperatorCommandStore:
                 replay_response = self._method_response(current_row) if current_row is not None else replay
                 replay_response["idempotent_replay"] = True
                 return replay_response
+            if method_action_id in STRICT_METHOD_ACTIONS:
+                expected_board_epochs = self._current_deck_board_epochs(state, method_action_id)
+                source["expected_board_epoch_by_board"] = expected_board_epochs
+                digest = _digest(source)
             count, bytes_used = self._capacity(conn)
             proposed_bytes = len(_canonical(source).encode("utf-8")) + sum(len(_canonical(i).encode("utf-8")) for _, i in expanded)
             if count + len(expanded) > COMMAND_CAPACITY or bytes_used + proposed_bytes > COMMAND_BYTES_CAPACITY:
@@ -5954,129 +4498,6 @@ class OperatorCommandStore:
             self._store_idempotency(conn, kind="method", key=key, fingerprint=fingerprint, response=response, method_id=method_id)
         self._wake.set()
         return response
-
-    def get_command(self, command_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self.connection.execute("SELECT * FROM operator_plane_commands WHERE command_id=?", (command_id,)).fetchone()
-            return self._command_response(row) if row else None
-
-    def get_command_summary(self, command_id: str) -> dict[str, Any] | None:
-        """Internal input to the unchanged V2 compact serializer; not authority.
-
-        Avoid reading/decode-copying requested plans and large terminal/stage
-        evidence on every poll. Explicit detail and recovery keep full readers.
-        """
-        with self._lock:
-            row = self.connection.execute(
-                "SELECT command_id,method_id,method_sequence,stream_sequence,action_id,status,"
-                "ownership_generation,queued_at,dispatched_at,finished_at,source_noop,"
-                "source_noop_reason,remote_acknowledged,controller_acknowledged,physical_effect_verified,version,"
-                "'{}' AS requested_json,'{}' AS effective_json,"
-                "json_object('completion_class',json_extract(terminal_json,'$.completion_class')) AS terminal_json "
-                "FROM operator_plane_commands WHERE command_id=?", (command_id,),
-            ).fetchone()
-            return self._command_response(row, compact=True) if row else None
-
-    def list_commands(self, *, limit: int = 100, before_sequence: int | None = None) -> list[dict[str, Any]]:
-        bounded = min(max(int(limit), 1), 200)
-        with self._lock:
-            if before_sequence is None:
-                rows = self.connection.execute(
-                    "SELECT * FROM operator_plane_commands ORDER BY stream_sequence DESC LIMIT ?",
-                    (bounded,),
-                ).fetchall()
-            else:
-                rows = self.connection.execute(
-                    "SELECT * FROM operator_plane_commands WHERE stream_sequence<? ORDER BY stream_sequence DESC LIMIT ?",
-                    (int(before_sequence), bounded),
-                ).fetchall()
-            return [self._command_response(row) for row in rows]
-
-    def command_detail_v2(self, command_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self.connection.execute("SELECT * FROM operator_plane_commands WHERE command_id=?", (command_id,)).fetchone()
-            if row is None:
-                return None
-            projection = self._command_response(row)
-            raw_terminal = projection.get("terminal_evidence")
-            terminal: dict[str, Any] = dict(raw_terminal) if isinstance(raw_terminal, Mapping) else {}
-            nested_response = terminal.get("response")
-            response: dict[str, Any] = dict(nested_response) if isinstance(nested_response, Mapping) else dict(terminal)
-            raw_keys = ("motor_command_raw_return", "board_wrapper_return", "public_wrapper_return", "public_wrapper_return_kind", "motor_command_delivery_count")
-            controller_keys = ("completion_class", "controller_completion_verified", "terminal_speed_zero", "source_returned_normally", "event", "event_window", "wait")
-            observed_keys = ("position_after", "terminal_position", "terminal_speed", "discrepancy", "observed_position_steps")
-            transitions = self.connection.execute(
-                "SELECT transition_sequence,state,payload_json,created_at FROM operator_plane_transitions WHERE command_id=? ORDER BY transition_sequence LIMIT 200",
-                (command_id,),
-            ).fetchall()
-            resources = [str(item[0]) for item in self.connection.execute(
-                "SELECT resource_key FROM serial206_command_resources WHERE command_id=? ORDER BY resource_key",
-                (command_id,),
-            ).fetchall()]
-            effective_values = dict(projection.get("effective_inputs") or {})
-            missing = object()
-
-            def scalar_observation(key: str, value: Any) -> Any:
-                if value is None or isinstance(value, (bool, int, float, str)):
-                    return value
-                if not isinstance(value, Mapping):
-                    return missing
-                preferred = {
-                    "position_after": ("position", "position_steps", "value"),
-                    "terminal_position": ("position", "position_steps", "value"),
-                    "terminal_speed": ("speed", "speed_steps", "value"),
-                    "discrepancy": ("discrepancy", "steps", "value"),
-                    "observed_position_steps": ("position", "position_steps", "value"),
-                }.get(key, ("value",))
-                for nested_key in preferred:
-                    nested = value.get(nested_key)
-                    if nested is None or isinstance(nested, (bool, int, float, str)):
-                        if nested_key in value:
-                            return nested
-                return missing
-
-            raw_observed = terminal.get("observed_values")
-            if not isinstance(raw_observed, Mapping):
-                raw_observed = {key: response[key] for key in observed_keys if key in response}
-            observed_values = {}
-            for key, value in raw_observed.items():
-                scalar = scalar_observation(str(key), value)
-                if scalar is not missing:
-                    observed_values[str(key)] = scalar
-
-            def transition_status(value: Any) -> str:
-                return {
-                    "stop_requested": "interrupting",
-                    "abort_requested": "interrupting",
-                    "stopped": "interrupted",
-                    "aborted": "interrupted",
-                    "cancelled": "cleared",
-                }.get(str(value), str(value))
-            for key in ("board_effective_target", "motor_effective_target", "near_high_noop"):
-                if key in response:
-                    effective_values[key] = response[key]
-            projection.update({
-                "canonical_inputs": dict(projection.get("requested_inputs") or {}),
-                "requested_values": dict(projection.get("requested_inputs") or {}),
-                "effective_values": effective_values,
-                "observed_values": observed_values,
-                "raw_return_layers": dict(response.get("raw_return_layers") or terminal.get("raw_return_layers") or {key: response[key] for key in raw_keys if key in response}),
-                "controller_evidence": dict(response.get("controller_evidence") or terminal.get("controller_evidence") or {key: response[key] for key in controller_keys if key in response}),
-                "transport_artifacts": list(terminal.get("transport_artifacts") or []),
-                "child_receipts": list(terminal.get("child_receipts") or []),
-                "resource_keys": resources,
-                "transitions": [
-                    {
-                        "transition_id": str(item["transition_sequence"]),
-                        "from_status": None if index == 0 else transition_status(transitions[index - 1]["state"]),
-                        "to_status": transition_status(item["state"]),
-                        "at": float(item["created_at"]),
-                        "reason": (_json_load(item["payload_json"], {}) or {}).get("reason"),
-                    }
-                    for index, item in enumerate(transitions)
-                ],
-            })
-            return projection
 
     def get_method(self, method_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -6967,12 +5388,6 @@ class OperatorCommandStore:
                 "response": _json_load(row["response_json"], {}),
             }
 
-    def method_home_established(self, method_id: str | None, method_sequence: int | None) -> bool:
-        if not method_id or method_sequence is None:
-            return False
-        with self._lock:
-            row = self.connection.execute("SELECT 1 FROM operator_plane_commands WHERE method_id=? AND method_sequence<? AND action_id='oem.z.manual_home' AND status='completed' LIMIT 1", (method_id, int(method_sequence))).fetchone()
-            return row is not None
 
     def claim_next(self) -> dict[str, Any] | None:
         # This indexed read is only a hint. An actual claim still revalidates
@@ -7146,6 +5561,10 @@ class OperatorCommandStore:
                 state="dispatched",
                 payload={"dispatch_attempt_id": attempt_id, "dispatcher_epoch": epoch},
             )
+            from .deck_location_invalidation import STANDALONE_ACTIONS, invalidate_at_dispatch
+            if action_id in STANDALONE_ACTIONS:
+                with self._authority_write():
+                    invalidate_at_dispatch(conn, root=self.root, command_id=str(row["command_id"]))
             claimed = conn.execute(
                 "SELECT * FROM operator_plane_commands WHERE command_id=?",
                 (row["command_id"],),
@@ -7709,8 +6128,6 @@ class OperatorCommandStore:
         self._wake.set()
         return current
 
-    def clear_priority_fence(self) -> None:
-        self._priority_fence.clear()
 
     @staticmethod
     def _axes_for_action(action_id: str) -> set[str]:
@@ -7777,7 +6194,7 @@ class OperatorCommandStore:
             return True
         return any(self._axis_priority_fences[axis].is_set() for axis in self._axes_for_action(action_id))
 
-    def assert_deck_execution_current(self, command_id: str, *, boundary: str | None = None) -> None:
+    def assert_deck_execution_current(self, command_id: str, *, boundary: str | None = None) -> Mapping[str, Any]:
         with self._lock:
             parent = self.connection.execute("SELECT parent_command_id FROM operator_commands WHERE command_id=?", (command_id,)).fetchone()
             if parent and parent[0]:
@@ -7787,12 +6204,9 @@ class OperatorCommandStore:
         with self._lock:
             row = self.connection.execute(
                 """
-                SELECT o.status,o.action_id,c.state,c.ownership_generation,c.expected_board_epochs_json,
-                       s.ownership_generation AS current_ownership,
-                       s.board_epoch_4,s.board_epoch_5
+                SELECT o.status,o.action_id,c.state,c.ownership_generation,c.expected_board_epochs_json
                 FROM operator_plane_commands AS o
                 JOIN serial206_movement_commands AS c ON c.command_id=o.command_id
-                JOIN operator_plane_deck_semantic_state AS s ON s.singleton=1
                 WHERE o.command_id=? AND o.action_id IN (
                     'oem.deck.move_to_location','oem.deck._mov_execution','oem.deck._finite_operation'
                 )
@@ -7817,6 +6231,7 @@ class OperatorCommandStore:
             raise RuntimeError("deck_execution_board_epoch_changed")
         if row["ownership_generation"] != stamps.get("ownership_generation"):
             raise RuntimeError("deck_execution_ownership_generation_changed")
+        return stamps
 
     def queue_pending_interrupt_reconciliation(self, record: Mapping[str, Any]) -> None:
         pending = dict(record)
@@ -8178,28 +6593,7 @@ class OperatorCommandPlane:
                 except Exception:
                     pass
 
-    def is_canonical(self, action_id: str) -> bool:
-        return action_id in CANONICAL_ACTIONS
 
-    def canonical_xz_target_action(self, action_id: str, inputs: Mapping[str, Any] | None = None) -> str | None:
-        """Map a normal X/Z target to the sole v2 action that may own it."""
-        if action_id in INTERRUPT_ACTIONS:
-            return None
-        if action_id in XZ_NORMAL_ACTIONS:
-            return action_id
-        target = self.dispatch.get(action_id)
-        if not isinstance(target, Mapping) or str(target.get("method") or "").upper() != "POST":
-            return None
-        path = str(target.get("path") or "").lower()
-        canonical_action_id = XZ_CANONICAL_ACTION_BY_TARGET_PATH.get(path)
-        if canonical_action_id is not None:
-            return canonical_action_id
-        effective = {**dict(target.get("fixed_inputs") or {}), **dict(inputs or {})}
-        axis = effective.get("axis")
-        body = effective.get("body")
-        if axis is None and isinstance(body, Mapping):
-            axis = body.get("axis")
-        return XZ_CANONICAL_ACTION_BY_AXIS_TARGET.get((path, str(axis or "").strip().lower()))
 
     def _state(self) -> dict[str, Any]:
         value = self.machine_state_provider()
@@ -8936,15 +7330,6 @@ class OperatorCommandPlane:
                 raise HTTPException(status_code=404, detail="idempotency receipt not found")
             return value
 
-    def compat_admission(self, action_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
-        if action_id not in CANONICAL_ACTIONS:
-            raise HTTPException(status_code=404, detail="unknown canonical action")
-        if action_id in INTERRUPT_ACTIONS:
-            return {"action_id": action_id, "ownership_generation": int(self._state().get("ownership_generation") or 0), "enabled": True, "disabled_reason": None, "dependencies": []}
-        state = self._state()
-        effective = _effective_inputs(action_id, payload.get("inputs") or {}, state)
-        assessment = _assess_action(self.by_id[action_id], state, effective)
-        return {"action_id": action_id, "ownership_generation": int(state.get("ownership_generation") or 0), **assessment}
 
     async def admit_strict_method(
         self,
@@ -8997,41 +7382,7 @@ class OperatorCommandPlane:
             strict_authority=True,
         )
 
-    async def invoke_internal_y_absolute(
-        self,
-        source_identity: str,
-        *,
-        target_steps: int,
-        acceleration_override: int | None = None,
-    ) -> dict[str, Any]:
-        """Dispatch the two source-owned M04 overloads without public catalog exposure."""
-        targets = {
-            "acceleration_overload": "oem.y.internal.acceleration_overload",
-            "board_test_my": "oem.y.internal.board_test_my",
-        }
-        action_id = targets.get(str(source_identity))
-        if action_id is None:
-            raise HTTPException(status_code=404, detail={"error": "unknown_internal_y_source_identity"})
-        body: dict[str, Any] = {"target_steps": int(target_steps)}
-        if source_identity == "acceleration_overload":
-            if type(acceleration_override) is not int:
-                raise HTTPException(status_code=422, detail={"error": "acceleration_override_required"})
-            body["acceleration_override"] = int(acceleration_override)
-        elif acceleration_override is not None:
-            raise HTTPException(status_code=422, detail={"error": "board_test_my_acceleration_is_source_fixed"})
-        target = self._action_target(action_id)
-        command_id = f"internal-y-{source_identity}-{uuid.uuid4().hex}"
-        token = _DISPATCH_CONTEXT.set({"operator_command_id": command_id, "idempotency_key": command_id, "expected_ownership_generation": int(self._state().get("ownership_generation") or 0), "action_id": action_id})
-        try:
-            status_code, response = await _dispatch_asgi(self.app, str(target["method"]), str(target["path"]), {**dict(target.get("fixed_inputs") or {}), **body}, target["locations"])
-        finally:
-            _DISPATCH_CONTEXT.reset(token)
-        if not 200 <= int(status_code) < 300:
-            raise HTTPException(status_code=int(status_code), detail=response)
-        return dict(response) if isinstance(response, Mapping) else {"ok": False, "failure": "internal_y_response_not_mapping"}
 
-    async def invoke_y_interrupt(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        return await self.compat_invoke("oem.y.stop", request)
 
     async def _deliver_controller_interrupt_raw(self, action_id: str, *, interrupt_attempt_id: str, observed_generation: int = 0) -> tuple[int, Any]:
         provider_action = "oem.abort_all" if action_id in {"oem.abort_all", "oem.z.abort"} else action_id
@@ -9054,73 +7405,6 @@ class OperatorCommandPlane:
         finally:
             _DISPATCH_CONTEXT.reset(token)
 
-    async def _invoke_controller_interrupt(self, action_id: str, *, receipt: Mapping[str, Any], idempotency_key: str) -> dict[str, Any]:
-        if str(receipt.get("persistence_state")) != "committed":
-            return dict(receipt)
-        if receipt.get("invocation_attempted") is True or receipt.get("controller_stop_attempted") is True:
-            return dict(receipt)
-        try:
-            receipt = await asyncio.to_thread(
-                self.store.mark_interrupt_attempted,
-                idempotency_key=str(idempotency_key),
-            )
-        except Exception as exc:
-            return {
-                **dict(receipt),
-                "controller_stop_attempted": False,
-                "source_call_completed": False,
-                "source_return_ok": False,
-                "controller_stop_acknowledged": False,
-                "physical_effect_verified": False,
-                "error": f"interrupt_attempt_persistence_failed:{type(exc).__name__}",
-                "persistence_state": "recovery_required",
-                "recovery_hold": True,
-            }
-        if receipt.get("idempotent_replay") is True:
-            return dict(receipt)
-        interrupt_attempt_id = str(receipt.get("interrupt_attempt_id") or receipt.get("interrupt_id") or uuid.uuid4())
-        response: Any = None
-        acknowledged = False
-        error: str | None = None
-        try:
-            status_code, response = await self._deliver_controller_interrupt_raw(
-                action_id,
-                interrupt_attempt_id=interrupt_attempt_id,
-            )
-            http_success = 200 <= int(status_code) < 300
-            source_call_field = _interrupt_source_response(response).get("source_call_completed")
-            acknowledged = source_call_field is True if type(source_call_field) is bool else bool(http_success and isinstance(response, Mapping) and type(response.get("ok")) is bool)
-            if not http_success:
-                error = f"controller_interrupt_http_{status_code}"
-            elif not acknowledged:
-                error = "oem_stop_source_call_failed"
-            elif response.get("ok") is not True:
-                error = "oem_stop_source_return_failure"
-        except Exception as exc:
-            error = f"controller_interrupt_exception:{type(exc).__name__}"
-        try:
-            return await asyncio.to_thread(
-                self.store.finalize_interrupt,
-                idempotency_key=idempotency_key,
-                receipt={**dict(receipt), "interrupt_attempt_id": interrupt_attempt_id},
-                attempted=True,
-                acknowledged=acknowledged,
-                response=response,
-                error=error,
-            )
-        except Exception as exc:
-            return {
-                **dict(receipt),
-                "interrupt_attempt_id": interrupt_attempt_id,
-                **_interrupt_invocation_evidence(action_id, attempted=True),
-                "source_call_completed": acknowledged,
-                "source_return_ok": _interrupt_source_return_ok(response),
-                "controller_stop_acknowledged": _interrupt_stop_acknowledged(action_id, response),
-                "controller_response": _bounded_json(response, 131072),
-                "error": error or f"interrupt_sqlite_finalization_failed:{type(exc).__name__}",
-                "persistence_state": "recovery_required",
-                "recovery_hold": True,
-            }
 
     async def compat_invoke(self, action_id: str, payload: Mapping[str, Any], *, controller_delivery: tuple[int, Any] | None = None, interrupt_attempt_id: str | None = None) -> dict[str, Any]:
         if action_id in INTERRUPT_ACTIONS:

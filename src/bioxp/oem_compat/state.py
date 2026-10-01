@@ -81,11 +81,7 @@ class VirtualBioXP:
     events: list[VirtualStateEvent] = field(default_factory=list)
     actions_applied: int = 0
 
-    def update_gantry_location(self, location: str) -> None:
-        self.gantry_location = str(location)
 
-    def update_tip_status(self, channel: int, loaded: bool) -> None:
-        self.tips_loaded[int(channel)] = bool(loaded)
 
     def apply_action(self, action: ProtocolAction) -> VirtualStateEvent:
         params = dict(action.params or {})

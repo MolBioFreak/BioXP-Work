@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
-from .oem_calibration import CALIBRATION_PLATES, CalibrationExecutionError, _Sequence, calibration_samples
+from .oem_calibration import CALIBRATION_PLATES, _Sequence, calibration_samples
 from ..oem_compat.position_table import well_id_from_label
 
 Result = dict[str, Any]

@@ -2,7 +2,7 @@
 
 Acceptance criteria exercised here:
 
-1. a stop press is durably recorded at admission, *before* physical delivery;
+1. a stop is sent before anything is written to disk, then fully recorded;
 2. a stop is admitted immediately -- it never queues behind the command it is
    stopping (a held provider lifecycle lock), behind another stop, or behind an
    unbounded lock;
@@ -132,9 +132,9 @@ def _phases_for_attempt(journal_path: Path, attempt_id: str):
 
 
 # ---------------------------------------------------------------------------
-# (1) write-ahead durability
+# (1) send first, record after
 # ---------------------------------------------------------------------------
-def test_stop_press_is_durable_before_the_physical_delivery(tmp_path, monkeypatch, producer):
+def test_stop_is_sent_before_any_journal_write_then_recorded(tmp_path, monkeypatch, producer):
     provider, tester, hardware = producer
     monkeypatch.setattr(api, "_serial206_oem_initialization_provider", provider)
     monkeypatch.setattr(api, "_tester", tester)
@@ -146,18 +146,11 @@ def test_stop_press_is_durable_before_the_physical_delivery(tmp_path, monkeypatc
     original_write = hardware.write
 
     def write(*args, **kwargs):
-        # First physical write of this Stop: the press must already be durable.
-        if hardware.stop_writes == 0:
-            rows = [
-                json.loads(line)
-                for line in journal.path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-            observed["attempts"] = {row["interrupt_attempt_id"] for row in rows}
-            observed["phases_at_first_write"] = [row["phase"] for row in rows]
-            observed["admitted_keys"] = [
-                row.get("idempotency_key") for row in rows if row["phase"] == "admitted"
-            ]
+        # First physical write of this Stop: nothing may be journaled yet.
+        if hardware.stop_writes == 0 and "journal_at_first_write" not in observed:
+            observed["journal_at_first_write"] = (
+                journal.path.read_text(encoding="utf-8") if journal.path.exists() else ""
+            )
         return original_write(*args, **kwargs)
 
     monkeypatch.setattr(hardware, "write", write)
@@ -171,18 +164,20 @@ def test_stop_press_is_durable_before_the_physical_delivery(tmp_path, monkeypatc
 
     response, saved = asyncio.run(scenario())
     assert response.status_code == 200, response.text
-    # Recorded before the first byte reached the controller, and recorded as an
-    # admission (not as a completion after the fact).
-    assert "admitted" in observed["phases_at_first_write"], observed
-    assert observed["phases_at_first_write"][0] == "admitted", observed
-    assert "delivered" not in observed["phases_at_first_write"], observed
-    assert "terminal" not in observed["phases_at_first_write"], observed
-    assert observed["admitted_keys"] == [INTERRUPT_BODY["idempotency_key"]]
-    attempt_id = next(iter(observed["attempts"]))
+    assert observed["journal_at_first_write"] == "", observed
+    rows = [
+        json.loads(line)
+        for line in journal.path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    attempt_id = rows[0]["interrupt_attempt_id"]
     phases = _phases_for_attempt(journal.path, attempt_id)
-    assert phases[0] == "admitted"
+    assert phases[0] == "delivered"
     assert phases[-1] == "terminal"
-    assert "delivered" in phases
+    assert "admitted" in phases
+    assert [row.get("idempotency_key") for row in rows if row["phase"] == "admitted"] == [
+        INTERRUPT_BODY["idempotency_key"]
+    ]
     # The operator-plane ledger is the projection of that same attempt identity.
     ledger = {
         row["interrupt_attempt_id"]
@@ -484,3 +479,43 @@ def test_startup_materialization_projects_orphaned_attempts(tmp_path):
         assert "materialized" in _phases_for_attempt(journal.path, attempt)
     # Re-running materialization is idempotent (nothing left to project).
     assert store.materialize_interrupt_journal(journal)["materialized"] == []
+
+
+@pytest.mark.parametrize("phases", [
+    ("delivered",),
+    ("delivered", "admitted"),
+    ("failed",),
+    ("reconciliation_pending",),
+    ("admitted", "delivery_attempted"),
+])
+def test_startup_materialization_preserves_post_delivery_attempt_truth(tmp_path, phases):
+    root = tmp_path / "state"
+    journal = InterruptJournal(root)
+    for phase in phases:
+        journal.record(
+            interrupt_attempt_id="post-delivery-orphan", action_id="oem.y.stop",
+            phase=phase, idempotency_key="post-delivery-key",
+            observed_ownership_generation=1, observed_board_epoch_by_board={4: 9},
+        )
+    OEMRuntimeStore(root).close()
+    store = OperatorCommandStore(root)
+    try:
+        summary = store.materialize_interrupt_journal(journal)
+        assert summary["materialized"] == ["post-delivery-orphan"]
+        rows = store.connection.execute(
+            "SELECT phase FROM operator_plane_interrupt_attempts WHERE interrupt_attempt_id=?",
+            ("post-delivery-orphan",),
+        ).fetchall()
+        assert {row["phase"] for row in rows} == {"admitted", "attempted"}
+        pending = store._pending_interrupt_spool_rows()
+        assert len(pending) == 1
+        assert pending[0]["attempted"] is True
+        assert pending[0]["acknowledged"] is False
+        assert pending[0]["response"] is None
+        assert pending[0]["error"] == "process_restart_during_interrupt_delivery"
+        assert not (root / "operator_interrupt_decisions.v1.jsonl").exists()
+        assert journal.unresolved_attempts() == []
+        assert store.materialize_interrupt_journal(journal)["materialized"] == []
+    finally:
+        store.connection.close()
+        journal.close()

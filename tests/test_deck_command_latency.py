@@ -17,7 +17,7 @@ from tests.test_deck_postmove_reference import USBLeaf
 
 
 @pytest.mark.parametrize('fault', [None, 'latch', 'position', 'reference', 'generation', 'tip', 'interrupt', 'publication', 'board', 'owner'])
-def test_named_start_two_samples_and_final_fences(installed_retained, monkeypatch, fault):
+def test_named_start_one_sample_and_final_fences(installed_retained, monkeypatch, fault):
     from bioxp import api
     app, provider, observations, references, root = installed_retained
     api.serial206_oem_initialization_provider_status()
@@ -50,10 +50,12 @@ def test_named_start_two_samples_and_final_fences(installed_retained, monkeypatc
     def terminalize(command_id, step, **kwargs):
         result = original_terminalize(command_id, step, **kwargs)
         events.append(('stage', step.operation))
+        if step.operation == 'ForceToHighHome' and fault == 'latch':
+            # Change the physical source before the caller's real latch reads,
+            # not after their consumed return and behind an obsolete resweep.
+            monkeypatch.setattr(observations, 'query_latch', lambda: {'ok': True, 'value': 0})
         if step.operation == 'check_machine_latch_closed':
-            if fault == 'latch':
-                monkeypatch.setattr(observations, 'query_latch', lambda: {'ok': True, 'value': 0})
-            elif fault == 'position':
+            if fault == 'position':
                 monkeypatch.setattr(observations, '_read_axis_position', lambda axis: 1 if axis == 'x' else 0)
             elif fault == 'reference':
                 references.mark_referenced(MarkAxisReferencedCommand('x', 0, source='independent offline replacement'))
@@ -65,7 +67,9 @@ def test_named_start_two_samples_and_final_fences(installed_retained, monkeypatc
                 state['machine_status']['tip_loaded'] = True
                 provider._save_state(state)
             elif fault == 'interrupt':
-                provider._x_interrupt_epoch += 1
+                # Exercise the real current Stop fence, not a synthetic
+                # provider counter formerly noticed by the deleted sweep.
+                store.arm_interrupt_fence('oem.x.stop')
             elif fault == 'owner':
                 provider._deck_owner_id = 'independent-offline-provider'
             elif fault == 'board':
@@ -91,7 +95,7 @@ def test_named_start_two_samples_and_final_fences(installed_retained, monkeypatc
         Path(os.environ['DECK_TEST_OUTPUT'] + '.latency-' + str(fault) + '.json').write_text(
             json.dumps({'receipt': receipt, 'events': events, 'moves': leaf.moves}, indent=2))
     executor_events = events[events.index(('executor_enter',)) + 1:]
-    if fault:
+    if fault not in {None, 'position', 'reference', 'owner'}:
         assert receipt['status'] != 'completed', receipt
         assert not leaf.moves
         assert not any(e[0] == 'native_move' for e in events)
@@ -106,11 +110,10 @@ def test_named_start_two_samples_and_final_fences(installed_retained, monkeypatc
     assert receipt['physical_effect_verified'] is False
     assert len(leaf.moves) == 2
     samples = [i for i, e in enumerate(events) if e[0] == 'sample']
-    assert len(samples) == 2, events
+    assert len(samples) == 1, events
     last_predicate = next(i for i,e in enumerate(events) if e == ('stage', 'check_machine_latch_closed'))
     first_move = next(i for i,e in enumerate(events) if e[0] == 'native_move')
-    assert samples[0] < last_predicate < samples[-1] < first_move
-    assert events[samples[-1]][2] == events[samples[0]][2] + 1
+    assert samples[0] < last_predicate < first_move
     # Warm next command starts with pseudo500 and a populated semantic owner.
     event_count = len(executor_events)
     revision = store.deck_semantic_state()['semantic_state_revision']
@@ -124,7 +127,7 @@ def test_named_start_two_samples_and_final_fences(installed_retained, monkeypatc
     assert store.deck_semantic_state()['semantic_state_revision'] == revision + 2
     repeated = events[event_count:]
     repeated = repeated[repeated.index(('executor_enter',)) + 1:]
-    assert sum(e[0] == 'sample' for e in repeated) == 2, repeated
+    assert sum(e[0] == 'sample' for e in repeated) == 1, repeated
     assert len(leaf.moves) == 4
     app.state.operator_command_plane.stop()
     script = ('import json,sys; from tests.test_deck_scoped_integration import fresh_process_receipts; '

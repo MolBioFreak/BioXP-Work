@@ -59,8 +59,8 @@ def test_delivery_lock_order_and_current_sql_fence(retained_rig, monkeypatch, sc
         if scenario == 'sql_owner_drift':
             def reader():
                 reads.append(threading.get_ident())
-                if len(reads) == 3:
-                    # The INSERT trigger, after both Python checks, must read
+                if len(reads) == 2:
+                    # The INSERT trigger, after the consolidated Python read, must read
                     # the actual current provider rather than captured stamps.
                     monkeypatch.setattr(provider, 'generation_provider', lambda: 4)
                 return original_reader()
@@ -115,7 +115,7 @@ def test_delivery_lock_order_and_current_sql_fence(retained_rig, monkeypatch, sc
     if scenario == 'sql_owner_drift':
         with pytest.raises(DeckExecutionFailure, match='named_delivery_marker_failed'):
             execute(**arguments)
-        assert len(reads) == 3
+        assert len(reads) == 2
         assert not store.has_delivery_attempt(admitted['command_id'])
         assert not any(call[0] == 'move' for call in primitive.calls)
     else:

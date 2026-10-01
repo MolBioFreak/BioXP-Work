@@ -85,12 +85,6 @@ From the project root, interactive operator/runtime truth is:
 sudo .venv/bin/python src/bioxp/usb_driver.py
 ```
 
-Legacy standalone 24V diagnostic:
-
-```bash
-sudo .venv/bin/python src/bioxp/diagnostic_24v.py
-```
-
 The robot-local HTTP API has one owner. Do not launch `uvicorn`, a generic
 container runner, a watchdog fallback, or a user recovery unit. Install the
 immutable packet described in `release/README.md`, then control only the
@@ -113,7 +107,7 @@ Most useful current docs:
 - `docs/ARCHITECTURE_AND_CONTROL_PLANE.md`
 - `docs/SUBSYSTEMS_AND_OPERATIONS.md`
 - `docs/RUNBOOK.md`
-- `docs/LIVE_HOMING_RUNBOOK_2026-04-13.md`
+- `docs/TOOLING_RETIREMENT.md`
 - `docs/VENDOR_PARITY_SCORECARD.md`
 - `docs/MOTION_RELIABILITY_ROADMAP_2026-04-12.md`
 - `docs/DECODE_AND_GAP_ASSESSMENT_2026-04-12.md`

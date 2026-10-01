@@ -147,23 +147,6 @@ class OemReplyFrame:
         return self.board_id == frame.sidh and (frame.command is None or self.command == frame.command)
 
 
-def demux_tmcl_responses(
-    raw_responses: list[bytes | bytearray | list[int]],
-    *,
-    expected_board_id: int,
-    expected_command: int,
-) -> tuple[OemReplyFrame | None, list[OemReplyFrame]]:
-    """Separate the first strict matching TMCL reply from asynchronous bus events."""
-
-    reply: OemReplyFrame | None = None
-    events: list[OemReplyFrame] = []
-    for raw in raw_responses:
-        parsed = OemReplyFrame.from_tmcl_response(raw)
-        if reply is None and parsed.board_id == int(expected_board_id) and parsed.command == int(expected_command):
-            reply = parsed
-        else:
-            events.append(parsed)
-    return reply, events
 
 
 def build_oem_motor_payload(command: int, cmd_type: int, motor: int, value: int) -> bytes:

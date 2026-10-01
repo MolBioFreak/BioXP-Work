@@ -7,13 +7,12 @@ flush the handle: the actual worker owner must explicitly flush on exit.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 import logging
 import threading
 import uuid
-from typing import Any, Callable, Iterator
+from typing import Any, Callable
 
 
 _LOG = logging.getLogger(__name__)
@@ -77,23 +76,6 @@ def current_exchange_owner() -> ExchangeObserver | None:
     return _CURRENT.get()
 
 
-@contextmanager
-def exchange_scope(
-    command_id: str | None = None,
-    *,
-    sink: Callable[[dict[str, Any]], None] | None = None,
-) -> Iterator[ExchangeObserver]:
-    """Reuse an existing root; anonymous calls acquire only a local trace ID."""
-    existing = _CURRENT.get()
-    if existing is not None:
-        yield existing
-        return
-    owner = ExchangeObserver(command_id, sink)
-    token = _CURRENT.set(owner)
-    try:
-        yield owner
-    finally:
-        _CURRENT.reset(token)
 
 
 def record_retention_failure(stage: str, error: Exception, *, owner: ExchangeObserver | None = None) -> None:
@@ -106,12 +88,3 @@ def record_retention_failure(stage: str, error: Exception, *, owner: ExchangeObs
         _LOG.error("Transport exchange retention failed (%s): %s", stage, type(error).__name__)
     except Exception:
         pass
-
-
-def publish_exchange(exchange: dict[str, Any]) -> None:
-    owner = _CURRENT.get()
-    if owner is not None:
-        try:
-            owner.append(exchange)
-        except Exception as exc:
-            record_retention_failure("append", exc, owner=owner)
