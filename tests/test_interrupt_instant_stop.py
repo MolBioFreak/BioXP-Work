@@ -479,3 +479,43 @@ def test_startup_materialization_projects_orphaned_attempts(tmp_path):
         assert "materialized" in _phases_for_attempt(journal.path, attempt)
     # Re-running materialization is idempotent (nothing left to project).
     assert store.materialize_interrupt_journal(journal)["materialized"] == []
+
+
+@pytest.mark.parametrize("phases", [
+    ("delivered",),
+    ("delivered", "admitted"),
+    ("failed",),
+    ("reconciliation_pending",),
+    ("admitted", "delivery_attempted"),
+])
+def test_startup_materialization_preserves_post_delivery_attempt_truth(tmp_path, phases):
+    root = tmp_path / "state"
+    journal = InterruptJournal(root)
+    for phase in phases:
+        journal.record(
+            interrupt_attempt_id="post-delivery-orphan", action_id="oem.y.stop",
+            phase=phase, idempotency_key="post-delivery-key",
+            observed_ownership_generation=1, observed_board_epoch_by_board={4: 9},
+        )
+    OEMRuntimeStore(root).close()
+    store = OperatorCommandStore(root)
+    try:
+        summary = store.materialize_interrupt_journal(journal)
+        assert summary["materialized"] == ["post-delivery-orphan"]
+        rows = store.connection.execute(
+            "SELECT phase FROM operator_plane_interrupt_attempts WHERE interrupt_attempt_id=?",
+            ("post-delivery-orphan",),
+        ).fetchall()
+        assert {row["phase"] for row in rows} == {"admitted", "attempted"}
+        pending = store._pending_interrupt_spool_rows()
+        assert len(pending) == 1
+        assert pending[0]["attempted"] is True
+        assert pending[0]["acknowledged"] is False
+        assert pending[0]["response"] is None
+        assert pending[0]["error"] == "process_restart_during_interrupt_delivery"
+        assert not (root / "operator_interrupt_decisions.v1.jsonl").exists()
+        assert journal.unresolved_attempts() == []
+        assert store.materialize_interrupt_journal(journal)["materialized"] == []
+    finally:
+        store.connection.close()
+        journal.close()

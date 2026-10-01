@@ -1475,8 +1475,13 @@ class OperatorCommandStore(CommandReceiptReader):
                 request=request,
                 interrupt_attempt_id=attempt_id,
             )
+            # Current send-first journals have no pre-delivery phase. Their
+            # post-delivery phases prove an attempt, not an ACK or physical Stop.
+            # Keep legacy journals readable and reconcile without resending.
             attempted = any(
-                str(row.get("phase")) == "delivery_attempted" for row in records
+                str(row.get("phase")) in {
+                    "delivery_attempted", "delivered", "failed", "reconciliation_pending",
+                } for row in records
             )
             if attempted:
                 self.mark_interrupt_attempted(idempotency_key=idempotency_key)
