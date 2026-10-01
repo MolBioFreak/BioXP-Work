@@ -11,6 +11,11 @@ from .oem_deck_catalog import DeckCatalog, configured_location_names
 from .oem_compat.position_table import PositionTable, well_id_from_label
 
 
+def _tip_exists(collection: Mapping[str, Any] | None) -> bool | None:
+    """The one collection fact Park consumes (ClassPipetteCollection.TipExist)."""
+    return None if not isinstance(collection, Mapping) else collection.get("tip_exists")
+
+
 def _controller_terminal_truth(result: Mapping[str, Any]) -> bool:
     """Require acknowledged source motion and non-contradictory terminal proof."""
     if result.get("source_noop") is True:
@@ -2053,15 +2058,17 @@ def make_deck_command_executor(
                     if (execution_authority.dependency_scope == "full"
                             and boundary.startswith("before_provider_stage_")):
                         current = provider._canonical_deck_semantic_state(no_tip_park=True)
+                        # Only facts the OEM Park/move branches consume; revision
+                        # counters, provenance digests and collection metadata
+                        # are bookkeeping and never refuse a move.
                         pairs = {
                             "current_location": "current_location_id", "current_well": "current_well_id",
                             "tip_loaded": "tip_loaded", "tip_dirty": "tip_dirty", "tip_location": "tip_location",
                             "plate_on_gantry": "plate_on_gantry", "pseudo_z_home": "pseudo_z_home",
-                            "semantic_state_revision": "machine_state_revision",
-                            "transition_provenance_digest": "semantic_state_provenance_digest",
-                            "collection_tip_state": "collection_tip_state",
                         }
-                        if any(current[key] != getattr(execution_authority, bound) for key, bound in pairs.items()):
+                        if (any(current[key] != getattr(execution_authority, bound) for key, bound in pairs.items())
+                                or _tip_exists(current["collection_tip_state"])
+                                != _tip_exists(execution_authority.collection_tip_state)):
                             raise MovementAuthorityChanged("deck_authority_changed_before_first_tx")
                         clean = (None if current["clean_path"] is None
                                  else provider._clean_path_from_tip_tray_authority())

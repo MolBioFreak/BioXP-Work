@@ -8809,7 +8809,10 @@ class Serial206OemInitializationProvider:
         if time.monotonic() - sampled_at >= 15.0:
             raise RuntimeError("deck_authority_cache_stale")
         if scope == "park.full" and snapshot.get("current_location_id") != "LOC_PARK":
-            if self._park_collection_state() != snapshot.get("collection_tip_state"):
+            # Park consumes only TipExist; collection metadata never disables it.
+            sampled = snapshot.get("collection_tip_state")
+            if self._park_collection_state()["tip_exists"] != (
+                    sampled.get("tip_exists") if isinstance(sampled, Mapping) else None):
                 raise RuntimeError("pipette_collection_owner_changed_after_collection")
         return copy.deepcopy(snapshot)
 
