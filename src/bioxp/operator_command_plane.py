@@ -2898,6 +2898,18 @@ class OperatorCommandStore(CommandReceiptReader):
             )
         return self.tip_tray_state(tray_id)
 
+    def deck_display_state(self) -> dict[str, Any]:
+        """Small current SQLite projection for display, never motion authority."""
+        from .deck_location_invalidation import location_is_invalidated
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT current_location,current_well,semantic_state_revision,ambiguity_state "
+                "FROM operator_plane_deck_semantic_state WHERE singleton=1"
+            ).fetchone()
+        assert row is not None
+        return {**dict(row),
+                "current_location": "UNKNOWN" if location_is_invalidated(self.root) else row["current_location"]}
+
     def deck_semantic_state(self) -> dict[str, Any]:
         from .deck_location_invalidation import location_is_invalidated
         with self._lock:

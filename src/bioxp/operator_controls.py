@@ -13,6 +13,7 @@ import asyncio
 import copy
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import wraps
+from sqlite3 import Error as SQLiteError
 import threading
 import hashlib
 import json
@@ -2985,6 +2986,7 @@ def install_operator_control_plane(
             admission_state_reader.close()
             preview_state_reader.close()
             invoke_state_reader.close()
+            deck_display_reader.close()
             reconciliation_executor.shutdown(wait=False, cancel_futures=True)
 
     app.router.lifespan_context = polling_lifespan
@@ -3171,6 +3173,29 @@ def install_operator_control_plane(
         dispatch=dispatch,
     )
     app.state.operator_command_plane = command_plane
+    # Location is committed SQLite state, not a hardware/history observation.
+    # Reuse the bounded metadata reader so a held full refresh cannot keep a
+    # completed arrival hidden, and no display read runs on the event loop.
+    deck_display_reader = _OperatorStateReader(command_plane.store.deck_display_state, metadata=True)
+    app.state.operator_deck_display_reader = deck_display_reader
+
+    def with_current_deck_display(fn):
+        @wraps(fn)
+        async def served(*args, **kwargs):
+            body = await fn(*args, **kwargs)
+            dashboard = body.get("dashboard", body)
+            if dashboard.get("schema_version") != "bioxp.operator_dashboard.v2":
+                return body
+            try:
+                display = await deck_display_reader.read()
+            except (HTTPException, SQLiteError, RuntimeError):
+                # Preserve the existing last-known warm view if the read is
+                # unavailable. Never change controls or add admission policy.
+                return body
+            dashboard["deck"].update(display)
+            return body
+        return served
+
     if oem_deck_provider is not None and oem_deck_position_table_provider is not None:
         from .oem_deck_movement import (
             make_deck_command_executor,
@@ -3879,6 +3904,7 @@ def install_operator_control_plane(
         return rows
 
     @router.get("/v2/dashboard")
+    @with_current_deck_display
     @poll_cache.wrap
     async def operator_dashboard_v2() -> dict[str, Any]:
         state = machine_state()
@@ -3886,6 +3912,7 @@ def install_operator_control_plane(
         return _v2_dashboard(state, {}, rows)
 
     @router.get("/v2/control-catalog")
+    @with_current_deck_display
     @poll_cache.wrap
     async def control_catalog_v2() -> dict[str, Any]:
         state = machine_state()
@@ -4171,6 +4198,7 @@ def install_operator_control_plane(
         }
 
     @router.get("/control-catalog")
+    @with_current_deck_display
     async def control_catalog_with_z_target(
         schema_version: str | None = Query(default=None),
         z_target_steps: int | None = Query(default=None, ge=-2147483648, le=2147483647),
@@ -4195,6 +4223,7 @@ def install_operator_control_plane(
         return {**catalog, "dashboard": dashboard}
 
     @router.get("/dashboard")
+    @with_current_deck_display
     @poll_cache.wrap
     async def operator_dashboard(schema_version: str | None = Query(default=None)) -> dict[str, Any]:
         if schema_version == "bioxp.operator_dashboard.v2":
