@@ -5627,6 +5627,14 @@ class BioXpTester:
             "set_home": go_home.get("set_home") if isinstance(go_home, dict) else None,
             "source_return_code": go_home.get("source_return_code") if isinstance(go_home, dict) else None,
             "switch_transition": go_home.get("switch_transition") if isinstance(go_home, dict) else None,
+            # OEM axisSearchHome returns goHome's result; carry its controller
+            # facts up so callers see the same proof the inner goHome reported.
+            "controller_command_acknowledged": bool(
+                isinstance(go_home, dict) and go_home.get("controller_command_acknowledged") is True),
+            "controller_terminal_state_verified": bool(
+                isinstance(go_home, dict) and go_home.get("controller_terminal_state_verified") is True),
+            "controller_home_proof_verified": bool(
+                isinstance(go_home, dict) and go_home.get("controller_home_proof_verified") is True),
         }
 
 
