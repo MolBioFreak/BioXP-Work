@@ -8,11 +8,6 @@ from typing import Any
 
 
 
-class OEMRuntimeMode(str, Enum):
-    DRY_RUN = "dry_run"
-    SHADOW = "shadow"
-    LIVE = "live"
-
 
 class OEMRuntimeStateName(str, Enum):
     BOOTING = "booting"

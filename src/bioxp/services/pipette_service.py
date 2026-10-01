@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import time
 import random
 import threading
@@ -28,7 +27,6 @@ from ..pipette.receipts import (
     PipetteReceiptError,
     PipetteReceiptStore,
 )
-from ..pipette.transport import PipetteTransport
 
 
 READ_ONLY_PIPETTE_OPERATIONS = frozenset({

@@ -11,7 +11,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
-from .oem_deck_schema_v6 import DECK_SCHEMA_V6_EXTRA_SQL, _statements, _normalized_sql
+from .oem_deck_schema_v6 import _normalized_sql
 from .oem_deck_schema_v7 import _canonical_v7_attestation
 
 VERSION = 9

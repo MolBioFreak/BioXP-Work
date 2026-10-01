@@ -11,7 +11,6 @@ import signal
 import json
 import concurrent.futures
 import threading
-from pathlib import Path
 from typing import Any, Mapping, cast
 
 try:
@@ -2054,63 +2053,6 @@ class BioXpTester:
             "elapsed_ms": int((time.time() - t0) * 1000),
         }
 
-    def latch_compat(self, locked):
-        state = 1 if locked else 0
-        t0 = time.time()
-        sent = 0
-        got = 0
-
-        # Compatibility mode: long timeouts + broad SIO path.
-        self.activate_boards(expect_reply=False)
-
-        primary = self.send_tmcl(
-            self.BOARD_DECK,
-            14,
-            2,
-            0,
-            state,
-            wait_reply=True,
-            write_timeout_ms=120,
-            read_timeout_ms=120,
-            max_reads=24,
-            strict_match=False,
-        )
-        sent += 1
-        if primary is not None:
-            got += 1
-
-        for bid in self.BOARDS:
-            self.send_tmcl(bid, 14, 2, 0, state, wait_reply=False, write_timeout_ms=40)
-            sent += 1
-            time.sleep(0.01)
-
-        for bid in self.BOARDS:
-            for port in range(8):
-                r = self.send_tmcl(
-                    bid,
-                    14,
-                    port,
-                    0,
-                    state,
-                    wait_reply=True,
-                    write_timeout_ms=120,
-                    read_timeout_ms=100,
-                    max_reads=20,
-                    strict_match=False,
-                )
-                sent += 1
-                if r is not None:
-                    got += 1
-                time.sleep(0.03)
-
-        snap = self.io_snapshot(self.BOARD_DECK)
-        return {
-            "primary": primary,
-            "snapshot": snap,
-            "sent": sent,
-            "got": got,
-            "elapsed_ms": int((time.time() - t0) * 1000),
-        }
 
     def latch_oneshot(self, locked, broad=False):
         """
@@ -2231,14 +2173,6 @@ class BioXpTester:
             "sent": sent,
             "elapsed_ms": int((time.time() - t0) * 1000),
         }
-
-    def led_mask_scaled(self, mask, intensity, broad=False):
-        val = self._led_scale_to_tmcl(intensity)
-        out = self.led_write(mask=int(mask), value=val, broad=broad, retries=2)
-        out["intensity"] = self._clamp_u8(intensity)
-        out["tmcl_value"] = val
-        return out
-
 
 
     def led_firstpath_restart(self, leave_on=True):
@@ -6505,25 +6439,6 @@ class BioXpTester:
             "ok": ok,
         }
 
-    def motor_capture_thermal_door_state(self) -> dict:
-        from .oem_initialization import classify_thermal_door_state
-
-        status = self.motor_thermal_door_status()
-        return {
-            "status": status,
-            "classified": classify_thermal_door_state(status),
-            "source_mode": "ControlLib.rehome door_state_capture",
-        }
-
-    def motor_plan_thermal_door_restore(self, *, restore_requested=True) -> dict:
-        from .oem_initialization import build_thermal_door_state_restore_plan
-
-        capture = self.motor_capture_thermal_door_state()
-        plan = build_thermal_door_state_restore_plan(capture["status"], restore_requested=restore_requested)
-        return {
-            "capture": capture,
-            "restore_plan": plan,
-        }
 
     def motor_oem_confirm_thermal_door_closed(self) -> dict:
         """Only confirmAxis(tcDoorClosed), not the diagnostic status sweep."""
@@ -7315,180 +7230,6 @@ class BioXpTester:
             "restore_current": None,
         }
 
-    def motor_oem_home_xy(self, *, timeout_s=30.0):
-        """Direct source-mode surface for OEM HomeXY.
-
-        OEM HomeXY sets X/Y speed+acc to 200, launches X and Y goHome(false,
-        axis, 200, true) concurrently via Task.Run/WaitAll semantics, then
-        restores the normal axis profiles.
-        """
-        t0 = time.time()
-        px = self._motion_oem_axis_profile("x")
-        py = self._motion_oem_axis_profile("y")
-        board_presence = {
-            "x": self._oem_board_present(int(px["board"])),
-            "y": self._oem_board_present(int(py["board"])),
-        }
-        if not all(board_presence.values()):
-            return {
-                "ok": True,
-                "source_mode": "HomeXY",
-                "source_noop": True,
-                "source_return": None,
-                "source_return_semantics": "null_when_either_board_absent",
-                "board_presence": board_presence,
-                "command_issued": False,
-                "physical_motion_commanded": False,
-                "controller_command_acknowledged": False,
-                "elapsed_ms": int((time.time() - t0) * 1000),
-            }
-        out = {
-            "ok": False,
-            "source_mode": "HomeXY",
-            "oem_reference": "ClassControlInterface.HomeXY lines 5054-5067",
-            "implementation_note": "oem_task_run_waitall_parallel_goHome_false_speed200",
-            "parallel_oem_semantics": True,
-            "live_parallel_execution": True,
-            "set_xy_speedacc_200": {},
-            "homes": {},
-            "home_errors": {},
-            "restore_xy_speedacc": {},
-        }
-        for axis, preset in (("x", px), ("y", py)):
-            board = int(preset["board"])
-            motor = int(preset["motor"])
-            out["set_xy_speedacc_200"][axis] = {
-                "speed": self.motor_set_axis_param(board, 4, 200, motor=motor),
-                "acc": self.motor_set_axis_param(board, 5, 200, motor=motor),
-            }
-        # Preserve OEM Task.Run/WaitAll at the axis-operation layer. Shared
-        # endpoint ownership is independently serialized per complete TMCL
-        # transaction by `_transport_lock`, so the tasks cannot steal replies.
-        out["live_parallel_execution"] = True
-        out["implementation_note"] = "oem_task_run_waitall_with_transaction_serialized_usb"
-        home_exceptions = []
-
-        def _run_home(axis):
-            return self.motor_oem_go_home(
-                axis,
-                speed=200,
-                rehome=False,
-                timeout_s=30.0,
-                require_switch_transition=False,
-            )
-
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix="bioxp-homexy",
-        ) as pool:
-            futures = {axis: pool.submit(_run_home, axis) for axis in ("x", "y")}
-            for axis in ("x", "y"):
-                try:
-                    out["homes"][axis] = futures[axis].result()
-                except Exception as exc:
-                    home_exceptions.append(exc)
-                    out["home_errors"][axis] = {
-                        "type": type(exc).__name__,
-                        "message": str(exc),
-                    }
-
-        if home_exceptions:
-            raise home_exceptions[0]
-
-        home_tasks_ok = bool(
-            not out["home_errors"]
-            and all(axis in out["homes"] for axis in ("x", "y"))
-        )
-        if not home_tasks_ok:
-            out["failure"] = "HomeXY_task_failure"
-            out["elapsed_ms"] = int((time.time() - t0) * 1000)
-            return out
-
-        # OEM performs these writes only after Task.WaitAll returns normally.
-        for axis, preset in (("x", px), ("y", py)):
-            preset = dict(preset)
-            board = int(preset["board"])
-            motor = int(preset["motor"])
-            out["restore_xy_speedacc"][axis] = {
-                "speed": self.motor_set_axis_param(board, 4, int(preset.get("speed", 1700 if axis == "x" else 1800)), motor=motor),
-                "acc": self.motor_set_axis_param(board, 5, int(preset.get("acc", 350 if axis == "x" else 400)), motor=motor),
-            }
-
-        out["ok"] = True
-        out["elapsed_ms"] = int((time.time() - t0) * 1000)
-        return out
-
-
-
-
-
-
-
-    def motor_oem_axis_already_home(self, axis_key, *, tolerance_steps=2):
-        """Return a no-motion OEM reference proof when an axis is already on home.
-
-        This is intentionally conservative.  It exists for the live-observed Z case
-        where the axis can start at the active top/home predicate near 0/-1 and a
-        forced re-search would trip the false-home transition guard.
-        """
-        preset = self._motion_oem_axis_profile(axis_key, startup=True)
-        board = int(preset["board"])
-        motor = int(preset["motor"])
-        key = str(axis_key).strip().lower()
-        active_value = int(self.MOTOR_SWITCH_ACTIVE_VALUE)
-        position = self.motor_get_position(board, motor=motor)
-        speed = self.motor_get_speed(board, motor=motor)
-        home = self.motor_query_home_switch(board, motor=motor)
-        switches = self.motor_get_switch_activity(board, motor=motor)
-        pos_value = position.get("position") if isinstance(position, dict) else None
-        speed_value = speed.get("speed") if isinstance(speed, dict) else None
-        home_value = home.get("value") if isinstance(home, dict) else None
-        near_reference = bool(
-            isinstance(position, dict)
-            and self._tmcl_success(position.get("ack"))
-            and type(pos_value) is int
-            and abs(int(pos_value)) <= int(tolerance_steps)
-        )
-        stopped = bool(
-            isinstance(speed, dict)
-            and self._tmcl_success(speed.get("ack"))
-            and type(speed_value) is int
-            and int(speed_value) == 0
-        )
-        predicate_active = bool(
-            isinstance(home, dict)
-            and self._tmcl_success(home.get("ack"))
-            and type(home_value) is int
-            and int(home_value) == active_value
-        )
-        # GAP10/right is diagnostic telemetry only for Z. It must never
-        # establish or supplement the authoritative GAP9 home predicate.
-        live_z_reference_active = False
-        ok = bool(stopped and near_reference and predicate_active)
-        return {
-            "axis": key,
-            "board": board,
-            "motor": motor,
-            "ok": ok,
-            "already_home": ok,
-            "physical_motion_commanded": False,
-            "home_active_value": active_value,
-            "tolerance_steps": int(tolerance_steps),
-            "position": position,
-            "speed": speed,
-            "home": home,
-            "switches": switches,
-            "predicate_active": bool(predicate_active),
-            "live_z_reference_active": bool(live_z_reference_active),
-            "stopped": bool(stopped),
-            "near_reference": bool(near_reference),
-            "source_intent": "safe_reference_established_before_downstream_initialization",
-            "z_reference_contract": {
-                "accepted": bool(ok),
-                "reason": "Only acknowledged GAP9/home plus controller zero and speed zero can satisfy Z already-home proof; GAP10/right is diagnostic-only",
-            } if key == "z" else None,
-        }
-
 
 
     def motor_wait_stopped(
@@ -7816,32 +7557,6 @@ class BioXpTester:
             "elapsed_ms": int((time.time() - t0) * 1000),
         }
 
-    def motor_rotate(self, board_id, velocity, motor=0):
-        vel = int(abs(int(velocity)))
-        if vel == 0:
-            return self.motor_stop(board_id, motor=motor)
-        cmd = 1 if int(velocity) > 0 else 2  # ROR / ROL
-        ack = self._send_motor(
-            int(board_id),
-            cmd,
-            0,
-            int(motor),
-            vel,
-            attempts=1,
-            wait_reply=True,
-            write_timeout_ms=55,
-            read_timeout_ms=70,
-            max_reads=18,
-            strict_match=True,
-        )
-        return {
-            "board": int(board_id),
-            "motor": int(motor),
-            "cmd": cmd,
-            "velocity": int(velocity),
-            "ack": ack,
-            "ok": self._tmcl_success(ack),
-        }
 
     def motor_oem_stop_exact(self, board_id, motor=0):
         first = self._send_motor(

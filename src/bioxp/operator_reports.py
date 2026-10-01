@@ -8,7 +8,6 @@ import io
 import json
 import math
 import os
-import shutil
 import sqlite3
 import stat
 
@@ -31,7 +30,7 @@ from pydantic import (
     field_validator,
 )
 
-from .operator_receipt_store import OperatorReceiptStore, _fsync_directory
+from .operator_receipt_store import OperatorReceiptStore
 from .release_identity import (
     current_release_identity,
     public_release_identity as _public_release_identity,

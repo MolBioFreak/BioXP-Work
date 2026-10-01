@@ -77,15 +77,6 @@ def _ack_status(value: Any) -> int | None:
     return int(status) if type(status) is int else None
 
 
-def _board_cycle_status(rows: Any, board: int) -> int | None:
-    row = rows.get(int(board)) if isinstance(rows, Mapping) else None
-    if isinstance(row, Mapping) and isinstance(row.get("ack"), Mapping):
-        row = row["ack"]
-    status = row.get("status") if isinstance(row, Mapping) else None
-    return int(status) if type(status) is int else None
-
-
-
 
 def _stage(stage_id: str, status: str, source_anchor: str, evidence: Any) -> dict[str, Any]:
     return {

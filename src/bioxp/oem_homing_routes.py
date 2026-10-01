@@ -21,7 +21,6 @@ from .oem_compat.machine_state import OemDefaultParameters, OemMachineState
 from .oem_compat.pathing import OemPathPlanner
 from .oem_compat.movement_readiness import build_movement_readiness_comparison
 from .oem_compat.position_table import load_bound_oem_position_table
-from .oem_shadow_readback_live import build_shadow_readback_artifact
 from .runtime_state import OemRuntimeStateError, get_active_oem_runtime_state_store
 
 router = APIRouter(tags=["OEM homing parity dry-run"])

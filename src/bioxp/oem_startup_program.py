@@ -1,15 +1,9 @@
 from __future__ import annotations
 
 import json
-import os
-import time
-import uuid
 from pathlib import Path
 from typing import Any
 
-from .oem_parity_config import load_oem_parity_config
-from .oem_startup_types import OemStartupState
-from .oem_gripper import GRIPPER_COMMISSION_HOME_ACK, gripper_commission_home
 
 SOURCE_ANCHORS = {
     "config": "ClassBioXPSettings config.xml load paths lines 2847-2857",
@@ -50,38 +44,6 @@ def _atomic_json(path: Path, payload: dict) -> None:
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
     tmp.replace(path)
 
-
-def validate_artifact_root(mode: str, artifact_root: str | Path | None, artifact_base: Path, allowlist_roots: list[str | Path] | None = None) -> tuple[bool, str | None, Path | None]:
-    if mode == "live" and not artifact_root:
-        return False, "artifact_root required for live mode", None
-    root = Path(artifact_root) if artifact_root else None
-    if root is None:
-        return True, None, None
-    if mode == "live" and not root.is_absolute():
-        return False, "artifact_root must be absolute for live mode", None
-    roots = [Path("/tmp/bioxp-live-runs"), artifact_base]
-    roots.extend(Path(r) for r in (allowlist_roots or []))
-    if mode == "live":
-        resolved_parent = root.parent.resolve(strict=False)
-        allowed = False
-        for allowed_root in roots:
-            allowed_resolved = allowed_root.resolve(strict=False)
-            try:
-                resolved_parent.relative_to(allowed_resolved)
-                allowed = True
-                break
-            except ValueError:
-                continue
-        if not allowed:
-            return False, "artifact_root outside allowed live roots", None
-    try:
-        root.mkdir(parents=True, exist_ok=True)
-        probe = root / ".write_probe"
-        probe.write_text("ok")
-        probe.unlink(missing_ok=True)
-    except Exception as exc:
-        return False, f"artifact_root not writable: {exc}", None
-    return True, None, root
 
 
 class DryRunStartupHardware:
@@ -258,79 +220,6 @@ class OEMStartupProgram:
         self.allowlist_roots = allowlist_roots or []
         self.sessions: dict[str, dict] = {}
         self.latest_session_id: str | None = None
-
-    def _artifact_dict(self, root: Path) -> dict:
-        return {name: str(root / name) for name in REQUIRED_ARTIFACTS if (root / name).exists()}
-
-    def _write_placeholder_artifacts(self, root: Path) -> None:
-        for name in REQUIRED_ARTIFACTS:
-            path = root / name
-            if path.exists():
-                continue
-            if name not in {"startup_request.json", "source_anchors.json"}:
-                _atomic_json(path, {"skipped": True, "reason": "stage not reached yet"})
-
-    def _closeout(self, status: dict) -> dict:
-        root = Path(status["artifact_root"])
-        status["artifacts"] = self._artifact_dict(root)
-        _atomic_json(root / "final_readiness.json", status)
-        return dict(status)
-
-    def _new_session(self, req: dict) -> dict:
-        ok, reason, explicit_root = validate_artifact_root(req.get("mode", "dry_run"), req.get("artifact_root"), self.artifact_base, self.allowlist_roots)
-        if not ok:
-            # For invalid live roots, create a safe local failure artifact under base rather than using the unsafe path.
-            sid = time.strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8]
-            safe_root = self.artifact_base / f"{sid}_OEM_APP_STARTUP_SEQUENCE_FAILED_ROOT"
-            safe_root.mkdir(parents=True, exist_ok=True)
-            status = self._status_template(sid, req, safe_root)
-            self.sessions[sid] = status
-            self.latest_session_id = sid
-            _atomic_json(safe_root / "startup_request.json", req)
-            _atomic_json(safe_root / "source_anchors.json", SOURCE_ANCHORS)
-            self._write_placeholder_artifacts(safe_root)
-            return self._fail(status, reason or "invalid artifact root")
-        sid = time.strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8]
-        artifact_root = explicit_root or (self.artifact_base / f"{sid}_OEM_APP_STARTUP_SEQUENCE")
-        artifact_root.mkdir(parents=True, exist_ok=True)
-        status = self._status_template(sid, req, artifact_root)
-        self.sessions[sid] = status
-        self.latest_session_id = sid
-        _atomic_json(artifact_root / "startup_request.json", req)
-        _atomic_json(artifact_root / "source_anchors.json", SOURCE_ANCHORS)
-        self._write_placeholder_artifacts(artifact_root)
-        return status
-
-    def _status_template(self, sid: str, req: dict, artifact_root: Path) -> dict:
-        return {
-            "ok": True,
-            "session_id": sid,
-            "mode": req.get("mode", "dry_run"),
-            "request": dict(req),
-            "state": OemStartupState.CREATED.value,
-            "ready": False,
-            "failed": False,
-            "failed_closed": False,
-            "failure_reason": None,
-            "active_stage": None,
-            "completed_stages": [],
-            "pending_stages": [],
-            "artifact_root": str(artifact_root),
-            "artifacts": {},
-            "source_anchors": dict(SOURCE_ANCHORS),
-            "door_latch": {},
-            "config": {},
-            "backend": {},
-            "axis_reference": {"required": True, "ok": False, "reason": "not reached"},
-            "pipette": {"required": True, "ok": False, "reason": "not checked"},
-            "vision": {"required": True, "ok": False, "reason": "not checked"},
-        }
-
-    def _fail(self, status: dict, reason: str) -> dict:
-        status.update({"ok": False, "state": OemStartupState.FAILED_CLOSED.value, "active_stage": OemStartupState.FAILED_CLOSED.value, "ready": False, "failed": True, "failed_closed": True, "failure_reason": reason})
-        root = Path(status["artifact_root"])
-        _atomic_json(root / "failure.json", {"reason": reason, "state": status["state"]})
-        return self._closeout(status)
 
 
     def door_event(self, session_id: str | None, *, door_closed: bool, latch_closed: bool) -> dict:

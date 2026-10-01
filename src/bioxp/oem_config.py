@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .oem_machine_bundle import (
     OemMachineBundleError,
@@ -380,20 +379,6 @@ def _snapshot_legacy_bundle(snapshot: OemMachineSnapshot) -> dict[str, Any]:
     }
 
 
-def _candidate_paths(root: Path) -> Iterable[Path]:
-    if root.is_file() and root.name.lower() == "config.xml":
-        yield root
-        return
-    if not root.exists():
-        return
-    direct = root / "config.xml"
-    if direct.exists():
-        yield direct
-    for dirpath, _, filenames in os.walk(root):
-        for fn in filenames:
-            if fn.lower() == "config.xml":
-                yield Path(dirpath) / fn
-
 
 def _typed(value: str):
     low = value.strip().lower()
@@ -406,18 +391,6 @@ def _typed(value: str):
     except ValueError:
         return value
 
-
-def _derived_requirements(fields: dict[str, str]) -> dict:
-    def truthy(name: str) -> bool:
-        val = str(fields.get(name, "")).strip().lower()
-        return val in {"1", "true", "yes", "enabled"}
-    return {
-        "camera_check_required": truthy("CheckCamera") and truthy("CameraInstalled"),
-        "camera_calibrated": truthy("CameraCalibrated"),
-        "calibrated": truthy("Calibrated"),
-        "start_mode": fields.get("StartMode"),
-        "gripper_version": fields.get("GripperVersion"),
-    }
 
 
 def _attr_int(elem: ET.Element, *names: str) -> int | None:
@@ -541,90 +514,3 @@ def harmonized_motion_config(config_result: dict | None = None) -> dict:
             "Live Linux Z sign convention observed during commissioning uses negative values for upward/head-clear motion; OEM limits are source-space positive steps.",
         ],
     }
-
-
-def load_oem_config(path: str | Path) -> dict:
-    p = Path(path)
-    fields: dict[str, str] = {}
-    axis_limits: dict[str, dict[str, Any]] = {axis: dict(row) for axis, row in OEM_DEFAULT_AXIS_LIMITS.items()}
-    try:
-        tree = ET.parse(p)
-        root = tree.getroot()
-        axis_limits = _extract_axis_limits(root)
-        for elem in root.iter():
-            tag = str(elem.tag).split("}")[-1]
-            text = (elem.text or "").strip()
-            if text and (tag in INTERESTING_FIELDS or tag.endswith("Max") or "Motor" in tag or "ThermalDoor" in tag or tag.startswith("TC_DOOR")):
-                fields[tag] = text
-            for attr_key, attr_value in elem.attrib.items():
-                if attr_key in INTERESTING_FIELDS or attr_key in {"GripperVersion", "Cameracalibrated", "Calibrated"} or "Motor" in attr_key or attr_key.startswith("m_Z_MOTOR") or attr_key.startswith("m_TC_DOOR") or attr_key.startswith("m_TCDoor"):
-                    normalized = "CameraCalibrated" if attr_key == "Cameracalibrated" else attr_key
-                    fields[normalized] = attr_value
-    except Exception as exc:
-        return {"status": "error", "path": str(p), "error": str(exc), "fields": {}, "fields_typed": {}, "axis_limits": axis_limits, "missing_fields": REQUIRED_FOR_LIVE, "derived_requirements": {}}
-    missing = [name for name in REQUIRED_FOR_LIVE if name not in fields]
-    return {
-        "status": "loaded",
-        "path": str(p),
-        "fields": fields,
-        "fields_raw": dict(fields),
-        "fields_typed": {k: _typed(v) for k, v in fields.items()},
-        "axis_limits": axis_limits,
-        "missing_fields": missing,
-        "live_ready": not missing,
-        "derived_requirements": _derived_requirements(fields),
-    }
-
-
-def find_oem_config(roots: Iterable[str | Path] | None = None) -> dict:
-    if roots is None:
-        try:
-            snapshot = get_active_oem_machine_snapshot()
-        except OemMachineBundleError:
-            return {"status": "unbound", "path": None, "searched_roots": [], "fields": {}, "fields_raw": {}, "fields_typed": {}, "axis_limits": {}, "missing_fields": ["OemMachineSnapshot"], "live_ready": False, "accepted_live_mode": False, "derived_requirements": {}}
-        fields = {
-            "StartMode": snapshot.startup_mode,
-            "GripperVersion": str(snapshot.fields["machine.gripper_version"].raw_value),
-            "Calibrated": str(snapshot.fields["machine.calibrated"].raw_value),
-            "CameraCalibrated": str(snapshot.fields["machine.camera_calibrated"].raw_value),
-            "CheckCamera": str(snapshot.operation_parameters["CheckCamera"]),
-        }
-        try:
-            from .runtime_state import get_active_oem_runtime_state_store
-
-            store = get_active_oem_runtime_state_store()
-            if store.snapshot.lock_sha256 == snapshot.lock_sha256:
-                operation = store.operation_parameters_projection()
-                fields["StartMode"] = str(operation["Mode"])
-                fields["CheckCamera"] = str(operation["CheckCamera"])
-        except Exception:
-            pass
-        return {
-            "status": "loaded",
-            "path": str(snapshot.bundle_root / "appdata/config.xml"),
-            "searched_roots": [],
-            "fields": fields,
-            "fields_raw": dict(fields),
-            "fields_typed": {key: _typed(value) for key, value in fields.items()},
-            "axis_limits": {axis: dict(row) for axis, row in snapshot.axis_limits.items()},
-            "missing_fields": [],
-            "live_ready": True,
-            "accepted_live_mode": True,
-            "derived_requirements": {
-                "camera_check_required": _typed(fields["CheckCamera"]) is True,
-                "camera_calibrated": snapshot.camera_calibrated,
-                "calibrated": snapshot.machine_calibrated,
-                "start_mode": fields["StartMode"],
-                "gripper_version": snapshot.fields["machine.gripper_version"].value,
-            },
-            "snapshot_status": snapshot.config_status_projection(),
-        }
-    searched = [str(Path(r)) for r in roots]
-    for root in searched:
-        for candidate in _candidate_paths(Path(root)):
-            loaded = load_oem_config(candidate)
-            loaded["searched_roots"] = searched
-            loaded["accepted_live_mode"] = False
-            loaded["non_authoritative_diagnostic_only"] = True
-            return loaded
-    return {"status": "missing", "path": None, "searched_roots": searched, "fields": {}, "fields_raw": {}, "fields_typed": {}, "axis_limits": {}, "missing_fields": REQUIRED_FOR_LIVE, "live_ready": False, "accepted_live_mode": False, "non_authoritative_diagnostic_only": True, "derived_requirements": {}}

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable, Mapping
 
-from .motion_safety import Serial206MotionAuthority, physical_aggregate_stop, prepare_motion_without_motion
+from .motion_safety import Serial206MotionAuthority, prepare_motion_without_motion
 from .oem_compat.machine_state import OemMachineState
 from .oem_compat.pathing import OemPathPlanner
 from .oem_compat.position_table import load_bound_oem_position_table
@@ -15617,34 +15617,7 @@ class Serial206OemInitializationProvider:
             "physical_motion_commanded": False,
         }
 
-    def _mark_referenced(self, spec: Serial206StageSpec, result: Any) -> None:
-        axis = _HOME_STAGE_AXIS.get(spec.key)
-        if axis is None or self.reference_store is None or not isinstance(result, Mapping):
-            return
-        if result.get("controller_reference_agrees") is not True:
-            return
-        self.reference_store.mark_referenced(
-            MarkAxisReferencedCommand(
-                axis=axis,
-                position_steps=int(result.get("home_position") or 0),
-                source="serial206_initializeMotors_operator_observed",
-                note=f"Controller evidence and separate operator observation agreed at {spec.key}.",
-                motion_kind="oem_initialize_motors_home",
-            )
-        )
 
-    def _mark_desynced(self, spec: Serial206StageSpec) -> None:
-        axis = _HOME_STAGE_AXIS.get(spec.key)
-        if axis is None or self.reference_store is None:
-            return
-        self.reference_store.mark_desynced(
-            MarkAxisDesyncedCommand(
-                axis=axis,
-                reason=f"Failed or operator-rejected serial-206 stage {spec.key}.",
-                source="serial206_initializeMotors",
-                motion_kind="oem_initialize_motors_failed",
-            )
-        )
 
     def _result_from_state(
         self,

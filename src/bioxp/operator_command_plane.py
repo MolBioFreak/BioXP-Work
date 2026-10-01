@@ -540,61 +540,6 @@ def _state_value(state: Mapping[str, Any], *keys: str) -> Any:
     return None
 
 
-def _axis_position(state: Mapping[str, Any], axis: str) -> int | None:
-    provider = state.get("serial206_initialization_provider") if isinstance(state, Mapping) else None
-    if isinstance(provider, Mapping):
-        authority_key = {"x": "x_authority", "y": "y_authority", "z": "z_authority"}.get(axis, "z_authority")
-        authority = provider.get(authority_key)
-        if isinstance(authority, Mapping):
-            live = authority.get("live_status")
-            terminal = authority.get("terminal_state")
-            for row in (live, terminal, authority):
-                if isinstance(row, Mapping):
-                    for key in ("position_steps", "current_position_steps", "position"):
-                        value = row.get(key)
-                        if type(value) is int:
-                            return value
-    domains = state.get("domains") if isinstance(state, Mapping) else None
-    if isinstance(domains, Mapping):
-        axes = domains.get("axes")
-        observation = axes.get("observation") if isinstance(axes, Mapping) else None
-        rows = observation.get("rows") if isinstance(observation, Mapping) else None
-        row = rows.get(axis) if isinstance(rows, Mapping) else None
-        status = row.get("status") if isinstance(row, Mapping) else None
-        if isinstance(status, Mapping):
-            position = status.get("position")
-            if isinstance(position, Mapping):
-                position = position.get("value")
-            if type(position) is int:
-                return position
-            if type(position) is float and position.is_integer():
-                return int(position)
-    return None
-
-
-def _axis_reference(state: Mapping[str, Any], axis: str) -> tuple[str, int]:
-    references = state.get("references") if isinstance(state, Mapping) else None
-    rows = references.get("rows") if isinstance(references, Mapping) else None
-    row = rows.get(axis) if isinstance(rows, Mapping) else None
-    row_state = "unknown"
-    row_version = 0
-    if isinstance(row, Mapping):
-        row_state = str(row.get("state") or "unknown")
-        version = row.get("version")
-        row_version = int(version) if type(version) is int else 0
-    provider = state.get("serial206_initialization_provider") if isinstance(state, Mapping) else None
-    authority_key = {"x": "x_authority", "y": "y_authority", "z": "z_authority"}.get(axis, "z_authority")
-    authority = provider.get(authority_key) if isinstance(provider, Mapping) else None
-    if isinstance(authority, Mapping):
-        authority_state = str(authority.get("reference_state") or authority.get("state") or row_state)
-        authority_version = max(
-            int(authority.get("current_generation") or 0),
-            int(authority.get("board_lifecycle_generation") or 0),
-        )
-        return (authority_state if authority_state != "unknown" else row_state), max(row_version, authority_version)
-    return row_state, row_version
-
-
 
 
 def _z_pseudo_home(state: Mapping[str, Any]) -> int:
@@ -668,30 +613,6 @@ def _active_board_epochs(state: Mapping[str, Any], action_id: str) -> dict[str, 
             return {"4": value}
     return {}
 
-
-def _axis_limit(state: Mapping[str, Any], axis: str) -> int | None:
-    provider = state.get("serial206_initialization_provider") if isinstance(state, Mapping) else None
-    if isinstance(provider, Mapping):
-        authority_key = {"x": "x_authority", "y": "y_authority", "z": "z_authority"}.get(axis, "z_authority")
-        authority = provider.get(authority_key)
-        if isinstance(authority, Mapping):
-            for key in ("source_max_steps", "axis_max_steps", "max_steps"):
-                value = authority.get(key)
-                if type(value) is int:
-                    return value
-    domains = state.get("domains") if isinstance(state, Mapping) else None
-    axes = domains.get("axes") if isinstance(domains, Mapping) else None
-    observation = axes.get("observation") if isinstance(axes, Mapping) else None
-    rows = observation.get("rows") if isinstance(observation, Mapping) else None
-    row = rows.get(axis) if isinstance(rows, Mapping) else None
-    if isinstance(row, Mapping):
-        preset = row.get("preset")
-        if isinstance(preset, Mapping):
-            for key in ("axis_max_steps", "max_steps"):
-                value = preset.get(key)
-                if type(value) is int:
-                    return value
-    return None
 
 
 def _home_completion_proven(response: Any) -> bool:
@@ -1151,9 +1072,6 @@ class OperatorCommandStore(CommandReceiptReader):
         if observed != supplied:
             raise RuntimeError("deck_owner_authority_changed")
 
-    def append_y_interrupt_fallback(self, receipt: Mapping[str, Any], *, reason: str) -> dict[str, Any]:
-        """Compatibility wrapper for the original Y-only caller."""
-        return self.append_interrupt_fallback(receipt, reason=reason)
 
     def _import_interrupt_fallback(self) -> None:
         lock_descriptor = os.open(self._y_interrupt_fallback_lock_path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -2078,48 +1996,6 @@ class OperatorCommandStore(CommandReceiptReader):
         byte_count = int(conn.execute("SELECT COALESCE(SUM(length(CAST(requested_json AS BLOB))+length(CAST(effective_json AS BLOB))),0) FROM operator_plane_commands WHERE status NOT IN ('completed','failed','ambiguous','stopped','aborted','cancelled','cleared','interrupted')").fetchone()[0])
         return count, byte_count
 
-    def _z_home_authority_row(self, conn: sqlite3.Connection) -> sqlite3.Row:
-        row = conn.execute("SELECT * FROM operator_plane_z_home_authority WHERE singleton=1").fetchone()
-        if row is None:
-            raise RuntimeError("operator-plane Z Home authority row is missing")
-        return row
-
-    @staticmethod
-    def _provider_z_authority(state: Mapping[str, Any]) -> Mapping[str, Any] | None:
-        provider = state.get("serial206_initialization_provider") if isinstance(state, Mapping) else None
-        authority = provider.get("z_authority") if isinstance(provider, Mapping) else None
-        return authority if isinstance(authority, Mapping) else None
-
-    def _sync_z_home_authority(self, conn: sqlite3.Connection, state: Mapping[str, Any]) -> sqlite3.Row:
-        row = self._z_home_authority_row(conn)
-        if str(row["state"]) != "valid":
-            return row
-        authority = self._provider_z_authority(state)
-        current_generation = int(state.get("ownership_generation") or 0)
-        provider_state = str(authority.get("state") or "") if authority is not None else ""
-        provider_reference = str(authority.get("reference_state") or "") if authority is not None else ""
-        provider_board_generation = authority.get("board_lifecycle_generation") if authority is not None else None
-        stale = (
-            int(row["ownership_generation"]) != current_generation
-            or provider_state != "referenced_ready"
-            or provider_reference != "referenced"
-            or (
-                provider_board_generation is not None
-                and row["board_lifecycle_generation"] is not None
-                and int(provider_board_generation) != int(row["board_lifecycle_generation"])
-            )
-        )
-        if stale:
-            conn.execute(
-                "UPDATE operator_plane_z_home_authority SET state='invalid',authority_version=authority_version+1,invalidation_reason=?,updated_at=? WHERE singleton=1 AND state='valid'",
-                ("provider_generation_or_reference_changed", _now()),
-            )
-            row = self._z_home_authority_row(conn)
-        return row
-
-    def _z_home_authority_valid(self, conn: sqlite3.Connection, state: Mapping[str, Any]) -> bool:
-        row = self._sync_z_home_authority(conn, state)
-        return str(row["state"]) == "valid" and int(row["ownership_generation"]) == int(state.get("ownership_generation") or 0)
 
 
     @staticmethod
@@ -6236,8 +6112,6 @@ class OperatorCommandStore(CommandReceiptReader):
         self._wake.set()
         return current
 
-    def clear_priority_fence(self) -> None:
-        self._priority_fence.clear()
 
     @staticmethod
     def _axes_for_action(action_id: str) -> set[str]:
@@ -7492,41 +7366,7 @@ class OperatorCommandPlane:
             strict_authority=True,
         )
 
-    async def invoke_internal_y_absolute(
-        self,
-        source_identity: str,
-        *,
-        target_steps: int,
-        acceleration_override: int | None = None,
-    ) -> dict[str, Any]:
-        """Dispatch the two source-owned M04 overloads without public catalog exposure."""
-        targets = {
-            "acceleration_overload": "oem.y.internal.acceleration_overload",
-            "board_test_my": "oem.y.internal.board_test_my",
-        }
-        action_id = targets.get(str(source_identity))
-        if action_id is None:
-            raise HTTPException(status_code=404, detail={"error": "unknown_internal_y_source_identity"})
-        body: dict[str, Any] = {"target_steps": int(target_steps)}
-        if source_identity == "acceleration_overload":
-            if type(acceleration_override) is not int:
-                raise HTTPException(status_code=422, detail={"error": "acceleration_override_required"})
-            body["acceleration_override"] = int(acceleration_override)
-        elif acceleration_override is not None:
-            raise HTTPException(status_code=422, detail={"error": "board_test_my_acceleration_is_source_fixed"})
-        target = self._action_target(action_id)
-        command_id = f"internal-y-{source_identity}-{uuid.uuid4().hex}"
-        token = _DISPATCH_CONTEXT.set({"operator_command_id": command_id, "idempotency_key": command_id, "expected_ownership_generation": int(self._state().get("ownership_generation") or 0), "action_id": action_id})
-        try:
-            status_code, response = await _dispatch_asgi(self.app, str(target["method"]), str(target["path"]), {**dict(target.get("fixed_inputs") or {}), **body}, target["locations"])
-        finally:
-            _DISPATCH_CONTEXT.reset(token)
-        if not 200 <= int(status_code) < 300:
-            raise HTTPException(status_code=int(status_code), detail=response)
-        return dict(response) if isinstance(response, Mapping) else {"ok": False, "failure": "internal_y_response_not_mapping"}
 
-    async def invoke_y_interrupt(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        return await self.compat_invoke("oem.y.stop", request)
 
     async def _deliver_controller_interrupt_raw(self, action_id: str, *, interrupt_attempt_id: str, observed_generation: int = 0) -> tuple[int, Any]:
         provider_action = "oem.abort_all" if action_id in {"oem.abort_all", "oem.z.abort"} else action_id
@@ -7549,73 +7389,6 @@ class OperatorCommandPlane:
         finally:
             _DISPATCH_CONTEXT.reset(token)
 
-    async def _invoke_controller_interrupt(self, action_id: str, *, receipt: Mapping[str, Any], idempotency_key: str) -> dict[str, Any]:
-        if str(receipt.get("persistence_state")) != "committed":
-            return dict(receipt)
-        if receipt.get("invocation_attempted") is True or receipt.get("controller_stop_attempted") is True:
-            return dict(receipt)
-        try:
-            receipt = await asyncio.to_thread(
-                self.store.mark_interrupt_attempted,
-                idempotency_key=str(idempotency_key),
-            )
-        except Exception as exc:
-            return {
-                **dict(receipt),
-                "controller_stop_attempted": False,
-                "source_call_completed": False,
-                "source_return_ok": False,
-                "controller_stop_acknowledged": False,
-                "physical_effect_verified": False,
-                "error": f"interrupt_attempt_persistence_failed:{type(exc).__name__}",
-                "persistence_state": "recovery_required",
-                "recovery_hold": True,
-            }
-        if receipt.get("idempotent_replay") is True:
-            return dict(receipt)
-        interrupt_attempt_id = str(receipt.get("interrupt_attempt_id") or receipt.get("interrupt_id") or uuid.uuid4())
-        response: Any = None
-        acknowledged = False
-        error: str | None = None
-        try:
-            status_code, response = await self._deliver_controller_interrupt_raw(
-                action_id,
-                interrupt_attempt_id=interrupt_attempt_id,
-            )
-            http_success = 200 <= int(status_code) < 300
-            source_call_field = _interrupt_source_response(response).get("source_call_completed")
-            acknowledged = source_call_field is True if type(source_call_field) is bool else bool(http_success and isinstance(response, Mapping) and type(response.get("ok")) is bool)
-            if not http_success:
-                error = f"controller_interrupt_http_{status_code}"
-            elif not acknowledged:
-                error = "oem_stop_source_call_failed"
-            elif response.get("ok") is not True:
-                error = "oem_stop_source_return_failure"
-        except Exception as exc:
-            error = f"controller_interrupt_exception:{type(exc).__name__}"
-        try:
-            return await asyncio.to_thread(
-                self.store.finalize_interrupt,
-                idempotency_key=idempotency_key,
-                receipt={**dict(receipt), "interrupt_attempt_id": interrupt_attempt_id},
-                attempted=True,
-                acknowledged=acknowledged,
-                response=response,
-                error=error,
-            )
-        except Exception as exc:
-            return {
-                **dict(receipt),
-                "interrupt_attempt_id": interrupt_attempt_id,
-                **_interrupt_invocation_evidence(action_id, attempted=True),
-                "source_call_completed": acknowledged,
-                "source_return_ok": _interrupt_source_return_ok(response),
-                "controller_stop_acknowledged": _interrupt_stop_acknowledged(action_id, response),
-                "controller_response": _bounded_json(response, 131072),
-                "error": error or f"interrupt_sqlite_finalization_failed:{type(exc).__name__}",
-                "persistence_state": "recovery_required",
-                "recovery_hold": True,
-            }
 
     async def compat_invoke(self, action_id: str, payload: Mapping[str, Any], *, controller_delivery: tuple[int, Any] | None = None, interrupt_attempt_id: str | None = None) -> dict[str, Any]:
         if action_id in INTERRUPT_ACTIONS:

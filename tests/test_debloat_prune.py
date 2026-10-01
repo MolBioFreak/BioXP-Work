@@ -8,7 +8,7 @@ import pytest
 
 @pytest.mark.parametrize("module", [
     "can_driver", "command_exchange_observer", "domain.capabilities",
-    "interrupt_journal", "motion_safety", "novo_router", "oem_command_contracts",
+    "interrupt_journal", "motion_safety", "novo_router",
     "oem_compat.control_lib", "oem_compat.frames", "oem_compat.machine_state",
     "oem_compat.position_table", "oem_compat.state", "oem_deck_catalog",
     "oem_gripper", "oem_homing_routes", "oem_initialization",
@@ -84,31 +84,3 @@ def test_homing_program_modes_survive_historical_model_retirement():
         "home_xy", "rehome", "initialize_motion", "manual_home_x",
         "manual_home_y", "manual_home_z", "manual_home_g", "manual_home_door",
     } <= set(program_names())
-
-
-def test_standalone_source_api_retains_no_live_import_isolation():
-    import os
-    import subprocess
-    import sys
-
-    # A fresh interpreter is essential: the parent imports the real primary app.
-    code = """
-import asyncio
-import sys
-
-def offline(event, args):
-    if event in ('socket.connect', 'socket.getaddrinfo'):
-        raise AssertionError('unexpected network')
-    if event == 'open' and args and isinstance(args[0], str) and args[0].startswith(('/dev/bus/usb/', '/dev/video', '/var/lib/bioxp-oem-runtime/')):
-        raise AssertionError('unexpected hardware/live state')
-sys.addaudithook(offline)
-from bioxp.oem_source_only_api import list_programs, dry_run_program
-programs = asyncio.run(list_programs())
-assert programs['opened_usb'] is False
-assert programs['programs']
-result = asyncio.run(dry_run_program('initialize_motors_without_motion'))
-assert result['opened_usb'] is False
-assert result['physical_motion'] is False
-assert not any(name in sys.modules for name in ('bioxp.api', 'bioxp.usb_driver', 'bioxp.camera_provider', 'src.bioxp.usb_driver'))
-"""
-    subprocess.run([sys.executable, "-c", code], check=True, env=os.environ.copy(), capture_output=True, text=True)

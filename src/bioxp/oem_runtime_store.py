@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import hashlib
 import fcntl
 import inspect
@@ -21,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .critical_logging import critical_receipt
-from .oem_runtime_types import OEMRuntimeSnapshot, utc_ts
+from .oem_runtime_types import utc_ts
 from .oem_deck_schema_v6 import (
     DECK_SCHEMA_V5_INDEXES,
     DECK_SCHEMA_V5_LEGACY_GLOBAL_TRIGGERS,
@@ -5008,149 +5007,3 @@ class OEMRuntimeStore:
                 "INSERT INTO runtime_metadata(key,value,updated_at) VALUES(?,?,?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
                 ("calibration_run_v1:" + payload["run_id"], encoded, time.time()))
-
-    def next_seq(self) -> int:
-        with self._lock:
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                row = self._db.execute(
-                    "SELECT value FROM runtime_metadata WHERE key='runtime_sequence'"
-                ).fetchone()
-                current = int(row[0]) if row is not None else 0
-                self._seq = max(int(self._seq), current) + 1
-                self._db.execute(
-                    "INSERT INTO runtime_metadata(key,value,updated_at) VALUES('runtime_sequence',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
-                    (str(self._seq), time.time()),
-                )
-                self._db.execute("COMMIT")
-            except Exception:
-                self._db.execute("ROLLBACK")
-                raise
-            return self._seq
-
-
-    def read_state(self) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._db.execute(
-                "SELECT state_json,state_sha256 FROM runtime_state_snapshots ORDER BY sequence DESC LIMIT 1"
-            ).fetchone()
-        if row is None:
-            return None
-        encoded = str(row["state_json"])
-        if encoded != json.dumps(json.loads(encoded), sort_keys=True, separators=(",", ":"), allow_nan=False):
-            raise RuntimeError("runtime state snapshot JSON is not canonical")
-        if str(row["state_sha256"]) != hashlib.sha256(encoded.encode("utf-8")).hexdigest():
-            raise RuntimeError("runtime state snapshot digest mismatch")
-        return json.loads(encoded)
-
-
-    def create_oem_full_lifecycle_run_once(
-        self,
-        run: dict[str, Any],
-        *,
-        current_ownership_generation: Callable[[], int] | None = None,
-    ) -> dict[str, Any]:
-        """Atomically converge same-key creators within the single runtime owner."""
-        payload = dict(run)
-        key = payload.get("idempotency_key")
-        request = payload.get("request")
-        if not isinstance(key, str) or not key or len(key) > 128:
-            raise ValueError("valid bounded idempotency_key required")
-        with self._lock:
-            if current_ownership_generation is not None:
-                expected = request.get("expected_generation") if isinstance(request, dict) else None
-                if expected != current_ownership_generation():
-                    raise ValueError("expected_generation no longer matches current robot ownership generation")
-            existing_runs = self.list_oem_full_lifecycle_runs()
-            for existing in existing_runs:
-                if existing.get("idempotency_key") != key:
-                    continue
-                if existing.get("request") != request:
-                    raise ValueError("idempotency_key is already bound to a different request")
-                return existing
-            active_states = {"planned", "running", "admitted", "acknowledged", "blocked", "reconciliation_required"}
-            if any(existing.get("run_state") in active_states for existing in existing_runs):
-                raise ValueError("another active OEM lifecycle run already owns the robot lifecycle")
-            return self.write_oem_full_lifecycle_run(payload)
-
-    def write_oem_full_lifecycle_run(self, run: dict[str, Any]) -> dict[str, Any]:
-        """Persist one full OEM movement-lifecycle run in SQLite."""
-        payload = dict(run)
-        run_id = str(payload.get("run_id") or "").strip()
-        if not run_id or "/" in run_id or "\\" in run_id or run_id in {".", ".."}:
-            raise ValueError("valid robot-owned run_id required")
-        with self._lock, self._authority_write():
-            sequence = self.next_seq()
-            payload["sequence"] = sequence
-            encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
-            self._db.execute(
-                """
-                INSERT INTO runtime_movement_runs(run_id,sequence,run_json,run_sha256,updated_at)
-                VALUES(?,?,?,?,?)
-                ON CONFLICT(run_id) DO UPDATE SET
-                    sequence=excluded.sequence,
-                    run_json=excluded.run_json,
-                    run_sha256=excluded.run_sha256,
-                    updated_at=excluded.updated_at
-                """,
-                (run_id, sequence, encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest(), time.time()),
-            )
-        return payload
-
-    def mutate_oem_full_lifecycle_run(
-        self,
-        run_id: str,
-        mutation: Callable[[dict[str, Any]], dict[str, Any]],
-    ) -> dict[str, Any]:
-        """Read, validate, and replace one run under the runtime-owner lock."""
-        with self._lock:
-            payload = self.read_oem_full_lifecycle_run(run_id)
-            if payload is None:
-                raise ValueError(f"full OEM lifecycle run {run_id!r} not found")
-            return self.write_oem_full_lifecycle_run(mutation(payload))
-
-    def read_oem_full_lifecycle_run(self, run_id: str) -> dict[str, Any] | None:
-        selected = str(run_id).strip()
-        if not selected or "/" in selected or "\\" in selected or selected in {".", ".."}:
-            raise ValueError("valid robot-owned run_id required")
-        with self._lock:
-            row = self._db.execute(
-                "SELECT run_json,run_sha256 FROM runtime_movement_runs WHERE run_id=?", (selected,)
-            ).fetchone()
-        if row is None:
-            return None
-        encoded = str(row["run_json"])
-        if encoded != json.dumps(json.loads(encoded), sort_keys=True, separators=(",", ":"), allow_nan=False):
-            raise RuntimeError("runtime movement run JSON is not canonical")
-        if str(row["run_sha256"]) != hashlib.sha256(encoded.encode("utf-8")).hexdigest():
-            raise RuntimeError("runtime movement run digest mismatch")
-        return json.loads(encoded)
-
-    def list_oem_full_lifecycle_runs(self) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._db.execute(
-                "SELECT run_json,run_sha256 FROM runtime_movement_runs ORDER BY sequence,run_id"
-            ).fetchall()
-        result = []
-        for row in rows:
-            encoded = str(row["run_json"])
-            if encoded != json.dumps(json.loads(encoded), sort_keys=True, separators=(",", ":"), allow_nan=False):
-                raise RuntimeError("runtime movement run JSON is not canonical")
-            if str(row["run_sha256"]) != hashlib.sha256(encoded.encode("utf-8")).hexdigest():
-                raise RuntimeError("runtime movement run digest mismatch")
-            result.append(json.loads(encoded))
-        return result
-
-    def append_journal(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        row = critical_receipt(payload)
-        row.setdefault("created_at", utc_ts())
-        sequence = self.next_seq()
-        row["sequence"] = sequence
-        encoded = json.dumps(row, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        with self._lock:
-            with self._authority_write():
-                self._db.execute(
-                    "INSERT INTO runtime_journal(sequence,stream,payload_json,payload_sha256,created_at) VALUES(?,?,?,?,?)",
-                    (sequence, str(name), encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest(), time.time()),
-                )
-        return row

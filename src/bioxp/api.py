@@ -1,17 +1,13 @@
 import asyncio
-import base64
 import copy
 import hashlib
 import json
 import os
 import re
-import signal
 import shutil
 import sqlite3
 
 import subprocess
-import tarfile
-import tempfile
 import threading
 import time
 import logging
@@ -22,11 +18,9 @@ from contextlib import ExitStack, asynccontextmanager, contextmanager, nullconte
 from contextvars import copy_context
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Annotated, Any, Awaitable, Callable, Literal, Mapping, Optional, Protocol, cast
-from pathlib import Path
+from typing import Annotated, Any, Callable, Literal, Mapping, Optional, Protocol, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from anyio import from_thread as anyio_from_thread
 
 from .camera_provider import CameraError, CameraFrame, CameraProvider
 from .oem_config import harmonized_motion_config
@@ -49,21 +43,16 @@ from .oem_gripper import (
     gripper_open,
     gripper_open_wide,
     gripper_status,
-    gripper_current_status,
-    gripper_current_observation,
     restore_gripper_idle_current,
 )
-from .motion_safety import Serial206MotionAuthority, physical_aggregate_stop, prepare_motion_without_motion
+from .motion_safety import Serial206MotionAuthority
 from .oem_serial206_initialization import (
     ProviderAuthorityBusy,
-    Serial206CommissioningEvidence,
     Serial206OemInitializationProvider,
     Serial206ProductionPrimitiveAdapter,
-    Serial206StageApproval,
 )
 from .oem_runtime_store import OEMRuntimeStore, migrate_runtime_database_v2
 from .runtime_audit_store import (
-    open_runtime_connection,
     record_runtime_release_start,
     runtime_state_root,
     runtime_write_coordinator,
@@ -91,7 +80,7 @@ from .oem_homing_routes import router as oem_homing_router
 
 from .oem_startup_program import BioXpStartupHardware, OEMStartupProgram, DryRunStartupHardware
 from .oem_startup_types import OemDoorEventRequest, OemInitialCheckRequest, OemStartupRequest, OemSwitchAuditRequest
-from .oem_switch_audit import OfflineSwitchAuditFixture, interpret_home_predicate, run_switch_audit
+from .oem_switch_audit import interpret_home_predicate, run_switch_audit
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -103,7 +92,6 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
@@ -125,7 +113,6 @@ from .pipette import (
     PipetteTipCommand,
     build_default_pipette_transport,
 )
-from .services.artifact_service import create_motion_validation_bundle
 from .services.motion_service import (
     AbsoluteMoveCommand,
     HomeAxisCommand,
@@ -143,7 +130,6 @@ from .services.pipette_service import (
     run_pipette_init_command,
     run_pipette_mix_command,
     run_pipette_operation,
-    run_pipette_status,
     run_pipette_tip_command,
     reset_direct_pipette_idempotency_key,
     set_direct_pipette_idempotency_key,
@@ -836,19 +822,6 @@ def _now_utc() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _reset_provenance(*, subsystem: str, source: str, reset_scope: str, **extra: Any) -> dict[str, Any]:
-    payload = {
-        "schema_version": RESET_PROVENANCE_SCHEMA_VERSION,
-        "created_at": _now_utc(),
-        "subsystem": subsystem,
-        "source": source,
-        "reset_scope": reset_scope,
-        "software_recovery": bool(extra.pop("software_recovery", True)),
-        "hardware_component_fault_proven": bool(extra.pop("hardware_component_fault_proven", False)),
-    }
-    payload.update(extra)
-    return payload
-
 
 def _maintenance_state_payload() -> dict[str, Any]:
     with _maintenance_state_lock:
@@ -1502,32 +1475,6 @@ def _execute_provider_x_intent(intent: str, inputs: Mapping[str, Any] | None = N
     if result.get("ok") is not True:
         raise HTTPException(status_code=409, detail=result)
     return result
-
-def _execute_runtime_provider_z_intent(
-    intent: str,
-    command: Any,
-    inputs: Mapping[str, Any],
-) -> dict[str, Any]:
-    provider = _require_serial206_oem_initialization_provider("initialize_motors")
-    execute = getattr(provider, "execute_z_intent", None)
-    if not callable(execute):
-        return {"ok": False, "failure": "serial206_z_authority_not_bound"}
-    provider_inputs = dict(inputs)
-    provider_inputs["command_id"] = str(command.command_id)
-    result = execute(
-        intent,
-        inputs=provider_inputs,
-        expected_generation=int(hardware_state.ownership_epoch),
-        idempotency_key=f"runtime:{command.command_id}:{intent}",
-    )
-    return result if isinstance(result, dict) else {
-        "ok": False,
-        "failure": "serial206_z_provider_returned_non_object",
-    }
-
-
-
-
 
 
 def _get_tester() -> BioXpTester:
@@ -2648,31 +2595,6 @@ class OemMoveToRequest(BaseModel):
     timeout_s: StrictFloat = Field(default=30.0, gt=0.1, le=120.0)
 
 
-class OemSerial206StageApprovalRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    approval_id: StrictStr = Field(min_length=1, max_length=200)
-    expected_generation: StrictInt = Field(ge=0)
-    expected_component: StrictStr = Field(min_length=1, max_length=40)
-    expected_direction: StrictStr = Field(min_length=1, max_length=120)
-    expected_bound: StrictInt
-    operator_note: StrictStr = Field(min_length=1, max_length=2000)
-    idempotency_key: StrictStr = Field(min_length=8, max_length=200)
-
-
-class OemSerial206CommissioningEvidenceRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    component: StrictStr = Field(min_length=1, max_length=40)
-    generation: StrictInt = Field(ge=0)
-    fresh: StrictBool
-    direction_verified: StrictBool
-    limits_verified: StrictBool
-    switch_verified: StrictBool
-    stop_verified: StrictBool
-    reference_verified: StrictBool
-    gap9_polarity: StrictInt | None = Field(None, ge=0, le=1)
-    gap10_polarity: StrictInt | None = Field(None, ge=0, le=1)
 
 
 class OemSerial206InitializeMotorsStepRequest(BaseModel):
@@ -2945,15 +2867,6 @@ class CameraHealthRequest(BaseModel):
     seconds: int = Field(5, ge=1, le=30)
 
 
-class CameraRecoverRequest(BaseModel):
-    device: str = Field("/dev/video0", description="Preferred V4L2 device")
-    max_resets: int = Field(2, ge=0, le=5)
-
-
-class CameraControlRequest(BaseModel):
-    device: str = Field("/dev/video0", description="Preferred V4L2 device")
-    cid: int = Field(..., ge=0)
-    value: int = Field(..., description="Raw V4L2 control value")
 
 
 class InspectionRequest(BaseModel):
@@ -3135,70 +3048,6 @@ def _axis_preset(tester: BioXpTester, axis: AxisName):
     out.setdefault("acc", _DEFAULT_MOTION_ACC)
     return out
 
-
-def _switch_activity_from_switches(tester: BioXpTester, board: int, motor: int, switches: Optional[dict]) -> dict:
-    left = None
-    right = None
-    left_disabled = False
-    right_disabled = False
-    left_raw_active = None
-    right_raw_active = None
-    if isinstance(switches, dict):
-        left = switches.get("left_state")
-        right = switches.get("right_state")
-        left_disabled = bool(switches.get("left_disabled", False))
-        right_disabled = bool(switches.get("right_disabled", False))
-        left_raw_active = switches.get("left_raw_active")
-        right_raw_active = switches.get("right_raw_active")
-    active_val = int(tester.MOTOR_SWITCH_ACTIVE_VALUE)
-    if left_raw_active is None and left is not None:
-        left_raw_active = int(left) == active_val
-    if right_raw_active is None and right is not None:
-        right_raw_active = int(right) == active_val
-    return {
-        "board": int(board),
-        "motor": int(motor),
-        "active_raw_value": active_val,
-        "left_state": left,
-        "right_state": right,
-        "left_disabled": left_disabled,
-        "right_disabled": right_disabled,
-        "left_raw_active": left_raw_active,
-        "right_raw_active": right_raw_active,
-        "left_active": None if left_raw_active is None else (bool(left_raw_active) and not left_disabled),
-        "right_active": None if right_raw_active is None else (bool(right_raw_active) and not right_disabled),
-        "switches": switches,
-    }
-
-
-def _axis_status_payload(tester: BioXpTester, axis: AxisName, *, include_current: bool = True) -> dict:
-    preset = _axis_preset(tester, axis)
-    board = int(preset["board"])
-    motor = int(preset["motor"])
-    switches = tester.motor_get_switches(board, motor=motor)
-    status = {
-        "board": board,
-        "motor": motor,
-        "position": tester.motor_get_position(board, motor=motor),
-        "speed": tester.motor_get_speed(board, motor=motor),
-        "switches": switches,
-    }
-    if include_current:
-        status["max_current"] = tester.motor_get_axis_param(board, 6, motor=motor)
-        status["standby_current"] = tester.motor_get_axis_param(board, 7, motor=motor)
-    current_safety = None
-    if axis == AxisName.GRIPPER and include_current:
-        speed_value = gripper_current_observation(status.get("speed"), "speed")
-        run_value = gripper_current_observation(status.get("max_current"), "value")
-        standby_value = gripper_current_observation(status.get("standby_current"), "value")
-        current_safety = gripper_current_status(run_value, standby_value, speed_value)
-    return {
-        "axis": axis.value,
-        "preset": preset,
-        "status": status,
-        "switch_activity": _switch_activity_from_switches(tester, board, motor, switches),
-        "current_safety": current_safety,
-    }
 
 
 def _parse_axes_csv(axes_csv: str) -> list[AxisName]:
@@ -5727,33 +5576,6 @@ def _pick_capture_device(tester: BioXpTester, preferred: str) -> dict:
     return pick
 
 
-def _camera_device_rows_local() -> list[dict]:
-    rows = []
-    for name in sorted(os.listdir("/dev")):
-        if not name.startswith("video"):
-            continue
-        device = f"/dev/{name}"
-        label = ""
-        try:
-            with open(f"/sys/class/video4linux/{name}/name", "r", encoding="utf-8", errors="ignore") as handle:
-                label = handle.read().strip()
-        except OSError:
-            label = ""
-        rows.append({"device": device, "name": label})
-    return rows
-
-
-def _pick_stream_device(preferred: str) -> dict:
-    rows = _camera_device_rows_local()
-    if preferred and os.path.exists(preferred):
-        return {"ok": True, "device": preferred, "rows": rows}
-    for row in rows:
-        if row["device"] == "/dev/video0":
-            return {"ok": True, "device": row["device"], "rows": rows}
-    if rows:
-        return {"ok": True, "device": rows[0]["device"], "rows": rows}
-    return {"ok": False, "device": None, "rows": [], "error": "no /dev/video* devices found"}
-
 
 def _camera_missing_dependency_payload(dependency: str, device: str | None = None, path: str | None = None, **extra) -> dict:
     return {
@@ -5770,108 +5592,6 @@ def _camera_missing_dependency_payload(dependency: str, device: str | None = Non
     }
 
 
-def _camera_ffmpeg_processes(device: str) -> list[dict]:
-    rows: list[dict] = []
-    proc_root = "/proc"
-    try:
-        entries = os.listdir(proc_root)
-    except OSError:
-        return rows
-
-    for name in entries:
-        if not name.isdigit():
-            continue
-        pid = int(name)
-        if pid == os.getpid():
-            continue
-        cmdline_path = os.path.join(proc_root, name, "cmdline")
-        try:
-            with open(cmdline_path, "rb") as handle:
-                raw = handle.read()
-        except OSError:
-            continue
-        if not raw:
-            continue
-        args = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
-        cmd = " ".join(args)
-        executable = os.path.basename(args[0]) if args else ""
-        if "ffmpeg" not in executable and " ffmpeg" not in f" {cmd}":
-            continue
-        if device not in args and device not in cmd:
-            continue
-        rows.append({"pid": pid, "cmd": cmd})
-    return rows
-
-
-def _camera_reset_local(preferred: str) -> dict:
-    device = preferred if preferred and os.path.exists(preferred) else "/dev/video0"
-    killed: list[int] = []
-    errors: list[dict] = []
-
-    for row in _camera_ffmpeg_processes(device):
-        pid = int(row["pid"])
-        try:
-            os.kill(pid, signal.SIGTERM)
-            killed.append(pid)
-        except ProcessLookupError:
-            continue
-        except Exception as exc:
-            errors.append({"pid": pid, "error": str(exc)})
-
-    if killed:
-        time.sleep(0.5)
-        for pid in killed:
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                continue
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                continue
-            except Exception as exc:
-                errors.append({"pid": pid, "error": str(exc)})
-
-    lock_released = False
-    if _camera_stream_lock.locked():
-        try:
-            _camera_stream_lock.release()
-            lock_released = True
-        except RuntimeError:
-            lock_released = False
-
-    _camera_stream_state.update(
-        {
-            "active": False,
-            "device": device,
-            "last_error": "stream stopped",
-            "last_frame_at": None,
-        }
-    )
-
-    survivors = _camera_ffmpeg_processes(device)
-
-    return {
-        "ok": not survivors,
-        "device": device,
-        "killed_pids": killed,
-        "lock_released": lock_released,
-        "survivors": survivors,
-        "errors": errors,
-        "reset_provenance": _reset_provenance(
-            subsystem="camera",
-            source="camera_reset_local",
-            reset_scope="ffmpeg_process_and_stream_lock",
-            requested_device=preferred,
-            resolved_device=device,
-            hardware_usb_reset_performed=False,
-            killed_pids=killed,
-            lock_released=lock_released,
-            survivor_count=len(survivors),
-            errors=errors,
-        ),
-    }
-
 
 def _camera_stream_state_payload() -> dict:
     last_frame_at = _camera_stream_state.get("last_frame_at")
@@ -5882,60 +5602,6 @@ def _camera_stream_state_payload() -> dict:
         "stream_age_s": None if not started_at else round(max(0.0, time.time() - float(started_at)), 2),
     }
 
-
-def _camera_capture_snapshot_direct(tester: BioXpTester, preferred: str) -> dict:
-    pick = _pick_capture_device(tester, preferred)
-    if not pick.get("ok"):
-        return {"ok": False, "error": pick.get("error"), "device": None, "path": None}
-
-    device = pick["device"]
-    if shutil.which("ffmpeg") is None:
-        return _camera_missing_dependency_payload("ffmpeg", device=device, path=None, size=0, pick=pick)
-
-    out_dir = os.path.join(tempfile.gettempdir(), "bioxp-api-camera")
-    os.makedirs(out_dir, exist_ok=True)
-    ts = __import__("time").strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(out_dir, f"snapshot_{ts}.jpg")
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-f",
-        "v4l2",
-        "-i",
-        device,
-        "-frames:v",
-        "1",
-        out_path,
-    ]
-    try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=10.0,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "ffmpeg snapshot timeout", "device": device, "path": out_path}
-
-    output = (proc.stdout or "").strip()
-    exists = os.path.exists(out_path)
-    size = os.path.getsize(out_path) if exists else 0
-    ok = proc.returncode == 0 and exists and size > 0
-    return {
-        "ok": ok,
-        "device": device,
-        "path": out_path,
-        "size": size,
-        "rc": int(proc.returncode),
-        "output": output,
-        "error": None if ok else (output or "snapshot failed"),
-        "pick": pick,
-    }
 
 
 def _camera_stream_health_direct(tester: BioXpTester, preferred: str, seconds: int) -> dict:
@@ -6005,18 +5671,6 @@ def _camera_stream_health_direct(tester: BioXpTester, preferred: str, seconds: i
     }
 
 
-def _camera_devices_payload(tester: BioXpTester) -> dict:
-    rows = tester.camera_device_rows()
-    preferred = None
-    pick = _pick_capture_device(tester, "/dev/video0")
-    if pick.get("ok"):
-        preferred = pick.get("device")
-    for row in rows:
-        row["capture_candidate"] = row.get("device") == preferred
-    return {"ok": True, "rows": rows, "preferred_device": preferred}
-
-
-
 
 def _camera_cache_envelope(cache: dict[str, Any] | None) -> dict[str, Any]:
     with _camera_projection_lock:
@@ -6028,12 +5682,6 @@ def _camera_cache_envelope(cache: dict[str, Any] | None) -> dict[str, Any]:
     state = "fresh" if age <= 30.0 else "stale"
     return {"available": True, "cache_state": state, "camera_ownership_epoch": epoch, "freshness": {"state": state, "age_s": round(age, 3), "fresh_for_s": 30.0}, "provenance": "POST /camera/probe", "probe": row}
 
-
-def _camera_process_active() -> bool:
-    with _camera_projection_lock:
-        session = _camera_session
-        process = None if session is None else session.get("process")
-        return bool(process is not None and process.returncode is None)
 
 
 _camera_owner_lock = asyncio.Lock()
