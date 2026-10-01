@@ -5397,9 +5397,7 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
 
             _admit(None)
             state["delivery_attempted"] = True
-            _journal_interrupt_phase(
-                "delivery_attempted", surface=surface_key, connection_lease_acquired=True
-            )
+            # Send first; the journal records the outcome after delivery.
             try:
                 value = await loop.run_in_executor(
                     _safety_interrupt_worker(surface_key), invoke_interrupt

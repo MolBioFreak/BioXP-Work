@@ -4438,35 +4438,23 @@ def install_operator_control_plane(
         interrupt_attempt_id: str | None = None
         interrupt_surface: str | None = None
         interrupt_journal_error: str | None = None
+        interrupt_admission: dict[str, Any] = {}
         if is_safety_interrupt:
-            # RCA F1: the press becomes durable BEFORE any lock is taken and
-            # before any physical delivery. The attempt id minted here is the
-            # identity the provider, the projection rows and the cockpit all use.
+            # The Stop is sent first, as in the OEM app; nothing is written to
+            # disk before delivery. The attempt id minted here is the identity
+            # the provider, the projection rows and the cockpit all use, and the
+            # admission facts are journaled with the outcome after delivery.
             interrupt_surface = interrupt_surface_key(action_id, target, effective_inputs)
             interrupt_attempt_id = uuid.uuid4().hex
-            journal = getattr(command_plane, "interrupt_journal", None)
-            if journal is not None:
-                try:
-                    journal.record(
-                        interrupt_attempt_id=interrupt_attempt_id,
-                        action_id=action_id,
-                        phase="admitted",
-                        idempotency_key=payload.idempotency_key,
-                        surface=interrupt_surface,
-                        caller_class="operator_interrupt",
-                        observed_ownership_generation=int(payload.expected_generation),
-                        observed_board_epoch_by_board=dict(
-                            payload.expected_board_epoch_by_board or {}
-                        ),
-                        physical_delivery_started=False,
-                        request_received_at=request_received_at,
-                    )
-                except Exception as exc:
-                    # A recording failure is not evidence that the Stop cannot be
-                    # sent: deliver anyway, but say plainly that it is unrecorded.
-                    interrupt_journal_error = f"{type(exc).__name__}: {exc}"[:300]
-            else:
-                interrupt_journal_error = "interrupt_journal_unavailable"
+            interrupt_admission = {
+                "idempotency_key": payload.idempotency_key,
+                "caller_class": "operator_interrupt",
+                "observed_ownership_generation": int(payload.expected_generation),
+                "observed_board_epoch_by_board": dict(
+                    payload.expected_board_epoch_by_board or {}
+                ),
+                "request_received_at": request_received_at,
+            }
         action_lock = invoke_lock
         # From this check through acquisition there is no scheduling suspension:
         # AsyncExitStack.__aenter__ and an uncontended asyncio.Lock.acquire return
@@ -4983,6 +4971,19 @@ def install_operator_control_plane(
             receipt["reconciliation_pending"] = reconciliation_pending
             if reconciliation_pending:
                 receipt["reconciliation_required"] = True
+            if journal is None:
+                interrupt_journal_error = "interrupt_journal_unavailable"
+            elif interrupt_attempt_id:
+                try:
+                    journal.record(
+                        interrupt_attempt_id=interrupt_attempt_id,
+                        action_id=action_id,
+                        phase="admitted",
+                        surface=interrupt_surface,
+                        **interrupt_admission,
+                    )
+                except Exception as exc:
+                    interrupt_journal_error = f"{type(exc).__name__}: {exc}"[:300]
             if interrupt_journal_error:
                 receipt["interrupt_journal_error"] = interrupt_journal_error
             if journal is not None and interrupt_attempt_id:
