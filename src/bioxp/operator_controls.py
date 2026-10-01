@@ -4617,6 +4617,9 @@ def install_operator_control_plane(
                     )
                 raise HTTPException(status_code=409, detail=detail)
             receipt["status"] = "queued"
+            from .deck_location_invalidation import STANDALONE_ACTIONS, standalone_xyz_route
+            invalidate_location = (action_id in STANDALONE_ACTIONS
+                                   or standalone_xyz_route(str(target["path"]), effective_inputs))
             receipt["queued_at"] = time.time()
             queued = receipt
             if not is_safety_interrupt:
@@ -4624,6 +4627,7 @@ def install_operator_control_plane(
                     store.put,
                     receipt,
                     _expected_status=claim_expected_status,
+                    _invalidate_deck_location=invalidate_location and _admitted is None,
                 )
                 claim_expected_status = str(queued["status"])
             receipt["admission_completed_at"] = time.time()
@@ -4685,7 +4689,8 @@ def install_operator_control_plane(
                 if not is_safety_interrupt and _admitted is not None:
                     # Durable dispatch intent precedes the controller call. A
                     # disconnected waiter/restart never turns it into a retry.
-                    dispatched = await asyncio.to_thread(store.put, receipt, _expected_status=claim_expected_status)
+                    dispatched = await asyncio.to_thread(store.put, receipt, _expected_status=claim_expected_status,
+                                                        _invalidate_deck_location=invalidate_location)
                     claim_expected_status = str(dispatched["status"])
                     if claim_expected_status != "dispatched":
                         return dispatched

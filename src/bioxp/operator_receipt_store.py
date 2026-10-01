@@ -412,6 +412,9 @@ class OperatorReceiptStore:
             self.reconcile_nonterminal_receipts()
 
     def _configure(self) -> None:
+        from .runtime_audit_store import canonical_json
+        self.connection.create_function('canonical_json', 1,
+            lambda value: canonical_json(json.loads(str(value))), deterministic=True)
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=FULL")
         self.connection.execute("PRAGMA foreign_keys=ON")
@@ -1166,6 +1169,7 @@ class OperatorReceiptStore:
         _expected_status: str | None = None,
         _reconciliation_transition: bool = False,
         _linked_pipette_finalization: Mapping[str, Any] | None = None,
+        _invalidate_deck_location: bool = False,
     ) -> dict[str, Any]:
         row = critical_receipt(receipt)
         with self.lock:
@@ -1195,6 +1199,15 @@ class OperatorReceiptStore:
                 if artifact_id is not None:
                     compact.update({"evidence_artifact_id": artifact_id, "evidence_relpath": evidence[0], "evidence_sha256": evidence[1], "evidence_bytes": evidence[2]})
                 pruned = self._prune_locked()
+                if _invalidate_deck_location:
+                    from .deck_location_invalidation import invalidate_at_dispatch
+                    prior_authority_write = self._audit_database._claim_resource_write
+                    self._audit_database._claim_resource_write = True
+                    try:
+                        invalidate_at_dispatch(self.connection, root=self.root,
+                                               command_id=str(row["command_id"]))
+                    finally:
+                        self._audit_database._claim_resource_write = prior_authority_write
                 self.connection.execute("COMMIT")
                 if (
                     previous is not None

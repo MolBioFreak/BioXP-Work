@@ -4662,7 +4662,7 @@ class OEMRuntimeStore:
             memo = self._projection_verified_state
             revision = (self._db.total_changes, self._db.execute("PRAGMA data_version").fetchone()[0]) if self._projection_read_depth else None
             if self._projection_read_depth and memo is not None and memo[0] == revision:
-                return json.loads(memo[1])
+                return self._project_deck_location_invalidation(json.loads(memo[1]))
             selected = self._db.execute(
                 "SELECT * FROM serial206_authority_snapshots ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
@@ -4709,6 +4709,19 @@ class OEMRuntimeStore:
                 self._projection_verified_state = (revision, state_json)
         if not isinstance(payload, dict):
             raise ValueError("serial-206 initialization state must be an object")
+        return self._project_deck_location_invalidation(payload)
+
+    def _project_deck_location_invalidation(self, payload):
+        # The latest immutable snapshot can predate standalone dispatch. The
+        # durable invalidation belongs to the semantic row; do not resurrect
+        # its old label through the restored ClassMachineStatus fallback.
+        from .deck_location_invalidation import location_is_invalidated
+        with self._lock:
+            semantic = self._db.execute(
+                "SELECT current_location FROM operator_plane_deck_semantic_state WHERE singleton=1").fetchone()
+        if (location_is_invalidated(self.root) or (semantic is not None and semantic[0] == "UNKNOWN")):
+            if isinstance(payload.get("machine_status"), dict):
+                payload["machine_status"]["current_location"] = 32
         return payload
 
     def _serial206_current_payload(self, state):

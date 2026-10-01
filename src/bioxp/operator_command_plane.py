@@ -2899,6 +2899,7 @@ class OperatorCommandStore(CommandReceiptReader):
         return self.tip_tray_state(tray_id)
 
     def deck_semantic_state(self) -> dict[str, Any]:
+        from .deck_location_invalidation import location_is_invalidated
         with self._lock:
             row = self.connection.execute(
                 "SELECT * FROM operator_plane_deck_semantic_state WHERE singleton=1"
@@ -2913,7 +2914,7 @@ class OperatorCommandStore(CommandReceiptReader):
         provenance = _json_load(row["transition_provenance_json"], {})
         return {
             **({"thermal_door_open": _json_load(door[0], {})["updates"]["thermal_door_open"]} if door else {}),
-            "current_location": row["current_location"],
+            "current_location": "UNKNOWN" if location_is_invalidated(self.root) else row["current_location"],
             "current_well": row["current_well"],
             "current_tray": row["current_tray"],
             "tip_loaded": None if row["tip_loaded"] is None else bool(row["tip_loaded"]),
@@ -3054,6 +3055,9 @@ class OperatorCommandStore(CommandReceiptReader):
                 source_command_id=source_command_id, updates=updates,
                 ownership_generation=ownership_generation,
                 board_epoch_4=board_epoch_4, board_epoch_5=board_epoch_5)
+        if source_operation == "updateLocation" and updates.get("current_location") != "UNKNOWN":
+            from .deck_location_invalidation import named_location_published
+            named_location_published(self.root)
         return self.deck_semantic_state()
 
     def _publish_deck_owner_state(
@@ -4097,6 +4101,9 @@ class OperatorCommandStore(CommandReceiptReader):
                     int(transition_row[0]), _canonical(results), _now(), str(command_id),
                 ),
             )
+
+        from .deck_location_invalidation import named_location_published
+        named_location_published(self.root)
 
     def _method_response(self, row: sqlite3.Row) -> dict[str, Any]:
         transition_row = self.connection.execute("SELECT MAX(transition_sequence) FROM operator_plane_transitions WHERE method_id=?", (str(row["method_id"]),)).fetchone()
@@ -5554,6 +5561,10 @@ class OperatorCommandStore(CommandReceiptReader):
                 state="dispatched",
                 payload={"dispatch_attempt_id": attempt_id, "dispatcher_epoch": epoch},
             )
+            from .deck_location_invalidation import STANDALONE_ACTIONS, invalidate_at_dispatch
+            if action_id in STANDALONE_ACTIONS:
+                with self._authority_write():
+                    invalidate_at_dispatch(conn, root=self.root, command_id=str(row["command_id"]))
             claimed = conn.execute(
                 "SELECT * FROM operator_plane_commands WHERE command_id=?",
                 (row["command_id"],),
