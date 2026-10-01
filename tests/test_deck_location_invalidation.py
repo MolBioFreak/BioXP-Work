@@ -124,7 +124,39 @@ def test_failure_stays_unknown_and_park_travels(native_named):
     '/motion/axis/absolute', '/motion/axis/zero', '/motion/axis/home'])
 @pytest.mark.parametrize('axis', ['x', 'y', 'z', 'g', 'gripper', 'door'])
 def test_manual_route_scope(path, axis):
-    assert standalone_xyz_route(path, {'axis': axis}) is (axis in {'x', 'y', 'z'})
+    assert standalone_xyz_route(path, {'axis': axis}) is (
+        path.startswith('/motion/oem/manual/') and axis in {'x', 'z'})
+
+
+@pytest.mark.parametrize('axis', ['x', 'y', 'z', 'g', 'door'])
+@pytest.mark.parametrize('operation', ['move-negative', 'move-positive', 'home',
+    'park-6000', 'status', 'stop', 'not-a-diagnostic'])
+def test_diagnostic_route_scope(axis, operation):
+    assert standalone_xyz_route('/motion/diagnostics/execute',
+        {'axis': axis, 'operation': operation}) is (
+            axis == 'x' and operation in {'move-negative', 'move-positive', 'home', 'park-6000'})
+
+
+def test_generated_live_route_actions_share_semantic_alias_invalidation():
+    from bioxp import api
+    from bioxp.operator_controls import _build_catalog
+    actions, targets = _build_catalog(api.app)
+    checked = []
+    for action in actions:
+        if action['action_id'] not in STANDALONE_ACTIONS:
+            continue
+        target = targets.get(action['action_id'])
+        if target is None:
+            continue
+        inputs = {'axis': 'z', **target.get('fixed_inputs', {})}
+        assert standalone_xyz_route(target['path'], inputs), action['action_id']
+        generated = [row for row in actions if row['category'] == 'route'
+                     and row['informational_path'] == target['path']]
+        for row in generated:
+            assert standalone_xyz_route(row['informational_path'], inputs), row['action_id']
+        checked.append(action['action_id'])
+    assert {'oem.x.manual_panel_home', 'oem.y.manual_panel_home',
+            'oem.z.manual_home', 'oem.xy.home'} <= set(checked)
 
 
 @pytest.mark.parametrize('action', ['oem.x.stop', 'oem.y.stop', 'oem.z.stop', 'oem.abort_all',

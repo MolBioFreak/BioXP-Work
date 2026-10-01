@@ -34,17 +34,34 @@ STANDALONE_ACTIONS = frozenset({
 
 
 def standalone_xyz_route(path: str, inputs: dict) -> bool:
+    # Legacy route actions coexist with semantic aliases. Classify both by
+    # their exact live entry points, never by an OEM or axis path prefix.
     if path in {
+        '/motion/oem/x/move_steps', '/motion/oem/x/move_absolute',
+        '/motion/oem/x/manual_home', '/motion/oem/x/diagnostic_home_axis',
+        '/motion/oem/x/startup_home', '/motion/oem/x/move_to_origin_home',
+        '/motion/oem/x/caught_plate_recovery_home', '/motion/oem/x/set_home',
+        '/motion/oem/y/move_steps', '/motion/oem/y/move_absolute',
+        '/motion/oem/y/home', '/motion/oem/y/set_home',
         '/motion/oem/y/internal/acceleration_overload',
-        '/motion/oem/y/internal/board_test_my', '/motion/oem/y/set_home',
+        '/motion/oem/y/internal/board_test_my',
+        '/motion/oem/z/clear', '/motion/oem/z/diagnostic_home_axis',
+        '/motion/oem/z/move_z_home', '/motion/oem/z/resume_after_abort',
+        '/motion/oem/z/set_home', '/motion/oem/z/move_gz',
+        '/motion/oem/z/lower_pipette', '/motion/oem/z/lift_pipette',
+        '/motion/oem/z/self_test', '/motion/oem/home_gz',
         '/motion/oem/move_xy', '/motion/oem/home_xy',
     }:
         return True
     if path in {'/motion/oem/manual/home', '/motion/oem/manual/sethome',
-                '/motion/oem/manual/relative', '/motion/oem/manual/absolute',
-                '/motion/axis/relative', '/motion/axis/absolute', '/motion/axis/zero',
-                '/motion/axis/home'}:
-        return str(inputs.get('axis', '')).lower() in {'x', 'y', 'z'}
+                '/motion/oem/manual/relative', '/motion/oem/manual/absolute'}:
+        # Y aliases are retired; dedicated Y entry points above remain live.
+        return str(inputs.get('axis', '')).lower() in {'x', 'z'}
+    if path == '/motion/diagnostics/execute':
+        # Only X diagnostics still dispatch live XYZ primitives. Generic
+        # Y/Z diagnostics and /motion/axis/* are retired or validation-only.
+        return (str(inputs.get('axis', '')).lower() == 'x'
+                and inputs.get('operation') in {'move-negative', 'move-positive', 'home', 'park-6000'})
     return False
 
 
