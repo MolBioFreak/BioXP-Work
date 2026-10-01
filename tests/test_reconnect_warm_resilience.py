@@ -179,3 +179,48 @@ def test_busy_status_envelope_falls_back_to_unbound_without_provider(monkeypatch
         assert status[axis]["available"] is False
         assert status[axis]["state"] == "unbound"
         assert status[axis]["blockers"] == ["provider_authority_busy"]
+
+
+def test_busy_display_poll_keeps_last_status_marked_busy(monkeypatch):
+    """A running move reads as busy on the cockpit, not as unavailable.
+
+    Only passive display polls get the last observed status; any other caller
+    (for example a motion resolving PSUDO_Z_HOME) gets the explicit busy
+    envelope and never acts on a cached view.
+    """
+    from bioxp import api
+    from bioxp.operator_controls import _PASSIVE_OPERATOR_POLL
+
+    busy = {"value": False}
+
+    class BusyScope:
+        def __enter__(self):
+            if busy["value"]:
+                raise ProviderAuthorityBusy("held by an active lease")
+
+        def __exit__(self, *exc):
+            return False
+
+    class FakeProvider:
+        def projection_scope(self):
+            return BusyScope()
+
+    observed = {"bound": True, "initialize_motors_live_available": True,
+                "machine_status": {"psudo_z_home_steps": 500}}
+    monkeypatch.setattr(api, "_serial206_oem_initialization_provider", FakeProvider(), raising=False)
+    monkeypatch.setattr(api, "_serial206_y_provider", None, raising=False)
+    monkeypatch.setattr(api, "_last_provider_status", None, raising=False)
+    monkeypatch.setattr(api, "_serial206_oem_initialization_provider_status_snapshot", lambda: dict(observed))
+
+    assert api.serial206_oem_initialization_provider_status() == {**observed, "authority_busy": False}
+    busy["value"] = True
+    token = _PASSIVE_OPERATOR_POLL.set(True)
+    try:
+        served = api.serial206_oem_initialization_provider_status()
+    finally:
+        _PASSIVE_OPERATOR_POLL.reset(token)
+    assert served == {**observed, "authority_busy": True}
+    direct = api.serial206_oem_initialization_provider_status()
+    assert direct["authority_busy"] is True
+    assert direct["machine_status"] is None
+    assert direct["initialize_motors_live_available"] is False

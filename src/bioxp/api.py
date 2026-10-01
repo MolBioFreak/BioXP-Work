@@ -470,18 +470,33 @@ _pipette_application = PipetteApplicationPlanner(
 
 
 
+_last_provider_status: tuple[int, dict[str, Any]] | None = None
+
+
 def serial206_oem_initialization_provider_status() -> dict[str, Any]:
+    global _last_provider_status
     provider = _serial206_oem_initialization_provider
     scope = getattr(provider, "projection_scope", None)
     manager: Any = scope() if callable(scope) else nullcontext()
     try:
         with manager:
-            return _serial206_oem_initialization_provider_status_snapshot()
+            snapshot = {**_serial206_oem_initialization_provider_status_snapshot(), "authority_busy": False}
     except ProviderAuthorityBusy:
-        # Passive polls never queue behind authority work; report busy
-        # explicitly so the caller serves its busy/stale projection instead
-        # of stalling (2026-09-20 warm-lock incident).
+        # Passive polls never queue behind authority work (2026-09-20
+        # warm-lock incident). A display poll keeps showing the last observed
+        # status marked busy, so a running move reads as busy, not as
+        # unavailable. Other callers get the explicit busy envelope.
+        try:
+            from .operator_controls import _PASSIVE_OPERATOR_POLL
+            passive = bool(_PASSIVE_OPERATOR_POLL.get())
+        except Exception:
+            passive = False
+        last = _last_provider_status
+        if passive and last is not None and last[0] == id(provider):
+            return {**last[1], "authority_busy": True}
         return _serial206_oem_initialization_provider_status_busy()
+    _last_provider_status = (id(provider), snapshot)
+    return snapshot
 
 
 def _serial206_oem_initialization_provider_status_busy() -> dict[str, Any]:
