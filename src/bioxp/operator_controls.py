@@ -1690,20 +1690,23 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _bounded_telemetry(state: Mapping[str, Any]) -> dict[str, Any]:
+def _bounded_telemetry(state: Mapping[str, Any], *, catalog: bool = False) -> dict[str, Any]:
     """Public read-only telemetry; never replace source time with poll time.
 
     Bound wire-detail fields, not channel state or control availability.
     Full provider receipts remain at their existing detail endpoints.
     """
     payload = _dashboard_payload(state)
-    pipettes = payload["pipettes"]
-    pipettes["last_group_transaction"] = _bounded_json(pipettes.get("last_group_transaction"), 4096)
-    pipettes["channels"] = [
-        {**row, "last_transaction": _bounded_json(row.get("last_transaction"), 2048)}
-        if isinstance(row, Mapping) else row
-        for row in pipettes.get("channels", [])
-    ]
+    if catalog:
+        payload = _catalog_dashboard(payload)
+    else:
+        pipettes = payload["pipettes"]
+        pipettes["last_group_transaction"] = _bounded_json(pipettes.get("last_group_transaction"), 4096)
+        pipettes["channels"] = [
+            {**row, "last_transaction": _bounded_json(row.get("last_transaction"), 2048)}
+            if isinstance(row, Mapping) else row
+            for row in pipettes.get("channels", [])
+        ]
     domains = state.get("domains") or {}
     observations = {
         name: row.get("observed_unix")
@@ -2794,6 +2797,69 @@ class _OperatorStateReader:
         return await _drain_operator_work(pending)
 
 
+# Definition fields are install-time values. Unknown fields remain live by default.
+_CATALOG_DEFINITION_FIELDS = frozenset({
+    "action_id", "kind", "category", "description", "informational_method",
+    "informational_path", "inputs", "label", "requires_confirmation", "safety_class",
+    "source_anchor", "stages", "subsystem", "timeout_seconds", "required_provider_capability",
+    "aggregate_abort", "physical_scope", "x_only", "request_schema_version",
+    "response_schema_version", "interrupt",
+})
+
+
+def _catalog_definitions(rows):
+    return [{k: v for k, v in row.items() if k in _CATALOG_DEFINITION_FIELDS} for row in rows]
+
+
+def _catalog_revision(rows):
+    return hashlib.sha256(json.dumps(_catalog_definitions(rows), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _catalog_assessment(body, revision):
+    # Intern identical assessment objects within this response, not across time.
+    # This preserves every dependency/reason/alias, omission and unknown field.
+    states, indices, seen = [], [], {}
+    for row in body["actions"]:
+        state = {k: v for k, v in row.items() if k not in _CATALOG_DEFINITION_FIELDS}
+        key = json.dumps(state, sort_keys=True, separators=(",", ":"))
+        if key not in seen:
+            seen[key] = len(states)
+            states.append(state)
+        indices.append(seen[key])
+    return {**{k: v for k, v in body.items() if k != "actions"},
+            "catalog_view": "assessment", "metadata_revision": revision,
+            "action_states": states, "action_state_indices": indices}
+
+
+def _catalog_dashboard(dashboard):
+    """Omit unconsumed transaction/proof detail, not displayed pipette truth."""
+    result = dict(dashboard)
+    if "telemetry" in result:
+        result["telemetry"] = _catalog_dashboard(result["telemetry"])
+    pipettes = result.get("pipettes")
+    if isinstance(pipettes, Mapping):
+        pipettes = dict(pipettes)
+        for field, keys in (("last_group_transaction", {"outcome"}),
+                            ("latest_receipt", {"operation", "receipt_id"})):
+            if isinstance(pipettes.get(field), Mapping):
+                pipettes[field] = {k: v for k, v in pipettes[field].items() if k in keys}
+        if isinstance(pipettes.get("channels"), list):
+            channels = []
+            for channel in pipettes["channels"]:
+                if not isinstance(channel, Mapping):
+                    channels.append(channel)
+                    continue
+                channel = {k: v for k, v in channel.items() if k != "last_transaction"}
+                for field in ("hardware_tip_status", "hardware_pressure"):
+                    if isinstance(channel.get(field), Mapping):
+                        channel[field] = {k: v for k, v in channel[field].items()
+                                          if k in {"ok", "hardware_truth_level", "tip_loaded", "pressure"}}
+                channels.append(channel)
+            pipettes["channels"] = channels
+        result["pipettes"] = pipettes
+    return result
+
+
 class _OperatorPollCache:
     """One refresh in flight, with coalesced demand per finite polling view.
 
@@ -2826,14 +2892,15 @@ class _OperatorPollCache:
     def wrap(self, fn):
         @wraps(fn)
         async def poll(*args, **kwargs):
-            # Routes have only one optional, finite schema selector. Unknown
-            # selectors retain the V1 behavior, never allocate arbitrary keys.
+            # Schema and representation selectors allocate only finite views.
+            # Draft Z values remain outside this cache.
             schema = kwargs.get("schema_version")
             expected_schema = {"operator_dashboard": "bioxp.operator_dashboard.v2",
                                "control_catalog": "bioxp.operator_control_catalog.v2"}.get(fn.__name__)
             if schema != expected_schema:
                 schema = None
-            key = (fn.__name__, schema)
+            view = kwargs.get("view") if kwargs.get("view") in {"assessment", "metadata"} else "full"
+            key = (fn.__name__, schema, view) if view != "full" else (fn.__name__, schema)
             with self._lock:
                 if self._closed:
                     raise HTTPException(503, detail="operator_poll_closed")
@@ -2964,6 +3031,18 @@ def install_operator_control_plane(
     by_id = {row["action_id"]: row for row in actions}
     v2_canonical_action_ids = _v2_canonical_action_ids(actions, dispatch)
     store = OperatorReceiptStore()
+    def canonical_definition(action):
+        return {"action_id": str(action["action_id"]),
+                "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2",
+                "response_schema_version": "bioxp.operator_action_receipt.v2",
+                "interrupt": str(action["safety_class"]) == "stop"}
+
+    catalog_metadata: dict[str, Any] = {"actions": _catalog_definitions(_v1_catalog_actions(actions))}
+    canonical_metadata: dict[str, Any] = {"actions": [canonical_definition(action) for action in actions
+                                      if str(action["action_id"]) in v2_canonical_action_ids]}
+    for metadata in (catalog_metadata, canonical_metadata):
+        metadata.update(catalog_view="metadata", metadata_revision=_catalog_revision(metadata["actions"]))
+
     poll_cache = _OperatorPollCache(lambda: int(hardware_state.ownership_epoch))
     app.state.operator_poll_cache = poll_cache
     from contextlib import AsyncExitStack, asynccontextmanager
@@ -3868,7 +3947,7 @@ def install_operator_control_plane(
             "active_command": None, "interrupt_epoch": int(raw.get("interrupt_epoch") or 0), "latest_compact_receipt": None, "last_discrepancy_steps": raw.get("last_discrepancy_steps"), "state_version": max(1, int(raw.get("state_version") or 1)), "updated_at": float(raw.get("updated_at") or 0.0), "physical_position_verified": bool(raw.get("physical_position_verified", False)),
         }
 
-    def _v2_dashboard(state: Mapping[str, Any], queue_projection: Mapping[str, Any] | None = None, rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def _v2_dashboard(state: Mapping[str, Any], queue_projection: Mapping[str, Any] | None = None, rows: list[dict[str, Any]] | None = None, *, catalog: bool = False) -> dict[str, Any]:
         queue_projection = queue_projection or {}
         rows = rows or []
         compact = [_v2_compact_receipt(row) for row in rows]
@@ -3897,7 +3976,7 @@ def install_operator_control_plane(
             "destination_catalog_revision": deck_authority.get("destination_catalog_revision"),
             "ambiguity_state": str(deck_state.get("ambiguity_state") or "none"),
         }
-        return {"schema_version": "bioxp.operator_dashboard.v2", "generated_at": now, "ownership_generation": int(state.get("ownership_generation") or 0), "telemetry": _bounded_telemetry(state), "board4": board4, "y_axis": y_axis, "deck": deck, "active_commands": active, "command_queue": {"schema_version": "bioxp.oem_command_queue.v1", "generated_at": now, "items": queue_items}, "latest_receipts": compact[:100]}
+        return {"schema_version": "bioxp.operator_dashboard.v2", "generated_at": now, "ownership_generation": int(state.get("ownership_generation") or 0), "telemetry": _bounded_telemetry(state, catalog=catalog), "board4": board4, "y_axis": y_axis, "deck": deck, "active_commands": active, "command_queue": {"schema_version": "bioxp.oem_command_queue.v1", "generated_at": now, "items": queue_items}, "latest_receipts": compact[:100]}
 
     async def history_rows(limit: int, *, cursor: str | None = None) -> list[dict[str, Any]]:
         rows, _ = await asyncio.to_thread(read_history_page, store.root, limit, cursor)
@@ -3911,22 +3990,18 @@ def install_operator_control_plane(
         rows = await history_rows(25)
         return _v2_dashboard(state, {}, rows)
 
-    @router.get("/v2/control-catalog")
     @with_current_deck_display
     @poll_cache.wrap
-    async def control_catalog_v2() -> dict[str, Any]:
+    async def control_catalog_v2(view: str = "full") -> dict[str, Any]:
         state = machine_state()
-        dashboard = _v2_dashboard(state, {}, await history_rows(25))
+        dashboard = _v2_dashboard(state, {}, await history_rows(25), catalog=view == "assessment")
         action_rows = []
         for action in actions:
             if str(action["action_id"]) not in v2_canonical_action_ids:
                 continue
             assessment = deck_contract(state, intent_only=True) if action["action_id"] == "oem.deck.move_to_location" else assessed_action(action, state)
             action_rows.append({
-                "action_id": str(action["action_id"]),
-                "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2",
-                "response_schema_version": "bioxp.operator_action_receipt.v2",
-                "interrupt": str(action["safety_class"]) == "stop",
+                **canonical_definition(action),
                 "enabled": bool(assessment.get("enabled")),
                 "disabled_reason": assessment.get("disabled_reason"),
                 **({
@@ -3938,7 +4013,16 @@ def install_operator_control_plane(
                     "destination_options": assessment["destination_options"],
                 } if action["action_id"] == "oem.deck.move_to_location" else {}),
             })
-        return {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": action_rows}
+        body = {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": action_rows}
+        if view == "assessment":
+            return _catalog_assessment(body, canonical_metadata["metadata_revision"])
+        return body
+
+    @router.get("/v2/control-catalog")
+    async def control_catalog_v2_view(view: str = Query(default="full", pattern="^(full|metadata|assessment)$")):
+        if view == "metadata":
+            return canonical_metadata
+        return await control_catalog_v2(view=view)
 
     async def retain_direct_action(action_id: str, payload: InvokeRequest) -> dict[str, Any]:
         binding = {"action_id": action_id, **payload.model_dump()}
@@ -4161,7 +4245,7 @@ def install_operator_control_plane(
         return await action_receipt_v2(command_id, detail=detail)
 
     @poll_cache.wrap
-    async def control_catalog(schema_version: str | None = Query(default=None)) -> dict[str, Any]:
+    async def control_catalog(schema_version: str | None = Query(default=None), view: str = "full") -> dict[str, Any]:
         state = machine_state()
         if schema_version == "bioxp.operator_control_catalog.v2":
             dashboard = _v2_dashboard(
@@ -4185,27 +4269,31 @@ def install_operator_control_plane(
                     if str(action["action_id"]) in v2_canonical_action_ids
                 ],
             }
-        return {
+        body = {
             "schema_name": "bioxp.operator_control_catalog",
             "schema_version": CATALOG_SCHEMA,
             "machine_serial": str(OEM_MACHINE_SERIAL),
             "ownership_generation": int(hardware_state.ownership_epoch),
             **authority(),
-            "dashboard": _dashboard_payload(state),
+            "dashboard": _catalog_dashboard(_dashboard_payload(state)) if view == "assessment" else _dashboard_payload(state),
             # Canonical methods require the V2 request/receipt and deck authority
             # contract; they cannot be advertised as executable V1 primitives.
             "actions": [assessed_action(action, state) for action in _v1_catalog_actions(actions)],
         }
+        return _catalog_assessment(body, catalog_metadata["metadata_revision"]) if view == "assessment" else body
 
     @router.get("/control-catalog")
     @with_current_deck_display
     async def control_catalog_with_z_target(
         schema_version: str | None = Query(default=None),
         z_target_steps: int | None = Query(default=None, ge=-2147483648, le=2147483647),
+        view: str = Query(default="full", pattern="^(full|metadata|assessment)$"),
     ) -> dict[str, Any]:
         # Reuse the finite cached snapshot; draft values never allocate cache
         # entries or collect hardware. This is presentation, not admission.
-        catalog = await control_catalog(schema_version=schema_version)
+        if view == "metadata":
+            return catalog_metadata
+        catalog = await control_catalog(schema_version=schema_version, view=view)
         if z_target_steps is None or schema_version == "bioxp.operator_control_catalog.v2":
             return catalog
         from .oem_serial206_initialization import Serial206OemInitializationProvider
