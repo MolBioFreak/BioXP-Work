@@ -797,8 +797,11 @@ def get_protocol_job(job_id: str, *, store: ProtocolOperatorBundleStore | None =
     return active_store.load(job_id)
 
 
-def list_protocol_jobs(*, limit: int = 20, store: ProtocolOperatorBundleStore | None = None, command_store=None) -> list[dict[str, Any]]:
-    canonical = command_store.list_workflows(limit=limit) if command_store is not None else []
+def list_protocol_jobs(*, limit: int = 20, summary: bool = False, store: ProtocolOperatorBundleStore | None = None, command_store=None) -> list[dict[str, Any]]:
+    canonical = ((command_store.list_workflow_summaries(limit=limit) if summary else
+                  command_store.list_workflows(limit=limit)) if command_store is not None else [])
+    if len(canonical) >= limit:
+        return canonical
     seen = {row["job_id"] for row in canonical}
     try:
         historical = (store or ProtocolOperatorBundleStore()).list(limit=limit)

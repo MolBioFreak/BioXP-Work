@@ -10963,9 +10963,9 @@ async def liquid_manual_execute(req: ManualPipettingExecuteRequest):
 
 
 @app.get("/protocol/jobs")
-async def protocol_jobs(limit: int = Query(20, ge=1, le=100)):
+async def protocol_jobs(limit: int = Query(20, ge=1, le=100), summary: bool = Query(False)):
     return {
-        "rows": await run_in_threadpool(list_protocol_jobs, limit=limit, command_store=_protocol_command_store()),
+        "rows": await run_in_threadpool(list_protocol_jobs, limit=limit, summary=summary, command_store=_protocol_command_store()),
     }
 
 
