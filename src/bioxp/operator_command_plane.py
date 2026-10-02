@@ -142,6 +142,7 @@ ALLOWED_ACTIONS = frozenset({
     "oem.xy.move_absolute",
     "oem.xy.home",
     "oem.deck.move_to_location",
+    "oem.deck.move_to_well",
 })
 INTERRUPT_ACTIONS = frozenset({
     "oem.x.stop", "oem.y.stop", "oem.z.stop", "oem.g.stop", "oem.abort_all", "oem.z.abort",
@@ -376,6 +377,7 @@ def _validate_inputs(action_id: str, inputs: Any) -> dict[str, Any]:
             "location19_y",
         },
         "oem.deck.move_to_location": {"target", "camera_offset"},
+        "oem.deck.move_to_well": {"location_id", "well", "position_flag"},
         "oem.deck._mov_execution": {
             "script_line", "plate_name", "location_id", "well", "material", "continuation",
         },
@@ -445,6 +447,13 @@ def _validate_inputs(action_id: str, inputs: Any) -> dict[str, Any]:
             raise HTTPException(status_code=422, detail={"error": "invalid_z_control_operation"})
         if "value" in result and type(result["value"]) is not int:
             raise HTTPException(status_code=422, detail={"error": "invalid_profile_value", "field": "value"})
+        return result
+    if action_id == "oem.deck.move_to_well":
+        from .manual_pipetting import ManualMove
+        try:
+            ManualMove.model_validate({"operation": "move", **result})
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={"error": "invalid_deck_well", "message": str(exc)}) from exc
         return result
     if action_id == "oem.deck.move_to_location":
         target = result.get("target")
@@ -564,7 +573,7 @@ def _active_board_epochs(state: Mapping[str, Any], action_id: str) -> dict[str, 
     axis = AXIS_BY_ACTION.get(action_id)
     if (
         action_id.startswith(("oem.xy.", "oem.xyz."))
-        or action_id in {"oem.z.scriptmove_to", "oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation"}
+        or action_id in {"oem.z.scriptmove_to", "oem.deck.move_to_location", "oem.deck.move_to_well", "oem.deck._mov_execution", "oem.deck._finite_operation"}
     ) and isinstance(provider, Mapping):
         epochs: dict[str, int] = {}
         x_authority = provider.get("x_authority")
@@ -1789,6 +1798,7 @@ class OperatorCommandStore(CommandReceiptReader):
                 return
             deck_actions = {
                 "oem.deck.move_to_location",
+                "oem.deck.move_to_well",
                 "oem.deck._mov_execution",
                 "oem.deck._finite_operation",
             }
@@ -2585,7 +2595,7 @@ class OperatorCommandStore(CommandReceiptReader):
         axis = AXIS_BY_ACTION.get(action_id)
         motor_by_axis = {"y": 0, "z": 1}
         composite_xy = action_id.startswith("oem.xy.")
-        deck_movement = action_id in {"oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation"}
+        deck_movement = action_id in {"oem.deck.move_to_location", "oem.deck.move_to_well", "oem.deck._mov_execution", "oem.deck._finite_operation"}
         composite_xyz = action_id.startswith("oem.xyz.") or action_id == "oem.z.scriptmove_to"
         axis_scope = "xyz" if composite_xyz or deck_movement else "xy" if composite_xy else axis
         board_scope = (
@@ -2670,7 +2680,7 @@ class OperatorCommandStore(CommandReceiptReader):
         ).fetchone()
         unresolved = conn.execute(
             "SELECT 1 FROM operator_plane_commands c LEFT JOIN operator_plane_deck_commands d USING(command_id) "
-            "WHERE c.action_id IN ('oem.deck.move_to_location','oem.deck._mov_execution','oem.deck._finite_operation') "
+            "WHERE c.action_id IN ('oem.deck.move_to_location','oem.deck.move_to_well','oem.deck._mov_execution','oem.deck._finite_operation') "
             "AND (c.status IN ('ambiguous','interrupted') OR d.ambiguity_state='recovery_required') "
             "AND NOT EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions r WHERE r.command_id=c.command_id) LIMIT 1"
         ).fetchone()
@@ -2903,12 +2913,16 @@ class OperatorCommandStore(CommandReceiptReader):
         from .deck_location_invalidation import location_is_invalidated
         with self._lock:
             row = self.connection.execute(
-                "SELECT current_location,current_well,semantic_state_revision,ambiguity_state "
+                "SELECT current_location,current_well,semantic_state_revision,ambiguity_state, "
+                "tip_location,producer_operation,producer_command_id,ownership_generation "
                 "FROM operator_plane_deck_semantic_state WHERE singleton=1"
             ).fetchone()
         assert row is not None
-        return {**dict(row),
-                "current_location": "UNKNOWN" if location_is_invalidated(self.root) else row["current_location"]}
+        return {key: row[key] for key in ("current_well", "semantic_state_revision", "ambiguity_state")} | {
+            "current_location": "UNKNOWN" if location_is_invalidated(self.root) else row["current_location"],
+            "head_alignment": {key: row[key] for key in ("tip_location", "semantic_state_revision",
+                "producer_operation", "producer_command_id", "ownership_generation")},
+        }
 
     def deck_semantic_state(self) -> dict[str, Any]:
         from .deck_location_invalidation import location_is_invalidated
@@ -4182,7 +4196,7 @@ class OperatorCommandStore(CommandReceiptReader):
         }
         observed_board_epochs = _active_board_epochs(state, action_id)
         expected_board_epochs: dict[str, int] = {}
-        if action_id in {"oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation"}:
+        if action_id in {"oem.deck.move_to_location", "oem.deck.move_to_well", "oem.deck._mov_execution", "oem.deck._finite_operation"}:
             if schema_version != ACTION_REQUEST_SCHEMA:
                 raise HTTPException(status_code=422, detail={"error": "deck_action_requires_v2"})
             raw_board_epochs = request.get("expected_board_epoch_by_board")
@@ -4228,7 +4242,7 @@ class OperatorCommandStore(CommandReceiptReader):
                 replay_response = self._command_response(current_row) if current_row is not None else replay
                 replay_response["idempotent_replay"] = True
                 return replay_response
-            if action_id in {"oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation"}:
+            if action_id in {"oem.deck.move_to_location", "oem.deck.move_to_well", "oem.deck._mov_execution", "oem.deck._finite_operation"}:
                 actual_generation = int(state.get("ownership_generation") or -1)
                 if expected_generation != actual_generation:
                     raise HTTPException(status_code=409, detail={"error": "ownership_generation_mismatch", "actual": actual_generation})
@@ -4390,7 +4404,7 @@ class OperatorCommandStore(CommandReceiptReader):
         expanded: list[tuple[str, dict[str, Any]]] = []
         for step in request.get("steps", []):
             action_id = str(step.get("action_id") or "")
-            if action_id not in ALLOWED_ACTIONS or action_id == "oem.deck.move_to_location":
+            if action_id not in ALLOWED_ACTIONS or action_id in {"oem.deck.move_to_location", "oem.deck.move_to_well"}:
                 raise HTTPException(status_code=422, detail={"error": "method_action_not_allowed", "action_id": action_id})
             inputs = _validate_inputs(action_id, step.get("inputs", {}))
             repeat = int(step.get("repeat", 1))
@@ -5189,7 +5203,7 @@ class OperatorCommandStore(CommandReceiptReader):
                 return _json_load(existing_decision["receipt_json"], {})
             if (
                 command is None
-                or str(command["action_id"]) not in {"oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation"}
+                or str(command["action_id"]) not in {"oem.deck.move_to_location", "oem.deck.move_to_well", "oem.deck._mov_execution", "oem.deck._finite_operation"}
                 or str(command["status"]) not in {"ambiguous", "interrupted"}
                 or (finite is None and str(command["ambiguity_state"]) != "recovery_required")
             ):
@@ -5298,7 +5312,7 @@ class OperatorCommandStore(CommandReceiptReader):
             if finite is not None:
                 other_finite = conn.execute(
                     "SELECT 1 FROM operator_plane_commands c WHERE c.command_id<>? "
-                    "AND c.action_id IN ('oem.deck._finite_operation','oem.deck._mov_execution','oem.deck.move_to_location') "
+                    "AND c.action_id IN ('oem.deck._finite_operation','oem.deck._mov_execution','oem.deck.move_to_location','oem.deck.move_to_well') "
                     "AND c.status IN ('ambiguous','interrupted') "
                     "AND NOT EXISTS(SELECT 1 FROM operator_plane_deck_recovery_decisions r WHERE r.command_id=c.command_id) LIMIT 1",
                     (str(command_id),)).fetchone()
@@ -6144,7 +6158,7 @@ class OperatorCommandStore(CommandReceiptReader):
     @staticmethod
     def _axes_for_action(action_id: str) -> set[str]:
         if action_id in {
-            "oem.deck.move_to_location", "oem.deck._mov_execution", "oem.deck._finite_operation",
+            "oem.deck.move_to_location", "oem.deck.move_to_well", "oem.deck._mov_execution", "oem.deck._finite_operation",
             "oem.z.scriptmove_to",
         }:
             # scriptmove_to is an XYZ source plan despite its historical Z name.
@@ -6220,7 +6234,7 @@ class OperatorCommandStore(CommandReceiptReader):
                 FROM operator_plane_commands AS o
                 JOIN serial206_movement_commands AS c ON c.command_id=o.command_id
                 WHERE o.command_id=? AND o.action_id IN (
-                    'oem.deck.move_to_location','oem.deck._mov_execution','oem.deck._finite_operation'
+                    'oem.deck.move_to_location','oem.deck.move_to_well','oem.deck._mov_execution','oem.deck._finite_operation'
                 )
                 """,
                 (str(command_id),),
@@ -6760,7 +6774,7 @@ class OperatorCommandPlane:
                 deck_assessment = getattr(self.app.state, "oem_deck_command_assessment", None)
                 assessment = (
                     deck_assessment(state, target=requested.get("target"))
-                    if action_id == "oem.deck.move_to_location" and callable(deck_assessment)
+                    if action_id in {"oem.deck.move_to_location", "oem.deck.move_to_well"} and callable(deck_assessment)
                     else self._current_assessment(action_id, requested, state)
                 )
                 if not isinstance(assessment, Mapping):
@@ -6790,7 +6804,7 @@ class OperatorCommandPlane:
         if self.store.action_fenced(action_id):
             self.store.finish(command_id, status="interrupted", payload={"reason": "interrupt_fence_won_before_provider"}, claimed=claimed)
             return
-        if action_id == "oem.deck._finite_operation":
+        if action_id in {"oem.deck._finite_operation", "oem.deck.move_to_well"}:
             provider = self._current_deck_provider()
             executor = getattr(self.app.state, "oem_wp8_operation_executor", None)
             if provider is None or not callable(executor):
@@ -6799,9 +6813,15 @@ class OperatorCommandPlane:
             delivery_attempted = False
             wp8_response: dict[str, Any] = {}
             try:
-                operation = str(effective["operation"])
-                operation_inputs = dict(effective["operation_inputs"])
-                plan = effective.get("prepared_plan")
+                if action_id == "oem.deck.move_to_well":
+                    from .manual_pipetting import manual_position_plan
+                    plan = manual_position_plan({"operation": "move", **effective})
+                    operation = "manual_pipette_move"
+                    operation_inputs = {}
+                else:
+                    operation = str(effective["operation"])
+                    operation_inputs = dict(effective["operation_inputs"])
+                    plan = effective.get("prepared_plan")
                 if plan is None:
                     snapshot_reader = getattr(provider, "wp8_operation_machine_state", None)
                     if not callable(snapshot_reader):

@@ -2554,6 +2554,18 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         "required_board_epochs": [4, 5],
         "raw_coordinate_inputs": False,
     })
+    actions.append({
+        **actions[-1],
+        "action_id": "oem.deck.move_to_well",
+        "label": "OEM Deck Move to Well",
+        "description": "Source manual well positioning through the durable global worker.",
+        "source_anchor": "manual_position_plan:manual_pipette_move",
+        "inputs": [
+            {"name": "location_id", "required": True, "type": "integer"},
+            {"name": "well", "required": True, "type": ["string", "integer"]},
+            {"name": "position_flag", "required": True, "type": "integer", "enum": [0, 1, 2]},
+        ],
+    })
     return actions, dispatch
 
 
@@ -3892,6 +3904,9 @@ def install_operator_control_plane(
         deck = {
             "current_location": deck_state.get("current_location"),
             "current_well": deck_state.get("current_well"),
+            "head_alignment": {key: deck_state.get(key) for key in (
+                "tip_location", "semantic_state_revision", "producer_operation",
+                "producer_command_id", "ownership_generation")},
             "semantic_state_revision": int(deck_state.get("semantic_state_revision") or 0),
             "position_table_revision": deck_authority.get("position_table_revision"),
             "destination_catalog_revision": deck_authority.get("destination_catalog_revision"),
@@ -3921,7 +3936,7 @@ def install_operator_control_plane(
         for action in actions:
             if str(action["action_id"]) not in v2_canonical_action_ids:
                 continue
-            assessment = deck_contract(state, intent_only=True) if action["action_id"] == "oem.deck.move_to_location" else assessed_action(action, state)
+            assessment = deck_contract(state, intent_only=True) if action["action_id"] in {"oem.deck.move_to_location", "oem.deck.move_to_well"} else assessed_action(action, state)
             action_rows.append({
                 "action_id": str(action["action_id"]),
                 "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2",
@@ -3929,6 +3944,7 @@ def install_operator_control_plane(
                 "interrupt": str(action["safety_class"]) == "stop",
                 "enabled": bool(assessment.get("enabled")),
                 "disabled_reason": assessment.get("disabled_reason"),
+                **({"inputs": action["inputs"]} if action["action_id"] == "oem.deck.move_to_well" else {}),
                 **({
                     "required_boards": assessment["required_boards"],
                     "expected_board_epoch_by_board": assessment["expected_board_epoch_by_board"],
@@ -3936,7 +3952,7 @@ def install_operator_control_plane(
                     "position_table_revision": assessment["position_table_revision"],
                     "destination_catalog_revision": assessment["destination_catalog_revision"],
                     "destination_options": assessment["destination_options"],
-                } if action["action_id"] == "oem.deck.move_to_location" else {}),
+                } if action["action_id"] in {"oem.deck.move_to_location", "oem.deck.move_to_well"} else {}),
             })
         return {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": action_rows}
 
@@ -4018,7 +4034,7 @@ def install_operator_control_plane(
             # Keep the approved independent delivery and canonical v2 receipt.
             # invoke_action reconciles the deck queue only after delivery.
             return _v2_compact_receipt(await invoke_action(action_id, payload))
-        if action_id == "oem.deck.move_to_location":
+        if action_id in {"oem.deck.move_to_location", "oem.deck.move_to_well"}:
             if not isinstance(payload, OperatorActionRequestV2):
                 raise HTTPException(status_code=422, detail={"error": "normal_action_request_schema_required"})
             request = {**payload.model_dump(), "action_id": action_id}

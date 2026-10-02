@@ -167,7 +167,10 @@ def test_narrow_display_reader_uses_one_read_only_query(installed_retained):
             display = store.deck_display_state()
         finally:
             store.connection.set_trace_callback(None)
-    assert set(display) == {'current_location', 'current_well', 'semantic_state_revision', 'ambiguity_state'}
+    assert set(display) == {'current_location', 'current_well', 'semantic_state_revision', 'ambiguity_state', 'head_alignment'}
+    semantic = store.deck_semantic_state()
+    assert display['head_alignment'] == {key: semantic[key] for key in (
+        'tip_location', 'semantic_state_revision', 'producer_operation', 'producer_command_id', 'ownership_generation')}
     assert len(sql) == 1 and sql[0].lstrip().upper().startswith('SELECT ')
     assert primitive.calls == before
 
