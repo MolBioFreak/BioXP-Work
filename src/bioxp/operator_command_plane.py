@@ -2161,6 +2161,52 @@ class OperatorCommandStore(CommandReceiptReader):
                 "status": row["status"], "terminal": row["status"] in {"completed","failed","interrupted","ambiguous","cleared","rejected"},
                 "status_path": f"/protocol/jobs/{command_id}"}}
 
+    def list_workflow_summaries(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Project discovery fields in SQLite; never hydrate full job bundles.
+
+        The receipt wins as a whole, exactly as in get_workflow. Missing receipt
+        fields must not be filled from an older admission bundle.
+        """
+        with self._lock:
+            rows = self.connection.execute("""
+                WITH recent AS (
+                    SELECT command_id, status, idempotency_key, ownership_generation,
+                           sequence, requested_inputs_json, receipt_json
+                    FROM operator_commands WHERE command_kind='protocol_workflow'
+                    ORDER BY sequence DESC LIMIT ?
+                ), payloads AS (
+                    SELECT c.*, p.version,
+                        CASE WHEN json_valid(c.receipt_json) THEN
+                            CASE WHEN json(c.receipt_json) NOT IN ('{}','null','[]','false','0','""')
+                                 THEN c.receipt_json END END AS receipt
+                    FROM recent c JOIN operator_plane_commands p USING(command_id)
+                )
+                SELECT command_id, status, idempotency_key, ownership_generation, version,
+                    CASE WHEN receipt IS NOT NULL THEN json_extract(receipt,
+                        '$.execution.dry_run', '$.protocol.document.protocol_id',
+                        '$.protocol.source_type', '$.created_at', '$.updated_at',
+                        '$.operator.pending_review')
+                    ELSE json_extract(CASE WHEN json_valid(requested_inputs_json)
+                                           THEN requested_inputs_json ELSE '{}' END,
+                        '$.bundle.execution.dry_run', '$.bundle.protocol.document.protocol_id',
+                        '$.bundle.protocol.source_type', '$.bundle.created_at', '$.bundle.updated_at',
+                        '$.bundle.operator.pending_review') END AS summary_json
+                FROM payloads ORDER BY sequence DESC
+            """, (limit,)).fetchall()
+            result = []
+            for row in rows:
+                fields = _json_load(row["summary_json"])
+                result.append(dict(zip(
+                    ("dry_run", "protocol_id", "source_type", "created_at", "updated_at", "pending_review"),
+                    fields), job_id=row["command_id"], status=row["status"], command={
+                        "command_id": row["command_id"], "idempotency_key": row["idempotency_key"],
+                        "ownership_generation": int(row["ownership_generation"]),
+                        "state_version": int(row["version"]), "status": row["status"],
+                        "terminal": row["status"] in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"},
+                        "status_path": f"/protocol/jobs/{row['command_id']}",
+                    }))
+            return result
+
     def list_workflows(self, *, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
             ids = self.connection.execute("SELECT command_id FROM operator_commands WHERE command_kind='protocol_workflow' "
