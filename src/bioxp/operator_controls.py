@@ -3047,7 +3047,8 @@ def install_operator_control_plane(
         return {"action_id": str(action["action_id"]),
                 "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2",
                 "response_schema_version": "bioxp.operator_action_receipt.v2",
-                "interrupt": str(action["safety_class"]) == "stop"}
+                "interrupt": str(action["safety_class"]) == "stop",
+                **({"inputs": action["inputs"]} if action["action_id"] == "oem.deck.move_to_well" else {})}
 
     catalog_metadata: dict[str, Any] = {"actions": _catalog_definitions(_v1_catalog_actions(actions))}
     canonical_metadata: dict[str, Any] = {"actions": [canonical_definition(action) for action in actions
@@ -4019,7 +4020,6 @@ def install_operator_control_plane(
                 **canonical_definition(action),
                 "enabled": bool(assessment.get("enabled")),
                 "disabled_reason": assessment.get("disabled_reason"),
-                **({"inputs": action["inputs"]} if action["action_id"] == "oem.deck.move_to_well" else {}),
                 **({
                     "required_boards": assessment["required_boards"],
                     "expected_board_epoch_by_board": assessment["expected_board_epoch_by_board"],

@@ -109,7 +109,12 @@ def test_real_routes_metadata_does_not_collect_state_and_z_preview_unchanged(tmp
                 assert cache._pending is None
             full = get(client, path, {})
             current = get(client, path, {"view": "assessment"})
-            assert compose(metadata["actions"], current) == full["actions"]
+            reconstructed = compose(metadata["actions"], current)
+            assert reconstructed == full["actions"], [
+                {"action_id": actual.get("action_id"), "fields": {key: (actual.get(key), expected.get(key))
+                 for key in set(actual) | set(expected) if actual.get(key) != expected.get(key) or (key in actual) != (key in expected)}}
+                for actual, expected in zip(reconstructed, full["actions"]) if actual != expected
+            ]
             assert "actions" not in current
         for z in (-2147483648, 0, 65000, 2147483647):
             full = get(client, "/operator/control-catalog", {"z_target_steps": z})
