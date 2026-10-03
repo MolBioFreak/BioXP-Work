@@ -159,6 +159,12 @@ def setting_commands(values: Mapping[str, Any]) -> list[tuple[str, str]]:
             if len(encoded.partition(".")[2]) > 3:
                 raise ValueError(f"{field}: at most three decimal places (30053815-C p36); no rounding")
             wire = f"{'v' if field == 'start_speed_ul_s' else 'c'}{encoded},1R"
+        elif field == "backlash_increments":
+            # 30053815-C p38: K[n], 0..500 plunger increments added at the end
+            # of each aspiration to take up direction-change slack.
+            if type(value) is not int or not 0 <= value <= 500:
+                raise ValueError("backlash_increments: expected integer 0..500 (30053815-C p38)")
+            wire = f"K{value}R"
         else:
             raise ValueError(f"{field}: unknown executable setting")
         commands.append((field, wire))
@@ -243,6 +249,8 @@ def capability_catalog() -> dict[str, Any]:
                 "controller_interaction": "actual start/cutoff temporarily limited by top speed; readback reports programmed value",
                 "persistence": "working memory only; no NVRAM save emitted",
                 "advisory": "30053815-C p36 discourages cutoff >100 uL/s (lost steps/overload), especially adjacent moves without >10 ms delay; 399156 p9 uses 200 uL/s. No cap or delay is inserted."},
+            "backlash_increments": {"wire": "KnR", "minimum": 0, "maximum": 500, "published_default": 0,
+                "unit": "plunger increments", "source": "30053815-C p38", "automatically_applied": False},
             "existing_native_families": {
                 "diagnostic_pipette": ["aspirate", "dispense", "dispense_all", "diagnoses", "initialize", "get_data", "last_error", "eject", "plunger_up", "plunger_down"],
                 "pipette_manual_physical": ["load_tip", "source_load_tips", "measure_fluid_height", "source_fluid_offset", "source_calwith_fluid", "source_mix", "source_purge"]},

@@ -277,3 +277,17 @@ def test_speed_setter_partial_channel_exception_does_not_replay(rig, monkeypatch
     assert result["events"][-1]["inputs"]["field"] == field
     assert result["partial_effects"] is True
     assert result["requested_control"] == "stop"
+
+
+@pytest.mark.parametrize("value,wire", [(0, "K0R"), (12, "K12R"), (500, "K500R")])
+def test_backlash_emits_documented_command(value, wire):
+    from bioxp.pipette.cavro_application import setting_commands
+    assert setting_commands({"backlash_increments": value}) == [("backlash_increments", wire)]
+
+
+@pytest.mark.parametrize("value", [-1, 501, 1.5, True, None])
+def test_backlash_rejects_out_of_range(value):
+    out = compile_application(request({"operation": "settings", "channels": [0], "timeout_ms": 30,
+        "values": {"backlash_increments": value}}))
+    assert [i["path"] for i in out["issues"]] == ["/operations/0/values/backlash_increments"]
+    assert out["operations"] is None
