@@ -78,8 +78,33 @@ def test_missing_water_or_invalid_field_not_replaced():
     assert out["application"] is None and out["issues"]
     assert out["recipe_requested"]["aspiration_delay_ms"] is None
     source = recipe()
-    source["phase_settings"] = {"dispense": {"start_speed_ul_s": 25}}
+    source["phase_settings"] = {"dispense": {"start_speed_ul_s": None}}
     assert compile_liquid_recipe(source)["application"] is None
+
+
+def test_original_start_cutoff_phase_order_and_no_implicit_reset(rig):
+    source = recipe()
+    source["phase_settings"] = {
+        "leading_air": {"start_speed_ul_s": "2.500", "cutoff_speed_ul_s": 50},
+        "aspirate": {"start_speed_ul_s": 25, "cutoff_speed_ul_s": 50},
+        "trailing_air": {"start_speed_ul_s": 10},
+        "dispense": {"start_speed_ul_s": 25, "cutoff_speed_ul_s": 200, "slope": [20, 10]},
+    }
+    plan = compile_liquid_recipe(source)
+    assert not plan["issues"], plan
+    result = run(rig, plan["application"])
+    assert result["ok"], result
+    assert rig.wire == [(0, wire) for wire in [
+        "v2.5,1R", "c50,1R", "V30,1R", "P20,1R",
+        "v25,1R", "c50,1R", "V50,1R", "P22.75,1R",
+        "v10,1R", "V40,1R", "P1.25,1R",
+        "v25,1R", "c200,1R", "L20,10R",
+        "V375,1R", "D12.75,1R", "V875,1R", "D10,1R", "V875,1R", "A0R"]]
+    assert result["liquid_settings"]["resolved_recipe"]["phase_settings"] == source["phase_settings"]
+    # Recommendation is documentary: no >100 cutoff cap, delay, reset or NVRAM save.
+    assert [event["operation"] for event in result["events"]].count("delay") == 1
+    assert all(event["reported_applied"]["readback"] is None
+               for event in result["events"] if event["operation"] != "delay")
 
 
 def test_exact_correction_points_and_explicit_function():

@@ -1,6 +1,8 @@
 """Original ADP application instructions inside the existing finite native owner.
 
 399156 V1.0 pp2–5: P/D/A0/V, ordered air/liquid phases and L(n1,n2).
+30053815-C pp35–37: original ADP v/c speed setters and their interactions.
+Manufacturer manual mirror: https://www.docin.com/p-4632231525.html
 399155 V1.0 p3: p0..p8. 399094 V1.0 pp2–3: BR + robotic Z.
 No firmware identification, Water resolution, pickup geometry or classifier is
 inferred here. Unknown executable fields are representation errors, not gates
@@ -144,7 +146,19 @@ def setting_commands(values: Mapping[str, Any]) -> list[tuple[str, str]]:
                 commands.append((field, "b15R"))
             wire = "o0,1R" if value else "o0,0R"
         elif field in {"start_speed_ul_s", "cutoff_speed_ul_s"}:
-            raise ValueError(f"{field}: original ADP wire/units mapping not established by retained sources")
+            # Original ADP Operating Manual 30053815-C pp35–37, not ADP Detect:
+            # lowercase v/c, explicit microliters/second selector 1, execute R.
+            # Keep conversion to increments and temporary top-speed limiting
+            # device-owned. Never infer defaults, cap cutoff at the advisory
+            # 100 uL/s recommendation, insert delays, or save to NVRAM.
+            encoded = _number(value)
+            number = Decimal(encoded)
+            maximum = 100 if field == "start_speed_ul_s" else 200
+            if not Decimal("2.5") <= number <= maximum:
+                raise ValueError(f"{field}: expected 2.500..{maximum}.000 uL/s (30053815-C p36)")
+            if len(encoded.partition(".")[2]) > 3:
+                raise ValueError(f"{field}: at most three decimal places (30053815-C p36); no rounding")
+            wire = f"{'v' if field == 'start_speed_ul_s' else 'c'}{encoded},1R"
         elif field in {"clot_classifier", "air_classifier", "adp_detect"}:
             raise ValueError(f"{field}: no original-ADP classifier implementation; raw streaming is not classification")
         else:
@@ -220,7 +234,17 @@ def capability_catalog() -> dict[str, Any]:
                 for name, spec in PRESSURE_PARAMETERS.items()},
             "slope": {"wire": "Ln1,n2R", "source": "399156 V1.0 p5",
                       "phase": "explicit ordered settings instruction"},
-            "start_cutoff_speed": {"status": "wire_mapping_unestablished", "source": "399156 p9 values only"},
+            "start_cutoff_speed": {
+                "status": "implemented", "source": "30053815-C pp35–37,45",
+                "source_url": "https://www.docin.com/p-4632231525.html",
+                "unit": "uL/s", "decimal_places": 3, "automatically_applied": False,
+                "start_speed_ul_s": {"wire": "vn,1R", "minimum": 2.5, "maximum": 100},
+                "cutoff_speed_ul_s": {"wire": "cn,1R", "minimum": 2.5, "maximum": 200},
+                "phase": "explicit ordered settings; applies to subsequent plunger moves until changed",
+                "controller_conversion": "configured maximum volume; increments/s rounded to nearest integer",
+                "controller_interaction": "actual start/cutoff temporarily limited by top speed; readback reports programmed value",
+                "persistence": "working memory only; no NVRAM save emitted",
+                "advisory": "30053815-C p36 discourages cutoff >100 uL/s (lost steps/overload), especially adjacent moves without >10 ms delay; 399156 p9 uses 200 uL/s. No cap or delay is inserted."},
             "existing_native_families": {
                 "diagnostic_pipette": ["aspirate", "dispense", "dispense_all", "diagnoses", "initialize", "get_data", "last_error", "eject", "plunger_up", "plunger_down"],
                 "pipette_manual_physical": ["load_tip", "source_load_tips", "measure_fluid_height", "source_fluid_offset", "source_calwith_fluid", "source_mix", "source_purge"]},

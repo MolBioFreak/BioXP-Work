@@ -37,6 +37,8 @@ def rig(monkeypatch, tmp_path):
     fault = {}
     drivers = []
     def transact(msg, *, channel, matcher_name, expected_function, **kwargs):
+        if hasattr(msg, "arbitration_id"):
+            assert msg.arbitration_id == 0x101 | (channel << 3)
         command = bytes(msg.data).decode("ascii")
         wire.append((channel, command))
         started = time.monotonic()
@@ -75,6 +77,11 @@ def rig(monkeypatch, tmp_path):
         def transact_many(messages, **kwargs):
             assert len(messages) > 1
             assert all(len(m.data) <= 8 for m in messages)
+            channel = kwargs["channel"]
+            assert [m.arbitration_id for m in messages] == [
+                0x103 | (channel << 3),
+                *([0x104 | (channel << 3)] * (len(messages) - 2)),
+                0x101 | (channel << 3)]
             joined = SimpleNamespace(data=b"".join(bytes(m.data) for m in messages))
             return transact(joined, **kwargs)
         driver.bus = SimpleNamespace(router=router, transact_can=transact,
@@ -187,7 +194,10 @@ def test_settings_every_p_parameter_slope_and_no_water_invention():
     assert capability_catalog()["clot_classifier"]["verdict"] is None
 
 
-@pytest.mark.parametrize("field,value", [("start_speed_ul_s", 25), ("cutoff_speed_ul_s", 200),
+@pytest.mark.parametrize("field,value", [("start_speed_ul_s", 100.001), ("cutoff_speed_ul_s", 200.001),
+    ("start_speed_ul_s", 2.499), ("cutoff_speed_ul_s", 2.499),
+    ("start_speed_ul_s", "25.0001"), ("cutoff_speed_ul_s", "50.0001"),
+    ("start_speed_ul_s", True), ("cutoff_speed_ul_s", None),
     ("clot_classifier", "invented"), ("slope", [20]), ("plld_persistence_ms", None),
     ("unknown", 3)])
 def test_no_truncated_executable_prefix(rig, field, value):
@@ -223,6 +233,50 @@ def test_native_frozen_application_preserves_null_and_metadata():
 
 def test_all_unsupported_settings_have_exact_paths():
     out = compile_application(request({"operation": "settings", "channels": [0], "timeout_ms": 30,
-        "values": {"start_speed_ul_s": 25, "cutoff_speed_ul_s": 200}}))
-    assert {i["path"] for i in out["issues"]} == {"/operations/0/values/start_speed_ul_s", "/operations/0/values/cutoff_speed_ul_s"}
+        "values": {"clot_classifier": "not_implemented", "air_classifier": "not_implemented"}}))
+    assert {i["path"] for i in out["issues"]} == {"/operations/0/values/clot_classifier", "/operations/0/values/air_classifier"}
     assert out["operations"] is None
+
+
+@pytest.mark.parametrize("start,cutoff,start_wire,cutoff_wire", [
+    (2.5, 2.5, "v2.5,1R", "c2.5,1R"),
+    (100, 200, "v100,1R", "c200,1R"),
+    ("25.1250", "199.875", "v25.125,1R", "c199.875,1R"),
+])
+def test_original_manual_speed_setters_real_can_owner_and_receipts(rig, start, cutoff, start_wire, cutoff_wire):
+    payload = request({"operation": "settings", "channels": [0, 2], "timeout_ms": 30,
+                       "values": {"start_speed_ul_s": start, "cutoff_speed_ul_s": cutoff}})
+    before = copy.deepcopy(payload)
+    result = run(rig, payload)
+    assert result["ok"], result
+    assert payload == before == result["requested"]
+    # 25.125/199.875 exercise the actual multipart CAN encoder and token owner.
+    assert rig.wire == [(ch, wire) for wire in [start_wire, cutoff_wire] for ch in [0, 2]]
+    assert len(rig.waits) == len(rig.wire)
+    assert len({token for _, token in rig.waits}) == len(rig.waits)
+    rows = rig.store.connection.execute("SELECT status,receipt_json FROM pipette_operations").fetchall()
+    assert len(rows) == 2 and all(row["status"] == "completed" for row in rows)
+    assert [e["inputs"]["field"] for e in result["events"]] == ["start_speed_ul_s", "cutoff_speed_ul_s"]
+    assert all(e["reported_applied"]["readback"] is None for e in result["events"])
+    assert result["physical_effect_verified"] is False
+    catalog = capability_catalog()
+    assert catalog["start_cutoff_speed"]["status"] == "implemented"
+    assert catalog["start_cutoff_speed"]["automatically_applied"] is False
+    assert catalog["installed_firmware"] is None
+    assert catalog["clot_classifier"]["verdict"] is catalog["air_classifier"]["verdict"] is None
+
+
+@pytest.mark.parametrize("field,wire", [("start_speed_ul_s", "v25,1R"), ("cutoff_speed_ul_s", "c200,1R")])
+def test_speed_setter_partial_channel_exception_does_not_replay(rig, monkeypatch, field, wire):
+    def fail(*args, **kwargs):
+        raise RuntimeError("offline setter channel exception")
+    monkeypatch.setattr(rig.drivers[1], "_send_pipette_command", fail)
+    value = 25 if field == "start_speed_ul_s" else 200
+    result = run(rig, request({"operation": "settings", "channels": [0, 1], "timeout_ms": 30,
+                               "values": {field: value}}, stroke()))
+    assert result["ok"] is False
+    assert rig.wire == [(0, wire)]
+    assert result["events"][-1]["status"] == "failed"
+    assert result["events"][-1]["inputs"]["field"] == field
+    assert result["partial_effects"] is True
+    assert result["requested_control"] == "stop"
