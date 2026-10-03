@@ -1,6 +1,6 @@
 # Final method native execution matrix
 
-Pinned native product: `759ee635e851fc447269c59ac69b3e705ab79b34`. No native production behavior changed by this qualification.
+Pinned native product: `960caec98518fb84e96dcd339bb514128f52d188`. No native production behavior changed by this qualification.
 
 BMS actual immutable snapshot producer: `33b40edd5a945f8b2be602ff2416551cd8e2d125`; final self-contained producer regression: `a613d12531d41da0810a689cc8b523c8a677024d`. Native schema identity is committed in BMS, not a mutable sibling interface note. The Methods producer recompiles every supplied raw method/binding/dependency snapshot and verifies the original compiler document before native execution.
 
@@ -39,6 +39,6 @@ Selected final JUnit: **87 matrix + 8 recovery/control + 1 native export + 207 B
 
 The initial matrix had fixture/context expectation failures; the next run narrowed to inspection fixtures. Missing tray/constructor state, synchronous CAN completion/query replies, motion home/wait leaves and camera controls/topology were corrected in the harness, not by relaxing product assertions. Initial white-frame inspection also exercised over-cover receipt rejection; positive topology now uses the existing station-specific image fixtures. The original failing JUnit remains under `prior/` and the durable audit directory.
 
-Classifier remains unavailable, with no inferred approval to defer it. No new classifier, automatic Z Stop, cleanup, retry, live hardware action, database migration, push or deployment occurred.
+The pipette has no clot/air classifier, so none is modelled. No automatic Z Stop, cleanup, retry, live hardware action, database migration, push or deployment occurred.
 
 Run using `../native_method_close/run-final-matrix.py`, then `../native_method_close/run-final-contract.py tests/test_final_recovery_producers.py tests/test_final_contract_export.py`. The runner reuses the established network-disabled, read-only container and offline hardware guard. `package-final-contract.py` verifies counts, snapshots, statuses and JUnit before packaging.

@@ -60,7 +60,7 @@ for i, document in enumerate(documents):
 
 from collections import Counter
 manifest = {'schema': 'bioxp.final-method-matrix.v1',
-            'native_product_commit': '759ee635e851fc447269c59ac69b3e705ab79b34',
+            'native_product_commit': '960caec98518fb84e96dcd339bb514128f52d188',
             'bms_producer_commit': '33b40edd5a945f8b2be602ff2416551cd8e2d125',
             'final_model_documents': len(rows), 'recovery_control_documents': len(recovery),
             'native_status_counts': dict(Counter(r['native_status'] for r in rows)),
@@ -68,7 +68,7 @@ manifest = {'schema': 'bioxp.final-method-matrix.v1',
             'recovery_document_sha256': sha(gzip.decompress((ROOT / 'testdata/final_recovery_documents.json.gz').read_bytes())),
             'exports': exports, 'matrix': rows, 'junit': roster,
             'physical_qualification': False,
-            'limits': ['Classifier unavailable; no approval to defer was inferred',
+            'limits': ['Pipette has no clot/air classifier; none modelled',
                        'Native ordinary method documents reject OEM-only deferred pause/wake',
                        'Expected context failures retain exact original document and partial effects',
                        'No native product behavior, automatic Stop, cleanup or retry was changed']}
