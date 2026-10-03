@@ -290,16 +290,9 @@ def test_invalid_intents_methods_capacity_and_same_key(installed_retained, monke
     for epochs in ({}, {'4': -1, '5': 1}, {**body['expected_board_epoch_by_board'], '6': -1}):
         malformed = client.post(URL, json={**body, 'expected_board_epoch_by_board': epochs})
         assert malformed.status_code in {409, 422}
-    generic = client.post('/operator/methods', json={
-        'schema_version': 'bioxp.operator_method_request.v1', 'name': 'not-a-deck-batch',
-        'idempotency_key': 'invalid-method', 'failure_policy': 'fail_fast',
-        'expected_ownership_generation': body['expected_ownership_generation'],
-        'steps': [{'action_id': 'oem.deck.move_to_location', 'inputs': body['inputs']}]})
-    assert generic.status_code == 422 and generic.json()['detail']['error'] == 'method_action_not_allowed'
-    with pytest.raises(HTTPException) as exc:
-        store.admit_method({'expected_ownership_generation': body['expected_ownership_generation'],
-            'steps': [{'action_id': 'oem.deck.move_to_location', 'inputs': body['inputs']}]}, state={})
-    assert exc.value.detail['error'] == 'method_action_not_allowed'
+    for retired in ('/operator/methods', '/operator/v2/methods'):
+        assert client.post(retired, json={}).status_code == 404
+    assert not hasattr(store, 'admit_method')
     monkeypatch.setattr(module, 'COMMAND_CAPACITY', store.queue()['pending_count'])
     full = client.post(URL, json={**body, 'idempotency_key': 'capacity-full'})
     assert full.status_code == 429 and full.json()['detail']['error'] == 'capacity_exceeded'

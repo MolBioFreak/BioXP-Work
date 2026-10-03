@@ -164,8 +164,8 @@ class CommandReceiptReader:
             "schema_version": RECEIPT_SCHEMA,
             "robot_identity": ROBOT_IDENTITY,
             "command_id": str(row["command_id"]),
-            "method_id": row["method_id"],
-            "method_sequence": row["method_sequence"],
+            "method_id": None,
+            "method_sequence": None,
             "stream_sequence": int(row["stream_sequence"]),
             "action_id": str(row["action_id"]),
             "status": str(canonical["state"]) if canonical is not None else str(row["status"]),
@@ -189,6 +189,22 @@ class CommandReceiptReader:
             "completion_class": terminal.get("completion_class") if isinstance(terminal, Mapping) else None,
             "transition_sequence": transition_sequence,
         }
+        if compact:
+            association = self.connection.execute(
+                "SELECT json_extract(payload_json,'$.method_id'),"
+                "json_extract(payload_json,'$.method_sequence') FROM runtime_retired_records "
+                "WHERE source_table='operator_plane_commands' AND record_key=json_array(?)",
+                (str(row["command_id"]),),
+            ).fetchone()
+            if association is not None:
+                response["method_id"], response["method_sequence"] = association
+        if not compact:
+            from .runtime_method_retirement_v15 import command_history
+            history = command_history(self.connection, str(row["command_id"]))
+            if history is not None:
+                response["retired_method_history"] = history
+                response["method_id"] = history["original_command"]["method_id"]
+                response["method_sequence"] = history["original_command"]["method_sequence"]
         if compact:
             # Compact V2 receipts consume only the completion-class correction,
             # never stage bodies. Keep the same historical recovery semantics.
@@ -227,7 +243,7 @@ class CommandReceiptReader:
         """
         with self._lock:
             row = self.connection.execute(
-                "SELECT command_id,method_id,method_sequence,stream_sequence,action_id,status,"
+                "SELECT command_id,stream_sequence,action_id,status,"
                 "ownership_generation,queued_at,dispatched_at,finished_at,source_noop,"
                 "source_noop_reason,remote_acknowledged,controller_acknowledged,physical_effect_verified,version,"
                 "'{}' AS requested_json,'{}' AS effective_json,"

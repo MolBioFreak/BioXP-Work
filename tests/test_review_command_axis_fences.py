@@ -45,37 +45,3 @@ def test_scriptmove_fences_xyz_and_reads_both_board_epochs():
         "x_authority": {"current_board_lifecycle_generation": 20},
         "board4_authority": {"active_board_epoch": 10}}}
     assert _active_board_epochs(state, "oem.z.scriptmove_to") == {"4": 10, "5": 20}
-
-
-@pytest.mark.parametrize("action,inputs,axis", [
-    ("oem.y.move_steps", {"steps": 10}, "y"),
-    ("oem.z.scriptmove_to", {"location_id": "LOC_OC"}, "x"),
-    ("oem.z.scriptmove_to", {"location_id": "LOC_OC"}, "y"),
-])
-def test_method_control_checks_each_composite_or_y_epoch(tmp_path, action, inputs, axis):
-    from fastapi import HTTPException
-    from bioxp.oem_runtime_store import OEMRuntimeStore
-    runtime = OEMRuntimeStore(tmp_path)
-    store = OperatorCommandStore(tmp_path)
-    state = {"ownership_generation": 7, "serial206_initialization_provider": {
-        "x_authority": {"current_board_lifecycle_generation": 20},
-        "board4_authority": {"active_board_epoch": 10}}}
-    try:
-        method = store.admit_method({"name": "offline-epoch-method", "idempotency_key": "method-review-key",
-            "expected_ownership_generation": 7,
-            "steps": [{"action_id": action, "inputs": inputs}]}, state=state)
-        recovery = store.recovery()
-        with store._transaction() as conn:
-            conn.execute(f"UPDATE operator_plane_safety SET {axis}_epoch={axis}_epoch+1 WHERE singleton=1")
-        request = {"idempotency_key": "pause-review-key", "expected_version": method["version"],
-            "expected_recovery_epoch": recovery["recovery_epoch"],
-            "expected_global_safety_epoch": recovery["global_safety_epoch"],
-            "expected_axis_safety_epoch": 0}
-        with pytest.raises(HTTPException) as exc:
-            store.method_mutation(method["method_id"], "pause", request)
-        assert exc.value.detail["error"] == "method_safety_epoch_conflict"
-        result = store.method_mutation(method["method_id"], "pause", {**request, "expected_axis_safety_epoch": 1})
-        assert result["status"] == "pause_requested"
-    finally:
-        store.connection.close()
-        runtime.close()

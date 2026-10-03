@@ -223,7 +223,11 @@ def read_history_page(root: str | Path, limit: int, cursor: str | None = None) -
                 join = "LEFT JOIN serial206_movement_commands c ON c.command_id=p.command_id" if canonical else ""
                 projection = "COALESCE(c.state,p.status) AS recorded_status,COALESCE(c.state_version,p.version) AS state_version,c.expected_board_epochs_json AS epochs,c.terminal_receipt_id" if canonical else "p.status AS recorded_status,p.version AS state_version,NULL AS epochs,NULL AS terminal_receipt_id"
                 rows = db.execute(f"""
-                    SELECT p.command_id,p.action_id,p.method_id,p.ownership_generation,p.queued_at,
+                    SELECT p.command_id,p.action_id,
+                        json_extract((SELECT payload_json FROM runtime_retired_records r
+                            WHERE r.source_table='operator_plane_commands'
+                              AND r.record_key=json_array(p.command_id)), '$.method_id') AS method_id,
+                        p.ownership_generation,p.queued_at,
                         p.dispatched_at,p.finished_at,p.remote_acknowledged,p.controller_acknowledged,
                         p.physical_effect_verified,{projection},
                         json_extract(p.terminal_json,'$.completion_class') AS completion_class

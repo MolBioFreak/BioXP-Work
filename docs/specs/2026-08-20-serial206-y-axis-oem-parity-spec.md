@@ -104,7 +104,7 @@ A replacement or hardening rule must never be reported as literal OEM parity.
 - `moveXY` and `HomeXY` Y ownership.
 - Board-4 Y/Z/gripper independence.
 - Shared board transition authority.
-- Durable normal command admission and source-ordered methods.
+- Durable normal command admission and source-ordered operations.
 - Robot-side command, receipt, discrepancy, and authority persistence in the existing runtime root and SQLite database.
 - Typed robot API, action catalog, dashboard, BMS relay, and cockpit closure.
 - Software, controller, and physical acceptance gates.
@@ -211,7 +211,6 @@ There is no standalone recovered `enableY()` method.
 
 These recovered operations are sequential `void` best-effort write sequences. They ignore subordinate returns and have no rollback. Preserve each write, wait, raw child result, and absent-board branch.
 
-Linux admits each aggregate as one parent method so unrelated operator commands cannot splice into its sequence. Parent admission atomicity is `LINUX_REPLACEMENT`; it does not make the controller writes OEM-atomic. The operations are not routine BMS actions.
 
 `enableYZ` checks only that the Z board exists before dereferencing the Y board. Preserve that raw branch in fixtures. Production preflight rejects either mandatory-board absence as a classified replacement.
 
@@ -506,10 +505,10 @@ These are `OEM_CALLER_POLICY`. They do not create a global axis admission blocke
 
 ### 9.1 Composite ownership
 
-The parent command owns method order only. X and Y child commands own their motor evidence, reference updates, interruptions, discrepancies, and terminal results.
+The parent command owns operation order only. X and Y child commands own their motor evidence, reference updates, interruptions, discrepancies, and terminal results.
 
 ```text
-parent method receipt
+parent command receipt
   x child receipt
   y child receipt
 ```
@@ -654,7 +653,7 @@ This evidence does not prove that every OEM Y API call used one durable movement
 
 Recovered `ClassNovoCommandQueue.ClearAll(axis)` drops the final queued entry and all `axis=-1` entries while rebuilding the queue. Do not port that defect. Axis containment and sibling preservation in sections 9 and 12 are `OPERATOR_REQUIRED_REPLACEMENT`.
 
-The design below is `LINUX_REPLACEMENT`. It preserves method order and fast admission. It is not a literal port of one recovered queue.
+The design below is `LINUX_REPLACEMENT`. It preserves command order and fast admission. It is not a literal port of one recovered queue.
 
 ### 11.2 Existing database and schema migration
 
@@ -683,7 +682,12 @@ user_version>2 -> refuse startup without modifying the database
 
 Migration runs under one `BEGIN IMMEDIATE` transaction after a verified SQLite backup and JSON-file hash capture. Failure rolls back all SQL changes. The migration record stores version `2`, backup digest, source JSON digests, start/end time, and result.
 
-#### v2 table ownership and exact DDL
+#### Historical v2 shared table ownership
+
+Retired method-only DDL and contracts have been removed from this document.
+The frozen v2 migration source retains the original bytes; migration 15 removes
+that feature from prepared stores. See [robot method retirement](../robot-method-retirement.md)
+for current history preservation and schema behavior.
 
 The migration preserves `runtime_metadata`, `operator_commands`, `operator_transitions`, and `serial206_receipts` with their frozen v1 columns and indexes. It creates these tables exactly, with foreign keys enabled:
 
@@ -735,28 +739,11 @@ CREATE TABLE serial206_axis_authority (
   updated_at REAL NOT NULL
 ) WITHOUT ROWID;
 
-CREATE TABLE serial206_movement_methods (
-  method_id TEXT PRIMARY KEY,
-  idempotency_key TEXT NOT NULL UNIQUE,
-  action_id TEXT NOT NULL,
-  canonical_inputs_sha256 TEXT NOT NULL CHECK(length(canonical_inputs_sha256)=64),
-  state TEXT NOT NULL CHECK(state IN ('queued','active','completed','completed_partial','failed','cleared','interrupted','ambiguous')),
-  state_version INTEGER NOT NULL CHECK(state_version>=1),
-  failure_policy TEXT NOT NULL CHECK(failure_policy='require_completed'),
-  child_count INTEGER NOT NULL CHECK(child_count>=1),
-  accepted_at REAL NOT NULL,
-  started_at REAL,
-  finished_at REAL
-) WITHOUT ROWID;
-
 CREATE TABLE serial206_movement_commands (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
   command_id TEXT NOT NULL UNIQUE,
   idempotency_key TEXT NOT NULL,
   action_id TEXT NOT NULL,
-  method_id TEXT REFERENCES serial206_movement_methods(method_id) ON DELETE CASCADE,
-  method_order INTEGER NOT NULL DEFAULT 0 CHECK(method_order>=0),
-  parallel_group INTEGER NOT NULL DEFAULT 0 CHECK(parallel_group>=0),
   axis_scope TEXT,
   board_scope_json TEXT NOT NULL CHECK(json_valid(board_scope_json)),
   ownership_generation INTEGER NOT NULL CHECK(ownership_generation>=0),
@@ -801,16 +788,15 @@ Required new indexes are:
 ```sql
 CREATE UNIQUE INDEX serial206_movement_commands_idempotency_idx ON serial206_movement_commands(idempotency_key);
 CREATE INDEX serial206_movement_commands_ready_idx ON serial206_movement_commands(state,sequence);
-CREATE INDEX serial206_movement_commands_method_idx ON serial206_movement_commands(method_id,method_order,parallel_group,sequence);
 CREATE INDEX serial206_command_resources_lookup_idx ON serial206_command_resources(resource_key,command_id);
 CREATE INDEX serial206_command_dependencies_reverse_idx ON serial206_command_dependencies(depends_on_command_id,command_id);
 ```
 
 The frozen v1 `serial206_receipts` table has no stream CHECK and already supports a `y` stream. Preserve its bytes, row count, primary keys, and three existing indexes. Migration does not rebuild it.
 
-Keep existing `operator_commands` and `operator_transitions` v1 rows as immutable history. Do not reinterpret them as dispatchable queue rows. v2 queue rows use `serial206_movement_commands`. Each top-level v2 admission also writes one ordinary operator-history row in the same transaction; method child state remains in movement tables and detailed v2 evidence.
+Keep existing `operator_commands` and `operator_transitions` v1 rows as immutable history. Do not reinterpret them as dispatchable queue rows. v2 queue rows use `serial206_movement_commands`. Each top-level v2 admission also writes one ordinary operator-history row in the same transaction; command state remains in movement tables and detailed v2 evidence.
 
-Backfill is exact: old receipt, operator-command, transition, and metadata rows remain byte-for-byte unchanged; no old command becomes dispatchable; all new movement/method/resource/dependency/import tables start empty; board and axis authority come only from the JSON cutover rules below. Set `PRAGMA user_version=2` only after row counts, primary-key digests, foreign-key checks, and required indexes pass inside the migration transaction.
+Backfill is exact: old receipt, operator-command, transition, and metadata rows remain byte-for-byte unchanged; no old command becomes dispatchable; all new movement/resource/dependency/import tables start empty; board and axis authority come only from the JSON cutover rules below. Set `PRAGMA user_version=2` only after row counts, primary-key digests, foreign-key checks, and required indexes pass inside the migration transaction.
 
 #### JSON authority cutover
 
@@ -853,7 +839,7 @@ The migration commits SQL authority and its cutover marker together. After commi
 
 SQLite is canonical for board authority, axis authority used by the scheduler, queue state, and compact receipts. Use one transaction owner for movement-journal, Serial-206 authority, operator-command, transition, and terminal-receipt updates. Independent store connections must not perform authority-bearing dual writes.
 
-### 11.3 Command and method state machines
+### 11.3 Command state machine
 
 Each normal command row contains:
 
@@ -862,9 +848,6 @@ sequence
 command_id
 idempotency_key
 action_id
-method_id
-method_order
-parallel_group
 axis_scope
 board_scope
 ownership_generation
@@ -902,30 +885,9 @@ terminal -> no later state
 
 `active` is a derived predicate over `dispatched`, `issued_pending`, and `interrupting`. `restart-dispatched` is not a state. On startup, every persisted active state becomes `ambiguous` in one recovery transaction before dispatch resumes.
 
-Persisted method states are:
-
-```text
-queued | active | completed | completed_partial | failed | cleared | interrupted | ambiguous
-```
-
-One method-admission transaction inserts the parent method, all child commands, every resource row, every dependency edge, and compact operator history. Children in the same `parallel_group` have no edge between them. Every child in group N depends on every child in the prior sequential group. The fixed dependency policy is `require_completed`; failed, cleared, interrupted, ambiguous, or rejected prerequisites cause dependent queued children to become `cleared` with `reason=dependency_not_completed`.
-
-Parent state becomes `active` when its first child dispatches. After every child terminal transition, compute parent terminal state in the same transaction:
-
-```text
-all children completed -> completed
-any child ambiguous -> ambiguous
-at least one completed plus any failed/cleared/interrupted/rejected -> completed_partial
-no completed child and any interrupted -> interrupted
-all children cleared before issue -> cleared
-otherwise, when all children terminal -> failed
-```
-
-This algorithm makes active XY plus Y STOP finish `completed_partial` after X ends. A queued XY cleared on Y finishes `cleared` without dispatching X.
-
 ### 11.4 Resource scheduler
 
-Keep one global admission sequence and method identity. Dispatch is resource-scoped.
+Keep one global command admission sequence. Dispatch is resource-scoped.
 
 - commands for the same motor serialize;
 - board-4 command 64 conflicts with every board-4 motor;
@@ -933,8 +895,7 @@ Keep one global admission sequence and method identity. Dispatch is resource-sco
 - transport request/reply exchange remains single-writer;
 - waiting for a motor event does not hold the transport writer;
 - source-defined XY parallel leaves can overlap;
-- independent motors can proceed when resource and method barriers permit;
-- a submitted method preserves its explicit sequential and parallel groups.
+- independent motors can proceed when resource barriers permit;
 
 The scheduler uses one robot process owner. Before claim, it resolves failed dependencies to `cleared` and stale generation/epoch rows to `rejected`. A row is eligible only when:
 
@@ -949,7 +910,7 @@ no earlier global barrier remains nonterminal
 
 Resource keys are acquired in lexical order and released only in the child terminal transaction. The dispatch transaction rechecks eligibility, updates `queued -> dispatched` with expected `state_version`, and records active resource ownership. The single-writer transport lock is acquired after this SQL claim and released after request/reply exchange.
 
-Dispatch scans global sequence order and chooses the earliest eligible row for each disjoint resource set. A later row may pass an earlier active or queued row only when resources are disjoint and no dependency, method, or global barrier connects them. Same-motor order is strict. Board activation uses `board:4:*` as a global board barrier.
+Dispatch scans global sequence order and chooses the earliest eligible row for each disjoint resource set. A later row may pass an earlier active or queued row only when resources are disjoint and no dependency or global barrier connects them. Same-motor order is strict. Board activation uses `board:4:*` as a global board barrier.
 
 A global sequence is durable truth. It is not universal physical serialization.
 
@@ -958,7 +919,7 @@ A global sequence is durable truth. It is not universal physical serialization.
 For normal actions:
 
 1. validate the typed request and current authority;
-2. reserve the idempotency key, sequence, method membership, and compact command row in one bounded SQLite transaction;
+2. reserve the idempotency key, sequence and compact command row in one bounded SQLite transaction;
 3. return the compact admission receipt;
 4. dispatch asynchronously on the robot.
 
@@ -991,7 +952,7 @@ current board epoch
 
 Terminal write requires the dispatch state version and unchanged axis interrupt epoch. A stale completion cannot overwrite `interrupting`, `cleared`, `interrupted`, or `ambiguous`.
 
-Terminal receipt rows, axis authority updates, method-child updates, and command transition are committed in one SQLite transaction.
+Terminal receipt rows, axis authority updates and command transition are committed in one SQLite transaction.
 
 Large transport evidence stays in existing bounded artifact files and is referenced by digest/path from the compact receipt.
 
@@ -1163,19 +1124,6 @@ observed_board_epoch_by_board: object<string, integer >= 0>
 
 Generation fields on STOP are evidence only. A mismatch does not suppress an addressed STOP attempt. The robot creates a unique `interrupt_attempt_id`; clients cannot supply an idempotency key for STOP.
 
-`POST /operator/methods` accepts a closed method template, not an arbitrary graph:
-
-```text
-schema_version: literal bioxp.operator_method_request.v1
-idempotency_key: string, 1..128 bytes
-method_action_id: oem.xy.move_absolute | oem.xy.home
-expected_ownership_generation: integer >= 0
-expected_board_epoch_by_board: object<string, integer >= 0>
-inputs: strict action-specific object above
-```
-
-The robot expands the template into the fixed parent, child, group, resource, and dependency rows from sections 8 and 11.
-
 Existing internal pathing callers may select the recovered blocking Y absolute wrapper or acceleration overload through a typed provider method. They do not expand the routine action inputs.
 
 Internal absolute intent is a closed discriminated union:
@@ -1256,13 +1204,6 @@ GET  /operator/actions/receipts/{command_id}?detail=true
 GET  /operator/actions/history
 GET  /operator/control-catalog
 GET  /operator/dashboard
-```
-
-Add atomic method submission in WP5:
-
-```text
-POST /operator/methods
-GET  /operator/methods/{method_id}
 ```
 
 `POST /operator/actions/{action_id}/admission` remains a no-side-effect readiness query. It never reserves a command ID and cannot substitute for the durable invocation transaction.
@@ -1361,7 +1302,7 @@ queued, dispatched, issued_pending, interrupting,
 completed, failed, cleared, interrupted, ambiguous, rejected
 ```
 
-The first four states are nonterminal. The remaining states are terminal. Method status adds terminal `completed_partial` and otherwise uses the applicable command names. Producer and BMS frontend use the same enum and terminality table.
+The first four states are nonterminal. The remaining states are terminal. Producer and BMS frontend use the same enum and terminality table.
 
 Compact action receipt fields are:
 
@@ -1441,15 +1382,14 @@ dashboard: dashboard-v2 object
 actions: array<{action_id:string,request_schema_version:string,response_schema_version:string,interrupt:boolean,enabled:boolean,disabled_reason:string|null}>
 ```
 
-Method v1 contains `method_id`, action ID, fixed method status, state version, child compact receipts, accepted time, and nullable finished time.
 
 BMS uses a discriminated `schema_version` union for complete v1 and v2 models. It does not widen strict v1 models or translate a v2 state into a v1 state.
 
 Robot and BMS relay HTTP mapping is fixed:
 
 ```text
-200: readiness query, receipt/history/dashboard/catalog/method GET, or completed STOP attempt response
-202: durable normal command or method admission
+200: readiness query, receipt/history/dashboard/catalog GET, or completed STOP attempt response
+202: durable normal command admission
 400: malformed or out-of-range request
 404: unknown command, method, or action
 409: idempotency conflict, stale generation/epoch, or illegal state transition
@@ -1527,8 +1467,8 @@ Request lane and timeout selection uses the catalog action schema before invocat
 
 ```text
 legacy v1 normal/workflow action: existing workflow lane and existing 900 s timeout
-v2 normal action or method admission: v2_enqueue lane, 5 s timeout
-v2 receipt/history/dashboard/catalog/method query: v2_query lane, 5 s timeout
+v2 normal action admission: v2_enqueue lane, 5 s timeout
+v2 receipt/history/dashboard/catalog query: v2_query lane, 5 s timeout
 v2 oem.y.stop or oem.abort_all: interrupt lane, 10 s timeout
 ```
 
@@ -1657,7 +1597,7 @@ tests/test_oem_runtime_store.py
 tests/test_y_axis_sqlite_authority.py
 ```
 
-Add board, axis, method, and command tables. Import existing compact state once. Make JSON a derived projection. Preserve the existing database and runtime root.
+Add board, axis and command tables. Import existing compact state once. Make JSON a derived projection. Preserve the existing database and runtime root.
 
 **Gate:** migration, restart, projection rebuild, CAS, retention, and rollback fixtures pass.
 
@@ -1731,7 +1671,7 @@ tests/test_oem_resource_scheduler.py
 tests/test_oem_interrupt_races.py
 ```
 
-Implement compact admission, method groups, resource conflicts, dispatch CAS, restart rules, normal idempotency, nonreplayable STOP attempts, and latency instrumentation.
+Implement compact admission, resource conflicts, dispatch CAS, restart rules, normal idempotency, nonreplayable STOP attempts, and latency instrumentation.
 
 **Gate:** queue and interrupt race matrix passes. No depth-eight axis rejection remains.
 
@@ -1753,7 +1693,7 @@ tests/test_operator_dashboard.py
 tests/test_operator_controls.py
 ```
 
-Publish Y actions, dashboard v2, receipts v2, command polling, method endpoints, and canonical compatibility redirects.
+Publish Y actions, dashboard v2, receipts v2, command polling and canonical compatibility redirects.
 
 **Gate:** every Y mutation reaches one provider and one authority store.
 
@@ -2004,7 +1944,7 @@ The irreversible boundary is the first committed v2 command, method, board trans
 #### Rollback A: no v2 authority or command row committed
 
 1. stop BMS Y-control publication and robot mutation admission;
-2. prove the v2 tables contain no authority mutation, command, method, or fallback-import row;
+2. prove the v2 tables contain no authority mutation, command or fallback-import row;
 3. stop the robot API under the separately approved service procedure;
 4. archive the attempted v2 database and logs;
 5. restore the verified `user_version=1` SQLite backup and exact JSON snapshots;
@@ -2020,7 +1960,7 @@ The irreversible boundary is the first committed v2 command, method, board trans
 5. create a verified post-boundary SQLite backup plus immutable receipt/artifact manifest;
 6. deploy the staged v2 robot build with `SERIAL206_Y_V2_MUTATIONS=0`; retain schema v2, fallback import, dashboard, history, and receipt reads;
 7. keep the BMS expand-only v2-capable consumer and confirm all mutation controls remain unavailable;
-8. verify `user_version=2`, migration row, command/method/receipt counts, ambiguous rows, fallback hashes, authority rows, source/process/database identity, and zero dispatchable Y rows.
+8. verify `user_version=2`, migration row, command/receipt counts, ambiguous rows, fallback hashes, authority rows, source/process/database identity, and zero dispatchable Y rows.
 
 Do not restore the pre-v2 database after the irreversible boundary. Do not start the frozen v1 binary against schema v2. A later return to v1 mutation code requires a separately reviewed lossless evidence export, isolated database migration, and controller-authority reconciliation. Restoring software never restores physical coordinates.
 

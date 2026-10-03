@@ -2407,8 +2407,8 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "category": "recovery",
             "kind": "meta",
             "safety_class": "service",
-            "description": "Run shared OEM motion preparation with the existing strict recovery physical checks and no homing. This action is available only while the maintenance latch requires recovery.",
-            "source_anchor": "Motion strict startup; run_homing=false",
+            "description": "Run shared OEM motion preparation with the existing recovery physical checks and no homing. This action is available only while the maintenance latch requires recovery.",
+            "source_anchor": "Motion recovery; run_homing=false",
             "informational_method": "POST",
             "informational_path": "/motion/arm/strict_startup",
             "provider_available": recovery_bound,
@@ -2421,7 +2421,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "requires_confirmation": False,
             "timeout_seconds": 90.0,
             "inputs": [],
-            "stages": ["strict startup", "no homing", "maintenance latch completion"],
+            "stages": ["motion recovery", "no homing", "maintenance latch completion"],
         },
 
         {
@@ -2535,7 +2535,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         "label": "OEM Deck Move to Location",
         "subsystem": "motion",
         "category": "deck",
-        "kind": "canonical_method",
+        "kind": "queued_action",
         "safety_class": "motion",
         "description": "Finite source-shaped Serial-206 named deck movement through the durable global worker.",
         "source_anchor": "ClassControlInterface.btnLOC1_Click",
@@ -2667,8 +2667,8 @@ def _route_failure_message(status_code: int, response: Any) -> str:
 
 
 def _v1_catalog_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Canonical methods require the V2 request/receipt and authority contract."""
-    return [action for action in actions if action["kind"] != "canonical_method"]
+    """Queued deck actions require the V2 request/receipt and authority contract."""
+    return [action for action in actions if action["kind"] != "queued_action"]
 
 
 async def _dispatch_asgi(app: FastAPI, method: str, path_template: str, inputs: dict[str, Any], locations: Mapping[str, Mapping[str, Any]]) -> tuple[int, Any]:
@@ -3331,7 +3331,6 @@ def install_operator_control_plane(
     # non-v2 queue/recovery surfaces; direct canonical v2 routes stay primary.
     from .operator_command_plane import (
         OperatorCommandPlane,
-        OperatorMethodRequestV1,
     )
 
     command_plane = OperatorCommandPlane(
@@ -4297,44 +4296,6 @@ def install_operator_control_plane(
         raw_return_layers["retry_forbidden"] = row.get("retry_forbidden") is True
         return {**compact, "canonical_inputs": dict(row.get("canonical_inputs") or {}), "requested_values": dict(row.get("requested_values") or {}), "effective_values": dict(row.get("effective_values") or {}), "observed_values": dict(row.get("observed_values") or {}), "raw_return_layers": raw_return_layers, "controller_evidence": dict(row.get("controller_evidence") or {}), "transport_artifacts": list(row.get("transport_artifacts") or []), "child_receipts": list(row.get("child_receipts") or []), "transitions": list(row.get("transitions") or []), "deck_movement": dict(row["deck_movement"]) if isinstance(row.get("deck_movement"), Mapping) else None}
 
-    async def _v2_method_receipt(
-        method: Mapping[str, Any], *, durable: bool = False,
-    ) -> dict[str, Any]:
-        raw_status = str(method.get("status") or "queued")
-        status = {"running": "active", "cancelled": "cleared", "stopped": "interrupted", "aborted": "interrupted", "recovery_required": "ambiguous"}.get(raw_status, raw_status)
-        method_reader = command_plane.store if durable else legacy_command_store
-        children = await asyncio.to_thread(method_reader.list_method_commands, str(method["method_id"]))
-        terminal = status in {"completed", "completed_partial", "failed", "cleared", "interrupted", "ambiguous"}
-        accepted_at = float(method.get("queued_at") or time.time())
-        return {
-            "schema_version": "bioxp.operator_method.v1",
-            "method_id": str(method["method_id"]),
-            "action_id": str(method.get("name") or ""),
-            "status": status,
-            "state_version": max(1, int(method.get("version") or 1)),
-            "child_receipts": [_v2_compact_receipt(row) for row in children],
-            "accepted_at": accepted_at,
-            "finished_at": float(method.get("updated_at") or accepted_at) if terminal else None,
-        }
-
-    @router.post("/v2/methods")
-    async def invoke_method_v2(payload: dict[str, Any]) -> dict[str, Any]:
-        try:
-            request = OperatorMethodRequestV1.model_validate(payload)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail={"error": "invalid_operator_method_request"}) from exc
-        method = await command_plane.admit_strict_method(request.model_dump())
-        return await _v2_method_receipt(method, durable=True)
-
-    @router.get("/v2/methods/{method_id}")
-    async def method_status_v2(method_id: str) -> dict[str, Any]:
-        method = await asyncio.to_thread(command_plane.store.get_method, method_id)
-        durable = method is not None
-        if method is None:
-            method = await asyncio.to_thread(legacy_command_store.get_method, method_id)
-        if method is None:
-            raise HTTPException(status_code=404, detail="operator method not found")
-        return await _v2_method_receipt(method, durable=durable)
 
     @router.get("/v2/commands/{command_id}")
     async def command_status_v2(command_id: str, detail: bool = True) -> dict[str, Any]:
@@ -4372,7 +4333,7 @@ def install_operator_control_plane(
             "ownership_generation": int(hardware_state.ownership_epoch),
             **authority(),
             "dashboard": _catalog_dashboard(_dashboard_payload(state)) if view == "assessment" else _dashboard_payload(state),
-            # Canonical methods require the V2 request/receipt and deck authority
+            # Queued deck actions require the V2 request/receipt and deck authority
             # contract; they cannot be advertised as executable V1 primitives.
             "actions": [assessed_action(action, state) for action in _v1_catalog_actions(actions)],
         }

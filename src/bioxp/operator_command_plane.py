@@ -1,4 +1,4 @@
-"""Durable robot-owned X/Y/Z command and method execution plane.
+"""Durable robot-owned X/Y/Z command execution plane.
 
 This module owns normal movement admission, global ordering, lifecycle rows,
 recovery, and the independent Stop/Abort lane. Existing source-shaped provider
@@ -65,8 +65,6 @@ COMMAND_SCHEMA = "bioxp.operator_command_request.v1"
 ACTION_REQUEST_SCHEMA = "bioxp.operator_action_request.v2"
 INTERRUPT_REQUEST_SCHEMA = "bioxp.operator_interrupt_request.v1"
 RECEIPT_SCHEMA = "bioxp.operator_command_receipt.v1"
-METHOD_SCHEMA = "bioxp.operator_method_request.v1"
-METHOD_RECEIPT_SCHEMA = "bioxp.operator_method_receipt.v1"
 ROBOT_IDENTITY = os.getenv("BIOXP_ROBOT_IDENTITY", "serial206").strip() or "serial206"
 TRANSITION_SCHEMA = "bioxp.operator_transition_feed.v1"
 RECOVERY_SCHEMA = "bioxp.operator_recovery.v1"
@@ -82,7 +80,6 @@ def _positive_env(name: str, default: int) -> int:
 
 COMMAND_CAPACITY = _positive_env("BIOXP_OPERATOR_COMMAND_CAPACITY", 10_000)
 COMMAND_BYTES_CAPACITY = _positive_env("BIOXP_OPERATOR_COMMAND_BYTES_CAPACITY", 16 * 1024 * 1024)
-MAX_METHOD_COMMANDS = 10_000
 
 COMMAND_STATES = frozenset({
     "queued", "dispatched", "issued_pending", "stop_requested", "abort_requested", "completed",
@@ -91,15 +88,6 @@ COMMAND_STATES = frozenset({
 })
 COMMAND_NONTERMINAL = frozenset({"queued", "dispatched", "issued_pending", "stop_requested", "abort_requested"})
 COMMAND_TERMINAL = COMMAND_STATES - COMMAND_NONTERMINAL
-METHOD_STATES = frozenset({
-    "queued", "running", "pause_requested", "paused", "cancel_requested",
-    "stopping", "aborting", "recovery_required", "completed", "failed",
-    "cancelled", "stopped", "aborted", "interrupted",
-})
-METHOD_NONTERMINAL = frozenset({
-    "queued", "running", "pause_requested", "paused", "cancel_requested",
-    "stopping", "aborting", "recovery_required",
-})
 
 ALLOWED_ACTIONS = frozenset({
     "oem.x.prepare",
@@ -187,7 +175,7 @@ XZ_NORMAL_ACTIONS = frozenset({
     "oem.x.move_absolute",
 
 })
-STRICT_METHOD_ACTIONS = frozenset({
+XY_ACTIONS = frozenset({
     "oem.xy.move_absolute",
     "oem.xy.home",
 })
@@ -318,8 +306,6 @@ def _json_load(value: str | None, default: Any = None) -> Any:
         return json.loads(value)
     except (TypeError, ValueError):
         return default
-
-
 
 
 def _validate_inputs(action_id: str, inputs: Any) -> dict[str, Any]:
@@ -550,8 +536,6 @@ def _state_value(state: Mapping[str, Any], *keys: str) -> Any:
     return None
 
 
-
-
 def _z_pseudo_home(state: Mapping[str, Any]) -> int:
     for key in ("psudo_z_home_steps", "pseudo_z_home_steps", "pseudo_z_home", "pseudo_home_steps"):
         value = _state_value(state, key)
@@ -624,7 +608,6 @@ def _active_board_epochs(state: Mapping[str, Any], action_id: str) -> dict[str, 
     return {}
 
 
-
 def _home_completion_proven(response: Any) -> bool:
     if not isinstance(response, (Mapping, list, tuple)):
         return False
@@ -671,8 +654,6 @@ def _addressed_event_proven(response: Any) -> bool:
         elif isinstance(current, (list, tuple)):
             pending.extend(value for value in current if isinstance(value, (Mapping, list, tuple)))
     return False
-
-
 
 
 def _position_readback_proven(response: Any) -> bool:
@@ -725,8 +706,6 @@ def _terminal_position_steps(response: Any) -> int | None:
             return int(value)
     nested = response.get("response")
     return _terminal_position_steps(nested) if isinstance(nested, Mapping) else None
-
-
 
 
 def _find_event(value: Any, *, code: int | None = None, name: str | None = None) -> bool:
@@ -813,48 +792,6 @@ class OperatorInterruptRequestV1(BaseModel):
     def validate_observed_board_epoch_keys(cls, value: dict[str, StrictInt]) -> dict[str, StrictInt]:
         if any(not key.isdecimal() or str(int(key)) != key or int(epoch) < 0 for key, epoch in value.items()):
             raise ValueError("observed board epoch keys must be canonical nonnegative decimal board IDs")
-        return value
-
-
-class MethodStep(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    action_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_.-]{0,127}$")
-    inputs: dict[str, Any] = Field(default_factory=dict, max_length=16)
-    repeat: StrictInt = Field(default=1, ge=1, le=10000)
-
-
-class MethodRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    schema_version: str = Field(pattern=r"^bioxp\.operator_method_request\.v1$")
-    name: str = Field(min_length=1, max_length=200)
-    idempotency_key: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
-    expected_ownership_generation: StrictInt = Field(ge=0)
-    failure_policy: str = Field(pattern=r"^fail_fast$")
-    steps: list[MethodStep] = Field(min_length=1, max_length=10000)
-    metadata: dict[str, str | int | bool] = Field(default_factory=dict, max_length=32)
-
-
-class OperatorMethodRequestV1(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    schema_version: str = Field(pattern=r"^bioxp\.operator_method_request\.v1$")
-    idempotency_key: str = Field(min_length=1, max_length=128)
-    method_action_id: str = Field(pattern=r"^oem\.xy\.(?:move_absolute|home)$")
-    expected_ownership_generation: StrictInt = Field(ge=0)
-    expected_board_epoch_by_board: dict[str, StrictInt]
-    inputs: dict[str, Any]
-
-    @field_validator("idempotency_key")
-    @classmethod
-    def validate_method_key_bytes(cls, value: str) -> str:
-        if not 1 <= len(value.encode("utf-8")) <= 128:
-            raise ValueError("idempotency_key must be 1..128 bytes")
-        return value
-
-    @field_validator("expected_board_epoch_by_board")
-    @classmethod
-    def validate_method_board_epochs(cls, value: dict[str, StrictInt]) -> dict[str, StrictInt]:
-        if any(not key.isdecimal() or str(int(key)) != key or int(epoch) < 0 for key, epoch in value.items()):
-            raise ValueError("board epoch keys must be canonical nonnegative decimal board IDs")
         return value
 
 
@@ -1795,10 +1732,10 @@ class OperatorCommandStore(CommandReceiptReader):
             finally:
                 self.connection.execute("PRAGMA busy_timeout=2000")
 
-    def _insert_transition(self, conn: sqlite3.Connection, *, event_kind: str, state: str, command_id: str | None = None, method_id: str | None = None, payload: Mapping[str, Any] | None = None) -> int:
+    def _insert_transition(self, conn: sqlite3.Connection, *, event_kind: str, state: str, command_id: str | None = None, payload: Mapping[str, Any] | None = None) -> int:
         row = conn.execute(
-            "INSERT INTO operator_plane_transitions(event_kind,command_id,method_id,state,payload_json,created_at) VALUES(?,?,?,?,?,?) RETURNING transition_sequence",
-            (event_kind, command_id, method_id, state, _canonical(payload or {}), _now()),
+            'INSERT INTO operator_plane_transitions(event_kind,command_id,state,payload_json,created_at) VALUES(?,?,?,?,?) RETURNING transition_sequence',
+            (event_kind, command_id, state, _canonical(payload or {}), _now(),),
         ).fetchone()
         assert row is not None
         self._transition_pending = True
@@ -1911,7 +1848,7 @@ class OperatorCommandStore(CommandReceiptReader):
             ).fetchone()
             active = conn.execute(
                 """
-                SELECT c.command_id,c.method_id,c.status,c.action_id,c.dispatch_attempt_id,
+                SELECT c.command_id,c.status,c.action_id,c.dispatch_attempt_id,
                        c.ownership_generation,d.command_id AS deck_plan_id,d.delivery_attempted,
                        w.command_id AS wp8_plan_id,
                        d.plan_digest,d.semantic_state_committed,d.provider_evidence_json,
@@ -2060,7 +1997,6 @@ class OperatorCommandStore(CommandReceiptReader):
                     conn,
                     event_kind="command_recovery",
                     command_id=command_id,
-                    method_id=item["method_id"],
                     state="failed",
                     payload=evidence,
                 )
@@ -2102,30 +2038,12 @@ class OperatorCommandStore(CommandReceiptReader):
                         conn,
                         event_kind="command_recovery",
                         command_id=command_id,
-                        method_id=item["method_id"],
                         state="recovery_required" if terminal_parent else "interrupted",
                         payload=evidence,
                     )
                     conn.execute(
                         "UPDATE operator_plane_wp8_background_tasks SET state='interrupted',evidence_json=?,updated_at=? WHERE command_id=? AND state IN ('created','running','ambiguous')",
                         (_canonical(evidence), _now(), command_id),
-                    )
-                method_ids = {
-                    str(item["method_id"]) for item in uncertain if item["method_id"]
-                }
-                for method_id in method_ids:
-                    conn.execute(
-                        "UPDATE operator_plane_methods SET status='recovery_required',"
-                        "version=version+1,updated_at=? WHERE method_id=? "
-                        "AND status NOT IN ('completed','failed','cancelled','stopped','aborted','interrupted')",
-                        (_now(), method_id),
-                    )
-                    self._insert_transition(
-                        conn,
-                        event_kind="method_recovery",
-                        method_id=method_id,
-                        state="recovery_required",
-                        payload={"reason": "process_owner_loss"},
                     )
                 conn.execute(
                     "UPDATE operator_plane_deck_commands SET ambiguity_state='recovery_required' "
@@ -2150,7 +2068,6 @@ class OperatorCommandStore(CommandReceiptReader):
         count = int(conn.execute("SELECT COUNT(*) FROM operator_plane_commands WHERE status NOT IN ('completed','failed','ambiguous','stopped','aborted','cancelled','cleared','interrupted')").fetchone()[0])
         byte_count = int(conn.execute("SELECT COALESCE(SUM(length(CAST(requested_json AS BLOB))+length(CAST(effective_json AS BLOB))),0) FROM operator_plane_commands WHERE status NOT IN ('completed','failed','ambiguous','stopped','aborted','cancelled','cleared','interrupted')").fetchone()[0])
         return count, byte_count
-
 
 
     @staticmethod
@@ -2194,10 +2111,10 @@ class OperatorCommandStore(CommandReceiptReader):
             payload["idempotent_replay"] = True
         return payload
 
-    def _store_idempotency(self, conn: sqlite3.Connection, *, kind: str, key: str, fingerprint: str, response: Mapping[str, Any], command_id: str | None = None, method_id: str | None = None) -> None:
+    def _store_idempotency(self, conn: sqlite3.Connection, *, kind: str, key: str, fingerprint: str, response: Mapping[str, Any], command_id: str | None = None) -> None:
         conn.execute(
-            "INSERT INTO operator_plane_idempotency(operation_kind,idempotency_key,fingerprint,command_id,method_id,response_json,created_at) VALUES(?,?,?,?,?,?,?)",
-            (kind, key, fingerprint, command_id, method_id, _canonical(response), _now()),
+            'INSERT INTO operator_plane_idempotency(operation_kind,idempotency_key,fingerprint,command_id,response_json,created_at) VALUES(?,?,?,?,?,?)',
+            (kind, key, fingerprint, command_id, _canonical(response), _now(),),
         )
 
     @staticmethod
@@ -2818,8 +2735,6 @@ class OperatorCommandStore(CommandReceiptReader):
         ownership_generation: int,
         accepted_at: float,
         expected_board_epochs: Mapping[str, int] | None = None,
-        method_id: str | None = None,
-        method_order: int = 0,
     ) -> None:
         axis = AXIS_BY_ACTION.get(action_id)
         motor_by_axis = {"y": 0, "z": 1}
@@ -2854,32 +2769,12 @@ class OperatorCommandStore(CommandReceiptReader):
             else {}
         )
         conn.execute(
-            """
-            INSERT INTO serial206_movement_commands(
-                command_id,idempotency_key,action_id,method_id,method_order,parallel_group,
-                axis_scope,board_scope_json,ownership_generation,expected_board_epochs_json,
-                canonical_inputs_sha256,state,state_version,admitted_interrupt_epochs_json,
-                accepted_at,queued_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                command_id,
-                idempotency_key,
-                action_id,
-                method_id,
-                int(method_order),
-                0,
-                axis_scope,
-                _canonical(board_scope),
-                int(ownership_generation),
-                _canonical(expected_epochs),
-                canonical_hash,
-                "queued",
-                1,
-                _canonical(interrupt_epochs),
-                accepted_at,
-                accepted_at,
-            ),
+            "INSERT INTO serial206_movement_commands("
+            "command_id,idempotency_key,action_id,axis_scope,board_scope_json,"
+            "ownership_generation,expected_board_epochs_json,canonical_inputs_sha256,"
+            "state,state_version,admitted_interrupt_epochs_json,accepted_at,queued_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (command_id, idempotency_key, action_id, axis_scope, _canonical(board_scope), int(ownership_generation), _canonical(expected_epochs), canonical_hash, "queued", 1, _canonical(interrupt_epochs), accepted_at, accepted_at,),
         )
         if deck_movement:
             resources = [
@@ -3258,8 +3153,8 @@ class OperatorCommandStore(CommandReceiptReader):
                 "upstream_source_command_id": snapshot["source_command_id"],
             }
             conn.execute(
-                "INSERT INTO operator_plane_commands(command_id,stream_sequence,method_id,method_sequence,action_id,requested_json,effective_json,status,version,ownership_generation,queued_at,dispatched_at,finished_at,terminal_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (command_id, sequence, None, None, "oem.deck.semantic_state_bootstrap", _canonical(dict(snapshot)), _canonical(dict(snapshot)), "completed", 1, int(snapshot["ownership_generation"]), now, now, now, _canonical(terminal), now),
+                'INSERT INTO operator_plane_commands(command_id,stream_sequence,action_id,requested_json,effective_json,status,version,ownership_generation,queued_at,dispatched_at,finished_at,terminal_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                (command_id, sequence, "oem.deck.semantic_state_bootstrap", _canonical(dict(snapshot)), _canonical(dict(snapshot)), "completed", 1, int(snapshot["ownership_generation"]), now, now, now, _canonical(terminal), now,),
             )
             self._insert_canonical_command(
                 conn,
@@ -3436,8 +3331,8 @@ class OperatorCommandStore(CommandReceiptReader):
         sequence = int(conn.execute("SELECT COALESCE(MAX(stream_sequence),0)+1 FROM operator_plane_commands").fetchone()[0])
         request = {"source_operation": operation, "source_command_id": upstream_id, "updates": values}
         conn.execute(
-            "INSERT INTO operator_plane_commands(command_id,stream_sequence,method_id,method_sequence,action_id,requested_json,effective_json,status,version,ownership_generation,queued_at,dispatched_at,finished_at,terminal_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (command_id, sequence, None, None, "oem.deck.semantic_state_publication", _canonical(request), _canonical(request), "completed", 1, ownership_generation, now, now, now, _canonical({"delivery_attempted": False, "source_command_id": upstream_id}), now),
+            'INSERT INTO operator_plane_commands(command_id,stream_sequence,action_id,requested_json,effective_json,status,version,ownership_generation,queued_at,dispatched_at,finished_at,terminal_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            (command_id, sequence, "oem.deck.semantic_state_publication", _canonical(request), _canonical(request), "completed", 1, ownership_generation, now, now, now, _canonical({"delivery_attempted": False, "source_command_id": upstream_id}), now,),
         )
         self._insert_canonical_command(
             conn, command_id=command_id, idempotency_key=f"deck-owner:{operation}:{upstream_id}",
@@ -4363,33 +4258,6 @@ class OperatorCommandStore(CommandReceiptReader):
         from .deck_location_invalidation import named_location_published
         named_location_published(self.root)
 
-    def _method_response(self, row: sqlite3.Row) -> dict[str, Any]:
-        transition_row = self.connection.execute("SELECT MAX(transition_sequence) FROM operator_plane_transitions WHERE method_id=?", (str(row["method_id"]),)).fetchone()
-        transition_sequence = transition_row[0] if transition_row and transition_row[0] is not None else None
-        pending_count, pending_bytes = self._capacity(self.connection)
-        return {
-            "schema_version": METHOD_RECEIPT_SCHEMA,
-            "robot_identity": ROBOT_IDENTITY,
-            "method_id": str(row["method_id"]),
-            "name": str(row["name"]),
-            "method_digest": str(row["digest"]),
-            "status": str(row["status"]),
-            "version": int(row["version"]),
-            "ownership_generation": int(row["ownership_generation"]),
-            "expanded_count": int(row["expanded_count"]),
-            "first_stream_sequence": row["first_stream_sequence"],
-            "last_stream_sequence": row["last_stream_sequence"],
-            "queued_at": float(row["queued_at"]),
-            "updated_at": float(row["updated_at"]),
-            "failure_policy": str(row["failure_policy"]),
-            "transition_sequence": int(transition_sequence) if transition_sequence is not None else None,
-            "capacity": {
-                "pending_count": pending_count,
-                "pending_bytes": pending_bytes,
-                "capacity_commands": COMMAND_CAPACITY,
-                "capacity_bytes": COMMAND_BYTES_CAPACITY,
-            },
-        }
 
     def admit_command(
         self,
@@ -4402,12 +4270,12 @@ class OperatorCommandStore(CommandReceiptReader):
         internal = action_id in INTERNAL_ACTIONS and getattr(self._internal_admission, "depth", 0) > 0
         if action_id not in ALLOWED_ACTIONS and not internal:
             raise HTTPException(status_code=422, detail={"error": "action_not_allowed", "action_id": action_id})
-        if action_id in STRICT_METHOD_ACTIONS:
+        if action_id in XY_ACTIONS:
             raise HTTPException(
                 status_code=409,
                 detail={
-                    "error": "canonical_strict_method_requires_v2_route",
-                    "replacement": "/operator/v2/methods",
+                    "error": "xy_action_requires_v2_route",
+                    "replacement": f"/operator/v2/actions/{action_id}",
                 },
             )
         inputs = _validate_inputs(action_id, request.get("inputs", {}))
@@ -4498,8 +4366,8 @@ class OperatorCommandStore(CommandReceiptReader):
                 "queued_at": _now(),
             }
             conn.execute(
-                "INSERT INTO operator_plane_commands(command_id,stream_sequence,method_id,method_sequence,action_id,requested_json,effective_json,status,version,ownership_generation,queued_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (command_id, sequence, None, None, action_id, _canonical(inputs), _canonical(effective), "queued", 1, expected_generation, row["queued_at"], row["queued_at"]),
+                'INSERT INTO operator_plane_commands(command_id,stream_sequence,action_id,requested_json,effective_json,status,version,ownership_generation,queued_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                (command_id, sequence, action_id, _canonical(inputs), _canonical(effective), "queued", 1, expected_generation, row["queued_at"], row["queued_at"],),
             )
             self._insert_canonical_command(
                 conn,
@@ -4618,189 +4486,6 @@ class OperatorCommandStore(CommandReceiptReader):
             self._internal_admission.depth = depth
             self._internal_admission.prepared_plan = previous_plan
 
-    def admit_method(
-        self,
-        request: Mapping[str, Any],
-        *,
-        state: Mapping[str, Any],
-        assessments: list[Mapping[str, Any]] | None = None,
-        strict_authority: bool = False,
-    ) -> dict[str, Any]:
-        expected_generation = int(request["expected_ownership_generation"])
-        requested_board_epochs = {
-            str(key): int(value)
-            for key, value in dict(request.get("expected_board_epoch_by_board") or {}).items()
-            if type(value) is int and value >= 0
-        }
-        expected_board_epochs: dict[str, int] = {}
-        expanded: list[tuple[str, dict[str, Any]]] = []
-        for step in request.get("steps", []):
-            action_id = str(step.get("action_id") or "")
-            if action_id not in ALLOWED_ACTIONS or action_id in {"oem.deck.move_to_location", "oem.deck.move_to_well"}:
-                raise HTTPException(status_code=422, detail={"error": "method_action_not_allowed", "action_id": action_id})
-            inputs = _validate_inputs(action_id, step.get("inputs", {}))
-            repeat = int(step.get("repeat", 1))
-            if repeat < 1 or repeat > MAX_METHOD_COMMANDS or len(expanded) + repeat > MAX_METHOD_COMMANDS:
-                raise HTTPException(status_code=422, detail={"error": "method_expansion_limit"})
-            for _ in range(repeat):
-                expanded.append((action_id, dict(inputs)))
-        if not expanded or len(expanded) > MAX_METHOD_COMMANDS:
-            raise HTTPException(status_code=422, detail={"error": "method_expansion_limit"})
-        method_action_id = str(dict(request.get("metadata") or {}).get("method_action_id") or "")
-        strict_actions = {action_id for action_id, _inputs in expanded if action_id in STRICT_METHOD_ACTIONS}
-        if strict_actions and not strict_authority:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "canonical_strict_method_requires_v2_route",
-                    "replacement": "/operator/v2/methods",
-                },
-            )
-        if strict_authority and strict_actions != {method_action_id}:
-            raise HTTPException(status_code=422, detail={"error": "strict_method_action_mismatch"})
-        if method_action_id in STRICT_METHOD_ACTIONS:
-            observed_generation = state.get("ownership_generation")
-            actual_generation = int(observed_generation) if type(observed_generation) is int else -1
-            if expected_generation != actual_generation:
-                raise HTTPException(
-                    status_code=409,
-                    detail={"error": "ownership_generation_mismatch", "actual": actual_generation},
-                )
-            expected_board_epochs = dict(requested_board_epochs)
-        source = {
-            "schema_version": METHOD_SCHEMA,
-            "name": str(request["name"]),
-            "failure_policy": "fail_fast",
-            "expected_board_epoch_by_board": expected_board_epochs,
-            "steps": [{"action_id": a, "inputs": i} for a, i in expanded],
-            "metadata": {
-                **dict(request.get("metadata") or {}),
-                "requested_board_epoch_by_board": requested_board_epochs,
-                "board_epoch_policy": "required_dispatch_execution_fence",
-            },
-        }
-        digest = _digest(source)
-        canonical_request = {"schema_version": METHOD_SCHEMA, "operation_kind": "method", "expected_ownership_generation": expected_generation, "expected_board_epoch_by_board": expected_board_epochs, "source": source}
-        fingerprint = _digest(canonical_request)
-        key = str(request["idempotency_key"])
-        saved = self.idempotency_checked("method", key, fingerprint)
-        if saved is not None:
-            current = self.get_method(str(saved.get("method_id") or ""))
-            replay_response = current or saved
-            replay_response["idempotent_replay"] = True
-            return replay_response
-        owner_scope = (self._deck_owner_authority_scope()
-                       if method_action_id in STRICT_METHOD_ACTIONS else nullcontext())
-        with owner_scope, self._transaction() as conn:
-            replay = self._saved_idempotency(conn, "method", key, fingerprint)
-            if replay is not None:
-                current_row = conn.execute(
-                    "SELECT * FROM operator_plane_methods WHERE method_id=?",
-                    (str(replay.get("method_id") or ""),),
-                ).fetchone()
-                replay_response = self._method_response(current_row) if current_row is not None else replay
-                replay_response["idempotent_replay"] = True
-                return replay_response
-            if method_action_id in STRICT_METHOD_ACTIONS:
-                expected_board_epochs = self._current_deck_board_epochs(state, method_action_id)
-                source["expected_board_epoch_by_board"] = expected_board_epochs
-                digest = _digest(source)
-            count, bytes_used = self._capacity(conn)
-            proposed_bytes = len(_canonical(source).encode("utf-8")) + sum(len(_canonical(i).encode("utf-8")) for _, i in expanded)
-            if count + len(expanded) > COMMAND_CAPACITY or bytes_used + proposed_bytes > COMMAND_BYTES_CAPACITY:
-                raise HTTPException(status_code=429, detail={"error": "capacity_exceeded", "pending_count": count, "pending_bytes": bytes_used, "max_pending_commands": COMMAND_CAPACITY, "max_pending_bytes": COMMAND_BYTES_CAPACITY})
-            method_id = str(uuid.uuid4())
-            now = _now()
-            first_sequence = int(conn.execute("SELECT COALESCE(MAX(stream_sequence),0)+1 FROM operator_plane_commands").fetchone()[0])
-            last_sequence = first_sequence + len(expanded) - 1
-            conn.execute(
-                "INSERT INTO operator_plane_methods(method_id,name,source_json,digest,failure_policy,status,version,ownership_generation,expanded_count,first_stream_sequence,last_stream_sequence,queued_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (method_id, str(request["name"]), _canonical(source), digest, "fail_fast", "queued", 1, expected_generation, len(expanded), first_sequence, last_sequence, now, now),
-            )
-            conn.execute(
-                "INSERT INTO serial206_movement_methods(method_id,idempotency_key,action_id,canonical_inputs_sha256,state,state_version,failure_policy,child_count,accepted_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (method_id, key, "operator.method", digest, "queued", 1, "require_completed", len(expanded), now),
-            )
-            previous_command_id: str | None = None
-            for index, (action_id, inputs) in enumerate(expanded, start=1):
-                sequence = first_sequence + index - 1
-                command_id = str(uuid.uuid4())
-                effective = _effective_inputs(action_id, inputs, state)
-                conn.execute(
-                    "INSERT INTO operator_plane_commands(command_id,stream_sequence,method_id,method_sequence,action_id,requested_json,effective_json,status,version,ownership_generation,queued_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (command_id, sequence, method_id, index, action_id, _canonical(inputs), _canonical(effective), "queued", 1, expected_generation, now, now),
-                )
-                self._insert_canonical_command(
-                    conn,
-                    command_id=command_id,
-                    idempotency_key=f"{key}:{index}",
-                    action_id=action_id,
-                    inputs=inputs,
-                    ownership_generation=expected_generation,
-                    accepted_at=now,
-                    method_id=method_id,
-                    method_order=index,
-                    expected_board_epochs={board: epoch for board, epoch in expected_board_epochs.items() if board in _active_board_epochs(state, action_id)},
-                )
-                if previous_command_id is not None:
-                    conn.execute(
-                        "INSERT INTO serial206_command_dependencies(command_id,depends_on_command_id,required_terminal) VALUES(?,?,'completed')",
-                        (command_id, previous_command_id),
-                    )
-                previous_command_id = command_id
-                self._insert_transition(conn, event_kind="command_admitted", command_id=command_id, method_id=method_id, state="queued", payload={"stream_sequence": sequence, "method_sequence": index, "action_id": action_id})
-            transition = self._insert_transition(conn, event_kind="method_admitted", method_id=method_id, state="queued", payload={"expanded_count": len(expanded), "first_stream_sequence": first_sequence, "last_stream_sequence": last_sequence})
-            method_row = conn.execute("SELECT * FROM operator_plane_methods WHERE method_id=?", (method_id,)).fetchone()
-            assert method_row is not None
-            response = {**self._method_response(method_row), "transition_sequence": transition, "idempotent_replay": False}
-            self._store_idempotency(conn, kind="method", key=key, fingerprint=fingerprint, response=response, method_id=method_id)
-        self._wake.set()
-        return response
-
-    def get_method(self, method_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self.connection.execute("SELECT * FROM operator_plane_methods WHERE method_id=?", (method_id,)).fetchone()
-            return self._method_response(row) if row else None
-
-    def list_method_commands(self, method_id: str) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self.connection.execute(
-                "SELECT * FROM operator_plane_commands WHERE method_id=? ORDER BY method_sequence,stream_sequence",
-                (method_id,),
-            ).fetchall()
-            return [self._command_response(row) for row in rows]
-
-    def method_commands(self, method_id: str, *, after: int, limit: int, token: str | None) -> dict[str, Any]:
-        limit = min(max(int(limit), 1), 200)
-        with self._transaction() as conn:
-            method = conn.execute("SELECT * FROM operator_plane_methods WHERE method_id=?", (method_id,)).fetchone()
-            if method is None:
-                raise HTTPException(status_code=404, detail="method not found")
-            if token is None:
-                watermark = int(conn.execute("SELECT COALESCE(MAX(transition_sequence),0) FROM operator_plane_transitions").fetchone()[0])
-                token = uuid.uuid4().hex
-                conn.execute("INSERT INTO operator_plane_snapshots(token,method_id,watermark,expires_at) VALUES(?,?,?,?)", (token, method_id, watermark, _now() + 900))
-            else:
-                snapshot = conn.execute("SELECT * FROM operator_plane_snapshots WHERE token=? AND method_id=?", (token, method_id)).fetchone()
-                if snapshot is None:
-                    raise HTTPException(status_code=409, detail={"error": "snapshot_expired"})
-                if float(snapshot["expires_at"]) < _now():
-                    conn.execute("DELETE FROM operator_plane_snapshots WHERE token=?", (token,))
-                    raise HTTPException(status_code=409, detail={"error": "snapshot_expired"})
-                watermark = int(snapshot["watermark"])
-            rows = conn.execute("SELECT * FROM operator_plane_commands WHERE method_id=? AND method_sequence>? ORDER BY method_sequence LIMIT ?", (method_id, int(after), limit + 1)).fetchall()
-            has_more = len(rows) > limit
-            rows = rows[:limit]
-            result: list[dict[str, Any]] = []
-            for row in rows:
-                current = self._command_response(row, transition_sequence=watermark)
-                transition = conn.execute("SELECT state,payload_json,transition_sequence FROM operator_plane_transitions WHERE command_id=? AND transition_sequence<=? ORDER BY transition_sequence DESC LIMIT 1", (row["command_id"], watermark)).fetchone()
-                if transition is not None:
-                    current["status"] = str(transition["state"])
-                    current["snapshot_transition_sequence"] = int(transition["transition_sequence"])
-                result.append(current)
-            next_after = int(rows[-1]["method_sequence"]) if rows else int(after)
-            return {"schema_version": "bioxp.operator_method_commands.v1", "method_id": method_id, "commands": result, "next_after_method_sequence": next_after, "has_more": has_more, "snapshot_transition_sequence": watermark, "snapshot_token": token}
 
     def queue(self) -> dict[str, Any]:
         with self._lock:
@@ -4809,7 +4494,7 @@ class OperatorCommandStore(CommandReceiptReader):
             row = self.connection.execute("SELECT stream_sequence FROM operator_plane_commands WHERE status NOT IN ('completed','failed','ambiguous','stopped','aborted','cancelled','cleared','interrupted') ORDER BY stream_sequence LIMIT 1").fetchone()
             safety = self.connection.execute("SELECT global_epoch FROM operator_plane_safety WHERE singleton=1").fetchone()
             pending = self.connection.execute(
-                "SELECT c.command_id,c.stream_sequence,m.state AS status,c.method_id,c.queued_at "
+                "SELECT c.command_id,c.stream_sequence,m.state AS status,c.queued_at "
                 "FROM operator_plane_commands c JOIN serial206_movement_commands m USING(command_id) "
                 "WHERE m.state IN ('queued','dispatched','issued_pending','interrupting') "
                 "ORDER BY c.stream_sequence"
@@ -4824,17 +4509,20 @@ class OperatorCommandStore(CommandReceiptReader):
                 resources.setdefault(str(resource["command_id"]), []).append(str(resource["resource_key"]))
             items = [{"command_id": str(item["command_id"]), "sequence": int(item["stream_sequence"]),
                 "status": str(item["status"]),
-                "method_id": item["method_id"], "resource_keys": resources.get(str(item["command_id"]), []),
+                "method_id": None, "resource_keys": resources.get(str(item["command_id"]), []),
                 "accepted_at": float(item["queued_at"])} for item in pending]
             return {"items": items, "schema_version": "bioxp.operator_queue.v1", "pending_count": count, "pending_bytes": bytes_used, "capacity_commands": COMMAND_CAPACITY, "capacity_bytes": COMMAND_BYTES_CAPACITY, "active_command": self._command_response(active) if active else None, "next_stream_sequence": int(row[0]) if row else None, "global_safety_epoch": int(safety["global_epoch"]) if safety is not None else 0}
 
     def transitions(self, *, after: int, limit: int) -> dict[str, Any]:
         limit = min(max(int(limit), 1), 200)
         with self._lock:
-            rows = self.connection.execute("SELECT * FROM operator_plane_transitions WHERE transition_sequence>? ORDER BY transition_sequence LIMIT ?", (int(after), limit + 1)).fetchall()
+            rows = self.connection.execute("SELECT t.*,json_extract(r.payload_json,'$.method_id') AS historical_method_id "
+                "FROM operator_plane_transitions t LEFT JOIN runtime_retired_records r "
+                "ON r.source_table='operator_plane_transitions' AND r.record_key=json_array(t.transition_sequence) "
+                "WHERE t.transition_sequence>? ORDER BY t.transition_sequence LIMIT ?", (int(after), limit + 1)).fetchall()
             has_more = len(rows) > limit
             rows = rows[:limit]
-            events = [{"event_kind": str(row["event_kind"]), "transition_sequence": int(row["transition_sequence"]), "command_id": row["command_id"], "method_id": row["method_id"], "state": str(row["state"]), "payload": _json_load(row["payload_json"], {}) , "created_at": float(row["created_at"])} for row in rows]
+            events = [{"event_kind": str(row["event_kind"]), "transition_sequence": int(row["transition_sequence"]), "command_id": row["command_id"], "method_id": row["historical_method_id"], "state": str(row["state"]), "payload": _json_load(row["payload_json"], {}) , "created_at": float(row["created_at"])} for row in rows]
             high = int(self.connection.execute("SELECT COALESCE(MAX(transition_sequence),0) FROM operator_plane_transitions").fetchone()[0])
             low = int(self.connection.execute("SELECT COALESCE(MIN(transition_sequence),0) FROM operator_plane_transitions").fetchone()[0])
             next_after = int(rows[-1]["transition_sequence"]) if rows else int(after)
@@ -4843,8 +4531,7 @@ class OperatorCommandStore(CommandReceiptReader):
     def recovery(self) -> dict[str, Any]:
         with self._lock:
             safety = self.connection.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone()
-            unknown = self.connection.execute("SELECT command_id,method_id,status,stream_sequence FROM operator_plane_commands WHERE status IN ('ambiguous','interrupted') ORDER BY stream_sequence").fetchall()
-            methods = sorted({str(row["method_id"]) for row in unknown if row["method_id"]})
+            unknown = self.connection.execute("SELECT command_id,status,stream_sequence FROM operator_plane_commands WHERE status IN ('ambiguous','interrupted') ORDER BY stream_sequence").fetchall()
             queued_rows = self.connection.execute("SELECT stream_sequence FROM operator_plane_commands WHERE status='queued' ORDER BY stream_sequence").fetchall()
             queued = len(queued_rows)
             lane = self.connection.execute("SELECT dispatcher_epoch FROM operator_plane_lane WHERE singleton=1").fetchone()
@@ -4852,7 +4539,7 @@ class OperatorCommandStore(CommandReceiptReader):
                 "first_stream_sequence": int(queued_rows[0][0]) if queued_rows else None,
                 "last_stream_sequence": int(queued_rows[-1][0]) if queued_rows else None,
             }
-            return {"schema_version": RECOVERY_SCHEMA, "recovery_epoch": int(safety["recovery_epoch"]), "version": int(safety["recovery_version"]), "hold": bool(safety["recovery_hold"]), "outcome_unknown_command_ids": [str(row["command_id"]) for row in unknown], "affected_method_ids": methods, "queued_count": int(queued), "queued_range": queued_range, "dispatcher_epoch": int(lane["dispatcher_epoch"]) if lane is not None else 0, "global_safety_epoch": int(safety["global_epoch"]), "x_safety_epoch": int(safety["x_epoch"]), "y_safety_epoch": int(safety["y_epoch"]), "z_safety_epoch": int(safety["z_epoch"]), "available_resolutions": ["resume_undispatched", "cancel_pending"] if safety["recovery_hold"] else []}
+            return {"schema_version": RECOVERY_SCHEMA, "recovery_epoch": int(safety["recovery_epoch"]), "version": int(safety["recovery_version"]), "hold": bool(safety["recovery_hold"]), "outcome_unknown_command_ids": [str(row["command_id"]) for row in unknown], "affected_method_ids": [], "queued_count": int(queued), "queued_range": queued_range, "dispatcher_epoch": int(lane["dispatcher_epoch"]) if lane is not None else 0, "global_safety_epoch": int(safety["global_epoch"]), "x_safety_epoch": int(safety["x_epoch"]), "y_safety_epoch": int(safety["y_epoch"]), "z_safety_epoch": int(safety["z_epoch"]), "available_resolutions": ["resume_undispatched", "cancel_pending"] if safety["recovery_hold"] else []}
 
     def mark_deck_recovery_required(
         self,
@@ -4927,57 +4614,6 @@ class OperatorCommandStore(CommandReceiptReader):
             self._store_idempotency(conn, kind="cancel_command", key=str(request["idempotency_key"]), fingerprint=fp, response=response, command_id=command_id)
             return response
 
-    def method_mutation(self, method_id: str, operation: str, request: Mapping[str, Any]) -> dict[str, Any]:
-        fp = _digest({"operation_kind": operation, "method_id": method_id, **_without_idempotency(request)})
-        key = str(request["idempotency_key"])
-        saved = self.idempotency_checked(operation, key, fp)
-        if saved is not None:
-            saved["idempotent_replay"] = True
-            return saved
-        with self._transaction() as conn:
-            method = conn.execute("SELECT * FROM operator_plane_methods WHERE method_id=?", (method_id,)).fetchone()
-            if method is None:
-                raise HTTPException(status_code=404, detail="method not found")
-            replay = self._saved_idempotency(conn, operation, key, fp)
-            if replay is not None:
-                return replay
-            safety = conn.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone()
-            axes = [str(item[0]) for item in conn.execute("SELECT action_id FROM operator_plane_commands WHERE method_id=?", (method_id,)).fetchall()]
-            relevant_axis_epoch = max(
-                [int(safety["x_epoch"]) for action in axes if action.startswith("oem.x.")]
-                + [int(safety["y_epoch"]) for action in axes if action.startswith("oem.y.")]
-                + [int(safety["z_epoch"]) for action in axes if action.startswith("oem.z.")]
-                + [int(safety[f"{axis}_epoch"]) for action in axes
-                   if action in {"oem.xy.move_absolute", "oem.xy.home", "oem.z.scriptmove_to"}
-                   for axis in self._axes_for_action(action)]
-                + [0]
-            )
-            if int(safety["recovery_epoch"]) != int(request["expected_recovery_epoch"]) or int(safety["global_epoch"]) != int(request["expected_global_safety_epoch"]) or relevant_axis_epoch != int(request["expected_axis_safety_epoch"]):
-                raise HTTPException(status_code=409, detail={"error": "method_safety_epoch_conflict"})
-            if int(method["version"]) != int(request["expected_version"]):
-                raise HTTPException(status_code=409, detail={"error": "method_version_conflict", "current_version": int(method["version"])})
-            status = str(method["status"])
-            if operation == "pause":
-                if status not in {"queued", "running"}:
-                    raise HTTPException(status_code=409, detail={"error": "method_not_pauseable", "status": status})
-                new_status = "pause_requested"
-            elif operation == "resume":
-                if status != "paused":
-                    raise HTTPException(status_code=409, detail={"error": "method_not_resumable", "status": status})
-                new_status = "running"
-            else:
-                if status not in METHOD_NONTERMINAL:
-                    raise HTTPException(status_code=409, detail={"error": "method_not_cancellable", "status": status})
-                new_status = "cancel_requested"
-                conn.execute("UPDATE operator_plane_commands SET status='cancelled',version=version+1,finished_at=?,updated_at=?,terminal_json=? WHERE method_id=? AND status='queued'", (_now(), _now(), _canonical({"reason": "method_cancel"}), method_id))
-            conn.execute("UPDATE operator_plane_methods SET status=?,version=version+1,updated_at=? WHERE method_id=? AND version=?", (new_status, _now(), method_id, int(method["version"])))
-            transition = self._insert_transition(conn, event_kind=f"method_{operation}", method_id=method_id, state=new_status, payload={"expected_version": int(method["version"])})
-            updated = conn.execute("SELECT * FROM operator_plane_methods WHERE method_id=?", (method_id,)).fetchone()
-            assert updated is not None
-            response = {**self._method_response(updated), "mutation_id": str(uuid.uuid4()), "prior_version": int(method["version"]), "transition_sequence": transition}
-            self._store_idempotency(conn, kind=operation, key=key, fingerprint=fp, response=response, method_id=method_id)
-        self._wake.set()
-        return response
 
     def _abandon_terminal_workflow(self, conn, *, acknowledged: Sequence[str]) -> str | None:
         """Relinquish software custody only; unknown physical outcomes stay unknown."""
@@ -5043,7 +4679,6 @@ class OperatorCommandStore(CommandReceiptReader):
                 # All cancellation and custody changes roll back on an active
                 # executor/child refusal; no old queued child can escape later.
                 abandoned_workflow = self._abandon_terminal_workflow(conn, acknowledged=unknown)
-            affected_methods = sorted({str(row["method_id"]) for row in conn.execute("SELECT method_id FROM operator_plane_commands WHERE command_id IN ({})".format(",".join("?" for _ in unknown)), tuple(unknown)).fetchall() if row["method_id"]} if unknown else set())
             deck_unknown = self._deck_recovery_blocker(conn) is not None
             for command_id in unknown:
                 acknowledgement = {
@@ -5061,12 +4696,6 @@ class OperatorCommandStore(CommandReceiptReader):
                     "INSERT INTO operator_plane_recovery_acknowledgements(acknowledgement_id,command_id,recovery_epoch,operation,receipt_json,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT(command_id,recovery_epoch) DO NOTHING",
                     (str(uuid.uuid4()), command_id, int(recovery_epoch), operation, _canonical(acknowledgement), _now()),
                 )
-            if operation == "cancel_pending":
-                for method_id in affected_methods:
-                    conn.execute("UPDATE operator_plane_methods SET status='cancelled',version=version+1,updated_at=? WHERE method_id=? AND status NOT IN ('completed','failed','cancelled','stopped','aborted','interrupted')", (_now(), method_id))
-            else:
-                for method_id in affected_methods:
-                    conn.execute("UPDATE operator_plane_methods SET status='running',version=version+1,updated_at=? WHERE method_id=? AND status='recovery_required'", (_now(), method_id))
             conn.execute(
                 "UPDATE operator_plane_safety SET recovery_hold=?,recovery_version=recovery_version+1,updated_at=? WHERE singleton=1",
                 (int(deck_unknown), _now()),
@@ -5644,7 +5273,7 @@ class OperatorCommandStore(CommandReceiptReader):
                 "idempotency_key": str(key),
                 "fingerprint": str(row["fingerprint"]),
                 "command_id": row["command_id"],
-                "method_id": row["method_id"],
+                "method_id": None,
                 "response": _json_load(row["response_json"], {}),
             }
 
@@ -5717,13 +5346,6 @@ class OperatorCommandStore(CommandReceiptReader):
                 ).fetchone()
                 if candidate_canonical is None or str(candidate_canonical["state"]) != "queued":
                     continue
-                if candidate["method_id"]:
-                    method = conn.execute(
-                        "SELECT status FROM operator_plane_methods WHERE method_id=?",
-                        (candidate["method_id"],),
-                    ).fetchone()
-                    if method is None or str(method["status"]) not in {"queued", "running"}:
-                        return None
                 dependency_pending = conn.execute(
                     """
                     SELECT 1
@@ -5764,23 +5386,6 @@ class OperatorCommandStore(CommandReceiptReader):
             if row is None or canonical is None:
                 return None
 
-            if row["method_id"]:
-                method = conn.execute(
-                    "SELECT status FROM operator_plane_methods WHERE method_id=?",
-                    (row["method_id"],),
-                ).fetchone()
-                if method is not None and str(method["status"]) == "queued":
-                    conn.execute(
-                        "UPDATE operator_plane_methods SET status='running',version=version+1,updated_at=? WHERE method_id=? AND status='queued'",
-                        (now, row["method_id"]),
-                    )
-                    self._insert_transition(
-                        conn,
-                        event_kind="method_running",
-                        method_id=str(row["method_id"]),
-                        state="running",
-                        payload={"first_child_command_id": str(row["command_id"])},
-                    )
 
             attempt_id = str(uuid.uuid4())
             epoch = int(lane["dispatcher_epoch"])
@@ -5817,7 +5422,6 @@ class OperatorCommandStore(CommandReceiptReader):
                 conn,
                 event_kind="command_dispatched",
                 command_id=str(row["command_id"]),
-                method_id=row["method_id"],
                 state="dispatched",
                 payload={"dispatch_attempt_id": attempt_id, "dispatcher_epoch": epoch},
             )
@@ -5832,8 +5436,8 @@ class OperatorCommandStore(CommandReceiptReader):
             assert claimed is not None
             return {
                 "command_id": str(claimed["command_id"]),
-                "method_id": claimed["method_id"],
-                "method_sequence": claimed["method_sequence"],
+                "method_id": None,
+                "method_sequence": None,
                 "action_id": str(claimed["action_id"]),
                 "requested_inputs": _json_load(claimed["requested_json"], {}),
                 "effective_inputs": _json_load(claimed["effective_json"], {}),
@@ -5865,7 +5469,7 @@ class OperatorCommandStore(CommandReceiptReader):
             evidence = _canonical(pending_payload)
             conn.execute("UPDATE operator_plane_commands SET status='issued_pending',version=version+1,terminal_json=?,updated_at=? WHERE command_id=? AND version=? AND status='dispatched'", (evidence, now, command_id, int(row["version"])))
             conn.execute("UPDATE serial206_movement_commands SET state='issued_pending',state_version=state_version+1 WHERE command_id=? AND state='dispatched'", (command_id,))
-            self._insert_transition(conn, event_kind="command_pending", command_id=command_id, method_id=row["method_id"], state="issued_pending", payload=dict(payload))
+            self._insert_transition(conn, event_kind="command_pending", command_id=command_id, state="issued_pending", payload=dict(payload))
             updated = conn.execute("SELECT * FROM operator_plane_commands WHERE command_id=?", (command_id,)).fetchone()
             assert updated is not None
             result = self._command_response(updated)
@@ -5968,83 +5572,15 @@ class OperatorCommandStore(CommandReceiptReader):
                 "UPDATE serial206_movement_commands SET state=?,state_version=state_version+1,finished_at=?,terminal_receipt_id=? WHERE command_id=? AND state NOT IN ('completed','failed','cleared','interrupted','ambiguous','rejected')",
                 (canonical_status, now, str(payload.get("receipt_id")) if payload.get("receipt_id") is not None else None, command_id),
             )
-            transition = self._insert_transition(conn, event_kind="command_terminal", command_id=command_id, method_id=row["method_id"], state=status, payload={"source_noop": source_noop, "reason": source_noop_reason, **dict(payload)})
+            transition = self._insert_transition(conn, event_kind="command_terminal", command_id=command_id, state=status, payload={"source_noop": source_noop, "reason": source_noop_reason, **dict(payload)})
             conn.execute("INSERT INTO operator_plane_outbox(outbox_id,command_id,transition_sequence,state,payload_json,updated_at) VALUES(?,?,?,?,?,?)", (str(uuid.uuid4()), command_id, transition, "pending", _canonical(_bounded_json(payload, 131072)), _now()))
-            method_id = row["method_id"]
 
-            if method_id:
-                self._derive_method(conn, str(method_id))
             updated = conn.execute("SELECT * FROM operator_plane_commands WHERE command_id=?", (command_id,)).fetchone()
             assert updated is not None
             result = self._command_response(updated, transition_sequence=transition)
         self._wake.set()
         return result
 
-    def _derive_method(self, conn: sqlite3.Connection, method_id: str) -> None:
-        method = conn.execute("SELECT * FROM operator_plane_methods WHERE method_id=?", (method_id,)).fetchone()
-        if method is None:
-            return
-        rows = conn.execute("SELECT status FROM operator_plane_commands WHERE method_id=? ORDER BY method_sequence", (method_id,)).fetchall()
-        states = [str(row[0]) for row in rows]
-        current = str(method["status"])
-        if any(state in {"ambiguous", "interrupted"} for state in states):
-            target = "recovery_required"
-        elif any(state == "failed" for state in states):
-            target = "failed"
-        elif current == "pause_requested" and not any(state in {"dispatched", "stop_requested", "abort_requested"} for state in states):
-            target = "paused"
-        elif current in {"cancel_requested", "stopping", "aborting"} and all(state in COMMAND_TERMINAL for state in states):
-            target = "cancelled" if current == "cancel_requested" else ("stopped" if current == "stopping" else "aborted")
-        elif states and all(state == "completed" for state in states):
-            target = "completed"
-        elif states and all(state in COMMAND_TERMINAL for state in states) and any(
-            state in {"stopped", "aborted", "cleared"} for state in states
-        ):
-            target = "interrupted"
-        elif any(state == "dispatched" for state in states):
-            target = "running"
-        else:
-            target = current
-        if target in {"failed", "cancelled", "stopped", "aborted"}:
-            child_state = "cancelled" if target in {"failed", "cancelled"} else "cleared"
-            reason = "method_fail_fast" if target == "failed" else f"method_{target}"
-            pending_children = conn.execute(
-                "SELECT command_id FROM operator_plane_commands WHERE method_id=? AND status='queued' ORDER BY method_sequence",
-                (method_id,),
-            ).fetchall()
-            conn.execute("UPDATE operator_plane_commands SET status=?,version=version+1,finished_at=?,updated_at=?,terminal_json=? WHERE method_id=? AND status='queued'", (child_state, _now(), _now(), _canonical({"reason": reason}), method_id))
-            conn.execute("UPDATE serial206_movement_commands SET state='cleared',state_version=state_version+1,finished_at=? WHERE method_id=? AND state='queued'", (_now(), method_id))
-            for pending_child in pending_children:
-                child_id = str(pending_child[0])
-                terminal_payload = {"reason": reason, "method_id": method_id, "delivery_attempted": False}
-                transition = self._insert_transition(conn, event_kind="method_sibling_terminal", command_id=child_id, method_id=method_id, state=child_state, payload=terminal_payload)
-                conn.execute(
-                    "INSERT INTO operator_plane_outbox(outbox_id,command_id,transition_sequence,state,payload_json,updated_at) VALUES(?,?,?,?,?,?)",
-                    (str(uuid.uuid4()), child_id, transition, "pending", _canonical(terminal_payload), _now()),
-                )
-        if target != current and target in METHOD_STATES:
-            conn.execute("UPDATE operator_plane_methods SET status=?,version=version+1,updated_at=? WHERE method_id=?", (target, _now(), method_id))
-            canonical_target = {
-                "queued": "queued",
-                "running": "active",
-                "pause_requested": "active",
-                "paused": "active",
-                "cancel_requested": "active",
-                "stopping": "active",
-                "aborting": "active",
-                "recovery_required": "ambiguous",
-                "completed": "completed",
-                "failed": "failed",
-                "cancelled": "cleared",
-                "stopped": "interrupted",
-                "aborted": "interrupted",
-                "interrupted": "interrupted",
-            }[target]
-            conn.execute(
-                "UPDATE serial206_movement_methods SET state=?,state_version=state_version+1,started_at=CASE WHEN ?='active' THEN COALESCE(started_at,?) ELSE started_at END,finished_at=CASE WHEN ? IN ('completed','failed','cleared','interrupted','ambiguous') THEN ? ELSE finished_at END WHERE method_id=?",
-                (canonical_target, canonical_target, _now(), canonical_target, _now(), method_id),
-            )
-            self._insert_transition(conn, event_kind="method_derived", method_id=method_id, state=target, payload={"child_states": states})
 
     @staticmethod
     def _conservative_aggregate_interrupt(action_id: str) -> bool:
@@ -6151,15 +5687,15 @@ class OperatorCommandStore(CommandReceiptReader):
                     conn.execute("UPDATE operator_plane_safety SET global_epoch=?,x_epoch=?,y_epoch=?,z_epoch=?,recovery_version=recovery_version+1,updated_at=? WHERE singleton=1", (global_epoch, x_epoch, y_epoch, z_epoch, _now()))
                     if aggregate_interrupt:
                         queued_rows = conn.execute(
-                            "SELECT command_id,method_id FROM operator_plane_commands WHERE stream_sequence<=? AND status='queued' ORDER BY stream_sequence",
+                            "SELECT command_id FROM operator_plane_commands WHERE stream_sequence<=? AND status='queued' ORDER BY stream_sequence",
                             (cutoff,),
                         ).fetchall()
                     else:
                         queued_rows = conn.execute(
-                            "SELECT DISTINCT c.command_id,c.method_id FROM operator_plane_commands c JOIN serial206_command_resources r ON r.command_id=c.command_id WHERE c.stream_sequence<=? AND c.status='queued' AND r.resource_key=? ORDER BY c.stream_sequence",
+                            "SELECT DISTINCT c.command_id FROM operator_plane_commands c JOIN serial206_command_resources r ON r.command_id=c.command_id WHERE c.stream_sequence<=? AND c.status='queued' AND r.resource_key=? ORDER BY c.stream_sequence",
                             (cutoff, f"axis:{axis}"),
                         ).fetchall()
-                    queued_by_id = {str(row["command_id"]): row["method_id"] for row in queued_rows}
+                    queued_by_id = {str(row["command_id"]): None for row in queued_rows}
                     dependency_roots = [*active_ids, *queued_by_id.keys()]
                     if not aggregate_interrupt and dependency_roots:
                         placeholders = ",".join("?" for _ in dependency_roots)
@@ -6173,7 +5709,7 @@ class OperatorCommandStore(CommandReceiptReader):
                                 FROM serial206_command_dependencies dependency
                                 JOIN dependent parent ON dependency.depends_on_command_id=parent.command_id
                             )
-                            SELECT command.command_id,command.method_id
+                            SELECT command.command_id
                             FROM operator_plane_commands command
                             JOIN dependent ON dependent.command_id=command.command_id
                             WHERE command.status='queued' AND command.stream_sequence<=?
@@ -6182,16 +5718,10 @@ class OperatorCommandStore(CommandReceiptReader):
                             (*dependency_roots, cutoff),
                         ).fetchall()
                         for dependent in dependent_rows:
-                            queued_by_id[str(dependent["command_id"])] = dependent["method_id"]
-                    affected_method_ids = {
-                        str(method_id) for method_id in queued_by_id.values() if method_id
-                    }
-                    for active_method in conn.execute("SELECT method_id FROM operator_plane_commands WHERE command_id IN (%s)" % ",".join("?" for _ in active_ids), tuple(active_ids)).fetchall() if active_ids else []:
-                        if active_method[0]:
-                            affected_method_ids.add(str(active_method[0]))
+                            queued_by_id[str(dependent["command_id"])] = None
                     reason_json = _canonical({"reason": action_id, "cutoff": cutoff})
                     now = _now()
-                    for queued_id, method_id in queued_by_id.items():
+                    for queued_id in queued_by_id:
                         conn.execute(
                             "UPDATE operator_plane_commands SET status='cleared',version=version+1,finished_at=?,updated_at=?,terminal_json=? WHERE command_id=? AND status='queued'",
                             (now, now, reason_json, queued_id),
@@ -6205,7 +5735,6 @@ class OperatorCommandStore(CommandReceiptReader):
                             conn,
                             event_kind="interrupt_cleared_queued",
                             command_id=queued_id,
-                            method_id=method_id,
                             state="cleared",
                             payload=terminal_payload,
                         )
@@ -6213,10 +5742,6 @@ class OperatorCommandStore(CommandReceiptReader):
                             "INSERT INTO operator_plane_outbox(outbox_id,command_id,transition_sequence,state,payload_json,updated_at) VALUES(?,?,?,?,?,?)",
                             (str(uuid.uuid4()), queued_id, transition_sequence, "pending", _canonical(terminal_payload), now),
                         )
-                    if action_id in {"oem.abort_all", "oem.z.abort"}:
-                        for method_id in affected_method_ids:
-                            conn.execute("UPDATE operator_plane_methods SET status='aborting',version=version+1,updated_at=? WHERE method_id=? AND status NOT IN ('completed','failed','cancelled','stopped','aborted','interrupted','recovery_required')", (now, method_id))
-                            self._insert_transition(conn, event_kind="method_derived", method_id=method_id, state="aborting", payload={"reason": action_id, "cutoff": cutoff})
                     if aggregate_interrupt:
                         conn.execute(
                             "UPDATE serial206_axis_authority SET interrupt_epoch=interrupt_epoch+1,lifecycle_state='reconciliation_required',reference_state='reconciliation_required',prepared_board_epoch=NULL,state_version=state_version+1,updated_at=? WHERE axis IN ('y','z','gripper')",
@@ -6232,9 +5757,7 @@ class OperatorCommandStore(CommandReceiptReader):
                         requested_state = "abort_requested" if action_id in {"oem.abort_all", "oem.z.abort"} else "stop_requested"
                         conn.execute("UPDATE operator_plane_commands SET status=?,version=version+1,interrupt_id=?,interrupt_global_safety_epoch=?,interrupt_axis_safety_epoch=?,updated_at=?,terminal_json=? WHERE command_id=? AND status IN ('dispatched','issued_pending')", (requested_state, interrupt_id, global_epoch, {"x": x_epoch, "y": y_epoch, "z": z_epoch}.get(axis or "", z_epoch), _now(), _canonical({"interrupt_id": interrupt_id, "action_id": action_id}), str(active_id)))
                         conn.execute("UPDATE serial206_movement_commands SET state='interrupting',state_version=state_version+1 WHERE command_id=? AND state IN ('dispatched','issued_pending')", (str(active_id),))
-                        transition = self._insert_transition(conn, event_kind="interrupt_requested", command_id=str(active_id), method_id=row["method_id"], state=requested_state, payload={"interrupt_id": interrupt_id, "action_id": action_id, "cutoff": cutoff})
-                    for method_id in affected_method_ids:
-                        self._derive_method(conn, method_id)
+                        transition = self._insert_transition(conn, event_kind="interrupt_requested", command_id=str(active_id), state=requested_state, payload={"interrupt_id": interrupt_id, "action_id": action_id, "cutoff": cutoff})
                     active_id = active_ids[0] if active_ids else None
                     response = {"schema_version": "bioxp.operator_interrupt_receipt.v1", "robot_identity": ROBOT_IDENTITY, "ownership_generation": int(state.get("ownership_generation") or 0), "interrupt_id": interrupt_id, "interrupt_attempt_id": interrupt_id, "action_id": action_id, "scope": "aggregate" if action_id in {"oem.abort_all", "oem.z.abort"} else axis, "cutoff": cutoff, "active_command_id": active_id, "active_command_ids": active_ids, "global_safety_epoch": global_epoch, "x_safety_epoch": x_epoch, "y_safety_epoch": y_epoch, "z_safety_epoch": z_epoch, "oem_abort_latched": action_id in {"oem.abort_all", "oem.z.abort"}, "controller_stop_attempted": False, "source_call_completed": False, "source_return_ok": False, "controller_stop_acknowledged": False, "physical_effect_verified": False, "persistence_state": "committed", "transition_sequence": transition, "idempotent_replay": replay}
                     response.update({"fence_scope": "aggregate" if aggregate_interrupt else axis, "invocation_attempted": False, "stop_delivery_attempted": False, "software_abort": action_id in {"oem.abort_all", "oem.z.abort"}, "physical_scope": "none_software_flags_and_waiters" if action_id in {"oem.abort_all", "oem.z.abort"} else axis, "observed_ownership_generation": request.get("observed_ownership_generation"), "observed_board_epoch_by_board": dict(request.get("observed_board_epoch_by_board") or {}), "recovery_hold": False, "terminal_transition_sequences": []})
@@ -6352,23 +5875,18 @@ class OperatorCommandStore(CommandReceiptReader):
                 "persistence_state": "committed",
                 "recovery_hold": False,
             })
-            affected_method_ids: set[str] = set()
             for active_id in active_ids:
                 row = conn.execute("SELECT * FROM operator_plane_commands WHERE command_id=?", (str(active_id),)).fetchone()
                 if row is not None and str(row["status"]) in {"dispatched", "stop_requested", "abort_requested"}:
                     final_state = terminal_state if interrupt_succeeded else "ambiguous"
                     terminal_payload = {"interrupt_id": interrupt_id, "source_call_completed": bool(acknowledged), "source_return_ok": source_return_ok, "controller_acknowledged": controller_acknowledged, "error": error}
                     conn.execute("UPDATE operator_plane_commands SET status=?,version=version+1,finished_at=?,updated_at=?,terminal_json=?,controller_acknowledged=? WHERE command_id=?", (final_state, _now(), _now(), _canonical(terminal_payload), int(controller_acknowledged), str(active_id)))
-                    if row["method_id"]:
-                        affected_method_ids.add(str(row["method_id"]))
                     self._update_z_home_authority(conn, command_id=str(active_id), ownership_generation=int(row["ownership_generation"]), status=final_state, payload=terminal_payload, source_noop=False)
                     canonical_state = "interrupted" if interrupt_succeeded else "ambiguous"
                     conn.execute("UPDATE serial206_movement_commands SET state=?,state_version=state_version+1,finished_at=?,terminal_receipt_id=? WHERE command_id=? AND state='interrupting'", (canonical_state, _now(), interrupt_id, str(active_id)))
-                    transition = self._insert_transition(conn, event_kind="interrupt_terminal", command_id=str(active_id), method_id=row["method_id"], state=final_state, payload={"interrupt_id": interrupt_id, "source_call_completed": bool(acknowledged), "source_return_ok": source_return_ok, "controller_acknowledged": controller_acknowledged, "error": error})
+                    transition = self._insert_transition(conn, event_kind="interrupt_terminal", command_id=str(active_id), state=final_state, payload={"interrupt_id": interrupt_id, "source_call_completed": bool(acknowledged), "source_return_ok": source_return_ok, "controller_acknowledged": controller_acknowledged, "error": error})
                     current.setdefault("terminal_transition_sequences", []).append(transition)
                     conn.execute("INSERT INTO operator_plane_outbox(outbox_id,command_id,transition_sequence,state,payload_json,updated_at) VALUES(?,?,?,?,?,?)", (str(uuid.uuid4()), str(active_id), transition, "pending", _canonical(terminal_payload), _now()))
-            for method_id in affected_method_ids:
-                self._derive_method(conn, method_id)
             self._store_interrupt_evidence(
                 conn,
                 interrupt_attempt_id=interrupt_attempt_id,
@@ -6854,7 +6372,6 @@ class OperatorCommandPlane:
                     pass
 
 
-
     def _state(self) -> dict[str, Any]:
         value = self.machine_state_provider()
         return dict(value) if isinstance(value, Mapping) else {}
@@ -6968,40 +6485,6 @@ class OperatorCommandPlane:
         requested = dict(claimed["requested_inputs"])
         effective = dict(claimed["effective_inputs"])
 
-        if action_id in STRICT_METHOD_ACTIONS:
-            observed_generation_value = state.get("ownership_generation")
-            observed_generation = (
-                int(observed_generation_value)
-                if type(observed_generation_value) is int
-                else -1
-            )
-            expected_generation = int(claimed["ownership_generation"])
-            expected_epochs = {
-                str(key): int(value)
-                for key, value in dict(
-                    claimed.get("expected_board_epoch_by_board") or {}
-                ).items()
-            }
-            observed_epochs = _active_board_epochs(state, action_id)
-            if (
-                expected_generation != observed_generation
-                or set(expected_epochs) != {"4", "5"}
-                or expected_epochs != observed_epochs
-            ):
-                self.store.finish(
-                    command_id,
-                    status="failed",
-                    payload={
-                        "error": "strict_method_authority_changed_before_dispatch",
-                        "delivery_attempted": False,
-                        "expected_ownership_generation": expected_generation,
-                        "observed_ownership_generation": observed_generation,
-                        "expected_board_epoch_by_board": expected_epochs,
-                        "observed_board_epoch_by_board": observed_epochs,
-                    },
-                    claimed=claimed,
-                )
-                return
 
         if action_id not in INTERNAL_ACTIONS:
             try:
@@ -7364,7 +6847,7 @@ class OperatorCommandPlane:
             return
         target = self._action_target(action_id)
         token = _DISPATCH_CONTEXT.set({"operator_command_id": command_id, "idempotency_key": f"dispatch:{claimed['dispatch_attempt_id']}", "expected_ownership_generation": claimed["ownership_generation"], "action_id": action_id,
-            "caller_class": "automated_method" if claimed.get("method_id") else "manual_operator"})
+            "caller_class": "manual_operator"})
         try:
             status_code, response = asyncio.run(_dispatch_asgi(self.app, str(target["method"]), str(target["path"]), {**dict(target.get("fixed_inputs") or {}), **effective}, target["locations"]))
         except Exception as exc:
@@ -7446,31 +6929,6 @@ class OperatorCommandPlane:
                 assessment=assessment,
             )
 
-        @router.post("/methods")
-        async def admit_method(request: MethodRequest, http_request: Request) -> dict[str, Any]:
-            content_length = http_request.headers.get("content-length")
-            try:
-                body_bytes = int(content_length) if content_length is not None else None
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail="Invalid Content-Length") from exc
-            if body_bytes is not None and body_bytes > 1_048_576:
-                raise HTTPException(status_code=413, detail="BioXP method document exceeds the 1 MiB limit")
-            body = request.model_dump()
-            if any(step.get("action_id") == "oem.deck.move_to_location" for step in body.get("steps", [])):
-                raise HTTPException(status_code=422, detail={"error": "method_action_not_allowed", "action_id": "oem.deck.move_to_location"})
-            state = self._state()
-            assessments: list[Mapping[str, Any]] = []
-            for step in body.get("steps", []):
-                action_id = str(step.get("action_id") or "")
-                assessment = self._current_assessment(action_id, dict(step.get("inputs") or {}), state)
-                self._require_enabled_assessment(action_id, assessment)
-                assessments.extend([assessment] * int(step.get("repeat", 1)))
-            return await asyncio.to_thread(
-                self.store.admit_method,
-                body,
-                state=state,
-                assessments=assessments,
-            )
 
         @router.get("/commands/{command_id}")
         async def command_detail(command_id: str) -> dict[str, Any]:
@@ -7479,16 +6937,6 @@ class OperatorCommandPlane:
                 raise HTTPException(status_code=404, detail="command not found")
             return row
 
-        @router.get("/methods/{method_id}")
-        async def method_detail(method_id: str) -> dict[str, Any]:
-            row = await asyncio.to_thread(self.store.get_method, method_id)
-            if row is None:
-                raise HTTPException(status_code=404, detail="method not found")
-            return row
-
-        @router.get("/methods/{method_id}/commands")
-        async def method_commands(method_id: str, after_method_sequence: int = Query(default=0, ge=0), limit: int = Query(default=200, ge=1, le=200), snapshot_token: str | None = None) -> dict[str, Any]:
-            return await asyncio.to_thread(self.store.method_commands, method_id, after=after_method_sequence, limit=limit, token=snapshot_token)
 
         @router.get("/queue")
         async def queue() -> dict[str, Any]:
@@ -7525,17 +6973,6 @@ class OperatorCommandPlane:
         async def cancel_command(command_id: str, request: MutationRequest) -> dict[str, Any]:
             return await asyncio.to_thread(self.store.cancel_command, command_id, request.model_dump())
 
-        @router.post("/methods/{method_id}/pause")
-        async def pause_method(method_id: str, request: MutationRequest) -> dict[str, Any]:
-            return await asyncio.to_thread(self.store.method_mutation, method_id, "pause", request.model_dump())
-
-        @router.post("/methods/{method_id}/resume")
-        async def resume_method(method_id: str, request: MutationRequest) -> dict[str, Any]:
-            return await asyncio.to_thread(self.store.method_mutation, method_id, "resume", request.model_dump())
-
-        @router.post("/methods/{method_id}/cancel")
-        async def cancel_method(method_id: str, request: MutationRequest) -> dict[str, Any]:
-            return await asyncio.to_thread(self.store.method_mutation, method_id, "cancel", request.model_dump())
 
         @router.get("/recovery")
         async def recovery() -> dict[str, Any]:
@@ -7618,59 +7055,6 @@ class OperatorCommandPlane:
             if value is None:
                 raise HTTPException(status_code=404, detail="idempotency receipt not found")
             return value
-
-
-    async def admit_strict_method(
-        self,
-        request: Mapping[str, Any],
-        *,
-        assessment: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        method_action_id = str(request.get("method_action_id"))
-        if method_action_id not in STRICT_METHOD_ACTIONS:
-            raise HTTPException(status_code=404, detail="unknown v2 operator method")
-        state = self._state()
-        observed_generation = int(request.get("expected_ownership_generation") or 0)
-        actual_generation = int(state.get("ownership_generation") or 0)
-        requested_epochs = {str(key): int(value) for key, value in dict(request.get("expected_board_epoch_by_board") or {}).items()}
-        actual_epochs = _active_board_epochs(state, method_action_id)
-        raw_inputs = dict(request.get("inputs") or {})
-        inputs = (
-            {"x": raw_inputs.get("x_steps"), "y": raw_inputs.get("y_steps")}
-            if method_action_id == "oem.xy.move_absolute"
-            else raw_inputs
-        )
-        validated_inputs = _validate_inputs(method_action_id, inputs)
-        current_assessment = assessment or self._current_assessment(
-            method_action_id,
-            validated_inputs,
-            state,
-        )
-        generic = {
-            "schema_version": "bioxp.operator_method_request.v1",
-            "name": method_action_id,
-            "idempotency_key": str(request["idempotency_key"]),
-            "expected_ownership_generation": observed_generation,
-            "expected_board_epoch_by_board": requested_epochs,
-            "failure_policy": "fail_fast",
-            "steps": [{"action_id": method_action_id, "inputs": validated_inputs, "repeat": 1}],
-            "metadata": {
-                "method_action_id": method_action_id,
-                "requested_ownership_generation": observed_generation,
-                "observed_ownership_generation": actual_generation,
-                "requested_board_epoch_by_board": requested_epochs,
-                "observed_board_epoch_by_board": actual_epochs,
-                "board_epoch_policy": "required_dispatch_execution_fence",
-            },
-        }
-        return await asyncio.to_thread(
-            self.store.admit_method,
-            generic,
-            state=state,
-            assessments=[current_assessment],
-            strict_authority=True,
-        )
-
 
 
     async def _deliver_controller_interrupt_raw(self, action_id: str, *, interrupt_attempt_id: str, observed_generation: int = 0) -> tuple[int, Any]:

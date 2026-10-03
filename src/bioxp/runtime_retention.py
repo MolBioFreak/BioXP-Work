@@ -60,15 +60,15 @@ def _legacy_receipts(connection: sqlite3.Connection, cutoff: float) -> list[sqli
           AND c.updated_at<? AND p.updated_at<? AND p.queued_at<? AND p.finished_at<?
           AND c.receipt_json<>'{}'
           AND NOT EXISTS (SELECT 1 FROM protected k WHERE k.command_id=c.command_id)
-          AND (p.method_id IS NULL OR EXISTS (
-              SELECT 1 FROM operator_plane_methods method WHERE method.method_id=p.method_id
-              AND method.status='completed' AND method.updated_at<?))
+          AND NOT EXISTS (SELECT 1 FROM runtime_retired_records r
+              WHERE r.source_table='operator_plane_commands'
+                AND r.record_key=json_array(p.command_id))
           AND json_type(c.receipt_json,'$.operator_assessment') IS NULL
           AND json_type(c.receipt_json,'$.operator_note') IS NULL
           AND json_type(c.receipt_json,'$.operator_assessment_idempotency_key') IS NULL
           AND json_type(c.receipt_json,'$.operator_assessed_at') IS NULL
         ORDER BY c.sequence
-    """, (cutoff, cutoff, cutoff, cutoff, cutoff, cutoff)).fetchall()
+    """, (cutoff, cutoff, cutoff, cutoff, cutoff)).fetchall()
 
 
 def _plan(connection: sqlite3.Connection, as_of: float) -> dict[str, Any]:

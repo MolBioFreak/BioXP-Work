@@ -115,6 +115,7 @@ _RUNTIME_PHYSICAL_SCHEMA_SHA256_BY_VERSION = {
     12: "baf43668869172821e7a22baafd84f229cdab09c78540515fc0ae0d4151dabe4",  # decision trigger only
     13: "baf43668869172821e7a22baafd84f229cdab09c78540515fc0ae0d4151dabe4",  # decision trigger only (critical-images branch)
     14: "baf43668869172821e7a22baafd84f229cdab09c78540515fc0ae0d4151dabe4",  # delivery/background triggers outside physical tables
+    15: "baf43668869172821e7a22baafd84f229cdab09c78540515fc0ae0d4151dabe4",  # retirement covered by exact union manifest
 }
 _RUNTIME_PHYSICAL_TABLES = {
     "runtime_metadata", "runtime_retired_json_artifacts", "serial206_authority_snapshots",
@@ -2696,6 +2697,7 @@ def _verify_runtime_release_start(connection: sqlite3.Connection) -> None:
 from . import oem_deck_recovery_schema_v12 as _recovery_v12
 from . import oem_deck_recovery_schema_v13 as _recovery_v13
 from . import oem_deck_schema_v14 as _deck_v14
+from . import runtime_method_retirement_v15 as _retirement_v15
 
 WORKFLOW_SCHEMA_VERSION = 11
 _WORKFLOW_DDL = (
@@ -2814,6 +2816,7 @@ def canonical_runtime_migration_registry() -> tuple[RuntimeMigrationIdentity, ..
         _recovery_v12.migration_identity(),
         _recovery_v13.migration_identity(),
         _deck_v14.migration_identity(),
+        _retirement_v15.migration_identity(),
     )
     versions = tuple(item.version for item in registry)
     if versions != tuple(sorted(set(versions))):
@@ -3132,7 +3135,7 @@ def _verify_report_identity_metadata_v1(connection: sqlite3.Connection) -> None:
 
 
 
-def canonical_runtime_schema_manifest(*, version: int = _deck_v14.VERSION) -> dict[tuple[str, str], str]:
+def canonical_runtime_schema_manifest(*, version: int = _retirement_v15.VERSION) -> dict[tuple[str, str], str]:
     """Return the exact union of every registered non-SQLite schema object."""
     expected = _expected_foundation_connection()
     try:
@@ -3182,6 +3185,9 @@ def canonical_runtime_schema_manifest(*, version: int = _deck_v14.VERSION) -> di
             _deck_v14.apply(expected)
         expected.execute(f"PRAGMA user_version={version}")
         _reinstall_operator_global_triggers(expected)
+        if version >= _retirement_v15.VERSION:
+            expected.execute("PRAGMA foreign_keys=OFF")
+            _retirement_v15.apply(expected)
         return {
             (str(row[0]), str(row[1])): normalize_sql_definition(row[2])
             for row in expected.execute(
@@ -3218,13 +3224,15 @@ def verify_canonical_runtime_database(
     actual = tuple((int(row[0]), str(row[1]), str(row[2])) for row in rows)
     if not _runtime_migration_registry_matches(actual, registry, allow_prefix=False):
         raise RuntimeError("runtime migration ledger is not the exact canonical ordered registry")
-    _verify_v2_schema(connection)
+    if version < _retirement_v15.VERSION:
+        _verify_v2_schema(connection)
     _verify_report_identity_metadata_v1(connection)
     _verify_runtime_release_start(connection)
     if full_data_check:
         if version >= WORKFLOW_SCHEMA_VERSION:
             _verify_workflow_resource_membership(connection)
-        _verify_operator_command_plane_schema_v1(connection)
+        if version < _retirement_v15.VERSION:
+            _verify_operator_command_plane_schema_v1(connection)
         if version >= _recovery_v12.VERSION:
             # The union manifest below attests every table/index/trigger, including
             # V12's changed decision trigger. Preserve full data FK validation.
@@ -3281,8 +3289,29 @@ def verify_canonical_runtime_database(
             and not unexpected
             and mismatched == [("table", "operator_plane_deck_semantic_state")]
         )
+        retired_legacy_history = False
+        if version >= _retirement_v15.VERSION and not missing:
+            # V15 preserves the previously accepted source-wrapper history
+            # variant verbatim. Bind just that exact variant, not removed tables.
+            variant = [(str(row[0]), str(row[1]), normalize_sql_definition(row[2]))
+                       for row in connection.execute(
+                           "SELECT type,name,sql FROM sqlite_master WHERE "
+                           "tbl_name='operator_plane_interrupt_history' AND sql IS NOT NULL ORDER BY type,name")]
+            retired_legacy_history = (
+                hashlib.sha256(json.dumps(variant, separators=(',', ':')).encode()).hexdigest()
+                == '19ed9256da9a7404afcdfc3a082301cd73890e209dbe33289b7965744efabd30'
+                and set(unexpected) == {('trigger', name) for name in (
+                    'operator_plane_interrupt_history_authorized_insert_v4',
+                    'operator_plane_interrupt_history_coherence_insert_v4',
+                    'operator_plane_interrupt_history_no_delete_v4',
+                    'operator_plane_interrupt_history_no_update_v4')}
+                and mismatched in ([('table', 'operator_plane_interrupt_history')],
+                                   [('table', 'operator_plane_deck_semantic_state'),
+                                    ('table', 'operator_plane_interrupt_history')])
+            )
         if not (
             additive_v6_lineage
+            or retired_legacy_history
             or (
                 legacy_compatibility
                 and compatibility_objects_are_bound
@@ -3703,6 +3732,16 @@ def _migrate_oem_deck_schema_v7_locked(
 
 
 def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path) -> None:
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) == _retirement_v15.VERSION:
+        verify_canonical_runtime_database(connection)
+        return
+    with runtime_write_coordinator(root).lock:
+        _migrate_runtime_database_through_v14(connection, root)
+        _retirement_v15.migrate(connection, Path(root).expanduser().resolve(strict=False),
+                               canonical_runtime_migration_registry()[-1])
+
+
+def _migrate_runtime_database_through_v14(connection: sqlite3.Connection, root: str | Path) -> None:
     """Apply the canonical ordered registry under the process-wide owner fence."""
     if int(connection.execute("PRAGMA user_version").fetchone()[0]) == _deck_v14.VERSION:
         # An already-prepared database needs no migration, lifecycle-exclusive
@@ -4076,7 +4115,7 @@ class OEMRuntimeStore:
         self._closed = False
         # A prepared database needs no writer fence or data audit. Only actual
         # schema preparation enters the authority fence (also supports new stores).
-        if int(self._db.execute("PRAGMA user_version").fetchone()[0]) == _deck_v14.VERSION:
+        if int(self._db.execute("PRAGMA user_version").fetchone()[0]) == _retirement_v15.VERSION:
             verify_canonical_runtime_database(self._db)
         else:
             with self._authority_write():
