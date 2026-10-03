@@ -10388,6 +10388,16 @@ def _protocol_live_source_barcode_handler(action, state):
         return app.state.oem_workflow_plan_executor(plan, action, state)
 
 
+def _protocol_live_park_handler(action, state):
+    from .oem_deck_movement import compile_finite_plate_operation
+    plan = compile_finite_plate_operation("park_gantry", source_leaf_available=True, **action.params)
+    _require_motion_route_ready()
+    store = _protocol_command_store()
+    with store.workflow_context(state.job_id, source_occurrence_id=action.action_id):
+        store.assert_workflow_current(state.job_id)
+        return app.state.oem_workflow_plan_executor(plan, action, state)
+
+
 def _protocol_mechanism_handlers(source_executor=None):
     from .protocols.mechanisms import build_mechanism_handlers
     def save_snapshot(frame, action, state):
@@ -10403,6 +10413,7 @@ def _protocol_mechanism_handlers(source_executor=None):
 def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
     return {
         **_protocol_mechanism_handlers(),
+        ProtocolActionKind.PARK: _protocol_live_park_handler,
         ProtocolActionKind.PLATE_CATCH: _protocol_live_custody_handler,
         ProtocolActionKind.PLATE_RELEASE: _protocol_live_custody_handler,
         ProtocolActionKind.PLATE_PRESS: _protocol_live_custody_handler,

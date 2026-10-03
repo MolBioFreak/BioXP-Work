@@ -280,7 +280,8 @@ def _send_wire(group, channels, wire, timeout_ms, *, after_sends=None, effect="c
                 **transport._driver_evidence(raw), **(inputs or {})}
     try:
         outcome = group._run_group_liquid_operation(effect, channels, send,
-            timeout_ms=timeout_ms, after_sends=after_sends)
+            timeout_ms=timeout_ms, after_sends=after_sends,
+            set_allow_to_stop=effect != "fluid detection")
     except Exception as exc:
         partial = getattr(exc, "pipette_partial_result", None)
         if partial is not None:
@@ -324,13 +325,18 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
             result["delivery_attempted"] = True
             body = (provider._manual_pipette_receipt_runner(name, call, command_id, identity, request)
                     if pipette else call())
-            event.update(result=body, status="completed" if body.get("ok") is True else "failed")
+            # Source-return success is distinct from missing adapter evidence.
+            # Do not turn an untyped return into either a failed event followed
+            # by success or a new execution gate. Explicit False still fails.
+            outcome = body.get("ok")
+            event.update(result=body, status=("completed" if outcome is True else
+                         "failed" if outcome is False else "unknown"))
             # Completion is not a settings readback or independent fluid proof.
             event["reported_applied"] = {"controller_outcome": body.get("ok"),
                 "completion_verified": body.get("completion_verified"), "readback": None}
-            fence(identity["source_identity"])
             if body.get("ok") is False:
                 raise PipetteCommandError(f"Cavro application child failed: {name}", details=body)
+            fence(identity["source_identity"])
             return body
         except Exception as exc:
             event.update(status="failed", error=str(exc), partial=getattr(exc, "details",
@@ -364,16 +370,38 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                 z_move(op["target_steps"], op["speed_native"])
             elif kind == "plld":
                 z_move(op["start_steps"], op["search_speed_native"])
-                motion = []
+                search = {"z_search_attempted": False, "z_stop_attempted": False,
+                          "final_position_steps": None, "z_settled": None,
+                          "clean_tip": None, "no_aspiration": None, "clot": None, "air": None}
+                result["plld"] = search
                 def start_z():
                     # Existing source pseudo-home/current handling; no synthetic pose.
                     state = provider._offset_deck_semantic_state(gripper_confirmed=False, pseudo_home_only=True)
-                    motion.append(record("plld_z_start", lambda: provider.primitives.oem_move_z(
-                        op["search_target_steps"], pseudo_home_steps=state["pseudo_z_home"],
-                        motor_current=op["z_motor_current"], wait_for_stop=False), inputs=op))
-                detected = record("detect_fluid_level", lambda t: _send_wire(t, op["channels"], "BR",
-                    op["timeout_ms"], after_sends=start_z, effect="fluid detection"), inputs=op, pipette=True)
-                record("plld_z_stop", provider.primitives.z_stop, inputs={})
+                    def dispatch():
+                        search["z_search_attempted"] = True
+                        return provider.primitives.oem_move_z(op["search_target_steps"],
+                            pseudo_home_steps=state["pseudo_z_home"],
+                            motor_current=op["z_motor_current"], wait_for_stop=False)
+                    search["start_result"] = record("plld_z_start", dispatch, inputs=op)
+                def detect(t):
+                    body = _send_wire(t, op["channels"], "BR", op["timeout_ms"],
+                                      after_sends=start_z, effect="fluid detection")
+                    if body.get("ok") is False and not body.get("interrupted_by_terminate"):
+                        # ControlLib.detectFluidLevel:7901: false wait terminates
+                        # pumps, not Z. No finally lift/home/Stop is in source.
+                        # Existing Stop/owner fences remain authoritative.
+                        try:
+                            fence(f"{owner_identity['source_identity']}:plld:terminate")
+                            body["source_timeout_termination"] = t.terminate()
+                        except Exception as exc:
+                            body["source_timeout_termination"] = {"error": str(exc),
+                                "exception_type": type(exc).__name__}
+                    return body
+                detected = record("detect_fluid_level", detect, inputs=op, pipette=True)
+                def stop_z():
+                    search["z_stop_attempted"] = True
+                    return provider.primitives.z_stop()
+                search["stop_result"] = record("plld_z_stop", stop_z, inputs={})
                 position = record("plld_z_position", lambda: {
                     "ok": True, "position_steps": provider.primitives._read_axis_position("z"),
                     "source_return_completed": True}, inputs={})
@@ -382,9 +410,8 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                     stamp = (row.get("completion", {}).get("pipette_message_state") or {}).get("fluid_timestamp")
                     timestamps[row["channel"]] = stamp
                     group._fluid_detection_timestamps[row["channel"]] = stamp
-                result["plld"] = {"channels": detected.get("channels", []), "z": position,
-                                  "fluid_timestamps": timestamps,
-                                  "clean_tip": None, "no_aspiration": None, "clot": None, "air": None}
+                search.update(channels=detected.get("channels", []), z=position,
+                              final_position_steps=position["position_steps"], fluid_timestamps=timestamps)
                 if op.get("after_detection_steps") is not None:
                     z_move(op["after_detection_steps"], op["after_detection_speed_native"])
             else:
@@ -401,7 +428,8 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                         _send_wire(t, op["channels"], w, op["timeout_ms"], effect=e, inputs=values),
                         inputs={"operation_index": index, "field": field, "ascii": wire,
                                 "channels": op["channels"]}, pipette=True)
-        result.update(ok=True, completed=True)
+        result.update(ok=True, completed=True, source_return_completed=True,
+                      has_unknown_outcomes=any(e["status"] == "unknown" for e in events))
     except Exception as exc:
         result.update(error=str(exc), exception_type=type(exc).__name__,
                       interrupted=epoch != group._interrupt_epoch,

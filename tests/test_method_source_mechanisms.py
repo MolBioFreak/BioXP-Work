@@ -11,6 +11,7 @@ from tests.test_cover_carry_release_connected import connected, _SETTINGS
 from tests.test_deck_scoped_integration import installed_retained
 from tests.test_method_runtime_connected import mount, submit, action
 from tests.test_protocol_workflow_connected import await_job
+from tests.test_deck_tip_query_publication import query_rig
 
 
 @pytest.fixture(autouse=True)
@@ -22,6 +23,7 @@ def local_asyncio(connected, monkeypatch):
     monkeypatch.setattr(socket, "socket", local_socket)
     connected.provider.primitives.pipette_transport = None
     native = connected.native
+    native._oem_active_board_lifecycle_generation = connected.provider._load_state()['z_lifecycle']['board_lifecycle_generation']
     from bioxp.usb_driver import BioXpTester
     profile = native._motion_oem_axis_profile
     native._motion_oem_axis_profile = lambda axis, startup=False: profile(axis, startup=startup)
@@ -36,13 +38,21 @@ def local_asyncio(connected, monkeypatch):
 
 
 @pytest.mark.parametrize('mode,count' , [('job_id', 3), ('reagent_id', 2)])
-def test_source_barcode_real_decoder_finite_api(connected, installed_retained, monkeypatch, tmp_path, mode, count):
+@pytest.mark.parametrize('barcode', ['', 'Sample-42', 'BLACK'])
+def test_source_barcode_real_decoder_finite_api(connected, installed_retained, monkeypatch, tmp_path, mode, count, barcode):
     from bioxp.camera_provider import CameraProvider, CameraIdentity
     from bioxp.vision.oem_inspection import scan_barcode
     app, client = mount(installed_retained, monkeypatch, tmp_path)
     provider = connected.provider
     image = BytesIO()
-    Image.new('RGB', (640, 480), 'white').save(image, format='JPEG')
+    pixels = Image.new('RGB', (640, 480), 'white')
+    if barcode:
+        import cv2
+        code = cv2.QRCodeEncoder_create().encode(barcode)
+        qr = Image.fromarray(code).resize((280, 280), Image.Resampling.NEAREST).convert('RGB')
+        pixels.paste(qr, (160, 100))
+    pixels.save(image, format='JPEG')
+    assert scan_barcode(image.getvalue()) == barcode
     captures, leds, rgb = [], [], []
     def capture(argv, **kwargs):
         captures.append(argv)
@@ -63,14 +73,21 @@ def test_source_barcode_real_decoder_finite_api(connected, installed_retained, m
     row = done['execution']['runtime_state']['action_results'][0]
     assert done['command']['status'] == 'completed', row
     source = row['barcode_result']
-    assert source['value'] == '' and source['source_return'] is False
-    assert source['decoded'] is False and source['ok'] is True
+    positive = bool(barcode and barcode != 'BLACK')
+    expected = barcode.lower() if positive or (barcode == 'BLACK' and mode == 'job_id') else ''
+    assert source['value'] == expected
+    assert source['source_return'] is bool(expected)
+    assert source['decoded'] is positive and source['ok'] is True
+    if positive:
+        count = 1
     assert len(source['attempts']) == len(captures) == count
     assert len({a['source_identity'] for a in source['attempts']}) == count
     assert all(a['status'] == 'completed' and a['move']['target'] for a in source['attempts'])
-    first, second = source['attempts'][:2]
-    assert second['offset_x'] == first['offset_x'] + 2000
-    assert second['offset_y'] == first['offset_y'] - 4000
+    first = source['attempts'][0]
+    if count > 1:
+        second = source['attempts'][1]
+        assert second['offset_x'] == first['offset_x'] + 2000
+        assert second['offset_y'] == first['offset_y'] - 4000
     if count == 3:
         assert source['attempts'][2]['offset_x'] == first['offset_x'] - 2000
         assert source['attempts'][2]['offset_y'] == first['offset_y']
@@ -78,6 +95,27 @@ def test_source_barcode_real_decoder_finite_api(connected, installed_retained, m
     assert leds[-3:] == [{'channel': i, 'on': False} for i in (1, 2, 3)]
     assert connected.store.deck_semantic_state()['current_location'] == ('LOC_TC' if mode == 'job_id' else 'LOC_RC')
     assert connected.native.moves
+
+
+@pytest.mark.parametrize('already_parked', [False, True])
+def test_ordinary_park_runs_source_finite_child(connected, query_rig, monkeypatch, tmp_path, already_parked):
+    from tests.test_pipette_constructor_collection import constructor
+    app, client = mount(query_rig, monkeypatch, tmp_path)
+    monkeypatch.setattr(api, '_require_motion_route_ready', lambda: None)
+    constructor(query_rig, monkeypatch)
+    connected.provider.primitives.pipette_transport = query_rig[8]
+    if already_parked:
+        connected.provider.wp8_update_location('updateLocation', {'destination': 28, 'well': 0},
+            command_id='fixture-park', child_order=0, plan_digest='fixture')
+    before = list(connected.native.moves)
+    job = submit(app, client, [action('park', {'rehome': False})], key='source-park')
+    done = await_job(client, job, lambda r: r['command']['terminal'])
+    assert done['command']['status'] == 'completed', done['execution']['runtime_state']['action_results']
+    assert connected.store.deck_semantic_state()['current_location'] == 'LOC_PARK'
+    ids = done['execution']['runtime_state']['workflow']['child_command_ids']
+    finite = app.state.operator_command_plane.store.wp8_operation_evidence(ids[0])
+    assert finite['children'][0]['operation'] == 'parkGantry'
+    assert (connected.native.moves == before) is already_parked
 
 
 @pytest.mark.parametrize('pattern,failure', [('d', False), ('r', False), ('h', False), ('t', False), ('h', True)])

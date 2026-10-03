@@ -3075,6 +3075,10 @@ class Serial206ProductionPrimitiveAdapter:
             int(motor_current),
             motor=profile.get("motor", 0),
         )
+        # This source call deliberately changes run current. Keep the existing
+        # profile verifier's expected setting aligned for a subsequent explicit
+        # speed/retract instruction; do not restore current or add another write.
+        self._z_profile_overrides = {**getattr(self, "_z_profile_overrides", {}), 6: int(motor_current)}
         move = self.tester.motor_oem_move_absolute(
             board,
             effective,

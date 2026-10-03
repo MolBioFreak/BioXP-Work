@@ -177,6 +177,20 @@ class ManualCavroApplication(_Request):
         return result["requested"]
 
 
+class ManualCavroRecipe(_Request):
+    operation: Literal["cavro_liquid_recipe"]
+    recipe: dict[str, Any]
+
+    @field_validator("recipe", mode="before")
+    @classmethod
+    def validate_recipe(cls, value):
+        from .pipette.cavro_liquid import compile_liquid_recipe
+        result = compile_liquid_recipe(value)
+        if result["issues"]:
+            raise ValueError(str(result["issues"]))
+        return result["recipe_requested"]
+
+
 class ManualCalwithFluid(_Request):
     operation: Literal["source_calwith_fluid"]
 
@@ -184,7 +198,7 @@ class ManualCalwithFluid(_Request):
 ManualStep = Annotated[Union[ManualMove, ManualLower, ManualLift, ManualLiquid, ManualMix,
     ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset, DiagnosticDetectFluid,
     ManualCalwithFluid, SourceLoadTips, SourceMix, SourceAir, SourcePurge,
-    ManualDiagnosticPipette, ManualCavroApplication], Field(discriminator="operation")]
+    ManualDiagnosticPipette, ManualCavroApplication, ManualCavroRecipe], Field(discriminator="operation")]
 
 
 class ManualPipettingRequest(_Request):
@@ -219,7 +233,7 @@ def compile_manual_pipetting(request: ManualPipettingRequest | Mapping[str, Any]
             add(ProtocolActionKind.PIPETTE_POSITION, step.model_dump(), index)
         elif isinstance(step, (ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset,
                                DiagnosticDetectFluid, ManualCalwithFluid, ManualDiagnosticPipette,
-                               SourceLoadTips, SourceMix, SourceAir, SourcePurge, ManualCavroApplication)):
+                               SourceLoadTips, SourceMix, SourceAir, SourcePurge, ManualCavroApplication, ManualCavroRecipe)):
             add(ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL, step.model_dump(), index)
         elif isinstance(step, ManualLiquid):
             liquid(step.operation, step.channels, step.volume_ul, step.speed, index)
@@ -274,6 +288,12 @@ def bind_manual_position_handler(*, command_store: Any, execute_plan: Callable,
 
 
 def manual_physical_plan(params: Mapping[str, Any]) -> dict[str, Any]:
+    if params.get("operation") == "cavro_liquid_recipe":
+        from .pipette.cavro_liquid import compile_liquid_recipe
+        step = ManualCavroRecipe.model_validate(dict(params))
+        application = compile_liquid_recipe(step.recipe)["application"]
+        return compile_finite_plate_operation("cavro_application", source_leaf_available=True,
+                                             application=application)
     if params.get("operation") == "cavro_application":
         step = ManualCavroApplication.model_validate(dict(params))
         return compile_finite_plate_operation("cavro_application", source_leaf_available=True,

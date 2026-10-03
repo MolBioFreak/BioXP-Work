@@ -38,7 +38,7 @@ def rig(monkeypatch, tmp_path):
     drivers = []
     def transact(msg, *, channel, matcher_name, expected_function, **kwargs):
         if hasattr(msg, "arbitration_id"):
-            assert msg.arbitration_id == 0x101 | (channel << 3)
+            assert msg.arbitration_id == (0x100 | expected_function | (channel << 3))
         command = bytes(msg.data).decode("ascii")
         wire.append((channel, command))
         started = time.monotonic()

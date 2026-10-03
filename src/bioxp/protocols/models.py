@@ -84,6 +84,7 @@ class ProtocolActionKind(str, Enum):
     PAUSE_REVIEW = "pause_review"
     NOTE = "note"
     LED = "led"
+    PARK = "park"
     WAIT = "wait"
     PLATE_PREPARE = "plate_prepare"
     PLATE_MOVE = "plate_move"

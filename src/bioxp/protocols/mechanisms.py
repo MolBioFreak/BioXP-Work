@@ -11,7 +11,7 @@ from .models import ProtocolActionKind as K
 
 KINDS = {K.WAIT, K.THERMAL_SETPOINT, K.THERMAL_HOLD, K.THERMAL_PROFILE,
          K.CHILLER_SETPOINT, K.SNAPSHOT, K.CAMERA_ILLUMINATION,
-         K.TIMER_START, K.TIMER_WAIT, K.BARCODE_READ}
+         K.TIMER_START, K.TIMER_WAIT, K.BARCODE_READ, K.LED, K.SEAL_SEPARATE}
 
 
 def validate_mechanism(kind, p):
@@ -23,6 +23,7 @@ def validate_mechanism(kind, p):
         K.THERMAL_HOLD: {"bank", "target_temp_c", "duration_s", "start", "tolerance_c", "timeout_s", "fan_speed", "cool_rate_c_s", "heat_rate_c_s"},
         K.THERMAL_PROFILE: {"segments", "repeat"}, K.SNAPSHOT: set(),
         K.CAMERA_ILLUMINATION: {"channel", "on"}, K.BARCODE_READ: {"mode"},
+        K.LED: {"red", "green", "blue"}, K.SEAL_SEPARATE: set(),
     }
     if set(p) - fields[kind]:
         raise ValueError(f"Unsupported {kind.value} fields: {sorted(set(p) - fields[kind])}")
@@ -32,6 +33,9 @@ def validate_mechanism(kind, p):
             raise ValueError(f"{kind.value}.{key} requires a finite {'nonnegative ' if nonnegative else ''}number")
     if kind == K.WAIT:
         number("seconds", True)
+    elif kind == K.LED:
+        if any(type(p.get(k)) is not int or not 0 <= p[k] <= 255 for k in ("red", "green", "blue")):
+            raise ValueError("led requires red, green, blue native integers 0..255")
     elif kind in {K.TIMER_START, K.TIMER_WAIT}:
         if not isinstance(p.get("timer_id"), str) or not p["timer_id"]:
             raise ValueError("timer_id requires a nonempty string")
@@ -150,6 +154,16 @@ def build_mechanism_handlers(*, get_tester, get_camera, get_executor, save_snaps
     def run(action, state):
         kind, p = action.kind, action.params
         validate_mechanism(kind, p)
+        if kind == K.SEAL_SEPARATE:
+            # SS has no lower-dispatch actuator in the recovered interpreter.
+            # Preserve its source no-op, not a cut/pierce or a fabricated pause.
+            return {"ok": True, "source_noop": True,
+                    "source_anchor": "ControlLib.scriptInterpretor.default (SS)",
+                    "seal_separation_performed": None, "motion_commanded": False,
+                    "physical_effect_verified": False}
+        if kind == K.LED:
+            return get_tester().strip_set_rgb(p["red"], p["green"], p["blue"],
+                reconnect_first=False, activate_first=False)
         if kind == K.WAIT:
             completed = wait(p["seconds"])
             return {"ok": completed, "elapsed_wait_complete": completed, "interrupted": not completed}

@@ -23,8 +23,8 @@ def request_payload(key, actions=None):
         "document": {
             "protocol_id": "offline-host-integration",
             "stages": [{"stage_id": "one", "actions": actions or [
-                {"action_id": "first", "kind": "led", "params": {"witness": "original"}},
-                {"action_id": "second", "kind": "led", "params": {"witness": "second"}},
+                {"action_id": "first", "kind": "led", "params": {"red": 1, "green": 2, "blue": 3}, "metadata": {"witness": "original"}},
+                {"action_id": "second", "kind": "led", "params": {"red": 4, "green": 5, "blue": 6}, "metadata": {"witness": "second"}},
             ]}],
         },
         "live_execution": {
@@ -66,13 +66,14 @@ def test_http_custody_returns_before_leaf_and_replays_without_current_support(in
 
     def leaf(action, state):
         from bioxp.runtime_audit_store import workflow_claim_context
-        calls.append((action.action_id, action.params["witness"], workflow_claim_context()))
+        calls.append((action.action_id, action.metadata["witness"], workflow_claim_context()))
         if action.action_id == "first":
             entered.set()
             assert release.wait(12)
         return {"ok": True, "fixture_only": True, "physical_operation": False}
 
     monkeypatch.setattr(api, "_protocol_live_handlers", lambda: {ProtocolActionKind.LED: leaf})
+    monkeypatch.setattr(api, "_protocol_mechanism_handlers", lambda *a, **kw: {ProtocolActionKind.LED: leaf})
     mount_protocol_routes(app)
     client = TestClient(app)
     payload = request_payload("connected-original")
@@ -117,7 +118,7 @@ def test_http_custody_returns_before_leaf_and_replays_without_current_support(in
     replay = client.post("/protocol/execute", json=payload)
     assert replay.status_code == 200 and replay.json()["job_id"] == job_id, replay.text
     changed = copy.deepcopy(payload)
-    changed["document"]["stages"][0]["actions"][0]["params"]["witness"] = "changed"
+    changed["document"]["stages"][0]["actions"][0]["params"]["red"] = 10
     conflict = client.post("/protocol/execute", json=changed)
     assert conflict.status_code == 409, conflict.text
     assert len(calls) == 2
@@ -149,11 +150,12 @@ def test_review_keeps_same_parent_and_original_ack_does_not_reexecute(installed_
         calls.append(action.action_id)
         return {"ok": True, "fixture_only": True}
     monkeypatch.setattr(api, "_protocol_live_handlers", lambda: {ProtocolActionKind.LED: leaf})
+    monkeypatch.setattr(api, "_protocol_mechanism_handlers", lambda *a, **kw: {ProtocolActionKind.LED: leaf})
     mount_protocol_routes(app)
     client = TestClient(app)
     payload = request_payload("review-parent", actions=[
-        {"action_id": "first", "kind": "led", "review_required": True},
-        {"action_id": "second", "kind": "led"},
+        {"action_id": "first", "kind": "led", "params": {"red": 1, "green": 2, "blue": 3}, "review_required": True},
+        {"action_id": "second", "kind": "led", "params": {"red": 4, "green": 5, "blue": 6}},
     ])
     response = client.post("/protocol/execute", json=payload)
     assert response.status_code == 202, response.text

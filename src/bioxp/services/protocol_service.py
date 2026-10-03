@@ -39,7 +39,7 @@ REFERENCE_REQUIRED_ACTION_KINDS = {
     ProtocolActionKind.PLATE_PREPARE,
     ProtocolActionKind.PLATE_MOVE,
     ProtocolActionKind.MOVE_COVER,
-    ProtocolActionKind.SEAL_SEPARATE,
+    ProtocolActionKind.PARK,
     ProtocolActionKind.LIQUID_ADJUST,
     ProtocolActionKind.TIP_EJECT,
 }

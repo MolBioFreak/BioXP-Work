@@ -1892,11 +1892,17 @@ class FourPipetteTransport:
             for row in rows:
                 channel = int(row["channel"])
                 remaining = max(0.0, deadline - time.monotonic())
-                completion = self._wait_channel_completion(
-                    self._transports[channel],
-                    remaining,
-                    owner_token=row.get("completion_owner_token"),
-                )
+                try:
+                    completion = self._wait_channel_completion(
+                        self._transports[channel],
+                        remaining,
+                        owner_token=row.get("completion_owner_token"),
+                    )
+                except Exception as exc:
+                    setattr(exc, "pipette_partial_result", {"operation": operation,
+                        "error": repr(exc), "channels": rows, "failed_channel": channel,
+                        "completion_wait_started": True})
+                    raise
                 row["completion"] = completion
                 completion_rows.append({"channel": channel, "result": completion})
                 with self._transaction_lock:

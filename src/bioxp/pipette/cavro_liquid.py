@@ -13,7 +13,7 @@ from typing import Any, Literal
 from pydantic import Field, ValidationError
 
 from .cavro_application import (_Input, ApplicationRequest, IMPLEMENTATION,
-                                 Instruction, compile_application)
+                                 Instruction, compile_application, _json_copy)
 
 
 class Segment(_Input):
@@ -99,7 +99,7 @@ def correction_at_target(target_ul: Any, correction: dict[str, Any]) -> str:
 
 
 def compile_liquid_recipe(request: dict[str, Any]) -> dict[str, Any]:
-    raw = deepcopy(request)
+    raw = _json_copy(request)
     try:
         r = Recipe.model_validate(raw)
         if (r.mode == "multi") != (r.multi is not None):

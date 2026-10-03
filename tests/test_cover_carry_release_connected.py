@@ -53,6 +53,12 @@ class TransferNative(OfflineNative):
             self.home = False
         return result
 
+    def motor_z_move_relative_strict(self, steps, *, timeout_s=20.0):
+        # Physical USB movement leaf; real adapter/preflight stays in the path.
+        result = self.motor_oem_move_absolute(4, self.positions[4, 1] + steps,
+                                              motor=1, wait_for_stop=True)
+        return {**result, 'command_sent': True}
+
     def motor_oem_home_axis(self, axis, **kwargs):
         assert axis == 'g'
         self.events.append(('home', axis))
@@ -86,12 +92,15 @@ def connected(retained_rig, monkeypatch):
         operator_label_serial=206, require_operator_label=True))
     qualify_test_references(references)
     native = TransferNative()
+    # Match the copied controller lifecycle before source inspection reads it.
+    native._oem_active_board_lifecycle_generation = provider._load_state()['z_lifecycle']['board_lifecycle_generation']
     adapter = object.__new__(mod.Serial206ProductionPrimitiveAdapter)
     adapter.tester, adapter.y_provider, adapter.reference_store = native, None, references
     from bioxp.serial206_y_provider import Serial206YProvider
     adapter.y_provider = Serial206YProvider(native, state_store=runtime,
         generation_provider=lambda: 3, reference_store=references)
     provider.primitives = adapter
+    provider.preparation_provider = adapter
     provider.bind_pipette_collection_state_reader(lambda: {'tip_exists': False})
     monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
     stamps = provider.deck_owner_authority_stamps()
