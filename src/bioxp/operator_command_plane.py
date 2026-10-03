@@ -4033,6 +4033,7 @@ class OperatorCommandStore(CommandReceiptReader):
 
     @staticmethod
     def _deck_stage_evidence(step: Any, result: Mapping[str, Any] | None, *, reason: str | None = None) -> dict[str, Any]:
+        from .protocols.operational_results import compact_operational
         row = dict(result or {})
         arguments = dict(step.arguments or {})
         return {
@@ -4047,6 +4048,7 @@ class OperatorCommandStore(CommandReceiptReader):
             "controller_completion_verified": row.get("controller_completion_verified") is True,
             "hardware_postcondition_verified": row.get("hardware_postcondition_verified") is True,
             "provider_evidence": _bounded_json(row, 131072), "reason": reason,
+            "operational_outcome": compact_operational(row),
         }
 
     @contextmanager
@@ -6529,6 +6531,8 @@ class OperatorCommandPlane:
                 return
             delivery_attempted = False
             wp8_response: dict[str, Any] = {}
+            from .protocols.operational_results import finite_child_outcomes
+            evidence = {}
             try:
                 if action_id == "oem.deck.move_to_well":
                     from .manual_pipetting import manual_position_plan
@@ -6579,6 +6583,7 @@ class OperatorCommandPlane:
                     "hardware_postcondition_verified": failure.hardware_postcondition_verified,
                     "provider_results": failure.provider_results,
                 } if failure is not None else {})
+                response["child_outcomes"] = finite_child_outcomes(command_id, evidence)
                 if delivery_attempted:
                     self.store.mark_deck_recovery_required(
                         command_id, reason=str(exc)[:500],
@@ -6594,13 +6599,18 @@ class OperatorCommandPlane:
                         "error": f"wp8_operation_exception:{type(exc).__name__}",
                         "detail": str(exc)[:500],
                         "delivery_attempted": delivery_attempted,
-                        **({"response": _bounded_json(response, 131072)} if failure is not None else {}),
+                        "response": _bounded_json(response, 131072),
                         **({"outcome_unknown": True} if delivery_attempted else {}),
                     },
                     controller_acknowledged=bool(response.get("controller_command_acknowledged")),
                     claimed=claimed,
                 )
                 return
+            # The typed ledger is operational, not diagnostic preview data.
+            try:
+                wp8_response["child_outcomes"] = finite_child_outcomes(command_id, self.store.wp8_operation_evidence(command_id))
+            except (OSError, RuntimeError, ValueError, KeyError) as exc:
+                wp8_response["child_outcomes_error"] = type(exc).__name__
             ok = wp8_response.get("ok") is True
             terminal_status = "completed" if ok else ("ambiguous" if delivery_attempted else "failed")
             terminal_payload = {

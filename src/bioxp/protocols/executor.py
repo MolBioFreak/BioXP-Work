@@ -523,6 +523,14 @@ class ProtocolExecutor:
         children = payload.pop("owned_children", ())
         result.update(payload)
         result.pop("pending", None)
+        application = payload.get("pipette_result")
+        if isinstance(application, Mapping) and application.get("kind") == "cavro_application":
+            # Publish the actual returned native events, not inferred liquid
+            # outcomes. Timestamp is publication time after finite completion;
+            # original event identities/order and device evidence are retained.
+            for event in application.get("events", ()):
+                self._state.record_event("cavro_application_event", stage_id=result.get("stage_id"),
+                    action_id=result.get("action_id"), detail=dict(event))
         command_id = payload.get("command_id")
         if command_id and command_id not in self._state.workflow.child_command_ids:
             self._state.workflow.child_command_ids.append(command_id)
@@ -564,7 +572,9 @@ class ProtocolExecutor:
             self._unknown = True
         if payload.get("ok") is not True and not (payload.get("interrupted") and (self._termination or self._interrupted)):
             self._failed = True
-            if result.get("on_error") == "pause_for_operator" and not self._termination:
+            application = payload.get("pipette_result") or {}
+            event_control = application.get("requested_control") if application.get("kind") == "cavro_application" else None
+            if (event_control == "pause_for_operator" or result.get("on_error") == "pause_for_operator") and not self._termination:
                 self._state.workflow.held_reason = "source_error_hold"
                 self._state.workflow.source_occurrence_id = result.get("source_occurrence_id") or result.get("action_id")
         if result.get("stage_id") in self._state.stage_states:
@@ -609,7 +619,9 @@ class ProtocolExecutor:
         while True:
             self._reap()
             self._service_requests()
-            if self._interrupted or self._recording_failed or self._unknown:
+            if self._interrupted or self._recording_failed:
+                raise _Diversion()
+            if self._unknown and self._state.workflow.held_reason != "source_error_hold":
                 raise _Diversion()
             if not any(set(child.domains).intersection(domains) for child, _ in self._owned):
                 break
@@ -753,7 +765,10 @@ class ProtocolExecutor:
         while True:
             self._reap()
             self._service_requests()
-            if self._interrupted or self._recording_failed or self._unknown:
+            # Authored failure holds retain partial/ambiguous effects without
+            # certifying them or exposing Continue/retry. Stop/owner loss still
+            # diverts immediately; Abort settles the unchanged unknown outcome.
+            if self._interrupted or self._recording_failed or (self._unknown and gate != "error_hold"):
                 raise _Diversion()
             if self._termination:
                 # A diversion never acknowledges review or runs restoration.

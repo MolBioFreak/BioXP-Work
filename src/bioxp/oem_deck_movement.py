@@ -815,6 +815,10 @@ def bind_mov_execution_script_plan(
 def _mov_terminal_truth(result: Any) -> bool:
     if not isinstance(result, Mapping) or result.get("ok") is not True:
         return False
+    if result.get("source_call_completed") is True and str(result.get("source_anchor", "")).startswith(
+            ("ClassControlInterface.scriptmoveTo:", "ClassControlInterface.rPunchFoil:",
+             "ClassControlInterface.hokeypokey:", "ClassControlInterface.CirclePunch:")):
+        return True
     if result.get("delivery_attempted") is False:
         return result.get("semantic_update_ready") is True or result.get("source_noop") is True
     return (
@@ -927,7 +931,11 @@ def execute_mov_execution(command_id: str, plan: MovExecutionPlan, *, provider: 
                 else:
                     assert callable(method)
                     mark_delivery(f"stage:{step.order}:{step.operation}")
-                    result = method(**dict(step.arguments))
+                    if step.operation in {"rPunchFoil", "hokeypokey", "CirclePunch"} and callable(getattr(provider, "_source_pierce", None)):
+                        result = method(**dict(step.arguments), source_fence=lambda boundary:
+                            assert_current(command_id, boundary=boundary))
+                    else:
+                        result = method(**dict(step.arguments))
                 if callable(assert_current):
                     assert_current(
                         command_id,
@@ -950,6 +958,8 @@ def execute_mov_execution(command_id: str, plan: MovExecutionPlan, *, provider: 
                     terminalize(
                         command_id, step, state="ambiguous" if delivery_attempted else "failed",
                         reason=f"provider_stage_exception:{type(exc).__name__}",
+                        result={"ok": False, "exception_type": type(exc).__name__, "exception": str(exc),
+                                "provider_results": getattr(exc, "provider_results", None)},
                         dispatch_attempt_id=step_dispatch_attempt_id,
                     )
                 return {
@@ -1068,7 +1078,7 @@ def _wp8_plan(operation: str, children: list[dict[str, Any]], **metadata: Any) -
             "terminal_source_point" if child["operation"] == "updatePlateLocation"
             else "immediate_after_source_call" if mutation else "none"
         )
-    if operation in {"manual_source_pipette", "diagnostic_pipette"}:
+    if operation in {"manual_source_pipette", "diagnostic_pipette", "cavro_application"}:
         # Typed source calls carry fractional values. Match the existing
         # SQLite owner's RFC8785 digest (10.0 and 10 are the same JSON number).
         import rfc8785
@@ -1081,6 +1091,8 @@ def _wp8_plan(operation: str, children: list[dict[str, Any]], **metadata: Any) -
 # Finite ControlLib pipette/lifecycle leaves. These are internal compiler
 # operations, never a public arbitrary-method dispatch surface.
 OEM_PIPETTE_LEAVES = {
+    "cavro_application": ("sourceCavroApplication", ("application",)),
+    "source_barcode": ("sourceReadBarcode", ("mode",)),
     "manual_source_pipette": ("sourceManualPipette", ("request",)),
     "diagnostic_pipette": ("sourceDiagnosticPipette", ("diagnostic",)),
     "pipette_load_tips": ("sourceLoadTips", ("tip_type", "force_new_tip")),
@@ -1186,6 +1198,11 @@ def _compile_finite_plate_operation_unchecked(
     if not source_leaf_available:
         raise RuntimeError(f"source_authority_missing:{operation}")
     children: list[dict[str, Any]] = []
+
+    if operation == "source_barcode":
+        _wp8_child(children, "sourceForceToHighHome", state_mutation={"pseudo_z_home": 500})
+        _wp8_child(children, "sourceReadBarcode", arguments={"mode": inputs["mode"]})
+        return _wp8_plan(operation, children)
 
     if operation == "diagnostic_detect_fluid":
         _wp8_child(children, "sourceDiagnosticDetectFluid")
@@ -1295,6 +1312,9 @@ def _compile_finite_plate_operation_unchecked(
         return _wp8_plan(operation, children, exception_policy="propagate")
 
     if operation == "cut_seal":
+        # ControlLib dispatcher acquires the gripper lock before cutSeal; the
+        # terminal sendZandGripperHome worker releases this same acquisition.
+        _wp8_child(children, "LockGripperOperation")
         count = inputs.get("count", 4)
         x, z = int(inputs["cut_x"]), int(inputs["cut_z"])
         if not inputs["thermal_door_open"]:
@@ -1313,7 +1333,9 @@ def _compile_finite_plate_operation_unchecked(
                 _wp8_child(children, "getG")
                 _wp8_child(children, "sourceMoveZ", arguments={"value": z - 20000})
         _wp8_child(children, "sendZandGripperHome", arguments={"run_in_parallel": True})
-        return _wp8_plan(operation, children, parent_return_allows_background_pending=True)
+        # Like single press/move_plate, the nested source helper owns these
+        # tasks; this root plan has no registered unawaited child to settle.
+        return _wp8_plan(operation, children)
 
     if operation == "shakeoff":
         for _ in range(inputs["count"]):

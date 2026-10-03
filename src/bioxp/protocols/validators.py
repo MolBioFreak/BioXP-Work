@@ -11,6 +11,7 @@ from .models import ProtocolActionKind, ProtocolDocument, OEM_OPERATION_FORMS, O
 _ACTION_CAPABILITY_MAP: dict[ProtocolActionKind, CapabilityName | None] = {
     ProtocolActionKind.MOVE: CapabilityName.MOTION,
     ProtocolActionKind.PIPETTE_POSITION: CapabilityName.MOTION,
+    ProtocolActionKind.PIPETTE_PIERCE: CapabilityName.MOTION,
     ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL: CapabilityName.MOTION,
     ProtocolActionKind.HOME: CapabilityName.MOTION,
     ProtocolActionKind.PIPETTE_INIT: CapabilityName.PIPETTE,
@@ -63,6 +64,19 @@ def validate_protocol_document(document: ProtocolDocument) -> ProtocolDocument:
         for action in stage.actions:
             from .mechanisms import validate_mechanism
             validate_mechanism(action.kind, action.params)
+            if action.kind == ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL and action.params.get("operation") == "cavro_application":
+                from ..manual_pipetting import ManualCavroApplication
+                ManualCavroApplication.model_validate(dict(action.params))
+            if action.kind == ProtocolActionKind.PIPETTE_PIERCE:
+                from ..oem_deck_movement import canonical_plate_name, well_id_from_label
+                p = action.params
+                if set(p) != {"plate", "well", "pattern"} or type(p["plate"]) is not int:
+                    raise ValueError("pipette_pierce requires plate, well and pattern")
+                plate = canonical_plate_name(p["plate"])
+                well_id_from_label(p["well"])
+                patterns = {"d": {0, 1, 2, 7, 8, 9, 10}, "r": {0, 1, 2, 7, 8, 9, 10}, "h": {2}, "t": {0}}
+                if p["pattern"] not in patterns or plate not in patterns[p["pattern"]]:
+                    raise ValueError("pipette_pierce pattern is not source-supported for this plate")
             custody_fields = {
                 ProtocolActionKind.PLATE_CATCH: ({"plate", "run_in_parallel"}, "plate"),
                 ProtocolActionKind.PLATE_RELEASE: ({"destination", "press_plate", "run_in_parallel"}, "destination"),

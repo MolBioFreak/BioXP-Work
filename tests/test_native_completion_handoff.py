@@ -120,8 +120,10 @@ def test_robot_owned_ordered_actions_keep_native_results_and_failure(handoff, mo
         assert semantic['movable_plate_locations'] == {
             'OUTPUT_COVER': 'LOC_OC_COVER', 'REAGENT_COVER': 'LOC_RC_COVER_STORAGE'}
         assert semantic['plate_on_gantry'] is None
+    child_ids = [cid for _, _, cid in rig.admitted]
     rows = store.connection.execute('SELECT parent_command_id FROM operator_commands '
-        "WHERE action_id='oem.deck._finite_operation'").fetchall()
+        "WHERE action_id='oem.deck._finite_operation' AND command_id IN (" +
+        ','.join('?' for _ in child_ids) + ')', child_ids).fetchall()
     assert rows and all(row[0] == job['job_id'] for row in rows)
 
 

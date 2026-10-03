@@ -19,8 +19,8 @@ def validate_mechanism(kind, p):
         return
     fields = {
         K.WAIT: {"seconds"}, K.TIMER_START: {"timer_id", "seconds"}, K.TIMER_WAIT: {"timer_id"},
-        K.THERMAL_SETPOINT: {"bank", "target_temp_c"}, K.CHILLER_SETPOINT: {"bank", "target_temp_c"},
-        K.THERMAL_HOLD: {"bank", "target_temp_c", "duration_s", "start", "tolerance_c", "timeout_s"},
+        K.THERMAL_SETPOINT: {"bank", "target_temp_c", "fan_speed", "cool_rate_c_s", "heat_rate_c_s"}, K.CHILLER_SETPOINT: {"bank", "target_temp_c"},
+        K.THERMAL_HOLD: {"bank", "target_temp_c", "duration_s", "start", "tolerance_c", "timeout_s", "fan_speed", "cool_rate_c_s", "heat_rate_c_s"},
         K.THERMAL_PROFILE: {"segments", "repeat"}, K.SNAPSHOT: set(),
         K.CAMERA_ILLUMINATION: {"channel", "on"}, K.BARCODE_READ: {"mode"},
     }
@@ -38,13 +38,23 @@ def validate_mechanism(kind, p):
         if kind == K.TIMER_START:
             number("seconds", True)
     elif kind == K.BARCODE_READ:
-        if p.get("mode") != "stationary":
-            raise ValueError("barcode_read.mode must be stationary; source multi-pose is a separate OEM operation")
+        if p.get("mode") not in {"stationary", "job_id", "reagent_id"}:
+            raise ValueError("barcode_read.mode requires stationary, job_id or reagent_id")
     elif kind in {K.THERMAL_SETPOINT, K.THERMAL_HOLD, K.CHILLER_SETPOINT}:
         number("target_temp_c")
         banks = {"rc", "oc"} if kind == K.CHILLER_SETPOINT else {"nest", "lid", "pedestal"}
         if p.get("bank") not in banks:
             raise ValueError(f"{kind.value}.bank requires one of {sorted(banks)}")
+        if kind != K.CHILLER_SETPOINT:
+            if "fan_speed" in p and (type(p["fan_speed"]) is not int or not 0 <= p["fan_speed"] <= 255):
+                raise ValueError("fan_speed requires native integer 0..255")
+            if "cool_rate_c_s" in p or "heat_rate_c_s" in p:
+                if p["bank"] == "pedestal":
+                    raise ValueError("thermal rates support nest/lid, not pedestal")
+                number("cool_rate_c_s")
+                number("heat_rate_c_s")
+                if not -2 <= p["cool_rate_c_s"] <= 0 or not 0 <= p["heat_rate_c_s"] <= 2:
+                    raise ValueError("thermal rates require cool -2..0 and heat 0..2 C/s")
         if kind == K.THERMAL_HOLD:
             number("duration_s", True)
             if p.get("start") not in {"dispatch", "attainment"}:
@@ -66,7 +76,7 @@ def validate_mechanism(kind, p):
             raise ValueError("camera_illumination requires channel 1/2/3 and boolean on")
 
 
-def build_mechanism_handlers(*, get_tester, get_camera, get_executor, save_snapshot):
+def build_mechanism_handlers(*, get_tester, get_camera, get_executor, save_snapshot, read_source_barcode=None):
     def owner():
         if get_executor is None:
             raise RuntimeError("workflow executor unavailable")
@@ -80,10 +90,21 @@ def build_mechanism_handlers(*, get_tester, get_camera, get_executor, save_snaps
 
     def setpoint(p):
         tester = get_tester()
-        if p["bank"] == "pedestal":
-            return tester.thermal_set_ped_temp(p["target_temp_c"], verify=True)
+        settings = []
+        if "fan_speed" in p:
+            value = tester.thermal_set_fan(p["fan_speed"], verify=True)
+            settings.append({"field": "fan_speed", "requested": p["fan_speed"], "result": value})
+            if value.get("ok") is not True:
+                return {"ok": False, "settings": settings, "setpoint_emitted": False}
         bank = tester.THERMAL_BANK_NEST if p["bank"] == "nest" else tester.THERMAL_BANK_LID
-        return tester.thermal_set_target_temp(bank, p["target_temp_c"], verify=True)
+        if "cool_rate_c_s" in p:
+            value = tester.thermal_set_rates(bank, p["cool_rate_c_s"], p["heat_rate_c_s"], verify=True)
+            settings.append({"field": "rates", "requested": {k: p[k] for k in ("cool_rate_c_s", "heat_rate_c_s")}, "result": value})
+            if value.get("ok") is not True:
+                return {"ok": False, "settings": settings, "setpoint_emitted": False}
+        value = (tester.thermal_set_ped_temp(p["target_temp_c"], verify=True) if p["bank"] == "pedestal"
+                 else tester.thermal_set_target_temp(bank, p["target_temp_c"], verify=True))
+        return {**value, "settings": settings, "setpoint_emitted": True}
 
     def read_temp(p):
         tester = get_tester()
@@ -156,6 +177,8 @@ def build_mechanism_handlers(*, get_tester, get_camera, get_executor, save_snaps
                     if result["ok"] is not True:
                         return {"ok": False, "profile_complete": False, "children": children, "failed_child": identity}
             return {"ok": True, "profile_complete": True, "children": children}
+        if kind == K.BARCODE_READ and p["mode"] != "stationary":
+            return read_source_barcode(action, state)
         camera = get_camera()
         if kind == K.CAMERA_ILLUMINATION:
             result = camera.command_illumination(channel=p["channel"], on=p["on"])

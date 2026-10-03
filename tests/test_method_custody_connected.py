@@ -47,7 +47,15 @@ def test_explicit_catch_release_native_custody(handoff, monkeypatch, failure):
     monkeypatch.setattr(store, "finish_workflow", finished)
     job = create_protocol_job(payload, dry_run=False, command_store=store, store=artifacts,
         handlers=handlers, ownership_generation=rig.provider.deck_owner_authority_stamps()["ownership_generation"], board_epochs={})
-    store.start(rig.plane._dispatch_one)
+    dispatch_errors = []
+    def dispatch(claimed):
+        try:
+            return rig.plane._dispatch_one(claimed)
+        except Exception as exc:
+            import traceback
+            dispatch_errors.append(traceback.format_exc())
+            raise
+    store.start(dispatch)
     assert done.wait(20), store.get_workflow(job["job_id"])
     result = store.get_workflow(job["job_id"])
     rows = result["execution"]["runtime_state"]["action_results"]
@@ -116,9 +124,39 @@ def test_explicit_press_cut_real_finite_owner(handoff, monkeypatch, kind, params
             {"action_id": kind, "kind": kind, "params": params}]}]}}
     job = create_protocol_job(payload, dry_run=False, command_store=store, store=artifacts,
         handlers=handlers, ownership_generation=rig.provider.deck_owner_authority_stamps()["ownership_generation"], board_epochs={})
-    store.start(rig.plane._dispatch_one)
+    dispatch_errors = []
+    def dispatch(claimed):
+        try:
+            return rig.plane._dispatch_one(claimed)
+        except Exception as exc:
+            import traceback
+            dispatch_errors.append(traceback.format_exc())
+            raise
+    store.start(dispatch)
     assert done.wait(20), store.get_workflow(job["job_id"])
     result = store.get_workflow(job["job_id"])
     rows = result["execution"]["runtime_state"]["action_results"]
+    import json, os
+    if os.environ.get("CAVRO_EVIDENCE_ROOT"):
+        from pathlib import Path
+        Path(os.environ["CAVRO_EVIDENCE_ROOT"], "native-cut-result.json").write_text(json.dumps(result, indent=2))
+    assert not dispatch_errors, dispatch_errors
     assert result["command"]["status"] == "completed", [(r.get("command", {}).get("terminal_evidence"), r.get("message"), r.get("child_outcomes")) for r in rows]
-    assert any(c["operation"] == leaf_operation for c in rows[0]["child_outcomes"])
+    outcomes = rows[0]["child_outcomes"]
+    assert any(c["operation"] == leaf_operation for c in outcomes)
+    command = rows[0]["command"]
+    durable = store.wp8_operation_evidence(command["command_id"])["children"]
+    assert len(outcomes) == len(durable)
+    assert command["terminal_evidence"]["response"]["child_outcomes"] == outcomes
+    assert '"omitted"' not in json.dumps(outcomes)
+    if kind == "cut_seal":
+        assert len(outcomes) > 10
+        acquired = json.loads(durable[0]["terminal_evidence_json"])["result"]["lock_token"]
+        assert durable[0]["operation"] == "LockGripperOperation"
+        gripper_tasks = [task for task in rig.provider._wp8_tasks.values() if task["kind"] == "gripper_home_and_unlock"]
+        assert gripper_tasks
+        for task in gripper_tasks:
+            task["thread"].join(timeout=5)
+            assert task["state"] == "completed", task["error"]
+            assert task["result"]["released"]["released_lock_token"] == acquired
+        assert rig.provider._wp8_gripper_lock_owner is None

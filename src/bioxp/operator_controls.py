@@ -724,7 +724,7 @@ def _pipette_source_errors(value: Any) -> list[Any]:
 
 
 _ADDITIONAL_PIPETTE_KINDS = frozenset({"source_load_tips", "source_mix",
-    "source_aspirate_air", "source_dispense_air", "source_purge", "diagnostic_pipette"})
+    "source_aspirate_air", "source_dispense_air", "source_purge", "diagnostic_pipette", "cavro_application"})
 
 
 def _compact_pipette_observation(value: Any) -> Any:
@@ -784,6 +784,13 @@ def _compact_pipette_response(value: Any) -> Any:
     """
     if not isinstance(value, Mapping):
         return value
+    if value.get("kind") == "cavro_application":
+        # Versioned application events are operational fields, not diagnostic
+        # previews: retain channels, partial settings and control at every child.
+        from .protocols.operational_results import compact_application
+        return compact_application(value)
+    if value.get("kind") == "source_barcode":
+        return dict(value)
     if value.get("kind") in _ADDITIONAL_PIPETTE_KINDS:
         return _compact_additional_pipette(value)
     source = str(value.get("source") or value.get("source_anchor") or "")
@@ -829,6 +836,7 @@ def _compact_pipette_response(value: Any) -> Any:
         return {"kind": kind, **result}
     result = dict(value)
     critical = result.get("pipette_result")
+    barcode = result.get("barcode_result")
     for key in ("result", "response", "completed_children", "source_children", "provider_results"):
         child = result.get(key)
         if isinstance(child, Mapping):
@@ -842,6 +850,10 @@ def _compact_pipette_response(value: Any) -> Any:
         for candidate in candidates:
             if not isinstance(candidate, Mapping):
                 continue
+            if candidate.get("kind") == "source_barcode":
+                barcode = candidate
+            elif isinstance(candidate.get("barcode_result"), Mapping):
+                barcode = candidate["barcode_result"]
             if isinstance(candidate.get("pipette_result"), Mapping):
                 critical = candidate["pipette_result"]
             anchor = str(candidate.get("source") or candidate.get("source_anchor") or "")
@@ -849,6 +861,8 @@ def _compact_pipette_response(value: Any) -> Any:
             child_kind = candidate.get("kind") if candidate.get("kind") in _ADDITIONAL_PIPETTE_KINDS else child_kind
             if child_kind:
                 critical = {"kind": child_kind, **candidate}
+    if barcode is not None:
+        result["barcode_result"] = barcode
     if critical is not None:
         result["pipette_result"] = critical
     return result
@@ -858,7 +872,7 @@ def _workflow_terminal_result(receipt: Mapping[str, Any]) -> dict[str, Any]:
     """One native consumer for persisted terminal success and partial failure."""
     evidence = receipt.get("terminal_evidence") or {}
     response = dict(evidence.get("response") or {})
-    for key in ("error", "detail", "pipette_result"):
+    for key in ("error", "detail", "pipette_result", "barcode_result", "child_outcomes"):
         if key in evidence:
             response[key] = evidence[key]
     return {**response, "ok": receipt["status"] == "completed",
@@ -877,10 +891,10 @@ def _bounded_json(value: Any, limit: int) -> Any:
             "source_calwith_fluid", "diagnostic_detect_fluid",
             "source_fluid_offset", "measure_fluid_height", *_ADDITIONAL_PIPETTE_KINDS}:
         return json.loads(raw)
-    if isinstance(value, Mapping) and isinstance(value.get("pipette_result"), Mapping):
+    if isinstance(value, Mapping) and any(key in value for key in ("pipette_result", "barcode_result", "child_outcomes")):
         # Critical source data is not diagnostic preview data. Drop the redundant
         # envelope rather than hashing it or losing samples to the diagnostic cap.
-        return {key: value[key] for key in ("pipette_result", "ok", "error", "detail",
+        return {key: value[key] for key in ("pipette_result", "barcode_result", "child_outcomes", "ok", "error", "detail",
             "delivery_attempted", "outcome_unknown") if key in value}
     digest = hashlib.sha256(raw).hexdigest()
     return {"bounded": True, "original_bytes": len(raw), "sha256": digest, "preview": raw[: min(limit // 2, 4096)].decode("utf-8", "replace")}

@@ -101,6 +101,7 @@ class ProtocolActionKind(str, Enum):
     PLATE_RELEASE = "plate_release"
     PLATE_PRESS = "plate_press"
     CUT_SEAL = "cut_seal"
+    PIPETTE_PIERCE = "pipette_pierce"
     LOOP_MARKER = "loop_marker"
     SEAL_SEPARATE = "seal_separate"
     LIQUID_ADJUST = "liquid_adjust"

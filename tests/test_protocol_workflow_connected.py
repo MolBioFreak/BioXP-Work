@@ -198,7 +198,8 @@ def test_late_unbound_action_is_rejected_before_any_native_leaf(installed_retain
         {"action_id": "first", "kind": "led"},
         {"action_id": "last", "kind": "wait", "params": {}},
     ])
+    existing = {row["job_id"] for row in app.state.operator_command_plane.store.list_workflows()}
     response = client.post("/protocol/execute", json=payload)
     assert response.status_code in (400, 409), response.text
     assert calls == []
-    assert app.state.operator_command_plane.store.list_workflows() == []
+    assert {row["job_id"] for row in app.state.operator_command_plane.store.list_workflows()} == existing

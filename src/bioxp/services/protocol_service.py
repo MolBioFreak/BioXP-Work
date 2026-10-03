@@ -28,6 +28,7 @@ REFERENCE_REQUIRED_ACTION_KINDS = {
     ProtocolActionKind.CUT_SEAL,
     ProtocolActionKind.MOVE,
     ProtocolActionKind.PIPETTE_POSITION,
+    ProtocolActionKind.PIPETTE_PIERCE,
     ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL,
     ProtocolActionKind.PIPETTE_TIP,
     ProtocolActionKind.PIPETTE_ASPIRATE,

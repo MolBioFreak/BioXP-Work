@@ -88,6 +88,44 @@ def test_native_thermal_timer_profile_real_store(installed_retained, monkeypatch
         (Path(export) / "thermal-result.json").write_text(json.dumps(done, indent=2))
 
 
+@pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize("kind", ["thermal_profile", "thermal_setpoint", "thermal_hold"])
+def test_profile_fan_ramp_native_writes(installed_retained, monkeypatch, tmp_path, thermal_leaf, failure, kind):
+    app, client = mount(installed_retained, monkeypatch, tmp_path)
+    tester, writes = thermal_leaf
+    send = tester._send_thermal
+    def exchange(command, typ, bank, value, **kw):
+        reply = send(command, typ, bank, value, **kw)
+        if failure and command == 141:
+            reply["status"] = 1
+        return reply
+    tester._send_thermal = exchange
+    params = {"bank": "nest", "target_temp_c": 37,
+        "fan_speed": 190, "cool_rate_c_s": -.125, "heat_rate_c_s": .25}
+    if kind != "thermal_setpoint":
+        params.update(duration_s=0, start="dispatch")
+    if kind == "thermal_profile":
+        params = {"repeat": 1, "segments": [params]}
+    job = submit(app, client, [action(kind, params), action("note")], key="fan-ramp")
+    done = await_job(client, job, lambda r: r["command"]["terminal"])
+    row = done["execution"]["runtime_state"]["action_results"][0]
+    body = row["children"][0] if kind == "thermal_profile" else row
+    settings = body["settings"] if kind == "thermal_setpoint" else body["setpoint"]["settings"]
+    assert settings[0]["field"] == "fan_speed"
+    if failure:
+        assert not row["ok"]
+        assert not any(w[1] == 140 for w in writes)
+    else:
+        assert row["ok"]
+        if kind == "thermal_profile":
+            assert row["profile_complete"]
+        assert settings[1]["result"]["cool_raw"] == -125
+        assert settings[1]["result"]["heat_raw"] == 250
+        assert ("thermal", 141, 0, 0, 190) in writes
+        assert ("thermal", 9, 8, 0, -125) in writes
+        assert ("thermal", 9, 7, 0, 250) in writes
+
+
 def test_camera_illumination_real_owner_and_store(installed_retained, led_rig, monkeypatch, tmp_path):
     app, client = mount(installed_retained, monkeypatch, tmp_path)
     provider, calls, _ = led_rig
