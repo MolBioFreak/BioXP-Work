@@ -851,6 +851,25 @@ def _set_maintenance_state(*, transition: str, **updates: Any) -> dict[str, Any]
         return dict(_maintenance_state)
 
 
+def _bind_axis_position_observer(*, epoch: int, owned: bool) -> None:
+    plane = getattr(app.state, "operator_command_plane", None)
+    if plane is not None:
+        plane.store.set_observation_generation(ownership_generation=epoch)
+    owner = _tester
+    bind = getattr(owner, "set_axis_position_observer", None)
+    if not callable(bind):
+        return
+
+    def publish(**observation):
+        if _tester is not owner or hardware_state.ownership_epoch != epoch:
+            return
+        plane = getattr(app.state, "operator_command_plane", None)
+        if plane is not None:
+            plane.store.publish_axis_observation(**observation)
+
+    bind(publish if owned else None, ownership_generation=epoch)
+
+
 def _ownership_changed(*, reason: str, transport: str, usb: str, router: str) -> int:
     """Invalidate every hardware and camera projection on ownership changes."""
     global _camera_projection_epoch, _camera_probe_cache, _camera_session
@@ -889,6 +908,9 @@ def _ownership_changed(*, reason: str, transport: str, usb: str, router: str) ->
         task = session.get("reader_task")
         if task is not None and not task.done():
             task.cancel()
+    _bind_axis_position_observer(
+        epoch=epoch, owned=(transport, usb, router) == ("owned", "service", "running"),
+    )
     _sync_serial206_oem_initialization_provider(transport=transport, usb=usb, router=router)
     return epoch
 

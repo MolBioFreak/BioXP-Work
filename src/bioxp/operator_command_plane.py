@@ -10,6 +10,7 @@ import asyncio
 import fcntl
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -946,6 +947,13 @@ class OperatorCommandStore(CommandReceiptReader):
         self._pending_interrupt_reconciliations: list[dict[str, Any]] = []
         self._active_interrupt_deliveries: dict[str, str] = {}
         self._wake = threading.Event()
+        self.source_instance_id = uuid.uuid4().hex
+        self._updates_lock = threading.Lock()
+        self._updates_waiters: dict[asyncio.Event, asyncio.AbstractEventLoop] = {}
+        self._transition_pending = False
+        self._observation_generation = 0
+        self._pose_sequence = 0
+        self._pose_axes: dict[str, dict[str, Any]] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._worker_lock = threading.Lock()
@@ -984,6 +992,131 @@ class OperatorCommandStore(CommandReceiptReader):
         self._owner_acquired = self._acquire_owner()
         if self._owner_acquired:
             self._startup_recover()
+
+    def _notify_updates(self) -> None:
+        # Only hints: cursors and committed SQLite rows remain authoritative.
+        with self._updates_lock:
+            waiters = tuple(self._updates_waiters.items())
+        for event, loop in waiters:
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                # A disconnected subscriber's event loop may already be closed.
+                pass
+
+    def set_observation_generation(self, *, ownership_generation: int) -> None:
+        """Invalidate display observations on owner replacement; never gate motion."""
+        if type(ownership_generation) is not int or ownership_generation < 0:
+            return
+        with self._updates_lock:
+            if ownership_generation <= self._observation_generation:
+                return
+            self._observation_generation = ownership_generation
+            self._pose_axes.clear()
+            self._pose_sequence += 1
+        self._notify_updates()
+
+    def publish_axis_observation(
+        self, *, axis: str, position_steps: int, observed_at: float,
+        ownership_generation: int,
+    ) -> None:
+        """Publish actual readback only, retaining each axis's own timestamp."""
+        if (not isinstance(axis, str) or axis not in {"x", "y", "z"}
+                or type(position_steps) not in {int, float}
+                or type(observed_at) not in {int, float}
+                or type(ownership_generation) is not int or ownership_generation < 0):
+            return
+        try:
+            if not math.isfinite(position_steps) or not math.isfinite(observed_at):
+                return
+        except OverflowError:
+            return
+        with self._updates_lock:
+            if ownership_generation < self._observation_generation:
+                return
+            if ownership_generation > self._observation_generation:
+                self._observation_generation = ownership_generation
+                self._pose_axes.clear()
+            prior = self._pose_axes.get(axis)
+            if prior is not None and observed_at < prior["observed_at"]:
+                return
+            observation = dict(axis=axis, position_steps=position_steps, observed_at=observed_at)
+            if prior == observation:
+                return
+            self._pose_axes[axis] = observation
+            self._pose_sequence += 1
+        self._notify_updates()
+
+    def _updates_snapshot(self, after_sequence: int | None, after_pose_sequence: int | None) -> dict[str, Any]:
+        # This short read runs off the event loop, never across the async wait.
+        with self._lock:
+            low, high = self.connection.execute(
+                "SELECT (SELECT COALESCE(MIN(transition_sequence),0) FROM operator_plane_transitions),"
+                "(SELECT COALESCE(MAX(transition_sequence),0) FROM operator_plane_transitions)"
+            ).fetchone()
+            reset = after_sequence is not None and (
+                after_sequence > high or after_sequence < max(0, low - 1))
+            rows = []
+            if after_sequence is not None and not reset:
+                rows = self.connection.execute(
+                    "SELECT transition_sequence,command_id FROM operator_plane_transitions "
+                    "WHERE transition_sequence>? ORDER BY transition_sequence LIMIT 201",
+                    (after_sequence,),
+                ).fetchall()
+            active = [str(row[0]) for row in self.connection.execute(
+                "SELECT p.command_id FROM operator_plane_commands p "
+                "JOIN serial206_movement_commands c USING(command_id) "
+                "WHERE c.state IN ('queued','dispatched','issued_pending','interrupting') "
+                "ORDER BY p.stream_sequence"
+            )]
+        has_more = len(rows) > 200
+        rows = rows[:200]
+        next_sequence = int(rows[-1][0]) if rows else (
+            int(high) if after_sequence is None or reset else after_sequence)
+        with self._updates_lock:
+            generation = self._observation_generation
+            pose_sequence = self._pose_sequence
+            axes = [dict(self._pose_axes[axis]) for axis in ("x", "y", "z") if axis in self._pose_axes]
+        return {
+            "schema_version": "bioxp.operator_updates.v1",
+            "source_instance_id": self.source_instance_id,
+            "ownership_generation": generation,
+            "next_after_sequence": next_sequence,
+            "pose_sequence": pose_sequence,
+            "changed_command_ids": list(dict.fromkeys(str(row[1]) for row in rows if row[1])),
+            "active_command_ids": active,
+            "has_more": has_more,
+            "reset": reset or (after_pose_sequence is not None and after_pose_sequence > pose_sequence),
+            "pose": {"ownership_generation": generation, "axes": axes} if axes else None,
+        }
+
+    async def updates(self, *, after_sequence: int | None = None,
+                      after_pose_sequence: int | None = None, wait_s: float = 0) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        event = asyncio.Event()
+        deadline = loop.time() + min(25.0, max(0.0, wait_s))
+        # Register BEFORE reading. Clear BEFORE rechecking: a commit at any
+        # point between the query and await therefore cannot be lost.
+        with self._updates_lock:
+            self._updates_waiters[event] = loop
+        try:
+            while True:
+                event.clear()
+                result = await asyncio.to_thread(self._updates_snapshot, after_sequence, after_pose_sequence)
+                if after_pose_sequence is None:
+                    after_pose_sequence = result["pose_sequence"]
+                if (after_sequence is None or result["reset"] or result["has_more"]
+                        or result["next_after_sequence"] != after_sequence
+                        or result["pose_sequence"] != after_pose_sequence
+                        or loop.time() >= deadline):
+                    return result
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=max(0.0, deadline - loop.time()))
+                except asyncio.TimeoutError:
+                    return result
+        finally:
+            with self._updates_lock:
+                self._updates_waiters.pop(event, None)
 
     def bind_deck_owner_authority_reader(
         self, reader: Callable[[], Mapping[str, Any]], *,
@@ -1630,6 +1763,7 @@ class OperatorCommandStore(CommandReceiptReader):
     def _transaction(self, *, timeout_ms: int = 2000):
         with self._lock:
             self.connection.execute(f"PRAGMA busy_timeout={int(timeout_ms)}")
+            pending_before = self._transition_pending
             if self.connection.in_transaction:
                 savepoint = f"operator_nested_{uuid.uuid4().hex}"
                 self.connection.execute(f"SAVEPOINT {savepoint}")
@@ -1637,7 +1771,8 @@ class OperatorCommandStore(CommandReceiptReader):
                     with self._authority_write():
                         yield self.connection
                     self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
-                except Exception:
+                except BaseException:
+                    self._transition_pending = pending_before
                     self.connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                     self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
                     raise
@@ -1649,7 +1784,11 @@ class OperatorCommandStore(CommandReceiptReader):
                 with self._authority_write():
                     yield self.connection
                 self.connection.execute("COMMIT")
-            except Exception:
+                if self._transition_pending:
+                    self._transition_pending = False
+                    self._notify_updates()
+            except BaseException:
+                self._transition_pending = pending_before
                 if self.connection.in_transaction:
                     self.connection.execute("ROLLBACK")
                 raise
@@ -1662,6 +1801,7 @@ class OperatorCommandStore(CommandReceiptReader):
             (event_kind, command_id, method_id, state, _canonical(payload or {}), _now()),
         ).fetchone()
         assert row is not None
+        self._transition_pending = True
         if command_id:
             # Keep SQL claim/report lineage current, not a second rendered
             # receipt. Readers use the canonical owner on their own connection.
@@ -3282,7 +3422,10 @@ class OperatorCommandStore(CommandReceiptReader):
         if operation == "updateLocation":
             merged["current_tray"] = self._oem_update_location_current_tray(
                 merged["current_location"], merged["movable_plate_locations"], merged["current_tray"])
-        if merged["tip_loaded"] is True and merged["tip_location"] not in {-1, 0, 1, 2, 3}:
+        # Location-only publication carries unknown tip metadata unchanged;
+        # the existing actual tip-state publishers retain their validation.
+        if (operation != "updateLocation" and merged["tip_loaded"] is True
+                and merged["tip_location"] not in {-1, 0, 1, 2, 3}):
             if not (operation == "pipette_owner" and "tip_location" in values
                     and values["tip_location"] is None):
                 raise ValueError("loaded tip requires a valid tip location")
@@ -4752,6 +4895,8 @@ class OperatorCommandStore(CommandReceiptReader):
                     str(command_id),
                 ),
             )
+            self._insert_transition(conn, event_kind="deck_recovery_required",
+                command_id=str(command_id), state="recovery_required", payload={"reason": reason})
 
 
     def cancel_command(self, command_id: str, request: Mapping[str, Any]) -> dict[str, Any]:
@@ -7348,6 +7493,29 @@ class OperatorCommandPlane:
         @router.get("/queue")
         async def queue() -> dict[str, Any]:
             return await asyncio.to_thread(self.store.queue)
+
+        @router.get("/updates")
+        async def updates(
+            request: Request,
+            after_sequence: int | None = Query(default=None, ge=0),
+            after_pose_sequence: int | None = Query(default=None, ge=0),
+            wait_s: float = Query(default=25, ge=0, le=25),
+        ) -> dict[str, Any]:
+            async def disconnected():
+                while (await request.receive())["type"] != "http.disconnect":
+                    pass
+            update = asyncio.create_task(self.store.updates(after_sequence=after_sequence,
+                after_pose_sequence=after_pose_sequence, wait_s=wait_s))
+            disconnect = asyncio.create_task(disconnected())
+            try:
+                done, _ = await asyncio.wait((update, disconnect), return_when=asyncio.FIRST_COMPLETED)
+                if update in done:
+                    return update.result()
+                raise asyncio.CancelledError
+            finally:
+                update.cancel()
+                disconnect.cancel()
+                await asyncio.gather(update, disconnect, return_exceptions=True)
 
         @router.get("/transitions")
         async def transitions(after_sequence: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=200)) -> dict[str, Any]:
