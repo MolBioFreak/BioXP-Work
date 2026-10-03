@@ -1849,6 +1849,7 @@ class FourPipetteTransport:
         if set_allow_to_stop:
             self._allow_to_stop = False
         rows: list[dict[str, Any]] = []
+        channel: int | None = None
         operation_interrupt_epoch = self._interrupt_epoch
         try:
             # Hold the transaction lock only while registering/sending the group.
@@ -1868,13 +1869,22 @@ class FourPipetteTransport:
                         self._sleep(float(post_send_delay_s))
         except Exception as exc:
             self._last_error = {"operation": operation, "error": repr(exc), "channels": rows}
+            # Retain channels already sent when a later channel throws. This
+            # changes evidence only: no retry, new query, stop or success rule.
+            setattr(exc, "pipette_partial_result", {**self._last_error,
+                "failed_channel": channel, "failure_details": getattr(exc, "details", None)})
             raise
 
         # ControlLib.detectFluidLevel starts Z only after all four BR owners
         # are captured, before waiting. Keep motion outside the send lock so
         # terminatecommands can interrupt it; the epoch below preserves Stop.
         if after_sends is not None:
-            after_sends()
+            try:
+                after_sends()
+            except Exception as exc:
+                setattr(exc, "pipette_partial_result", {"operation": operation,
+                    "error": repr(exc), "channels": rows, "completion_wait_started": False})
+                raise
 
         completion_rows: list[dict[str, Any]] = []
         if defer_completion:
