@@ -2921,8 +2921,8 @@ class _OperatorPollCache:
         self._pending = None
         self._pending_key = None
         self._cache = {}
-        # One immutable wire baseline per existing finite catalog view, not per
-        # caller/draft. Clients keep it in their existing QueryClient entry.
+        # Current/previous immutable snapshots per native schema, never per
+        # caller/draft. Clients promote them in their existing QueryClient.
         self._assessment_bases = {}
         self._closed = False
 
@@ -2933,19 +2933,36 @@ class _OperatorPollCache:
         generation = body.get("ownership_generation", (body.get("dashboard") or {}).get("ownership_generation"))
         identity = (generation, body.get("metadata_revision"))
         with self._lock:
-            previous = self._assessment_bases.get(key)
-            if previous is None or previous[0] != identity:
+            retained = self._assessment_bases.get(key)
+            current, previous = retained[1:] if retained and retained[0] == identity else (None, None)
+            # Resolve the request BEFORE promotion evicts the oldest slot:
+            # two staggered clients may each observe a different source update.
+            source = next((item for item in (current, previous) if item and item[0] == requested_base), None)
+            changes = _catalog_changes(current[1], body) if current else []
+            # These are request/display-only fields, not source advancement.
+            # Still transmit them losslessly below. Receipt times, deck state,
+            # recovery and every other source field DO advance the snapshot.
+            def material(change):
+                path = tuple(change[0])
+                return path not in {("dashboard", "generated_at"),
+                                    ("dashboard", "command_queue", "generated_at")} and path[:4] != (
+                                        "dashboard", "z_axis", "provider", "target_preview")
+            if current is None or any(material(change) for change in changes):
                 revision = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-                previous = (identity, revision, copy.deepcopy(body))
-                self._assessment_bases[key] = previous
-            _, revision, baseline = previous
-            if requested_base != revision:
-                # Resync sends the baseline, plus current changes in this same
-                # response. No second GET and no stale intermediate display.
-                return {"catalog_view": "assessment", "assessment_revision": revision,
-                        "assessment_base": baseline, "assessment_changes": _catalog_changes(baseline, body)}
-            return {"catalog_view": "assessment", "assessment_revision": revision,
-                    "assessment_changes": _catalog_changes(baseline, body)}
+                previous, current = current, (revision, copy.deepcopy(body))
+                self._assessment_bases[key] = (identity, current, previous)
+                changes = []
+            revision, snapshot = current
+            result = {"catalog_view": "assessment", "assessment_revision": revision,
+                      "assessment_source_revision": source[0] if source else revision,
+                      "assessment_changes": _catalog_changes(source[1], snapshot) if source else [],
+                      "assessment_overlay": changes}
+            if source is None:
+                # Unknown/evicted clients get CURRENT state, never an old base
+                # plus its permanently accumulating history. Keep the shared
+                # revision stable for other clients and return display overlay.
+                result["assessment_base"] = copy.deepcopy(snapshot)
+            return result
 
     def assessment_response(self, fn):
         @wraps(fn)
