@@ -30,7 +30,7 @@ def test_real_provider_plld_and_canonical_workflow_owner(wire_rig, native_rig, m
     assert any(event[0] == "stop_z" for event in native_rig.events)
     assert wire_rig.wire == [(i, "BR") for i in range(4)]
     store.publish_workflow("offline-finite-owner", payload={"application_result": result})
-    assert store.get_workflow("offline-finite-owner")["application_result"]["plld"]["clot"] is None
+    assert store.get_workflow("offline-finite-owner")["application_result"]["plld"]["final_position_steps"] is not None
     assert wire_rig.store.connection.execute("SELECT count(*) FROM pipette_operations").fetchone()[0] == 1
     import os, json
     from pathlib import Path

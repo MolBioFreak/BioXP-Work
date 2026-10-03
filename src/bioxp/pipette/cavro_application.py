@@ -4,7 +4,7 @@
 30053815-C pp35–37: original ADP v/c speed setters and their interactions.
 Manufacturer manual mirror: https://www.docin.com/p-4632231525.html
 399155 V1.0 p3: p0..p8. 399094 V1.0 pp2–3: BR + robotic Z.
-No firmware identification, Water resolution, pickup geometry or classifier is
+No firmware identification, Water resolution or pickup geometry is
 inferred here. Unknown executable fields are representation errors, not gates
 on existing OEM operations. Requested raw JSON is never normalized in-place.
 """
@@ -159,8 +159,6 @@ def setting_commands(values: Mapping[str, Any]) -> list[tuple[str, str]]:
             if len(encoded.partition(".")[2]) > 3:
                 raise ValueError(f"{field}: at most three decimal places (30053815-C p36); no rounding")
             wire = f"{'v' if field == 'start_speed_ul_s' else 'c'}{encoded},1R"
-        elif field in {"clot_classifier", "air_classifier", "adp_detect"}:
-            raise ValueError(f"{field}: no original-ADP classifier implementation; raw streaming is not classification")
         else:
             raise ValueError(f"{field}: unknown executable setting")
         commands.append((field, wire))
@@ -248,11 +246,8 @@ def capability_catalog() -> dict[str, Any]:
             "existing_native_families": {
                 "diagnostic_pipette": ["aspirate", "dispense", "dispense_all", "diagnoses", "initialize", "get_data", "last_error", "eject", "plunger_up", "plunger_down"],
                 "pipette_manual_physical": ["load_tip", "source_load_tips", "measure_fluid_height", "source_fluid_offset", "source_calwith_fluid", "source_mix", "source_purge"]},
-            "raw_pressure_streaming": {"status": "implemented", "classifier": False,
-                "samples_owner": "existing NovoRouter pressure observation/receipt path", "verdict": None},
-            "clot_classifier": {"status": "unsupported", "verdict": None},
-            "air_classifier": {"status": "unsupported", "verdict": None},
-            "adp_detect": {"status": "different_controller_generation"},
+            "raw_pressure_streaming": {"status": "implemented",
+                "samples_owner": "existing NovoRouter pressure observation/receipt path"},
             "tip_profiles": {name: {"design_intent": True, "physical_fit_verified": False,
                 "pickup_mapping": "existing OEM T50/T200 only"} for name in ("T10", "T50", "T200", "T1000")}}
 
@@ -371,8 +366,7 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
             elif kind == "plld":
                 z_move(op["start_steps"], op["search_speed_native"])
                 search = {"z_search_attempted": False, "z_stop_attempted": False,
-                          "final_position_steps": None, "z_settled": None,
-                          "clean_tip": None, "no_aspiration": None, "clot": None, "air": None}
+                          "final_position_steps": None, "z_settled": None}
                 result["plld"] = search
                 def start_z():
                     # Existing source pseudo-home/current handling; no synthetic pose.

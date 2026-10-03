@@ -176,7 +176,6 @@ def test_plld_is_send_start_z_wait_stop_observe_not_classifier(rig):
     assert rig.wire == [(0, "BR"), (1, "BR")]
     assert [name for name, _ in rig.native] == ["z_speed", "z_move", "z_search",
         "pipette_wait", "pipette_wait", "z_stop", "z_observation"]
-    assert out["plld"]["clean_tip"] is out["plld"]["no_aspiration"] is out["plld"]["clot"] is None
     assert all(isinstance(stamp, float) for stamp in out["plld"]["fluid_timestamps"].values())
 
 
@@ -191,14 +190,13 @@ def test_settings_every_p_parameter_slope_and_no_water_invention():
     wires = [c["ascii"] for c in out["operations"][0]["wire_commands"]]
     assert wires == ["p0,15R", "p1,5R", "p2,0R", "p3,150R", "p4,44000R", "p5,0R",
                      "p6,20R", "p7,3R", "p8,50R", "L20,10R", "b15R", "o0,1R"]
-    assert capability_catalog()["clot_classifier"]["verdict"] is None
 
 
 @pytest.mark.parametrize("field,value", [("start_speed_ul_s", 100.001), ("cutoff_speed_ul_s", 200.001),
     ("start_speed_ul_s", 2.499), ("cutoff_speed_ul_s", 2.499),
     ("start_speed_ul_s", "25.0001"), ("cutoff_speed_ul_s", "50.0001"),
     ("start_speed_ul_s", True), ("cutoff_speed_ul_s", None),
-    ("clot_classifier", "invented"), ("slope", [20]), ("plld_persistence_ms", None),
+    ("slope", [20]), ("plld_persistence_ms", None),
     ("unknown", 3)])
 def test_no_truncated_executable_prefix(rig, field, value):
     payload = request(stroke(), {"operation": "settings", "channels": [0], "timeout_ms": 30,
@@ -233,8 +231,8 @@ def test_native_frozen_application_preserves_null_and_metadata():
 
 def test_all_unsupported_settings_have_exact_paths():
     out = compile_application(request({"operation": "settings", "channels": [0], "timeout_ms": 30,
-        "values": {"clot_classifier": "not_implemented", "air_classifier": "not_implemented"}}))
-    assert {i["path"] for i in out["issues"]} == {"/operations/0/values/clot_classifier", "/operations/0/values/air_classifier"}
+        "values": {"unknown_a": 1, "unknown_b": 2}}))
+    assert {i["path"] for i in out["issues"]} == {"/operations/0/values/unknown_a", "/operations/0/values/unknown_b"}
     assert out["operations"] is None
 
 
@@ -263,7 +261,6 @@ def test_original_manual_speed_setters_real_can_owner_and_receipts(rig, start, c
     assert catalog["start_cutoff_speed"]["status"] == "implemented"
     assert catalog["start_cutoff_speed"]["automatically_applied"] is False
     assert catalog["installed_firmware"] is None
-    assert catalog["clot_classifier"]["verdict"] is catalog["air_classifier"]["verdict"] is None
 
 
 @pytest.mark.parametrize("field,wire", [("start_speed_ul_s", "v25,1R"), ("cutoff_speed_ul_s", "c200,1R")])
