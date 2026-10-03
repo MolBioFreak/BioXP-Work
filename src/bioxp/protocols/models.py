@@ -91,6 +91,16 @@ class ProtocolActionKind(str, Enum):
     MOVE_COVER = "move_cover"
     CHILLER_SETPOINT = "chiller_setpoint"
     THERMAL_SETPOINT = "thermal_setpoint"
+    THERMAL_HOLD = "thermal_hold"
+    THERMAL_PROFILE = "thermal_profile"
+    SNAPSHOT = "snapshot"
+    CAMERA_ILLUMINATION = "camera_illumination"
+    TIMER_START = "timer_start"
+    TIMER_WAIT = "timer_wait"
+    PLATE_CATCH = "plate_catch"
+    PLATE_RELEASE = "plate_release"
+    PLATE_PRESS = "plate_press"
+    CUT_SEAL = "cut_seal"
     LOOP_MARKER = "loop_marker"
     SEAL_SEPARATE = "seal_separate"
     LIQUID_ADJUST = "liquid_adjust"
@@ -118,11 +128,14 @@ class ProtocolAction:
     oem_opcode: str | None = None
     source_occurrence_id: str | None = None
     source_key: str | int | None = None
+    on_error: str = "stop"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", normalize_action_kind(self.kind))
         object.__setattr__(self, "params", _capture(self.params))
         object.__setattr__(self, "metadata", _capture(self.metadata))
+        if self.on_error not in {"stop", "pause_for_operator"}:
+            raise ValueError("on_error must be stop or pause_for_operator")
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "ProtocolAction":
@@ -140,6 +153,7 @@ class ProtocolAction:
             oem_opcode=payload.get("oem_opcode"),
             source_occurrence_id=payload.get("source_occurrence_id"),
             source_key=payload.get("source_key"),
+            on_error=payload.get("on_error", "stop"),
             metadata=dict(payload.get("metadata") or {}),
         )
 
@@ -156,6 +170,7 @@ class ProtocolAction:
             "oem_opcode": self.oem_opcode,
             "source_occurrence_id": self.source_occurrence_id,
             "source_key": self.source_key,
+            "on_error": self.on_error,
             "metadata": _payload(self.metadata),
         }
 

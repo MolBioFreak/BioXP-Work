@@ -61,6 +61,23 @@ def validate_protocol_document(document: ProtocolDocument) -> ProtocolDocument:
             raise ValueError(f"Stage '{stage.stage_id}' must include at least one action")
 
         for action in stage.actions:
+            from .mechanisms import validate_mechanism
+            validate_mechanism(action.kind, action.params)
+            custody_fields = {
+                ProtocolActionKind.PLATE_CATCH: ({"plate", "run_in_parallel"}, "plate"),
+                ProtocolActionKind.PLATE_RELEASE: ({"destination", "press_plate", "run_in_parallel"}, "destination"),
+                ProtocolActionKind.PLATE_PRESS: ({"plate", "run_in_parallel"}, "plate"),
+                ProtocolActionKind.CUT_SEAL: ({"count"}, "count"),
+            }
+            if action.kind in custody_fields:
+                fields, required = custody_fields[action.kind]
+                if set(action.params) - fields or type(action.params.get(required)) is not int:
+                    raise ValueError(f"{action.kind.value} requires native integer {required} and supported fields")
+                for field in {"press_plate", "run_in_parallel"} & set(action.params):
+                    if type(action.params[field]) is not bool:
+                        raise ValueError(f"{action.kind.value}.{field} requires boolean")
+                if action.kind == ProtocolActionKind.CUT_SEAL and action.params["count"] == 0:
+                    raise ValueError("cut_seal.count zero cannot represent source integer division")
             if action.stage_id != stage.stage_id:
                 raise ValueError(
                     f"Action '{action.action_id}' is attached to stage '{action.stage_id}', expected '{stage.stage_id}'"

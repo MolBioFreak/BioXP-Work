@@ -1791,9 +1791,10 @@ def make_wp8_operation_executor(
             command_store.persist_wp8_plan(command_id, plan, authority_stamps=stamps)
 
             delivery_attempted = False
+            gripper_lock_identity = None
 
             def invoke(child: Mapping[str, Any]) -> Any:
-                nonlocal delivery_attempted
+                nonlocal delivery_attempted, gripper_lock_identity
                 order = int(child["order"])
                 command_store.assert_deck_execution_current(command_id, boundary=f"before_child_{order}")
                 dispatch = getattr(provider, "execute_wp8_child", None)
@@ -1835,12 +1836,24 @@ def make_wp8_operation_executor(
                             "board_epoch_4": int(stamps["board_epoch_4"]),
                             "board_epoch_5": int(stamps["board_epoch_5"]),
                         }
+                        if operation == "ReleaseLockGripperOperation" and gripper_lock_identity is not None:
+                            # Release the lock actually acquired by this finite
+                            # plan, not a fictitious lock acquired by the release
+                            # child's own occurrence. Delivery remains recorded
+                            # under this child's distinct durable work identity.
+                            dispatch_child["_delivery_identity"]["work_identity"] = gripper_lock_identity
                     result = dispatch(
                         dispatch_child,
                         command_id=command_id,
                         child_order=order,
                         plan_digest=str(plan["plan_digest"]),
                     )
+                    if operation == "LockGripperOperation" and isinstance(result, Mapping):
+                        token = result.get("lock_token")
+                        if isinstance(token, Mapping):
+                            gripper_lock_identity = token.get("acquiring_identity")
+                    elif operation == "ReleaseLockGripperOperation":
+                        gripper_lock_identity = None
                     command_store.assert_deck_execution_current(
                         command_id, boundary=f"after_provider_child_{order}",
                     )

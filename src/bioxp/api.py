@@ -10017,7 +10017,13 @@ async def liquid_status_readback():
 
 @app.post("/protocol/compile")
 async def protocol_compile(req: ProtocolCompileRequest):
-    compiled = compile_protocol_source(req.model_dump(exclude_none=True))
+    from .protocols.input_errors import ProtocolInputError
+    try:
+        compiled = compile_protocol_source(req.model_dump(exclude_none=True))
+    except ProtocolInputError as exc:
+        raise HTTPException(status_code=422, detail=exc.to_payload()) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=ProtocolInputError(str(exc)).to_payload()) from exc
     return compiled.to_payload()
 
 
@@ -10202,9 +10208,32 @@ def _wait_protocol_deck_command(command_id: str, *, timeout_s: float = 180.0) ->
 def _protocol_deck_action_result(command_id: str) -> dict[str, Any]:
     # Terminal queue status is a command outcome, not physical placement proof.
     # Preserve the complete command row and its nested terminal/child evidence.
-    command = _wait_protocol_deck_command(command_id)
+    try:
+        command = _wait_protocol_deck_command(command_id)
+    except HTTPException as exc:
+        if not isinstance(exc.detail, Mapping) or exc.detail.get("error") != "canonical_deck_command_failed":
+            raise
+        command = dict(exc.detail["command"])
+    # The append-only typed ledger is separate from bounded diagnostic trees.
+    # Keep every finite child, including not-entered children, in native results.
+    evidence_error = None
+    try:
+        evidence = _protocol_command_store().wp8_operation_evidence(command_id)
+    except (OSError, RuntimeError, ValueError, HTTPException) as exc:
+        # Observation loss is evidence, never a new execution predicate.
+        evidence, evidence_error = {}, type(exc).__name__
+    children = []
+    for child in evidence.get("children", ()):
+        terminal = json.loads(child.get("terminal_evidence_json") or "{}")
+        leaf = terminal.get("result") or {}
+        children.append({"command_id": command_id, "child_order": child["child_order"],
+                         "operation": child["operation"], "status": child["terminal_state"],
+                         **{key: leaf[key] for key in ("ok", "source_return", "source_noop",
+                            "controller_command_required", "controller_command_acknowledged",
+                            "controller_completion_verified", "exception", "exception_type") if key in leaf}})
     return {"ok": command.get("status") == "completed", "command_id": command_id,
-            "command": command}
+            "command": command, "child_outcomes": children,
+            **({"child_outcomes_error": evidence_error} if evidence_error else {})}
 
 
 def _protocol_live_plate_move_handler(action, state):
@@ -10228,6 +10257,22 @@ def _protocol_live_plate_move_handler(action, state):
         inputs=intent,
         idempotency_key=f"protocol:{job_id}:{action.action_id}",
     )
+    command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
+    if not isinstance(command_id, str) or not command_id:
+        raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
+    return _protocol_deck_action_result(command_id)
+
+
+def _protocol_live_custody_handler(action, state):
+    """Explicit source operations through the same finite deck owner as MP/MC."""
+    operations = {ProtocolActionKind.PLATE_CATCH: "catch_plate",
+                  ProtocolActionKind.PLATE_RELEASE: "release_plate",
+                  ProtocolActionKind.PLATE_PRESS: "press_plate", ProtocolActionKind.CUT_SEAL: "cut_seal"}
+    admitter = getattr(app.state, "oem_wp8_operation_admitter", None)
+    if not callable(admitter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    admitted = admitter(operations[action.kind], inputs=action.to_payload()["params"],
+                       idempotency_key=f"protocol:{state.job_id}:{action.action_id}")
     command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
     if not isinstance(command_id, str) or not command_id:
         raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
@@ -10318,8 +10363,24 @@ def _protocol_live_manual_physical_handler(action, state):
     return handler(action, state)
 
 
+def _protocol_mechanism_handlers(source_executor=None):
+    from .protocols.mechanisms import build_mechanism_handlers
+    def save_snapshot(frame, action, state):
+        return {**_deck_cover_inspection_save(frame=frame.content, condition="method_photo_only",
+                    artifact_id=f"{state.job_id}:{action.action_id}"),
+                "provider_generation": frame.provider_generation, "sequence": frame.sequence,
+                "captured_at": frame.captured_at.isoformat()}
+    return build_mechanism_handlers(get_tester=_get_tester, get_camera=lambda: _camera_provider,
+                                    get_executor=source_executor, save_snapshot=save_snapshot)
+
+
 def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
     return {
+        **_protocol_mechanism_handlers(),
+        ProtocolActionKind.PLATE_CATCH: _protocol_live_custody_handler,
+        ProtocolActionKind.PLATE_RELEASE: _protocol_live_custody_handler,
+        ProtocolActionKind.PLATE_PRESS: _protocol_live_custody_handler,
+        ProtocolActionKind.CUT_SEAL: _protocol_live_custody_handler,
         ProtocolActionKind.MOVE: _protocol_live_move_handler,
         ProtocolActionKind.PLATE_MOVE: _protocol_live_plate_move_handler,
         ProtocolActionKind.MOVE_COVER: _protocol_live_plate_move_handler,
@@ -10599,7 +10660,7 @@ def _protocol_bindings(bundle, *, source_executor=None):
     native = {}
     lifecycle = {}
     if metadata.get("input_mode") != "oem_prepared":
-        return _protocol_live_handlers(), {}, {}
+        return {**_protocol_live_handlers(), **_protocol_mechanism_handlers(source_executor)}, {}, {}
     capabilities = set()
     if callable(getattr(FourPipetteTransport, "dispense_air_for_oem_script", None)):
         capabilities.add("dispense_air_for_oem_script")

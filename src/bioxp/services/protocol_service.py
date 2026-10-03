@@ -22,6 +22,10 @@ PROTOCOL_LIVE_CONTRACT_SCHEMA_VERSION = "bioxp.protocol_live_execution_contract.
 PROTOCOL_LIVE_RESERVATION_SCHEMA_VERSION = "bioxp.protocol_live_idempotency_reservation.v1"
 LIVE_REFERENCE_REQUIRED_AXES = ("x", "y", "z")
 REFERENCE_REQUIRED_ACTION_KINDS = {
+    ProtocolActionKind.PLATE_CATCH,
+    ProtocolActionKind.PLATE_RELEASE,
+    ProtocolActionKind.PLATE_PRESS,
+    ProtocolActionKind.CUT_SEAL,
     ProtocolActionKind.MOVE,
     ProtocolActionKind.PIPETTE_POSITION,
     ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL,
@@ -256,8 +260,17 @@ def _job_status_from_state(state: ProtocolRuntimeState) -> str:
     if state.workflow is not None:
         if state.workflow.phase == "queued":
             return "queued"
-        if state.workflow.phase == "reconciling":
-            return "ambiguous"
+        if state.workflow.phase in {"reconciling", "terminal"}:
+            # Reconciliation can still own entered native children. Only a
+            # settled executor outcome makes this an ambiguous terminal result.
+            settled = next((event for event in reversed(state.events)
+                            if event.event == "workflow_settled"), None)
+            if settled is not None:
+                outcome = settled.detail.get("outcome")
+                if outcome in {"completed", "failed", "interrupted", "ambiguous"}:
+                    return outcome
+            if state.workflow.phase == "reconciling":
+                return "dispatched"
         if state.workflow.phase != "terminal":
             requested = state.workflow.requested_control or {}
             return "interrupting" if requested.get("action") in {"safe_stop", "abort"} else "dispatched"
@@ -548,6 +561,10 @@ def _workflow_resources(document: ProtocolDocument) -> list[str]:
             resources.add("pipette")
         if action.kind.value.startswith("thermal"):
             resources.add("thermal")
+        if action.kind is ProtocolActionKind.CHILLER_SETPOINT:
+            resources.add("chiller")
+        if action.kind in {ProtocolActionKind.SNAPSHOT, ProtocolActionKind.CAMERA_ILLUMINATION, ProtocolActionKind.BARCODE_READ}:
+            resources.add("camera")
     return sorted(resources)
 
 

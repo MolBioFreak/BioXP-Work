@@ -16,6 +16,7 @@ def _action_from_mapping(stage_id: str, index: int, data: Mapping[str, Any]) -> 
         "action_id", "stage_id", "kind", "type", "params", "description",
         "review_required", "pause_message", "message", "metadata",
         "required_capability", "oem_opcode", "source_occurrence_id", "source_key",
+        "on_error",
     }
     params_payload = data.get("params")
     params = dict(params_payload) if isinstance(params_payload, Mapping) else {
@@ -37,6 +38,7 @@ def _action_from_mapping(stage_id: str, index: int, data: Mapping[str, Any]) -> 
         oem_opcode=data.get("oem_opcode"),
         source_occurrence_id=data.get("source_occurrence_id"),
         source_key=data.get("source_key"),
+        on_error=data.get("on_error", "stop"),
     )
 
 
@@ -48,16 +50,25 @@ def _metadata(data: Mapping[str, Any], known_keys: set[str]) -> dict[str, Any]:
 
 def _stage_from_mapping(index: int, data: Mapping[str, Any]) -> ProtocolStage:
     stage_id = str(data.get("stage_id") or data.get("id") or f"stage_{index}")
+    from .input_errors import ProtocolInputError
+    actions = []
+    for i, action in enumerate(data.get("actions", ()), 1):
+        try:
+            actions.append(_action_from_mapping(stage_id, i, action))
+        except (ValueError, TypeError) as exc:
+            raise ProtocolInputError(str(exc), f"/stages/{index - 1}/actions/{i - 1}") from exc
     return ProtocolStage(
         stage_id=stage_id,
         title=data.get("title"),
-        actions=tuple(_action_from_mapping(stage_id, i, action) for i, action in enumerate(data.get("actions", ()), 1)),
+        actions=tuple(actions),
         review_required=bool(data.get("review_required", False)),
         metadata=_metadata(data, {"stage_id", "id", "title", "actions", "review_required"}),
     )
 
 
 def compile_native_protocol(data: Mapping[str, Any]) -> ProtocolDocument:
+    from .input_errors import validate_native_shape
+    validate_native_shape(data)
     if "operations" in data:
         if "stages" in data:
             raise ValueError("Prepared operations and native stages cannot be combined")
