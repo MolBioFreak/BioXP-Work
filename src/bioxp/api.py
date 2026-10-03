@@ -10970,9 +10970,9 @@ async def protocol_jobs(limit: int = Query(20, ge=1, le=100), summary: bool = Qu
 
 
 @app.get("/protocol/jobs/{job_id}")
-async def protocol_job_detail(job_id: str):
+async def protocol_job_detail(job_id: str, observation: bool = Query(False)):
     try:
-        return await run_in_threadpool(get_protocol_job, job_id, command_store=_protocol_command_store())
+        return await run_in_threadpool(get_protocol_job, job_id, observation=observation, command_store=_protocol_command_store())
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

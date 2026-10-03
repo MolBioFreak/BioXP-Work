@@ -788,9 +788,10 @@ def create_protocol_job(
     return command_store.get_workflow(job_id)
 
 
-def get_protocol_job(job_id: str, *, store: ProtocolOperatorBundleStore | None = None, command_store=None) -> dict[str, Any]:
+def get_protocol_job(job_id: str, *, observation: bool = False, store: ProtocolOperatorBundleStore | None = None, command_store=None) -> dict[str, Any]:
     if command_store is not None:
-        canonical = command_store.get_workflow(job_id)
+        canonical = (command_store.get_workflow_observation(job_id) if observation else
+                     command_store.get_workflow(job_id))
         if canonical is not None:
             return canonical
     active_store = store or ProtocolOperatorBundleStore()

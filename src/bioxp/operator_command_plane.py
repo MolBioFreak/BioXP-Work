@@ -2171,6 +2171,49 @@ class OperatorCommandStore(CommandReceiptReader):
                 "status": row["status"], "terminal": row["status"] in {"completed","failed","interrupted","ambiguous","cleared","rejected"},
                 "status_path": f"/protocol/jobs/{command_id}"}}
 
+    def get_workflow_observation(self, command_id: str) -> dict[str, Any] | None:
+        """Read current control/review truth, not the retained scientific bundle.
+
+        Always project the current receipt: terminal versions do not describe
+        every later observation/recovery publication. No version-gated cache.
+        SQLite selects only the consumed subtrees before Python JSON decoding.
+        """
+        with self._lock:
+            row = self.connection.execute("""
+                WITH payload AS (
+                    SELECT c.command_id, c.status, c.idempotency_key,
+                           c.ownership_generation, p.version,
+                           CASE WHEN json_valid(c.receipt_json) AND
+                               EXISTS (SELECT 1 FROM json_each(c.receipt_json)
+                                       WHERE key IS NOT NULL)
+                           THEN c.receipt_json ELSE
+                               json_extract(CASE WHEN json_valid(c.requested_inputs_json)
+                                   THEN c.requested_inputs_json ELSE '{}' END, '$.bundle')
+                           END AS body
+                    FROM operator_commands c JOIN operator_plane_commands p USING(command_id)
+                    WHERE c.command_id=? AND c.command_kind='protocol_workflow'
+                )
+                SELECT command_id, status, idempotency_key, ownership_generation, version,
+                    json_extract(body, '$.execution.dry_run',
+                        '$.execution.runtime_state.workflow', '$.operator.pending_review') AS observation_json,
+                    json_type(body, '$.execution.dry_run') AS dry_run_type,
+                    json_type(body, '$.execution.runtime_state.workflow') AS workflow_type,
+                    json_type(body, '$.operator.pending_review') AS review_type
+                FROM payload
+            """, (command_id,)).fetchone()
+            if row is None:
+                return None
+            dry_run, workflow, review = _json_load(row["observation_json"])
+            runtime = {"workflow": workflow} if row["workflow_type"] is not None else {}
+            operator = {"pending_review": review} if row["review_type"] is not None else {}
+            return {"schema_version": "bioxp.protocol_job_observation.v1",
+                "job_id": command_id, "status": row["status"],
+                "execution": {**({"dry_run": dry_run} if row["dry_run_type"] is not None else {}),
+                              "runtime_state": runtime}, "operator": operator,
+                "command": {"command_id": command_id,
+                    "ownership_generation": int(row["ownership_generation"]), "state_version": int(row["version"]),
+                    "status": row["status"], "terminal": row["status"] in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"}}}
+
     def list_workflow_summaries(self, *, limit: int = 20) -> list[dict[str, Any]]:
         """Project discovery fields in SQLite; never hydrate full job bundles.
 
