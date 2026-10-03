@@ -1,0 +1,791 @@
+{
+  "$defs": {
+    "DiagnosticDetectFluid": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "diagnostic_detect_fluid",
+          "title": "Operation",
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation"
+      ],
+      "title": "DiagnosticDetectFluid",
+      "type": "object"
+    },
+    "DiagnosticEject": {
+      "additionalProperties": false,
+      "properties": {
+        "channels": {
+          "items": {
+            "maximum": 3,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 4,
+          "title": "Channels",
+          "type": "array"
+        },
+        "action": {
+          "const": "eject",
+          "title": "Action",
+          "type": "string"
+        }
+      },
+      "required": [
+        "channels",
+        "action"
+      ],
+      "title": "DiagnosticEject",
+      "type": "object"
+    },
+    "DiagnosticLiquid": {
+      "additionalProperties": false,
+      "properties": {
+        "channels": {
+          "items": {
+            "maximum": 3,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 4,
+          "title": "Channels",
+          "type": "array"
+        },
+        "action": {
+          "enum": [
+            "aspirate",
+            "dispense"
+          ],
+          "title": "Action",
+          "type": "string"
+        },
+        "volume_ul": {
+          "minimum": 0,
+          "title": "Volume Ul",
+          "type": "number"
+        },
+        "speed": {
+          "exclusiveMinimum": 0,
+          "title": "Speed",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "channels",
+        "action",
+        "volume_ul",
+        "speed"
+      ],
+      "title": "DiagnosticLiquid",
+      "type": "object"
+    },
+    "DiagnosticPlunger": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "plunger_up",
+            "plunger_down"
+          ],
+          "title": "Action",
+          "type": "string"
+        },
+        "steps": {
+          "maximum": 2147483647,
+          "minimum": 0,
+          "title": "Steps",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "action",
+        "steps"
+      ],
+      "title": "DiagnosticPlunger",
+      "type": "object"
+    },
+    "DiagnosticSimple": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "dispense_all",
+            "diagnoses",
+            "initialize",
+            "get_data",
+            "last_error"
+          ],
+          "title": "Action",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "DiagnosticSimple",
+      "type": "object"
+    },
+    "ManualCalwithFluid": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "source_calwith_fluid",
+          "title": "Operation",
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation"
+      ],
+      "title": "ManualCalwithFluid",
+      "type": "object"
+    },
+    "ManualCavroApplication": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "cavro_application",
+          "title": "Operation",
+          "type": "string"
+        },
+        "application": {
+          "additionalProperties": true,
+          "title": "Application",
+          "type": "object"
+        }
+      },
+      "required": [
+        "operation",
+        "application"
+      ],
+      "title": "ManualCavroApplication",
+      "type": "object"
+    },
+    "ManualCavroRecipe": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "cavro_liquid_recipe",
+          "title": "Operation",
+          "type": "string"
+        },
+        "recipe": {
+          "additionalProperties": true,
+          "title": "Recipe",
+          "type": "object"
+        }
+      },
+      "required": [
+        "operation",
+        "recipe"
+      ],
+      "title": "ManualCavroRecipe",
+      "type": "object"
+    },
+    "ManualDiagnosticPipette": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "diagnostic_pipette",
+          "title": "Operation",
+          "type": "string"
+        },
+        "diagnostic": {
+          "discriminator": {
+            "mapping": {
+              "aspirate": "#/$defs/DiagnosticLiquid",
+              "diagnoses": "#/$defs/DiagnosticSimple",
+              "dispense": "#/$defs/DiagnosticLiquid",
+              "dispense_all": "#/$defs/DiagnosticSimple",
+              "eject": "#/$defs/DiagnosticEject",
+              "get_data": "#/$defs/DiagnosticSimple",
+              "initialize": "#/$defs/DiagnosticSimple",
+              "last_error": "#/$defs/DiagnosticSimple",
+              "plunger_down": "#/$defs/DiagnosticPlunger",
+              "plunger_up": "#/$defs/DiagnosticPlunger"
+            },
+            "propertyName": "action"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/DiagnosticLiquid"
+            },
+            {
+              "$ref": "#/$defs/DiagnosticEject"
+            },
+            {
+              "$ref": "#/$defs/DiagnosticSimple"
+            },
+            {
+              "$ref": "#/$defs/DiagnosticPlunger"
+            }
+          ],
+          "title": "Diagnostic"
+        }
+      },
+      "required": [
+        "operation",
+        "diagnostic"
+      ],
+      "title": "ManualDiagnosticPipette",
+      "type": "object"
+    },
+    "ManualFluidOffset": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "source_fluid_offset",
+          "title": "Operation",
+          "type": "string"
+        },
+        "plate": {
+          "enum": [
+            "TC",
+            "MS",
+            "OC",
+            "RC",
+            "STRIP",
+            "OCMS"
+          ],
+          "title": "Plate",
+          "type": "string"
+        },
+        "speed": {
+          "default": 300,
+          "title": "Speed",
+          "type": "integer"
+        },
+        "transfer_fluid": {
+          "default": true,
+          "title": "Transfer Fluid",
+          "type": "boolean"
+        },
+        "skip_steps": {
+          "default": 4,
+          "minimum": 1,
+          "title": "Skip Steps",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "operation",
+        "plate"
+      ],
+      "title": "ManualFluidOffset",
+      "type": "object"
+    },
+    "ManualLift": {
+      "additionalProperties": false,
+      "properties": {
+        "location_id": {
+          "title": "Location Id",
+          "type": "integer"
+        },
+        "operation": {
+          "const": "lift",
+          "title": "Operation",
+          "type": "string"
+        },
+        "height_steps": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Height Steps"
+        }
+      },
+      "required": [
+        "location_id",
+        "operation",
+        "height_steps"
+      ],
+      "title": "ManualLift",
+      "type": "object"
+    },
+    "ManualLiquid": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "enum": [
+            "aspirate",
+            "dispense"
+          ],
+          "title": "Operation",
+          "type": "string"
+        },
+        "channels": {
+          "items": {
+            "maximum": 3,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 4,
+          "minItems": 1,
+          "title": "Channels",
+          "type": "array"
+        },
+        "volume_ul": {
+          "title": "Volume Ul",
+          "type": "number"
+        },
+        "speed": {
+          "title": "Speed",
+          "type": "number"
+        }
+      },
+      "required": [
+        "operation",
+        "channels",
+        "volume_ul",
+        "speed"
+      ],
+      "title": "ManualLiquid",
+      "type": "object"
+    },
+    "ManualLoadTip": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "load_tip",
+          "title": "Operation",
+          "type": "string"
+        },
+        "tray": {
+          "maximum": 5,
+          "minimum": 1,
+          "title": "Tray",
+          "type": "integer"
+        },
+        "well": {
+          "pattern": "^[ABab](?:[1-9]|1[0-2])$",
+          "title": "Well",
+          "type": "string"
+        },
+        "overpress": {
+          "default": false,
+          "title": "Overpress",
+          "type": "boolean"
+        },
+        "lift_z": {
+          "default": false,
+          "title": "Lift Z",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "operation",
+        "tray",
+        "well"
+      ],
+      "title": "ManualLoadTip",
+      "type": "object"
+    },
+    "ManualLower": {
+      "additionalProperties": false,
+      "properties": {
+        "location_id": {
+          "title": "Location Id",
+          "type": "integer"
+        },
+        "operation": {
+          "const": "lower",
+          "title": "Operation",
+          "type": "string"
+        }
+      },
+      "required": [
+        "location_id",
+        "operation"
+      ],
+      "title": "ManualLower",
+      "type": "object"
+    },
+    "ManualMeasureFluidHeight": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "measure_fluid_height",
+          "title": "Operation",
+          "type": "string"
+        },
+        "speed": {
+          "default": 300,
+          "title": "Speed",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "operation"
+      ],
+      "title": "ManualMeasureFluidHeight",
+      "type": "object"
+    },
+    "ManualMix": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "mix",
+          "title": "Operation",
+          "type": "string"
+        },
+        "channels": {
+          "items": {
+            "maximum": 3,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 4,
+          "minItems": 1,
+          "title": "Channels",
+          "type": "array"
+        },
+        "volume_ul": {
+          "title": "Volume Ul",
+          "type": "number"
+        },
+        "aspirate_speed": {
+          "title": "Aspirate Speed",
+          "type": "number"
+        },
+        "dispense_speed": {
+          "title": "Dispense Speed",
+          "type": "number"
+        },
+        "cycles": {
+          "maximum": 50,
+          "minimum": 1,
+          "title": "Cycles",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "operation",
+        "channels",
+        "volume_ul",
+        "aspirate_speed",
+        "dispense_speed",
+        "cycles"
+      ],
+      "title": "ManualMix",
+      "type": "object"
+    },
+    "ManualMove": {
+      "additionalProperties": false,
+      "properties": {
+        "location_id": {
+          "title": "Location Id",
+          "type": "integer"
+        },
+        "operation": {
+          "const": "move",
+          "title": "Operation",
+          "type": "string"
+        },
+        "well": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            }
+          ],
+          "title": "Well"
+        },
+        "position_flag": {
+          "enum": [
+            0,
+            1,
+            2
+          ],
+          "title": "Position Flag",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "location_id",
+        "operation",
+        "well",
+        "position_flag"
+      ],
+      "title": "ManualMove",
+      "type": "object"
+    },
+    "SourceAir": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "enum": [
+            "source_aspirate_air",
+            "source_dispense_air"
+          ],
+          "title": "Operation",
+          "type": "string"
+        },
+        "volume_ul": {
+          "title": "Volume Ul",
+          "type": "number"
+        }
+      },
+      "required": [
+        "operation",
+        "volume_ul"
+      ],
+      "title": "SourceAir",
+      "type": "object"
+    },
+    "SourceLoadTips": {
+      "additionalProperties": false,
+      "description": "newloadTips, not calibration loadTips or manual tray/well pickup.\n\nA matching tip type with force_new_tip=False returns without realignment.\nPipette is the OEM zero-based index; -1 is the fixed four-head group.",
+      "properties": {
+        "operation": {
+          "const": "source_load_tips",
+          "title": "Operation",
+          "type": "string"
+        },
+        "tip_type": {
+          "enum": [
+            50,
+            200
+          ],
+          "title": "Tip Type",
+          "type": "integer"
+        },
+        "pipette": {
+          "maximum": 3,
+          "minimum": -1,
+          "title": "Pipette",
+          "type": "integer"
+        },
+        "force_new_tip": {
+          "title": "Force New Tip",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "operation",
+        "tip_type",
+        "pipette",
+        "force_new_tip"
+      ],
+      "title": "SourceLoadTips",
+      "type": "object"
+    },
+    "SourceMix": {
+      "additionalProperties": false,
+      "description": "ControlLib.mmix scientific procedure, not repeated manual strokes.",
+      "properties": {
+        "operation": {
+          "const": "source_mix",
+          "title": "Operation",
+          "type": "string"
+        },
+        "volume_ul": {
+          "title": "Volume Ul",
+          "type": "number"
+        },
+        "air_ul": {
+          "default": 15.0,
+          "title": "Air Ul",
+          "type": "number"
+        },
+        "aspirate_speed": {
+          "default": 100.0,
+          "title": "Aspirate Speed",
+          "type": "number"
+        },
+        "dispense_speed": {
+          "default": 20.0,
+          "title": "Dispense Speed",
+          "type": "number"
+        },
+        "aspirate_delay_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Aspirate Delay Ms"
+        },
+        "dispense_delay_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dispense Delay Ms"
+        },
+        "cycles": {
+          "default": 2,
+          "minimum": 0,
+          "title": "Cycles",
+          "type": "integer"
+        },
+        "mix_type": {
+          "default": "N",
+          "enum": [
+            "N",
+            "H",
+            "C"
+          ],
+          "title": "Mix Type",
+          "type": "string"
+        },
+        "tip_dip": {
+          "default": true,
+          "title": "Tip Dip",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "operation",
+        "volume_ul"
+      ],
+      "title": "SourceMix",
+      "type": "object"
+    },
+    "SourcePurge": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "source_purge",
+          "title": "Operation",
+          "type": "string"
+        },
+        "speed": {
+          "default": 30.0,
+          "title": "Speed",
+          "type": "number"
+        },
+        "amp": {
+          "default": false,
+          "title": "Amp",
+          "type": "boolean"
+        },
+        "ntd": {
+          "default": false,
+          "title": "Ntd",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "operation"
+      ],
+      "title": "SourcePurge",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "protocol_id": {
+      "minLength": 1,
+      "title": "Protocol Id",
+      "type": "string"
+    },
+    "steps": {
+      "items": {
+        "discriminator": {
+          "mapping": {
+            "aspirate": "#/$defs/ManualLiquid",
+            "cavro_application": "#/$defs/ManualCavroApplication",
+            "cavro_liquid_recipe": "#/$defs/ManualCavroRecipe",
+            "diagnostic_detect_fluid": "#/$defs/DiagnosticDetectFluid",
+            "diagnostic_pipette": "#/$defs/ManualDiagnosticPipette",
+            "dispense": "#/$defs/ManualLiquid",
+            "lift": "#/$defs/ManualLift",
+            "load_tip": "#/$defs/ManualLoadTip",
+            "lower": "#/$defs/ManualLower",
+            "measure_fluid_height": "#/$defs/ManualMeasureFluidHeight",
+            "mix": "#/$defs/ManualMix",
+            "move": "#/$defs/ManualMove",
+            "source_aspirate_air": "#/$defs/SourceAir",
+            "source_calwith_fluid": "#/$defs/ManualCalwithFluid",
+            "source_dispense_air": "#/$defs/SourceAir",
+            "source_fluid_offset": "#/$defs/ManualFluidOffset",
+            "source_load_tips": "#/$defs/SourceLoadTips",
+            "source_mix": "#/$defs/SourceMix",
+            "source_purge": "#/$defs/SourcePurge"
+          },
+          "propertyName": "operation"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/ManualMove"
+          },
+          {
+            "$ref": "#/$defs/ManualLower"
+          },
+          {
+            "$ref": "#/$defs/ManualLift"
+          },
+          {
+            "$ref": "#/$defs/ManualLiquid"
+          },
+          {
+            "$ref": "#/$defs/ManualMix"
+          },
+          {
+            "$ref": "#/$defs/ManualLoadTip"
+          },
+          {
+            "$ref": "#/$defs/ManualMeasureFluidHeight"
+          },
+          {
+            "$ref": "#/$defs/ManualFluidOffset"
+          },
+          {
+            "$ref": "#/$defs/DiagnosticDetectFluid"
+          },
+          {
+            "$ref": "#/$defs/ManualCalwithFluid"
+          },
+          {
+            "$ref": "#/$defs/SourceLoadTips"
+          },
+          {
+            "$ref": "#/$defs/SourceMix"
+          },
+          {
+            "$ref": "#/$defs/SourceAir"
+          },
+          {
+            "$ref": "#/$defs/SourcePurge"
+          },
+          {
+            "$ref": "#/$defs/ManualDiagnosticPipette"
+          },
+          {
+            "$ref": "#/$defs/ManualCavroApplication"
+          },
+          {
+            "$ref": "#/$defs/ManualCavroRecipe"
+          }
+        ]
+      },
+      "minItems": 1,
+      "title": "Steps",
+      "type": "array"
+    }
+  },
+  "required": [
+    "protocol_id",
+    "steps"
+  ],
+  "title": "ManualPipettingRequest",
+  "type": "object"
+}

@@ -1,0 +1,717 @@
+{
+  "source_commit": "ae006a9a854c2959ab313aac994b396217ac12f6",
+  "qualification": "offline actual native owners with physical leaves replaced; no live hardware",
+  "files": [
+    {
+      "path": "junit/test_bms_method_documents_connected.py.xml",
+      "sha256": "1715a096ff3d64fe9b14f5d71687e1bddc5e895cfbafaa43e71227cb812a9e90",
+      "uncompressed_sha256": "1715a096ff3d64fe9b14f5d71687e1bddc5e895cfbafaa43e71227cb812a9e90",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_bms_method_documents_connected.py.xml"
+    },
+    {
+      "path": "junit/test_bms_method_full_connected.py.xml",
+      "sha256": "6078badee3253d66205b0cc2fa6da13cabcf8a1a72f5dd109151635ace2dec4a",
+      "uncompressed_sha256": "6078badee3253d66205b0cc2fa6da13cabcf8a1a72f5dd109151635ace2dec4a",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_bms_method_full_connected.py.xml"
+    },
+    {
+      "path": "junit/test_cavro_application.py.xml",
+      "sha256": "99a444f9959efb8f53013c9f8607ecd6ef3bb40c751be4675951b33c19e32a53",
+      "uncompressed_sha256": "99a444f9959efb8f53013c9f8607ecd6ef3bb40c751be4675951b33c19e32a53",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_cavro_application.py.xml"
+    },
+    {
+      "path": "junit/test_cavro_liquid.py.xml",
+      "sha256": "d584178f72e847557f123f193eeafb89833543363e1d0ad6d078c4cdaf8e533d",
+      "uncompressed_sha256": "d584178f72e847557f123f193eeafb89833543363e1d0ad6d078c4cdaf8e533d",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_cavro_liquid.py.xml"
+    },
+    {
+      "path": "junit/test_cavro_native_integrated.py.xml",
+      "sha256": "759cebeab4f438f12f9ea2a04b61cff4379bcacf14403acb9d7945b1d5032a65",
+      "uncompressed_sha256": "759cebeab4f438f12f9ea2a04b61cff4379bcacf14403acb9d7945b1d5032a65",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_cavro_native_integrated.py.xml"
+    },
+    {
+      "path": "junit/test_cavro_provider_connected.py.xml",
+      "sha256": "b12a4593f6f42bb33550c269cb953777a80cdeb11504365558c63db9342f893a",
+      "uncompressed_sha256": "b12a4593f6f42bb33550c269cb953777a80cdeb11504365558c63db9342f893a",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_cavro_provider_connected.py.xml"
+    },
+    {
+      "path": "junit/test_cavro_review_regressions.py.xml",
+      "sha256": "cb24be9a64005a6f89eecf27b17284c0b9f428daa3a8b3970b439dc2326f869d",
+      "uncompressed_sha256": "cb24be9a64005a6f89eecf27b17284c0b9f428daa3a8b3970b439dc2326f869d",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_cavro_review_regressions.py.xml"
+    },
+    {
+      "path": "junit/test_cover_carry_release_connected.py.xml",
+      "sha256": "7328436bacb28886a2195d36803a5062291b548a8d8e6d29b1ed08f374148975",
+      "uncompressed_sha256": "7328436bacb28886a2195d36803a5062291b548a8d8e6d29b1ed08f374148975",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_cover_carry_release_connected.py.xml"
+    },
+    {
+      "path": "junit/test_manual_physical_native.py.xml",
+      "sha256": "eddfd0d7f49be4ce5a5296594121fc5fe8507e6ddd32faa52c24bccbd2b6cd0f",
+      "uncompressed_sha256": "eddfd0d7f49be4ce5a5296594121fc5fe8507e6ddd32faa52c24bccbd2b6cd0f",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_manual_physical_native.py.xml"
+    },
+    {
+      "path": "junit/test_method_custody_connected.py.xml",
+      "sha256": "4d8d014758b104b1c5935bebd5ad40cc80415d8e248451af03d33154b108fe8a",
+      "uncompressed_sha256": "4d8d014758b104b1c5935bebd5ad40cc80415d8e248451af03d33154b108fe8a",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_method_custody_connected.py.xml"
+    },
+    {
+      "path": "junit/test_method_runtime_connected.py.xml",
+      "sha256": "3ed6d393bb0c39713fe08bac0c4bc3f55986729658eac45cb30ae8ec27992654",
+      "uncompressed_sha256": "3ed6d393bb0c39713fe08bac0c4bc3f55986729658eac45cb30ae8ec27992654",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_method_runtime_connected.py.xml"
+    },
+    {
+      "path": "junit/test_method_source_mechanisms.py.xml",
+      "sha256": "69c8ac9188f4e3e0eeaf26d40d430fb3ff73f05d427cbc72d7650d25b6042dd0",
+      "uncompressed_sha256": "69c8ac9188f4e3e0eeaf26d40d430fb3ff73f05d427cbc72d7650d25b6042dd0",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_method_source_mechanisms.py.xml"
+    },
+    {
+      "path": "junit/test_moveto_x_noop_connected.py.xml",
+      "sha256": "3939ede976a4e9fc68974509e009510904547bcfb001dec3c471324e17b162c7",
+      "uncompressed_sha256": "3939ede976a4e9fc68974509e009510904547bcfb001dec3c471324e17b162c7",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_moveto_x_noop_connected.py.xml"
+    },
+    {
+      "path": "junit/test_native_close_contracts.py.xml",
+      "sha256": "df93de4672cac29e81016579cb919bac978299092371e58d78639c44100bb386",
+      "uncompressed_sha256": "df93de4672cac29e81016579cb919bac978299092371e58d78639c44100bb386",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_native_close_contracts.py.xml"
+    },
+    {
+      "path": "junit/test_native_completion_handoff.py.xml",
+      "sha256": "b6f2a632a8dd8d363ef1e6af11fd441ed227f6752bdec9471957d236570ec5f1",
+      "uncompressed_sha256": "b6f2a632a8dd8d363ef1e6af11fd441ed227f6752bdec9471957d236570ec5f1",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_native_completion_handoff.py.xml"
+    },
+    {
+      "path": "junit/test_oem_native_thermal_lifecycle.py.xml",
+      "sha256": "de97798aa1a21f0db869d80b6d90a273ee9b9b390b94b4b3966f5c7e2a9cf22a",
+      "uncompressed_sha256": "de97798aa1a21f0db869d80b6d90a273ee9b9b390b94b4b3966f5c7e2a9cf22a",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_oem_native_thermal_lifecycle.py.xml"
+    },
+    {
+      "path": "junit/test_oem_pipette_calibration.py.xml",
+      "sha256": "a1b8f04c691552be95191ebf800b68d3d25dbb46c097b330712bce80985eab00",
+      "uncompressed_sha256": "a1b8f04c691552be95191ebf800b68d3d25dbb46c097b330712bce80985eab00",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_oem_pipette_calibration.py.xml"
+    },
+    {
+      "path": "junit/test_protocol_v1_connected_thermal_completion.py.xml",
+      "sha256": "94721a725579b62942e26670af84b237d45b028e9b16ac0f3d8a3afe02eeb3ca",
+      "uncompressed_sha256": "94721a725579b62942e26670af84b237d45b028e9b16ac0f3d8a3afe02eeb3ca",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_protocol_v1_connected_thermal_completion.py.xml"
+    },
+    {
+      "path": "junit/test_protocol_workflow_connected.py.xml",
+      "sha256": "1a96588db4d19ae4fac268253196b2e29ce55605cb182291bf0035c57bcb5806",
+      "uncompressed_sha256": "1a96588db4d19ae4fac268253196b2e29ce55605cb182291bf0035c57bcb5806",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-workflow-final.xml"
+    },
+    {
+      "path": "junit/test_protocol_workflow_controls_connected.py.xml",
+      "sha256": "0a5bea791ac8d8fd50387b65fb586746c892e24898a38c9c42637886374e2b30",
+      "uncompressed_sha256": "0a5bea791ac8d8fd50387b65fb586746c892e24898a38c9c42637886374e2b30",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_protocol_workflow_controls_connected.py.xml"
+    },
+    {
+      "path": "bms/bms-0-error-hold.json.gz",
+      "sha256": "b1990e2ae14ce9e9f091f64c74dc3b81b081d2d2ffcca5b4a638e6cbbd1df438",
+      "uncompressed_sha256": "c25e6e84d14ad36b2064a2f31a3955303f15d1964b90b3174faabe38a00fd56e",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-0-error-hold.json"
+    },
+    {
+      "path": "bms/bms-10-success.json.gz",
+      "sha256": "80d603753947052071729a261fad3a36efb53e825cacc4f5f978f5652f932a74",
+      "uncompressed_sha256": "9a5960e16b13fc73baf55911a8b8c1e85859dadf9d5e2d822867e583a4aa4657",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-10-success.json"
+    },
+    {
+      "path": "bms/bms-11-success.json.gz",
+      "sha256": "d47956f2b26dbfd1500c33bad02ec13d4b786511777a1271e5dd560afbcf88dd",
+      "uncompressed_sha256": "b3e47b5fc91dc6b5b8df8a05b9c5914d3081898469fa6f51483f4b6eb3f45506",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-11-success.json"
+    },
+    {
+      "path": "bms/bms-12-success.json.gz",
+      "sha256": "a7697566b07fb8d60e95c4a85a756833687ec6e494299e1348649b4f118ef56f",
+      "uncompressed_sha256": "935b1174ec140b8df78782ac295c381223d4f5d896a1054c259edacc1f30d354",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-12-success.json"
+    },
+    {
+      "path": "bms/bms-13-success.json.gz",
+      "sha256": "550bc6fea39552fffa64e608f1e5d3337d72d52b8f684ea9dbbbd145b8074ea2",
+      "uncompressed_sha256": "41bad08078616b47cd39f3b3bfd38dacaf7adccbba68fff89aeeb83213d3f4b8",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-13-success.json"
+    },
+    {
+      "path": "bms/bms-14-success.json.gz",
+      "sha256": "626c92eb87a9e9aa4b09935e59f0b094640d59259a69ce0b74f6c4fd6d72dc23",
+      "uncompressed_sha256": "a38da0833ed253aaf3448fd8e6ffda72855334e87a8e89ca72bd9e1504a56f40",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-14-success.json"
+    },
+    {
+      "path": "bms/bms-15-success.json.gz",
+      "sha256": "3a3baf9f3ca9e49b721eac64ec8e39ef6a0627883e336876a5671cf91b8e34ac",
+      "uncompressed_sha256": "b11edb00ed6f17abc3978b215af6268e3c52b3baa4d4eed2647e2b5c7e3a0e4d",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-15-success.json"
+    },
+    {
+      "path": "bms/bms-16-success.json.gz",
+      "sha256": "580cd1fbf49d435501595b0a3ddeccb1513e56a062063056f90e2b0e44d679b6",
+      "uncompressed_sha256": "1f9019d51f2959725c62b6f6b182961f19bec8ca272766278b60a7d1b1ea2420",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-16-success.json"
+    },
+    {
+      "path": "bms/bms-17-success.json.gz",
+      "sha256": "dc1ec94fc025d3d0b409c007c3ce7e3eb0bfb4a08e44a82d5d03b3d0e85e6321",
+      "uncompressed_sha256": "6d99862788892f4f31c16e0a86c619df1e9fa3533a5b20f42133161ef527d75b",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-17-success.json"
+    },
+    {
+      "path": "bms/bms-18-success.json.gz",
+      "sha256": "e112adc2c3f930d8b501adcbfa2e512ce5b67dba048a97da47fded85cfb2f4f0",
+      "uncompressed_sha256": "d0384e32e2027bda124d0c33a1d095e2bbb3cfcbb67c13a2ca14f45ad9ab0e9c",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-18-success.json"
+    },
+    {
+      "path": "bms/bms-19-success.json.gz",
+      "sha256": "e576eecadb26e0b4dff4ed3b84a415a3c932ebba6d44978f80a2a81c05c09322",
+      "uncompressed_sha256": "d324ef844021ea9186f09e77a5f081f86d61502b292b14f79176b70004812ae2",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-19-success.json"
+    },
+    {
+      "path": "bms/bms-2-success.json.gz",
+      "sha256": "cf0bf091d38cd95f6fd3a5db477bed9e731a29ec95c44be6dd1e2317a47a2cde",
+      "uncompressed_sha256": "19539bda4a50f6bf7316987cfb6e843f4f4cf938233525e24e1e3877606a9b07",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-2-success.json"
+    },
+    {
+      "path": "bms/bms-20-success.json.gz",
+      "sha256": "c6d80eef3cae49fa35f2cf0c8217de31d8ff578d3c25cffdcc436c8a073e8392",
+      "uncompressed_sha256": "7661e98c08bb27ef99d0cf82d06d3dc9ae865407a1bc18ba8e69a3e9f98ef17b",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-20-success.json"
+    },
+    {
+      "path": "bms/bms-21-missing-timer.json.gz",
+      "sha256": "5177977f5119996ff66b8cfc52a2a9a74bbe0fe7fcf145f8e7cf70013ef4ba8f",
+      "uncompressed_sha256": "3955b147d5d37f36d7ad964eed155e4c727a60d35a20bcf477d6c13abce1b93d",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-21-missing-timer.json"
+    },
+    {
+      "path": "bms/bms-22-success.json.gz",
+      "sha256": "cae375f82ec3b0fdb8ca90136688708af9a23f3273844c7999c474986c48d128",
+      "uncompressed_sha256": "6214026dfc32baafd84b43295795939cd7d8c91e175f28c82608471019083151",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-22-success.json"
+    },
+    {
+      "path": "bms/bms-23-success.json.gz",
+      "sha256": "b4651be64dc1ec2e2d3abb1a6b44ad2f56f643cbf5d76af70ab91ea943f614c9",
+      "uncompressed_sha256": "24cec55e25aa71d0cde950b02adf4af9137dba33a5377fcc59f678713dfcf7ff",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-23-success.json"
+    },
+    {
+      "path": "bms/bms-24-success.json.gz",
+      "sha256": "e7ded2615a96926dd238dc6a212fc7764c31364cd022d274f268751f6f359c62",
+      "uncompressed_sha256": "e339fe10bdb9a8cb9a7494e7433bb8e367010cd808a188274c7f35a66bcabd5f",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-24-success.json"
+    },
+    {
+      "path": "bms/bms-25-success.json.gz",
+      "sha256": "1b8004bc5156debfbc5e9872865631671efcdba899af903ec69f88cedd7babd5",
+      "uncompressed_sha256": "1225e3e2a0c5ee67e51cd138f741bc18d7f4a44cb35d28f078cb3bbbca16aa2d",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-25-success.json"
+    },
+    {
+      "path": "bms/bms-26-success.json.gz",
+      "sha256": "a225476171aa762440849d6cfcad56e6c31fe01909d86d694892a0efa3fd1797",
+      "uncompressed_sha256": "78fdbb6eb3ccc25e5b7ea296ea5c52aad3da5db7d574088bc09f6e6721dc6ea5",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-26-success.json"
+    },
+    {
+      "path": "bms/bms-28-success.json.gz",
+      "sha256": "82522f1e5b272ad2e043a07ae9aab88a053b9cb66562bfcd9ec6934e8bb8f9ea",
+      "uncompressed_sha256": "7c49ba11112e66699aa947a796014e08d4ac5726ac068fa4b652641512fc5fb2",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-28-success.json"
+    },
+    {
+      "path": "bms/bms-29-success.json.gz",
+      "sha256": "aad007b37593a747f5a5ceb1b0a7fb977409b76f9bf15822a0612c3271253558",
+      "uncompressed_sha256": "f185ea68f27a4b578bf18a6d07589d54218591ed0d2c7e26d5237247aa26271a",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-29-success.json"
+    },
+    {
+      "path": "bms/bms-38-success.json.gz",
+      "sha256": "108863bf223e74581f5b4822eb50fe3aa447973e9c576d0382db449144de1315",
+      "uncompressed_sha256": "619b4d57821da45304443287063228a23687a4e5906a893842b9fe1eca6aa095",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-38-success.json"
+    },
+    {
+      "path": "bms/bms-39-success.json.gz",
+      "sha256": "0befde3fbed7f6e53823ec5c099b123a99ccf505b71a2bcc9ead339bdb1bfef4",
+      "uncompressed_sha256": "d7126d3e4c35fbac61c52b7afe2dd8869748188603424793708e450e3137f987",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-39-success.json"
+    },
+    {
+      "path": "bms/bms-4-success.json.gz",
+      "sha256": "16f1ba7d4d0f7fcd07058bceea8e7b5bcde5fdd97c0fe40c99234f56499babfb",
+      "uncompressed_sha256": "92c7622a15fde4f958f0f4c5ede26f68fa7251f6186c09ba3b04b87ca80acdaa",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-4-success.json"
+    },
+    {
+      "path": "bms/bms-42-success.json.gz",
+      "sha256": "e2aa0916ec8eecb5d348d26934e1f4c30c27cd6ef30ebc69a659623155f9ea2e",
+      "uncompressed_sha256": "fcd7572d2a62cb582f8d513172f15e0176ae035afde657392a6b6b82edb732b8",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-42-success.json"
+    },
+    {
+      "path": "bms/bms-43-success.json.gz",
+      "sha256": "e2f0194d29e77f14b6bcccaaf62cbd7fe2f9e7fb5a79f78ed4c76b4da04927e9",
+      "uncompressed_sha256": "04077edbbf14636965834ad338730bcba9bed4dd8e9a068bfb0e8880f42c56e1",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-43-success.json"
+    },
+    {
+      "path": "bms/bms-44-success.json.gz",
+      "sha256": "2168a081cc78a66c612ae89f1e3adcfba61ab081ad8f9ed501c3ed046ff9c658",
+      "uncompressed_sha256": "14b275332445989943f34f3f0d00630ff49f08dd50d5607f75ae7c374697c36f",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-44-success.json"
+    },
+    {
+      "path": "bms/bms-46-aspirate.json.gz",
+      "sha256": "7b999fc4cc702bc81413615b64048bfcb107cf2308cc23ff8194fb1ac4aa204e",
+      "uncompressed_sha256": "c0288740278404f6c29729a9a53ebf28e9eb7913caeec53bf815676138382567",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-46-aspirate.json"
+    },
+    {
+      "path": "bms/bms-46-dispense.json.gz",
+      "sha256": "9b5edfe2addcde75da812202f10d528efcd0539e393aa0ae346cc2c1e6b94abd",
+      "uncompressed_sha256": "785906bf64db8c9d373c57fa778fb81a12b3ea0712e2a64b2805f34c4106c34a",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-46-dispense.json"
+    },
+    {
+      "path": "bms/bms-46-success.json.gz",
+      "sha256": "0ec37e816d4234bb7fa4d009b569940ee55c7dd16d78b5aac96a308a921cb8a2",
+      "uncompressed_sha256": "16f243647ef01a6d004064594279f32469e557170910ca02e009006a3a23c774",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-46-success.json"
+    },
+    {
+      "path": "bms/bms-47-success.json.gz",
+      "sha256": "b9908e44d8ddfacd02f3b1b249a406cb8ab485f95472b70a25ab8143b2684b2c",
+      "uncompressed_sha256": "d0aa7e7b5786761cf37703977ecbd13ea83ae2337a3509a063f0da688d044e28",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-47-success.json"
+    },
+    {
+      "path": "bms/bms-5-success.json.gz",
+      "sha256": "487bf792ad6a1c526a3d4b8d897ab0e55537610819f0ca9b99629d1a75867f18",
+      "uncompressed_sha256": "dd2e8ab631331a620526ce721161a514e45cc7d58142222189dfe22df6e626ad",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-5-success.json"
+    },
+    {
+      "path": "bms/bms-51-success.json.gz",
+      "sha256": "a435d4ee92107adc1fd28692e75d8fcbea9efae68ad69caddb1526c3c1c1e933",
+      "uncompressed_sha256": "84aaa1289d09b8338ca418cf7865188e0ef9509fa84203a8751441878a06aeed",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-51-success.json"
+    },
+    {
+      "path": "bms/bms-52-success.json.gz",
+      "sha256": "1351389ccbaf64fb18fb5ba9b1273c299b823d6487df58607090da83aad337ad",
+      "uncompressed_sha256": "e35ab1d621f71f5184afe2a04c34a592a67bd02eedff9c16ac33e6573a29ccff",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-52-success.json"
+    },
+    {
+      "path": "bms/bms-53-success.json.gz",
+      "sha256": "600f9a5dbc3e9f35bec9d759f08b143e2bc5667b528b053d958afeb05355b1e1",
+      "uncompressed_sha256": "ada9be05cfd1ef7bfd4053e0c238416a895d6a029caf4102e078fd11e1ebf0db",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-53-success.json"
+    },
+    {
+      "path": "bms/bms-54-success.json.gz",
+      "sha256": "e7233021857ffa03f2e7c26f8da674b241f880664e9b1ca8386bf89c5f5c1f8a",
+      "uncompressed_sha256": "eb886ba8db024ee069067ab736f75878b4808fcb9d97c3b42299eb2a25ea49d3",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-54-success.json"
+    },
+    {
+      "path": "bms/bms-55-success.json.gz",
+      "sha256": "2928f8f38fb4f876fa2a7acdf5d4dff0502cbb29fdf40a01eb842dc8647b0ff6",
+      "uncompressed_sha256": "091bd746f0f1fc44374627f2ad9ee25486b5acd433974aec52c224316480bf3c",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-55-success.json"
+    },
+    {
+      "path": "bms/bms-56-success.json.gz",
+      "sha256": "eabdd87f6c63faf9839d777e62f137309d5e6d26a94a0da43c9115656a73ec6c",
+      "uncompressed_sha256": "2b3673a52c20e9a244d022b02ea53c7aa6a1121b05d4b7948a222e3db5245bc0",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-56-success.json"
+    },
+    {
+      "path": "bms/bms-57-success.json.gz",
+      "sha256": "d3f195000f710ae2be2970925c99d02ea9ea11b067f83fc697c97c60b168bebc",
+      "uncompressed_sha256": "479ee315c7068985fb47ae282f152c4da2199cd501ba87884bf8f557b3a5107c",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-57-success.json"
+    },
+    {
+      "path": "bms/bms-58-success.json.gz",
+      "sha256": "c775bfc5555a3954adb46c849d353b68fc9d6c7c2475f7182dca3ae6474bcfde",
+      "uncompressed_sha256": "efa6cf07cbf8bdfd515be40a68bf6056dd417a86a8a336174084c0be29c44540",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-58-success.json"
+    },
+    {
+      "path": "bms/bms-59-success.json.gz",
+      "sha256": "e91b07d07070613db84d287084b75e944c02dfe34dd204620bf28ef3ac811b3f",
+      "uncompressed_sha256": "20e19cb42d29d37d13712f3575d609d98b6211fe34047dae383dee8438bf83b9",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-59-success.json"
+    },
+    {
+      "path": "bms/bms-6-success.json.gz",
+      "sha256": "fc10e338ff6d140d967fff177a9ebd188fea7820bb9b863f6b59827351137c0f",
+      "uncompressed_sha256": "6590e47fe595162ece905a3fc852e5bb9c8121531ca692275b85275b39c34b7d",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-6-success.json"
+    },
+    {
+      "path": "bms/bms-61-success.json.gz",
+      "sha256": "09bdc76cbaf2bbfd75fe4d33aa4fd9eff7025d5e5811c2515f901576e96791f2",
+      "uncompressed_sha256": "fa0e069c1831c72cd1d431b5378146fb923a74fc33e27b86ecb0f6be4cf37cfa",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-61-success.json"
+    },
+    {
+      "path": "bms/bms-63-success.json.gz",
+      "sha256": "fc48b5b6489966fa4255b119be4cbc850d0335940bc2aceb724b33e00e42ea8d",
+      "uncompressed_sha256": "0cdf0316de835f677877e7895d85b41aa35f38bf5f7f3faa11845af9cd8a6f62",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-63-success.json"
+    },
+    {
+      "path": "bms/bms-64-success.json.gz",
+      "sha256": "35e9facb387f0cca7cb3b3cc50b287f2c26b12e7ea886276a23350f915de63bf",
+      "uncompressed_sha256": "3508cf475e5f6b1323f42936ec8e93b85af6adf4481196daf2bbfc80a414ec8f",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-64-success.json"
+    },
+    {
+      "path": "bms/bms-65-success.json.gz",
+      "sha256": "25e5b5007ad143daa4d5ec117650ea5edf313e42c0a80a70bb301f71f8c3f858",
+      "uncompressed_sha256": "076bebf54922701e5cdb170b2ca2f30940169bb50c5c5f5a2d8c3aa460745282",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-65-success.json"
+    },
+    {
+      "path": "bms/bms-66-success.json.gz",
+      "sha256": "db7ce939362ffef561ff7e21bcd0fc3342cc6909ce2f0d3e322844bd2faaacda",
+      "uncompressed_sha256": "985c0767fcccb168c501a8da82ef174c5be042fa57528db5df30e32b468816c5",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-66-success.json"
+    },
+    {
+      "path": "bms/bms-67-success.json.gz",
+      "sha256": "73e63f4ea279c59598ea52fddfbe11adde9c59325be95599dec50d49274daf9f",
+      "uncompressed_sha256": "45da9936d9973fe75f46cf5e75a3574699f4d99f69dd17487c740f2f487cc0c0",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-67-success.json"
+    },
+    {
+      "path": "bms/bms-7-success.json.gz",
+      "sha256": "56e787231e49bf65f8ce028af25b305ea2ae788a153c1eeb2cc8e5afde3f9a2e",
+      "uncompressed_sha256": "01aaa4808dc5e9995e8b16832d999b75ef62977974e08b810cf263eb193b823c",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-7-success.json"
+    },
+    {
+      "path": "bms/bms-8-success.json.gz",
+      "sha256": "79611b2a526d86b289de889a3cefee6e7da49f4a9a461f4bf3bbcebbb4ad3f12",
+      "uncompressed_sha256": "2a7c8d2a32e0c0fe65404028c9f95d8de2b4cb2e6a1c728364fe23d35288f2ef",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-8-success.json"
+    },
+    {
+      "path": "bms/bms-9-success.json.gz",
+      "sha256": "d0a6a4376afbeb4ed5962a8096c867d8bc28fcd6e501b35353c71ba8166bb7b6",
+      "uncompressed_sha256": "104933e2f9aa746a869adde8da193e7f47343f0593171b60958dc6588079035c",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-bms-exports/bms-9-success.json"
+    },
+    {
+      "path": "native/plld-channel.json.gz",
+      "sha256": "ccfd976118329c622f4eac5914b07c95f7a629a80007360674196546c2bb9abd",
+      "uncompressed_sha256": "dc2c0b6ffc28cfdc3cc7025f9baa6a69fe37885677ca926658e17d2559d36508",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-exports/plld-channel.json"
+    },
+    {
+      "path": "native/plld-exception.json.gz",
+      "sha256": "c71691f8d6af27e0c65eff85ca938cc7bc7f0c7b66e666a4853c8300271276c8",
+      "uncompressed_sha256": "3e42cf00548f405076cfc3b021376349fccbee0036c7c2d8ae0157da7ec50af5",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-exports/plld-exception.json"
+    },
+    {
+      "path": "native/plld-owner_loss.json.gz",
+      "sha256": "fb8ae288551bf433cc8f3eda16c1d73cc1c94bd5d241730ae977cb9cb1c15e3b",
+      "uncompressed_sha256": "381db209303db6986d05dc4c558ef1843aa3c3568226b6a3534dbdc9b5b1d8a3",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-exports/plld-owner_loss.json"
+    },
+    {
+      "path": "native/plld-stop.json.gz",
+      "sha256": "2f7650093dabaaf150501717b27b9ca399a3e27f40a5bba05608b7f806062aa3",
+      "uncompressed_sha256": "45ce075c1e0bf385d7a43c62811d542485a8d7275cbc150e8ee966ed104d5106",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-exports/plld-stop.json"
+    },
+    {
+      "path": "native/plld-termination_exception.json.gz",
+      "sha256": "b3131e70b56b77f83dd4348dd76f3cd454d67d0fef3eb77b71f1d18b1d2b600b",
+      "uncompressed_sha256": "33b464524db9bd3ed3898da01bf5fd2b415c5855b2a89708f3138bd80256446b",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-exports/plld-termination_exception.json"
+    },
+    {
+      "path": "native/plld-timeout.json.gz",
+      "sha256": "aa7a6fa444deddeafad12cddd5f988ac6603cd94e1aba7ef59218360bc1f2172",
+      "uncompressed_sha256": "28e9459d8066e20387fc37281a2abace7fb2dd3201f5615d887ec496e0ec0014",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-exports/plld-timeout.json"
+    },
+    {
+      "path": "native/recipe-None.json.gz",
+      "sha256": "55b2defb6efc6ed187f239196e8a9d66cfbe97eaed1cc409c4b5b43e62d3fe96",
+      "uncompressed_sha256": "5665803f11adffebb5b0edf4153d4b65fa1813daf3c79b28c70b9f7e08fe3bb1",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-exports/recipe-None.json"
+    },
+    {
+      "path": "native/recipe-device.json.gz",
+      "sha256": "620366d0daae552a07c03ceb647b813cb4d401402ef97366405dda6451fd8c2b",
+      "uncompressed_sha256": "4d15a361913c6273e6e251ebea40c13faccd5e270995b734b591bf59832964eb",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-exports/recipe-device.json"
+    },
+    {
+      "path": "native-close-contract.json",
+      "sha256": "10879367f05fdc4f761c3b337c67bcff5e417f73766f82e0824aec62fb7938e0",
+      "uncompressed_sha256": "10879367f05fdc4f761c3b337c67bcff5e417f73766f82e0824aec62fb7938e0",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-contract.json"
+    },
+    {
+      "path": "native-close-manual-schema.json",
+      "sha256": "e97bd6f83a7e197f82237e748122f064facc48f4e33607e9ccde9f9c34c31954",
+      "uncompressed_sha256": "e97bd6f83a7e197f82237e748122f064facc48f4e33607e9ccde9f9c34c31954",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-manual-schema.json"
+    },
+    {
+      "path": "native-close-recipe-schema.json",
+      "sha256": "d03e5a727577043771c2a0104ad7334f1ddd2acc09be167511d1aeed11366a48",
+      "uncompressed_sha256": "d03e5a727577043771c2a0104ad7334f1ddd2acc09be167511d1aeed11366a48",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-recipe-schema.json"
+    },
+    {
+      "path": "native-close-source-decision.md",
+      "sha256": "7e28722afcc590a6983a3919a6485af6e6b247f40ec0c96e5fc98807e4dbe263",
+      "uncompressed_sha256": "7e28722afcc590a6983a3919a6485af6e6b247f40ec0c96e5fc98807e4dbe263",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-source-decision.md"
+    },
+    {
+      "path": "run-native-close-offline.py",
+      "sha256": "dbb2b5f6958c489a5e0a0696c430989c1ba81710f88acc77e7e814db9d56cb30",
+      "uncompressed_sha256": "dbb2b5f6958c489a5e0a0696c430989c1ba81710f88acc77e7e814db9d56cb30",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/run-native-close-offline.py"
+    },
+    {
+      "path": "run-native-finish-offline.py",
+      "sha256": "ebf12157515f0dcb4c0d31b9316b2d1c2336d8e8f8b93ac0f43632ca7b6455de",
+      "uncompressed_sha256": "ebf12157515f0dcb4c0d31b9316b2d1c2336d8e8f8b93ac0f43632ca7b6455de",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/run-native-finish-offline.py"
+    },
+    {
+      "path": "run-native-close-roster.py",
+      "sha256": "d72ed97505e6e41482be3931c8bfe2fbe2d4e882beb7c608c5ecc851954124b5",
+      "uncompressed_sha256": "d72ed97505e6e41482be3931c8bfe2fbe2d4e882beb7c608c5ecc851954124b5",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/run-native-close-roster.py"
+    },
+    {
+      "path": "prior/combined-final1.xml.gz",
+      "sha256": "e225e286cb30857cfa021946c291c62c80aaafb2409cb67cf36f034a682d1cc3",
+      "uncompressed_sha256": "30fb08f1bbd9ebca5f17aa08737fab38147366bfe383e96b34e501dd82875a60",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-combined-final1.xml"
+    },
+    {
+      "path": "prior/workflow-before-fixture-correction.xml",
+      "sha256": "2913d885bcd361abbb380062681151f191a93791befbcfc6d739c0aea9e2740f",
+      "uncompressed_sha256": "2913d885bcd361abbb380062681151f191a93791befbcfc6d739c0aea9e2740f",
+      "source": "/home/dalab/.hermes/profiles/fresh/robot-audit/bioxp-workflow-implementation-r4/native-close-final-roster/test_protocol_workflow_connected.py.xml"
+    }
+  ],
+  "totals": {
+    "tests": 337,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "roster": [
+    {
+      "module": "test_bms_method_documents_connected.py",
+      "tests": 106,
+      "junit": "junit/test_bms_method_documents_connected.py.xml"
+    },
+    {
+      "module": "test_bms_method_full_connected.py",
+      "tests": 14,
+      "junit": "junit/test_bms_method_full_connected.py.xml"
+    },
+    {
+      "module": "test_cavro_application.py",
+      "tests": 28,
+      "junit": "junit/test_cavro_application.py.xml"
+    },
+    {
+      "module": "test_cavro_liquid.py",
+      "tests": 6,
+      "junit": "junit/test_cavro_liquid.py.xml"
+    },
+    {
+      "module": "test_cavro_native_integrated.py",
+      "tests": 4,
+      "junit": "junit/test_cavro_native_integrated.py.xml"
+    },
+    {
+      "module": "test_cavro_provider_connected.py",
+      "tests": 1,
+      "junit": "junit/test_cavro_provider_connected.py.xml"
+    },
+    {
+      "module": "test_cavro_review_regressions.py",
+      "tests": 9,
+      "junit": "junit/test_cavro_review_regressions.py.xml"
+    },
+    {
+      "module": "test_cover_carry_release_connected.py",
+      "tests": 6,
+      "junit": "junit/test_cover_carry_release_connected.py.xml"
+    },
+    {
+      "module": "test_manual_physical_native.py",
+      "tests": 12,
+      "junit": "junit/test_manual_physical_native.py.xml"
+    },
+    {
+      "module": "test_method_custody_connected.py",
+      "tests": 4,
+      "junit": "junit/test_method_custody_connected.py.xml"
+    },
+    {
+      "module": "test_method_runtime_connected.py",
+      "tests": 20,
+      "junit": "junit/test_method_runtime_connected.py.xml"
+    },
+    {
+      "module": "test_method_source_mechanisms.py",
+      "tests": 13,
+      "junit": "junit/test_method_source_mechanisms.py.xml"
+    },
+    {
+      "module": "test_moveto_x_noop_connected.py",
+      "tests": 16,
+      "junit": "junit/test_moveto_x_noop_connected.py.xml"
+    },
+    {
+      "module": "test_native_close_contracts.py",
+      "tests": 4,
+      "junit": "junit/test_native_close_contracts.py.xml"
+    },
+    {
+      "module": "test_native_completion_handoff.py",
+      "tests": 13,
+      "junit": "junit/test_native_completion_handoff.py.xml"
+    },
+    {
+      "module": "test_oem_native_thermal_lifecycle.py",
+      "tests": 52,
+      "junit": "junit/test_oem_native_thermal_lifecycle.py.xml"
+    },
+    {
+      "module": "test_oem_pipette_calibration.py",
+      "tests": 16,
+      "junit": "junit/test_oem_pipette_calibration.py.xml"
+    },
+    {
+      "module": "test_protocol_v1_connected_thermal_completion.py",
+      "tests": 7,
+      "junit": "junit/test_protocol_v1_connected_thermal_completion.py.xml"
+    },
+    {
+      "module": "test_protocol_workflow_connected.py",
+      "tests": 3,
+      "junit": "junit/test_protocol_workflow_connected.py.xml"
+    },
+    {
+      "module": "test_protocol_workflow_controls_connected.py",
+      "tests": 3,
+      "junit": "junit/test_protocol_workflow_controls_connected.py.xml"
+    }
+  ],
+  "bms_executed_unique_indices": [
+    0,
+    2,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    28,
+    29,
+    38,
+    39,
+    42,
+    43,
+    44,
+    46,
+    47,
+    51,
+    52,
+    53,
+    54,
+    55,
+    56,
+    57,
+    58,
+    59,
+    61,
+    63,
+    64,
+    65,
+    66,
+    67
+  ],
+  "bms_parsed_document_count": 69,
+  "not_executed_as_whole_document": [
+    1,
+    3,
+    27,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    40,
+    41,
+    45,
+    48,
+    49,
+    50,
+    60,
+    62,
+    68
+  ],
+  "source_document_sha256": "95dca7bccc05596d7e7a6b1c0ce2a7308839c247255ad55a1acd45ad1b0683c7"
+}

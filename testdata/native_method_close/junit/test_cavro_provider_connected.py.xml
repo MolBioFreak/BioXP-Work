@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1" time="2.409" timestamp="2026-10-03T10:38:29.244963+00:00" hostname="e70d36aab1e5"><testcase classname="tests.test_cavro_provider_connected" name="test_real_provider_plld_and_canonical_workflow_owner" time="1.743" /></testsuite></testsuites>
