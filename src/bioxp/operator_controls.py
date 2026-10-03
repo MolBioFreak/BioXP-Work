@@ -2872,6 +2872,34 @@ def _catalog_dashboard(dashboard):
     return result
 
 
+def _catalog_changes(before, after, path=(), source_path=None):
+    """Lossless JSON tree updates; no guessed defaults or timestamp suppression."""
+    if source_path is None:
+        source_path = path
+    if type(before) is type(after) and isinstance(after, dict):
+        changes: list[list[Any]] = [[list(path + (key,))] for key in before.keys() - after.keys()]
+        for key, value in after.items():
+            changes.extend(_catalog_changes(before[key], value, path + (key,), source_path + (key,))
+                           if key in before else [[list(path + (key,)), value]])
+        return changes
+    if isinstance(before, list) and isinstance(after, list):
+        # Receipt queues shift when another client submits work. Reuse the
+        # baseline row by native identity instead of retransmitting the tail.
+        identities = {row["command_id"]: index for index, row in enumerate(before)
+                      if isinstance(row, dict) and isinstance(row.get("command_id"), str)}
+        changes = [[list(path + (index,))] for index in range(len(before) - 1, len(after) - 1, -1)]
+        for index, value in enumerate(after):
+            source = identities.get(value["command_id"], index) if isinstance(value, dict) and isinstance(value.get("command_id"), str) else index
+            if source < len(before):
+                if source != index:
+                    changes.append([list(path + (index,)), None, list(source_path + (source,))])
+                changes.extend(_catalog_changes(before[source], value, path + (index,), source_path + (source,)))
+            else:
+                changes.append([list(path + (index,)), value])
+        return changes
+    return [] if type(before) is type(after) and before == after else [[list(path), after]]
+
+
 class _OperatorPollCache:
     """One refresh in flight, with coalesced demand per finite polling view.
 
@@ -2893,7 +2921,38 @@ class _OperatorPollCache:
         self._pending = None
         self._pending_key = None
         self._cache = {}
+        # One immutable wire baseline per existing finite catalog view, not per
+        # caller/draft. Clients keep it in their existing QueryClient entry.
+        self._assessment_bases = {}
         self._closed = False
+
+    def assessment_wire(self, body, requested_base):
+        if requested_base is None or body.get("catalog_view") != "assessment":
+            return body
+        key = body.get("schema_version")
+        generation = body.get("ownership_generation", (body.get("dashboard") or {}).get("ownership_generation"))
+        identity = (generation, body.get("metadata_revision"))
+        with self._lock:
+            previous = self._assessment_bases.get(key)
+            if previous is None or previous[0] != identity:
+                revision = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                previous = (identity, revision, copy.deepcopy(body))
+                self._assessment_bases[key] = previous
+            _, revision, baseline = previous
+            if requested_base != revision:
+                # Resync sends the baseline, plus current changes in this same
+                # response. No second GET and no stale intermediate display.
+                return {"catalog_view": "assessment", "assessment_revision": revision,
+                        "assessment_base": baseline, "assessment_changes": _catalog_changes(baseline, body)}
+            return {"catalog_view": "assessment", "assessment_revision": revision,
+                    "assessment_changes": _catalog_changes(baseline, body)}
+
+    def assessment_response(self, fn):
+        @wraps(fn)
+        async def served(*args, **kwargs):
+            requested_base = kwargs.pop("assessment_base", None)
+            return self.assessment_wire(await fn(*args, **kwargs), requested_base)
+        return served
 
     def close(self):
         with self._lock:
@@ -4035,7 +4094,11 @@ def install_operator_control_plane(
         return body
 
     @router.get("/v2/control-catalog")
-    async def control_catalog_v2_view(view: str = Query(default="full", pattern="^(full|metadata|assessment)$")):
+    @poll_cache.assessment_response
+    async def control_catalog_v2_view(
+        view: str = Query(default="full", pattern="^(full|metadata|assessment)$"),
+        assessment_base: str | None = Query(default=None, max_length=64),
+    ):
         if view == "metadata":
             return canonical_metadata
         return await control_catalog_v2(view=view)
@@ -4299,11 +4362,13 @@ def install_operator_control_plane(
         return _catalog_assessment(body, catalog_metadata["metadata_revision"]) if view == "assessment" else body
 
     @router.get("/control-catalog")
+    @poll_cache.assessment_response
     @with_current_deck_display
     async def control_catalog_with_z_target(
         schema_version: str | None = Query(default=None),
         z_target_steps: int | None = Query(default=None, ge=-2147483648, le=2147483647),
         view: str = Query(default="full", pattern="^(full|metadata|assessment)$"),
+        assessment_base: str | None = Query(default=None, max_length=64),
     ) -> dict[str, Any]:
         # Reuse the finite cached snapshot; draft values never allocate cache
         # entries or collect hardware. This is presentation, not admission.
