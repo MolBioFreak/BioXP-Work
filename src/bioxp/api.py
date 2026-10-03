@@ -10219,7 +10219,7 @@ def _protocol_deck_action_result(command_id: str) -> dict[str, Any]:
     evidence_error = None
     try:
         evidence = _protocol_command_store().wp8_operation_evidence(command_id)
-    except (OSError, RuntimeError, ValueError, HTTPException) as exc:
+    except (OSError, RuntimeError, ValueError, KeyError, HTTPException) as exc:
         # Observation loss is evidence, never a new execution predicate.
         evidence, evidence_error = {}, type(exc).__name__
     children = []
@@ -10265,6 +10265,19 @@ def _protocol_live_plate_move_handler(action, state):
 
 def _protocol_live_custody_handler(action, state):
     """Explicit source operations through the same finite deck owner as MP/MC."""
+    if action.kind is ProtocolActionKind.CUT_SEAL:
+        from dataclasses import replace
+        provider = _serial206_oem_initialization_provider
+        plane = app.state.operator_command_plane
+        def execute_plan(plan, source_action, runtime):
+            admitted = plane.store.admit_internal_wp8_operation(
+                "cut_seal", inputs={}, state=plane._state(), prepared_plan=plan,
+                idempotency_key=f"protocol:{state.job_id}:{action.action_id}")
+            return _protocol_deck_action_result(admitted["command_id"])
+        # Reuse the source owner for calibrated X/Z and source child order.
+        handlers = provider.build_oem_native_handlers(
+            settings={"CutZ_Offset": action.params["cut_z_offset_steps"]}, execute_plan=execute_plan)
+        return handlers["cutseal"](replace(action, params={"arguments": [str(action.params["count"])]}), state)
     operations = {ProtocolActionKind.PLATE_CATCH: "catch_plate",
                   ProtocolActionKind.PLATE_RELEASE: "release_plate",
                   ProtocolActionKind.PLATE_PRESS: "press_plate", ProtocolActionKind.CUT_SEAL: "cut_seal"}

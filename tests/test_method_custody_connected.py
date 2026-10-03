@@ -70,3 +70,55 @@ def test_explicit_catch_release_native_custody(handoff, monkeypatch, failure):
         assert result["command"]["status"] == "completed", result
         assert semantic["plate_on_gantry"] is None
         assert semantic["movable_plate_locations"]["OUTPUT_COVER"] == "LOC_OC_COVER_STORAGE"
+
+
+@pytest.mark.parametrize("kind,params,leaf_operation", [
+    ("plate_press", {"plate": 0, "run_in_parallel": False}, "moveZPress"),
+    ("cut_seal", {"count": 1, "cut_z_offset_steps": 0}, "getG"),
+])
+def test_explicit_press_cut_real_finite_owner(handoff, monkeypatch, kind, params, leaf_operation):
+    from bioxp import api
+    from bioxp.services.protocol_service import bind_protocol_dispatcher, create_protocol_job, ProtocolOperatorBundleStore
+    rig, done = handoff, threading.Event()
+    store = rig.store
+    monkeypatch.setattr(api, "_serial206_oem_initialization_provider", rig.provider)
+    # Authored simulated predecessor: door already open avoids adding a
+    # composed door/Park test to this cutting qualification.
+    rig.provider.wp8_update_thermal_door_open("updateThermalDoorOpen", {"value": True},
+        command_id="method-cut-predecessor", child_order=0, plan_digest="fixture")
+    rig.native.positions[6, 0] = 1
+    # This simulator commits target positions synchronously at the physical
+    # move leaf; expose its stopped observation, not a planner success stub.
+    rig.native.motor_wait_stopped = lambda *a, **k: {"ok": True, "stopped": True}
+    profile = rig.native._motion_oem_axis_profile
+    rig.native._motion_oem_axis_profile = lambda axis, startup=False: profile(axis, startup=startup)
+    rig.provider.primitives._z_profile_overrides = {}
+    rig.provider.primitives._x_profile_overrides = {}
+    from bioxp.usb_driver import BioXpTester
+    rig.native._tmcl_success = BioXpTester._tmcl_success
+    rig.native.oem_current_board_lifecycle_generation = lambda: 3
+    rig.native.motor_oem_require_no_motion_profile = BioXpTester.motor_oem_require_no_motion_profile.__get__(rig.native)
+    for axis in ("x", "z"):
+        preset = rig.native._motion_oem_axis_profile(axis)
+        for param, value in ((4, preset["speed"]), (5, preset["acc"]), (6, preset["run_current"]), (205, preset["stall_guard"]), (12, 1)):
+            rig.native.parameters[preset["board"], preset["motor"], param] = value
+    artifacts = ProtocolOperatorBundleStore(rig.root / "method-artifacts")
+    handlers = {kind: api._protocol_live_custody_handler}
+    bind_protocol_dispatcher(store, binding_factory=lambda *a, **k: (handlers, {}, {}), artifact_store=artifacts)
+    finish = store.finish_workflow
+    def finished(*a, **k):
+        result = finish(*a, **k)
+        done.set()
+        return result
+    monkeypatch.setattr(store, "finish_workflow", finished)
+    payload = {"idempotency_key": "explicit-" + kind, "live_execution": {"live_execution_ack": True},
+        "document": {"protocol_id": kind, "stages": [{"stage_id": "s", "actions": [
+            {"action_id": kind, "kind": kind, "params": params}]}]}}
+    job = create_protocol_job(payload, dry_run=False, command_store=store, store=artifacts,
+        handlers=handlers, ownership_generation=rig.provider.deck_owner_authority_stamps()["ownership_generation"], board_epochs={})
+    store.start(rig.plane._dispatch_one)
+    assert done.wait(20), store.get_workflow(job["job_id"])
+    result = store.get_workflow(job["job_id"])
+    rows = result["execution"]["runtime_state"]["action_results"]
+    assert result["command"]["status"] == "completed", [(r.get("command", {}).get("terminal_evidence"), r.get("message"), r.get("child_outcomes")) for r in rows]
+    assert any(c["operation"] == leaf_operation for c in rows[0]["child_outcomes"])

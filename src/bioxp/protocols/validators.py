@@ -67,7 +67,7 @@ def validate_protocol_document(document: ProtocolDocument) -> ProtocolDocument:
                 ProtocolActionKind.PLATE_CATCH: ({"plate", "run_in_parallel"}, "plate"),
                 ProtocolActionKind.PLATE_RELEASE: ({"destination", "press_plate", "run_in_parallel"}, "destination"),
                 ProtocolActionKind.PLATE_PRESS: ({"plate", "run_in_parallel"}, "plate"),
-                ProtocolActionKind.CUT_SEAL: ({"count"}, "count"),
+                ProtocolActionKind.CUT_SEAL: ({"count", "cut_z_offset_steps"}, "count"),
             }
             if action.kind in custody_fields:
                 fields, required = custody_fields[action.kind]
@@ -78,6 +78,8 @@ def validate_protocol_document(document: ProtocolDocument) -> ProtocolDocument:
                         raise ValueError(f"{action.kind.value}.{field} requires boolean")
                 if action.kind == ProtocolActionKind.CUT_SEAL and action.params["count"] == 0:
                     raise ValueError("cut_seal.count zero cannot represent source integer division")
+                if action.kind == ProtocolActionKind.CUT_SEAL and type(action.params.get("cut_z_offset_steps")) is not int:
+                    raise ValueError("cut_seal requires captured cut_z_offset_steps")
             if action.stage_id != stage.stage_id:
                 raise ValueError(
                     f"Action '{action.action_id}' is attached to stage '{action.stage_id}', expected '{stage.stage_id}'"
