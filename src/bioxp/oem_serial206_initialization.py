@@ -3439,6 +3439,18 @@ class Serial206ProductionPrimitiveAdapter:
                 row["terminal"] and (row["acknowledged"] or not row["command_required"])
                 for row in child_evidence
             )
+            if controller_completion_verified:
+                # One arrival observation per axis, after all nested moves settle
+                # and before releasing this command owner. The bounded query-only
+                # path publishes fresh replies through the existing display sink.
+                for axis in ("x", "y", "z"):
+                    try:
+                        profile = self._axis_profile(axis)
+                        self.tester.query_only_tmcl(
+                            profile["board"], 6, 1, motor=profile.get("motor", 0))
+                    except Exception:
+                        # Display observation must never change completed motion.
+                        pass
             return {
                 "ok": all(isinstance(row, Mapping) and row.get("ok") is True for row in results),
                 "source_return_code": 0,
