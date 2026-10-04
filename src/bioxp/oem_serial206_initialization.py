@@ -10174,6 +10174,12 @@ class Serial206OemInitializationProvider:
                     result = self.primitives.z_stop()
             except Exception as exc:
                 result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                # A Home may fail in its preliminary absolute move, before any
+                # homing sweep. Retain the driver's original attached facts for
+                # every Z intent; do not infer a home or change source outcome.
+                motion_evidence = getattr(exc, "motion_evidence", None)
+                if isinstance(motion_evidence, Mapping):
+                    result["motion_evidence"] = copy.deepcopy(dict(motion_evidence))
                 critical = getattr(exc, "critical_z_evidence", None)
                 if intent == "move_absolute" and isinstance(critical, Mapping):
                     result.update(critical)

@@ -2586,7 +2586,7 @@ _ROUTE_FAILURE_MESSAGES = {
     "route_http_failed": "Robot route reported an HTTP failure.",
     "action_failed": "Operator action failed; inspect retained evidence.",
     "action_rejected": "Operator action was rejected.",
-    "action_outcome_unknown": "Action outcome unknown; reconciliation required and retry forbidden",
+    "action_outcome_unknown": "Action outcome is uncertain; inspect the exact receipt and controller state. No automatic retry was performed.",
 }
 _DECK_DIAGNOSTICS = {
     "deck_bootstrap_semantic_location_unavailable", "deck_bootstrap_board_epochs_unavailable",
@@ -2649,7 +2649,7 @@ def _route_failure_code(status_code: int | None, response: Any) -> str:
             # This exact OEM diagnostic has a known meaning. Do not classify
             # arbitrary exception prose by substring or expose its text.
             if isinstance(value, str) and re.fullmatch(
-                r"(?:RuntimeError: |xy_intent_exception:OemMotionCompletionError:)"
+                r"(?:RuntimeError: |OemMotionCompletionError: |xy_intent_exception:OemMotionCompletionError:)"
                 r"Reach GZ position time out! board=[0-9]{1,3}; axis=[0-9]{1,3}; position=-?[0-9]{1,10}", value
             ):
                 return "controller_position_wait_timeout"
@@ -5068,7 +5068,7 @@ def install_operator_control_plane(
                     ) else "pass" if ok else "fail",
                     "response": full_response,
                     "error": (
-                        "Action outcome unknown; reconciliation required and retry forbidden"
+                        _ROUTE_FAILURE_MESSAGES["action_outcome_unknown"]
                         if completion_ambiguous
                         else None if ok else _route_failure_message(status_code, response)
                     ),
