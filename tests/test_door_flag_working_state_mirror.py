@@ -67,6 +67,53 @@ def test_door_flag_update_mirrors_into_working_state(tmp_path, monkeypatch):
         runtime.close()
 
 
+@pytest.mark.parametrize('tip_location', [None, -1, 0, 3])
+def test_door_cycles_publish_with_retained_tip_metadata(tmp_path, monkeypatch, tip_location):
+    """Real provider + both SQLite owners; no physical controller operations.
+
+    OEM ControlLib.doorOpen assigns ThermalDoorOpen without inspecting tips.
+    A loaded-tip observation with unknown location must survive that assignment.
+    """
+    from contextlib import nullcontext
+    from bioxp.operator_command_plane import OperatorCommandStore
+
+    provider, _, runtime = door_rig(tmp_path, monkeypatch)
+    store = OperatorCommandStore(tmp_path)
+    stamps = provider.deck_owner_authority_stamps()
+    store.bind_deck_owner_authority_reader(lambda: stamps, scope=nullcontext)
+    provider.bind_deck_semantic_state_publisher(store.publish_deck_owner_state)
+    try:
+        initial = store.publish_deck_owner_state(
+            source_operation='pipette_owner', source_command_id='offline-tip-observation',
+            updates={'tip_loaded': True, 'tip_dirty': None, 'tip_location': tip_location},
+            **stamps,
+        )
+        current = initial
+        for cycle in range(3):
+            for opened in (True, False):
+                out = provider.execute_wp8_child(
+                    {'order': 10, 'operation': 'updateThermalDoorOpen', 'arguments': {'value': opened}},
+                    command_id=f'offline-door-{cycle}-{opened}', child_order=10,
+                    plan_digest='offline-door-publication',
+                )
+                assert out['ok'] is True
+                current = store.deck_semantic_state()
+                assert current['thermal_door_open'] is opened
+                assert provider.wp8_operation_machine_state(
+                    'thermal_door', {'open': not opened})['door_is_open'] is opened
+                for field in ('tip_loaded', 'tip_dirty', 'tip_location',
+                              'current_location', 'current_well', 'plate_on_gantry'):
+                    assert current[field] == initial[field]
+                assert current['transition_provenance']['source_operation'] == 'updateThermalDoorOpen'
+        assert current['semantic_state_revision'] == initial['semantic_state_revision'] + 6
+        store.stop()
+        store = OperatorCommandStore(tmp_path)
+        assert store.deck_semantic_state() == current
+    finally:
+        store.stop()
+        runtime.close()
+
+
 def test_door_flag_update_rejects_non_boolean(tmp_path, monkeypatch):
     provider, published, runtime = door_rig(tmp_path, monkeypatch)
     try:
