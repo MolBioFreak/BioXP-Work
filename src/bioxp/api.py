@@ -629,17 +629,16 @@ def _execute_serial206_motion_intent(intent: str, inputs: Mapping[str, Any] | No
         canonical_replacements = {
             "move_xy": "oem.xy.move_absolute",
             "home_xy": "oem.xy.home",
-            "move_to": "oem.xyz.move_to",
         }
-        canonical_method_id = canonical_replacements.get(intent)
-        if canonical_method_id is not None:
+        replacement_action_id = canonical_replacements.get(intent)
+        if replacement_action_id is not None:
             raise HTTPException(
                 status_code=409,
                 detail={
-                    "error": "canonical_xz_method_requires_v2_route",
-                    "replacement_method_action_id": canonical_method_id,
-                    "replacement_route": "/operator/v2/methods",
-                    "required_schema": "bioxp.operator_method_request.v1",
+                    "error": "xy_action_requires_v2_route",
+                    "replacement_action_id": replacement_action_id,
+                    "replacement_route": f"/operator/v2/actions/{replacement_action_id}",
+                    "required_schema": "bioxp.operator_action_request.v2",
                     "physical_motion_commanded": False,
                 },
             )
@@ -851,6 +850,25 @@ def _set_maintenance_state(*, transition: str, **updates: Any) -> dict[str, Any]
         return dict(_maintenance_state)
 
 
+def _bind_axis_position_observer(*, epoch: int, owned: bool) -> None:
+    plane = getattr(app.state, "operator_command_plane", None)
+    if plane is not None:
+        plane.store.set_observation_generation(ownership_generation=epoch)
+    owner = _tester
+    bind = getattr(owner, "set_axis_position_observer", None)
+    if not callable(bind):
+        return
+
+    def publish(**observation):
+        if _tester is not owner or hardware_state.ownership_epoch != epoch:
+            return
+        plane = getattr(app.state, "operator_command_plane", None)
+        if plane is not None:
+            plane.store.publish_axis_observation(**observation)
+
+    bind(publish if owned else None, ownership_generation=epoch)
+
+
 def _ownership_changed(*, reason: str, transport: str, usb: str, router: str) -> int:
     """Invalidate every hardware and camera projection on ownership changes."""
     global _camera_projection_epoch, _camera_probe_cache, _camera_session
@@ -889,6 +907,9 @@ def _ownership_changed(*, reason: str, transport: str, usb: str, router: str) ->
         task = session.get("reader_task")
         if task is not None and not task.done():
             task.cancel()
+    _bind_axis_position_observer(
+        epoch=epoch, owned=(transport, usb, router) == ("owned", "service", "running"),
+    )
     _sync_serial206_oem_initialization_provider(transport=transport, usb=usb, router=router)
     return epoch
 
@@ -9995,7 +10016,13 @@ async def liquid_status_readback():
 
 @app.post("/protocol/compile")
 async def protocol_compile(req: ProtocolCompileRequest):
-    compiled = compile_protocol_source(req.model_dump(exclude_none=True))
+    from .protocols.input_errors import ProtocolInputError
+    try:
+        compiled = compile_protocol_source(req.model_dump(exclude_none=True))
+    except ProtocolInputError as exc:
+        raise HTTPException(status_code=422, detail=exc.to_payload()) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=ProtocolInputError(str(exc)).to_payload()) from exc
     return compiled.to_payload()
 
 
@@ -10180,9 +10207,28 @@ def _wait_protocol_deck_command(command_id: str, *, timeout_s: float = 180.0) ->
 def _protocol_deck_action_result(command_id: str) -> dict[str, Any]:
     # Terminal queue status is a command outcome, not physical placement proof.
     # Preserve the complete command row and its nested terminal/child evidence.
-    command = _wait_protocol_deck_command(command_id)
+    try:
+        command = _wait_protocol_deck_command(command_id)
+    except HTTPException as exc:
+        if not isinstance(exc.detail, Mapping) or exc.detail.get("error") != "canonical_deck_command_failed":
+            raise
+        command = dict(exc.detail["command"])
+    # The append-only typed ledger is separate from bounded diagnostic trees.
+    # Keep every finite child, including not-entered children, in native results.
+    evidence_error = None
+    from .protocols.operational_results import finite_child_outcomes, deck_child_outcomes
+    try:
+        if (command.get("deck_movement") or {}).get("stages"):
+            children = deck_child_outcomes(command)
+        else:
+            evidence = _protocol_command_store().wp8_operation_evidence(command_id)
+            children = finite_child_outcomes(command_id, evidence)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, HTTPException) as exc:
+        # Observation loss is evidence, never a new execution predicate.
+        children, evidence_error = [], type(exc).__name__
     return {"ok": command.get("status") == "completed", "command_id": command_id,
-            "command": command}
+            "command": command, "child_outcomes": children,
+            **({"child_outcomes_error": evidence_error} if evidence_error else {})}
 
 
 def _protocol_live_plate_move_handler(action, state):
@@ -10206,6 +10252,43 @@ def _protocol_live_plate_move_handler(action, state):
         inputs=intent,
         idempotency_key=f"protocol:{job_id}:{action.action_id}",
     )
+    command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
+    if not isinstance(command_id, str) or not command_id:
+        raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
+    return _protocol_deck_action_result(command_id)
+
+
+def _protocol_live_pierce_handler(action, state):
+    """Existing movExecution positioning/piercing/publication, not cutseal or SS."""
+    from dataclasses import replace
+    return _protocol_live_move_handler(replace(action, params={
+        "script_line": 0, "plate_name": action.params["plate"],
+        "well": action.params["well"], "continuation": action.params["pattern"]}), state)
+
+
+def _protocol_live_custody_handler(action, state):
+    """Explicit source operations through the same finite deck owner as MP/MC."""
+    if action.kind is ProtocolActionKind.CUT_SEAL:
+        from dataclasses import replace
+        provider = _serial206_oem_initialization_provider
+        plane = app.state.operator_command_plane
+        def execute_plan(plan, source_action, runtime):
+            admitted = plane.store.admit_internal_wp8_operation(
+                "cut_seal", inputs={}, state=plane._state(), prepared_plan=plan,
+                idempotency_key=f"protocol:{state.job_id}:{action.action_id}")
+            return _protocol_deck_action_result(admitted["command_id"])
+        # Reuse the source owner for calibrated X/Z and source child order.
+        handlers = provider.build_oem_native_handlers(
+            settings={"CutZ_Offset": action.params["cut_z_offset_steps"]}, execute_plan=execute_plan)
+        return handlers["cutseal"](replace(action, params={"arguments": [str(action.params["count"])]}), state)
+    operations = {ProtocolActionKind.PLATE_CATCH: "catch_plate",
+                  ProtocolActionKind.PLATE_RELEASE: "release_plate",
+                  ProtocolActionKind.PLATE_PRESS: "press_plate", ProtocolActionKind.CUT_SEAL: "cut_seal"}
+    admitter = getattr(app.state, "oem_wp8_operation_admitter", None)
+    if not callable(admitter):
+        raise HTTPException(status_code=503, detail={"error": "canonical_deck_queue_unavailable"})
+    admitted = admitter(operations[action.kind], inputs=action.to_payload()["params"],
+                       idempotency_key=f"protocol:{state.job_id}:{action.action_id}")
     command_id = admitted.get("command_id") if isinstance(admitted, Mapping) else None
     if not isinstance(command_id, str) or not command_id:
         raise HTTPException(status_code=500, detail={"error": "canonical_deck_admission_invalid"})
@@ -10296,8 +10379,45 @@ def _protocol_live_manual_physical_handler(action, state):
     return handler(action, state)
 
 
+def _protocol_live_source_barcode_handler(action, state):
+    from .oem_deck_movement import compile_finite_plate_operation
+    plan = compile_finite_plate_operation("source_barcode", source_leaf_available=True, mode=action.params["mode"])
+    _require_motion_route_ready()
+    store = _protocol_command_store()
+    with store.workflow_context(state.job_id, source_occurrence_id=action.action_id):
+        return app.state.oem_workflow_plan_executor(plan, action, state)
+
+
+def _protocol_live_park_handler(action, state):
+    from .oem_deck_movement import compile_finite_plate_operation
+    plan = compile_finite_plate_operation("park_gantry", source_leaf_available=True, **action.params)
+    _require_motion_route_ready()
+    store = _protocol_command_store()
+    with store.workflow_context(state.job_id, source_occurrence_id=action.action_id):
+        store.assert_workflow_current(state.job_id)
+        return app.state.oem_workflow_plan_executor(plan, action, state)
+
+
+def _protocol_mechanism_handlers(source_executor=None):
+    from .protocols.mechanisms import build_mechanism_handlers
+    def save_snapshot(frame, action, state):
+        return {**_deck_cover_inspection_save(frame=frame.content, condition="method_photo_only",
+                    artifact_id=f"{state.job_id}:{action.action_id}"),
+                "provider_generation": frame.provider_generation, "sequence": frame.sequence,
+                "captured_at": frame.captured_at.isoformat()}
+    return build_mechanism_handlers(get_tester=_get_tester, get_camera=lambda: _camera_provider,
+                                    get_executor=source_executor, save_snapshot=save_snapshot,
+                                    read_source_barcode=_protocol_live_source_barcode_handler)
+
+
 def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
     return {
+        **_protocol_mechanism_handlers(),
+        ProtocolActionKind.PARK: _protocol_live_park_handler,
+        ProtocolActionKind.PLATE_CATCH: _protocol_live_custody_handler,
+        ProtocolActionKind.PLATE_RELEASE: _protocol_live_custody_handler,
+        ProtocolActionKind.PLATE_PRESS: _protocol_live_custody_handler,
+        ProtocolActionKind.CUT_SEAL: _protocol_live_custody_handler,
         ProtocolActionKind.MOVE: _protocol_live_move_handler,
         ProtocolActionKind.PLATE_MOVE: _protocol_live_plate_move_handler,
         ProtocolActionKind.MOVE_COVER: _protocol_live_plate_move_handler,
@@ -10307,6 +10427,7 @@ def _protocol_live_handlers() -> dict[ProtocolActionKind, Any]:
         ProtocolActionKind.PIPETTE_INIT: _protocol_live_pipette_handler,
         ProtocolActionKind.PIPETTE_POSITION: _protocol_live_manual_position_handler,
         ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL: _protocol_live_manual_physical_handler,
+        ProtocolActionKind.PIPETTE_PIERCE: _protocol_live_pierce_handler,
         ProtocolActionKind.PIPETTE_TIP: _protocol_live_pipette_handler,
         ProtocolActionKind.TIP_EJECT: _protocol_live_pipette_handler,
         ProtocolActionKind.PIPETTE_ASPIRATE: _protocol_live_pipette_handler,
@@ -10513,6 +10634,7 @@ def _bind_deck_cover_inspection(provider) -> None:
         led=_deck_inspection_led,
         rgb=lambda r, g, b: _get_tester().strip_set_rgb(r, g, b, reconnect_first=False, activate_first=False),
         barcode=scan_barcode,
+        rgb_state=lambda: (_get_tester().led_state_cached() or {}).get("rgb"),
     )
 
 
@@ -10577,7 +10699,7 @@ def _protocol_bindings(bundle, *, source_executor=None):
     native = {}
     lifecycle = {}
     if metadata.get("input_mode") != "oem_prepared":
-        return _protocol_live_handlers(), {}, {}
+        return {**_protocol_live_handlers(), **_protocol_mechanism_handlers(source_executor)}, {}, {}
     capabilities = set()
     if callable(getattr(FourPipetteTransport, "dispense_air_for_oem_script", None)):
         capabilities.add("dispense_air_for_oem_script")
@@ -10963,16 +11085,16 @@ async def liquid_manual_execute(req: ManualPipettingExecuteRequest):
 
 
 @app.get("/protocol/jobs")
-async def protocol_jobs(limit: int = Query(20, ge=1, le=100)):
+async def protocol_jobs(limit: int = Query(20, ge=1, le=100), summary: bool = Query(False)):
     return {
-        "rows": await run_in_threadpool(list_protocol_jobs, limit=limit, command_store=_protocol_command_store()),
+        "rows": await run_in_threadpool(list_protocol_jobs, limit=limit, summary=summary, command_store=_protocol_command_store()),
     }
 
 
 @app.get("/protocol/jobs/{job_id}")
-async def protocol_job_detail(job_id: str):
+async def protocol_job_detail(job_id: str, observation: bool = Query(False)):
     try:
-        return await run_in_threadpool(get_protocol_job, job_id, command_store=_protocol_command_store())
+        return await run_in_threadpool(get_protocol_job, job_id, observation=observation, command_store=_protocol_command_store())
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

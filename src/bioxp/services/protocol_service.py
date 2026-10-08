@@ -22,8 +22,13 @@ PROTOCOL_LIVE_CONTRACT_SCHEMA_VERSION = "bioxp.protocol_live_execution_contract.
 PROTOCOL_LIVE_RESERVATION_SCHEMA_VERSION = "bioxp.protocol_live_idempotency_reservation.v1"
 LIVE_REFERENCE_REQUIRED_AXES = ("x", "y", "z")
 REFERENCE_REQUIRED_ACTION_KINDS = {
+    ProtocolActionKind.PLATE_CATCH,
+    ProtocolActionKind.PLATE_RELEASE,
+    ProtocolActionKind.PLATE_PRESS,
+    ProtocolActionKind.CUT_SEAL,
     ProtocolActionKind.MOVE,
     ProtocolActionKind.PIPETTE_POSITION,
+    ProtocolActionKind.PIPETTE_PIERCE,
     ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL,
     ProtocolActionKind.PIPETTE_TIP,
     ProtocolActionKind.PIPETTE_ASPIRATE,
@@ -34,7 +39,7 @@ REFERENCE_REQUIRED_ACTION_KINDS = {
     ProtocolActionKind.PLATE_PREPARE,
     ProtocolActionKind.PLATE_MOVE,
     ProtocolActionKind.MOVE_COVER,
-    ProtocolActionKind.SEAL_SEPARATE,
+    ProtocolActionKind.PARK,
     ProtocolActionKind.LIQUID_ADJUST,
     ProtocolActionKind.TIP_EJECT,
 }
@@ -256,8 +261,17 @@ def _job_status_from_state(state: ProtocolRuntimeState) -> str:
     if state.workflow is not None:
         if state.workflow.phase == "queued":
             return "queued"
-        if state.workflow.phase == "reconciling":
-            return "ambiguous"
+        if state.workflow.phase in {"reconciling", "terminal"}:
+            # Reconciliation can still own entered native children. Only a
+            # settled executor outcome makes this an ambiguous terminal result.
+            settled = next((event for event in reversed(state.events)
+                            if event.event == "workflow_settled"), None)
+            if settled is not None:
+                outcome = settled.detail.get("outcome")
+                if outcome in {"completed", "failed", "interrupted", "ambiguous"}:
+                    return outcome
+            if state.workflow.phase == "reconciling":
+                return "dispatched"
         if state.workflow.phase != "terminal":
             requested = state.workflow.requested_control or {}
             return "interrupting" if requested.get("action") in {"safe_stop", "abort"} else "dispatched"
@@ -548,6 +562,10 @@ def _workflow_resources(document: ProtocolDocument) -> list[str]:
             resources.add("pipette")
         if action.kind.value.startswith("thermal"):
             resources.add("thermal")
+        if action.kind is ProtocolActionKind.CHILLER_SETPOINT:
+            resources.add("chiller")
+        if action.kind in {ProtocolActionKind.SNAPSHOT, ProtocolActionKind.CAMERA_ILLUMINATION, ProtocolActionKind.BARCODE_READ}:
+            resources.add("camera")
     return sorted(resources)
 
 
@@ -788,17 +806,21 @@ def create_protocol_job(
     return command_store.get_workflow(job_id)
 
 
-def get_protocol_job(job_id: str, *, store: ProtocolOperatorBundleStore | None = None, command_store=None) -> dict[str, Any]:
+def get_protocol_job(job_id: str, *, observation: bool = False, store: ProtocolOperatorBundleStore | None = None, command_store=None) -> dict[str, Any]:
     if command_store is not None:
-        canonical = command_store.get_workflow(job_id)
+        canonical = (command_store.get_workflow_observation(job_id) if observation else
+                     command_store.get_workflow(job_id))
         if canonical is not None:
             return canonical
     active_store = store or ProtocolOperatorBundleStore()
     return active_store.load(job_id)
 
 
-def list_protocol_jobs(*, limit: int = 20, store: ProtocolOperatorBundleStore | None = None, command_store=None) -> list[dict[str, Any]]:
-    canonical = command_store.list_workflows(limit=limit) if command_store is not None else []
+def list_protocol_jobs(*, limit: int = 20, summary: bool = False, store: ProtocolOperatorBundleStore | None = None, command_store=None) -> list[dict[str, Any]]:
+    canonical = ((command_store.list_workflow_summaries(limit=limit) if summary else
+                  command_store.list_workflows(limit=limit)) if command_store is not None else [])
+    if len(canonical) >= limit:
+        return canonical
     seen = {row["job_id"] for row in canonical}
     try:
         historical = (store or ProtocolOperatorBundleStore()).list(limit=limit)

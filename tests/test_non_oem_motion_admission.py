@@ -208,28 +208,3 @@ def test_axis_stop_still_excludes_dispatch_with_stale_reference(connected, axis)
         result = provider.execute_xy_intent(40000, 40000)
     assert result['ok'] is False
     assert not rig.native.moves
-
-
-@pytest.mark.parametrize('caller_epochs', [{}, {'4': 1, '5': 1}])
-def test_strict_xy_method_binds_current_owner_not_caller_epochs(retained_rig, caller_epochs):
-    from fastapi import HTTPException
-    provider, _, _, _, store, _ = retained_rig
-    stamps = provider.deck_owner_authority_stamps()
-    state = {'ownership_generation': 3, 'serial206_initialization_provider': {
-        'x_authority': {'current_board_lifecycle_generation': stamps['board_epoch_5']},
-        'board4_authority': {'active_board_epoch': stamps['board_epoch_4']}}}
-    request = {'schema_version': 'bioxp.operator_method_request.v1',
-        'name': 'oem.xy.move_absolute', 'idempotency_key': 'offline-strict-xy',
-        'expected_ownership_generation': 3, 'expected_board_epoch_by_board': caller_epochs,
-        'steps': [{'action_id': 'oem.xy.move_absolute', 'inputs': {'x': 40000, 'y': 40000}}],
-        'metadata': {'method_action_id': 'oem.xy.move_absolute'}}
-    result = store.admit_method(request, state=state, strict_authority=True)
-    child = store.claim_next()
-    assert child['method_id'] == result['method_id']
-    assert child['expected_board_epoch_by_board'] == {
-        '4': stamps['board_epoch_4'], '5': stamps['board_epoch_5']}
-    replay = store.admit_method(request, state=state, strict_authority=True)
-    assert replay['method_id'] == result['method_id'] and replay['idempotent_replay']
-    with pytest.raises(HTTPException):
-        store.admit_method({**request, 'steps': [{'action_id': 'oem.xy.move_absolute',
-            'inputs': {'x': 41000, 'y': 40000}}]}, state=state, strict_authority=True)

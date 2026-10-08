@@ -132,6 +132,7 @@ class ProtocolExecutor:
         self.outcome: str | None = None
         self._pool: ThreadPoolExecutor | None = None
         self._reached_controls: set[str] = set()
+        self._method_timers: dict[str, float] = {}
 
     def execute(
         self,
@@ -371,7 +372,8 @@ class ProtocolExecutor:
                         or self._pause or mode not in {"ordinary", "deferred"}):
                     raise ValueError("Pause is not eligible")
                 if not self._oem:
-                    raise ValueError("OEM pause requires OEM lifecycle")
+                    if mode != "ordinary":
+                        raise ValueError("Deferred pause requires OEM lifecycle")
                 self._pause = (mode, control_id)
             elif action == "wake":
                 if self._termination or workflow.phase != "waiting" or workflow.gate != "deferred_pause" or gate_id != workflow.gate_id or self._wake_complete or self._wake_control:
@@ -521,6 +523,14 @@ class ProtocolExecutor:
         children = payload.pop("owned_children", ())
         result.update(payload)
         result.pop("pending", None)
+        application = payload.get("pipette_result")
+        if isinstance(application, Mapping) and application.get("kind") == "cavro_application":
+            # Publish the actual returned native events, not inferred liquid
+            # outcomes. Timestamp is publication time after finite completion;
+            # original event identities/order and device evidence are retained.
+            for event in application.get("events", ()):
+                self._state.record_event("cavro_application_event", stage_id=result.get("stage_id"),
+                    action_id=result.get("action_id"), detail=dict(event))
         command_id = payload.get("command_id")
         if command_id and command_id not in self._state.workflow.child_command_ids:
             self._state.workflow.child_command_ids.append(command_id)
@@ -560,8 +570,20 @@ class ProtocolExecutor:
             self._pause = ("ordinary", self._state.workflow.source_occurrence_id or result.get("action_id"))
         if payload.get("uncertain") or payload.get("status") == "ambiguous":
             self._unknown = True
-        if payload.get("ok") is not True:
+        if payload.get("ok") is not True and not (payload.get("interrupted") and (self._termination or self._interrupted)):
             self._failed = True
+            application = payload.get("pipette_result") or {}
+            event_control = application.get("requested_control") if application.get("kind") == "cavro_application" else None
+            if (event_control == "pause_for_operator" or result.get("on_error") == "pause_for_operator") and not self._termination:
+                self._state.workflow.held_reason = "source_error_hold"
+                self._state.workflow.source_occurrence_id = result.get("source_occurrence_id") or result.get("action_id")
+        if result.get("stage_id") in self._state.stage_states:
+            stage = self._state.stage_states[result["stage_id"]]
+            result["status"] = "completed" if payload.get("ok") is True else "failed"
+            if payload.get("ok") is True and result.get("action_id") not in stage.completed_actions:
+                stage.completed_actions.append(result["action_id"])
+            elif payload.get("ok") is not True:
+                stage.status = StageExecutionStatus.FAILED
         self._notify()
         self._publish()
 
@@ -597,7 +619,9 @@ class ProtocolExecutor:
         while True:
             self._reap()
             self._service_requests()
-            if self._interrupted or self._recording_failed or self._unknown:
+            if self._interrupted or self._recording_failed:
+                raise _Diversion()
+            if self._unknown and self._state.workflow.held_reason != "source_error_hold":
                 raise _Diversion()
             if not any(set(child.domains).intersection(domains) for child, _ in self._owned):
                 break
@@ -741,7 +765,10 @@ class ProtocolExecutor:
         while True:
             self._reap()
             self._service_requests()
-            if self._interrupted or self._recording_failed or self._unknown:
+            # Authored failure holds retain partial/ambiguous effects without
+            # certifying them or exposing Continue/retry. Stop/owner loss still
+            # diverts immediately; Abort settles the unchanged unknown outcome.
+            if self._interrupted or self._recording_failed or (self._unknown and gate != "error_hold"):
                 raise _Diversion()
             if self._termination:
                 # A diversion never acknowledges review or runs restoration.
@@ -847,6 +874,35 @@ class ProtocolExecutor:
         self._publish("executing")
         return {"ok": True, "host_exit": reason}
 
+    def wait_elapsed(self, seconds: float) -> bool:
+        """Cooperative elapsed clock for authored methods, not OEM WAIT tokens."""
+        deadline = monotonic() + seconds
+        with self._condition:
+            while True:
+                if self._termination or self._interrupted or self._recording_failed or self._unknown:
+                    return False
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return True
+                self._condition.wait(min(remaining, 0.25))
+
+    def method_timer(self, timer_id: str, seconds: float | None, *, start: bool) -> dict[str, Any]:
+        if start:
+            self._method_timers[timer_id] = monotonic() + seconds
+            return {"ok": True, "timer_id": timer_id, "duration_s": seconds, "timer_started": True,
+                    "clock": "monotonic_elapsed"}
+        if timer_id not in self._method_timers:
+            return {"ok": False, "timer_id": timer_id, "error": "timer_not_started"}
+        complete = self.wait_elapsed(max(0, self._method_timers[timer_id] - monotonic()))
+        return {"ok": complete, "timer_id": timer_id, "timer_complete": complete, "interrupted": not complete}
+
+    def mechanism_event(self, action: ProtocolAction, name: str, detail: Mapping[str, Any]) -> None:
+        """Identified producer event; raw readings do not invent classifier verdicts."""
+        with self._condition:
+            self._state.record_event(name, stage_id=action.stage_id, action_id=action.action_id,
+                                     detail={"producer": "robot-orchestration", **dict(detail)})
+            self._publish()
+
     def _source_wait(self, action: ProtocolAction, state: ProtocolRuntimeState) -> dict[str, Any]:
         # Core 6641–6674: one-shot timer token; malformed Int32 is a source
         # no-op. A nonpositive Timer.Interval is a source error, not expiry.
@@ -882,7 +938,9 @@ class ProtocolExecutor:
         identity = action.source_occurrence_id or action.action_id
         self._entry(identity)
         result = {"stage_id": action.stage_id, "action_id": action.action_id,
-                  "kind": action.kind.value, "source_occurrence_id": identity}
+                  "kind": action.kind.value, "source_occurrence_id": identity,
+                  "metadata": action.to_payload()["metadata"], "on_error": action.on_error,
+                  "status": "running"}
         state.action_results.append(result)
         if action.kind in {ProtocolActionKind.NOTE, ProtocolActionKind.PAUSE_REVIEW}:
             value = {"ok": True, "host_only": True}
@@ -909,6 +967,14 @@ class ProtocolExecutor:
         else:
             self._consume(value, result)
         self._reap()
+        if not self._oem:
+            # Native authored actions are serial boundaries. Publish the exact
+            # entered child before advancing the cursor to the next child.
+            self._publish()
+            self.wait_for_domains(ALL_DOMAINS)
+            if self._pause and not self._termination:
+                self._gate("ordinary_pause", self._pause[1])
+            return
         if result.get("source_error_hold"):
             self._gate("error_hold", identity)
         if self._failed or self._unknown:
@@ -1075,11 +1141,17 @@ class ProtocolExecutor:
                 if request["action"] in {"abort", "safe_stop"} or request.get("decision") == "abort":
                     self._reached_controls.add(control_id)
                     state.workflow.reached_control_id = control_id
-        for stage_state in state.stage_states.values():
-            rows = [r for r in state.action_results if r.get("stage_id") == stage_state.stage_id and r.get("ok") is True]
-            stage_state.completed_actions = [r["action_id"] for r in rows]
-            stage_state.current_action_id = None
-            stage_state.status = StageExecutionStatus.COMPLETED if state.completed else StageExecutionStatus.FAILED
+        for stage in document.stages:
+            stage_state = state.stage_states[stage.stage_id]
+            rows = [r for r in state.action_results if r.get("stage_id") == stage.stage_id]
+            stage_state.completed_actions = [r["action_id"] for r in rows if r.get("ok") is True]
+            stage_state.current_action_id = next((r["action_id"] for r in rows if r.get("ok") is not True), None)
+            if len(stage_state.completed_actions) == len(stage.actions):
+                stage_state.status = StageExecutionStatus.COMPLETED
+            elif rows:
+                stage_state.status = StageExecutionStatus.FAILED
+            else:
+                stage_state.status = StageExecutionStatus.PENDING
         state.workflow.gate = state.workflow.gate_id = None
         state.workflow.source_occurrence_id = None
         state.current_stage_id = None

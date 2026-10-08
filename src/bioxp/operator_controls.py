@@ -13,6 +13,7 @@ import asyncio
 import copy
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import wraps
+from sqlite3 import Error as SQLiteError
 import threading
 import hashlib
 import json
@@ -723,7 +724,7 @@ def _pipette_source_errors(value: Any) -> list[Any]:
 
 
 _ADDITIONAL_PIPETTE_KINDS = frozenset({"source_load_tips", "source_mix",
-    "source_aspirate_air", "source_dispense_air", "source_purge", "diagnostic_pipette"})
+    "source_aspirate_air", "source_dispense_air", "source_purge", "diagnostic_pipette", "cavro_application"})
 
 
 def _compact_pipette_observation(value: Any) -> Any:
@@ -783,6 +784,13 @@ def _compact_pipette_response(value: Any) -> Any:
     """
     if not isinstance(value, Mapping):
         return value
+    if value.get("kind") == "cavro_application":
+        # Versioned application events are operational fields, not diagnostic
+        # previews: retain channels, partial settings and control at every child.
+        from .protocols.operational_results import compact_application
+        return compact_application(value)
+    if value.get("kind") == "source_barcode":
+        return dict(value)
     if value.get("kind") in _ADDITIONAL_PIPETTE_KINDS:
         return _compact_additional_pipette(value)
     source = str(value.get("source") or value.get("source_anchor") or "")
@@ -828,6 +836,7 @@ def _compact_pipette_response(value: Any) -> Any:
         return {"kind": kind, **result}
     result = dict(value)
     critical = result.get("pipette_result")
+    barcode = result.get("barcode_result")
     for key in ("result", "response", "completed_children", "source_children", "provider_results"):
         child = result.get(key)
         if isinstance(child, Mapping):
@@ -841,6 +850,10 @@ def _compact_pipette_response(value: Any) -> Any:
         for candidate in candidates:
             if not isinstance(candidate, Mapping):
                 continue
+            if candidate.get("kind") == "source_barcode":
+                barcode = candidate
+            elif isinstance(candidate.get("barcode_result"), Mapping):
+                barcode = candidate["barcode_result"]
             if isinstance(candidate.get("pipette_result"), Mapping):
                 critical = candidate["pipette_result"]
             anchor = str(candidate.get("source") or candidate.get("source_anchor") or "")
@@ -848,6 +861,8 @@ def _compact_pipette_response(value: Any) -> Any:
             child_kind = candidate.get("kind") if candidate.get("kind") in _ADDITIONAL_PIPETTE_KINDS else child_kind
             if child_kind:
                 critical = {"kind": child_kind, **candidate}
+    if barcode is not None:
+        result["barcode_result"] = barcode
     if critical is not None:
         result["pipette_result"] = critical
     return result
@@ -857,7 +872,7 @@ def _workflow_terminal_result(receipt: Mapping[str, Any]) -> dict[str, Any]:
     """One native consumer for persisted terminal success and partial failure."""
     evidence = receipt.get("terminal_evidence") or {}
     response = dict(evidence.get("response") or {})
-    for key in ("error", "detail", "pipette_result"):
+    for key in ("error", "detail", "pipette_result", "barcode_result", "child_outcomes"):
         if key in evidence:
             response[key] = evidence[key]
     return {**response, "ok": receipt["status"] == "completed",
@@ -876,10 +891,10 @@ def _bounded_json(value: Any, limit: int) -> Any:
             "source_calwith_fluid", "diagnostic_detect_fluid",
             "source_fluid_offset", "measure_fluid_height", *_ADDITIONAL_PIPETTE_KINDS}:
         return json.loads(raw)
-    if isinstance(value, Mapping) and isinstance(value.get("pipette_result"), Mapping):
+    if isinstance(value, Mapping) and any(key in value for key in ("pipette_result", "barcode_result", "child_outcomes")):
         # Critical source data is not diagnostic preview data. Drop the redundant
         # envelope rather than hashing it or losing samples to the diagnostic cap.
-        return {key: value[key] for key in ("pipette_result", "ok", "error", "detail",
+        return {key: value[key] for key in ("pipette_result", "barcode_result", "child_outcomes", "ok", "error", "detail",
             "delivery_attempted", "outcome_unknown") if key in value}
     digest = hashlib.sha256(raw).hexdigest()
     return {"bounded": True, "original_bytes": len(raw), "sha256": digest, "preview": raw[: min(limit // 2, 4096)].decode("utf-8", "replace")}
@@ -1689,20 +1704,23 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _bounded_telemetry(state: Mapping[str, Any]) -> dict[str, Any]:
+def _bounded_telemetry(state: Mapping[str, Any], *, catalog: bool = False) -> dict[str, Any]:
     """Public read-only telemetry; never replace source time with poll time.
 
     Bound wire-detail fields, not channel state or control availability.
     Full provider receipts remain at their existing detail endpoints.
     """
     payload = _dashboard_payload(state)
-    pipettes = payload["pipettes"]
-    pipettes["last_group_transaction"] = _bounded_json(pipettes.get("last_group_transaction"), 4096)
-    pipettes["channels"] = [
-        {**row, "last_transaction": _bounded_json(row.get("last_transaction"), 2048)}
-        if isinstance(row, Mapping) else row
-        for row in pipettes.get("channels", [])
-    ]
+    if catalog:
+        payload = _catalog_dashboard(payload)
+    else:
+        pipettes = payload["pipettes"]
+        pipettes["last_group_transaction"] = _bounded_json(pipettes.get("last_group_transaction"), 4096)
+        pipettes["channels"] = [
+            {**row, "last_transaction": _bounded_json(row.get("last_transaction"), 2048)}
+            if isinstance(row, Mapping) else row
+            for row in pipettes.get("channels", [])
+        ]
     domains = state.get("domains") or {}
     observations = {
         name: row.get("observed_unix")
@@ -2403,8 +2421,8 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "category": "recovery",
             "kind": "meta",
             "safety_class": "service",
-            "description": "Run shared OEM motion preparation with the existing strict recovery physical checks and no homing. This action is available only while the maintenance latch requires recovery.",
-            "source_anchor": "Motion strict startup; run_homing=false",
+            "description": "Run shared OEM motion preparation with the existing recovery physical checks and no homing. This action is available only while the maintenance latch requires recovery.",
+            "source_anchor": "Motion recovery; run_homing=false",
             "informational_method": "POST",
             "informational_path": "/motion/arm/strict_startup",
             "provider_available": recovery_bound,
@@ -2417,7 +2435,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "requires_confirmation": False,
             "timeout_seconds": 90.0,
             "inputs": [],
-            "stages": ["strict startup", "no homing", "maintenance latch completion"],
+            "stages": ["motion recovery", "no homing", "maintenance latch completion"],
         },
 
         {
@@ -2531,7 +2549,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         "label": "OEM Deck Move to Location",
         "subsystem": "motion",
         "category": "deck",
-        "kind": "canonical_method",
+        "kind": "queued_action",
         "safety_class": "motion",
         "description": "Finite source-shaped Serial-206 named deck movement through the durable global worker.",
         "source_anchor": "ClassControlInterface.btnLOC1_Click",
@@ -2553,6 +2571,18 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         "required_board_epochs": [4, 5],
         "raw_coordinate_inputs": False,
     })
+    actions.append({
+        **actions[-1],
+        "action_id": "oem.deck.move_to_well",
+        "label": "OEM Deck Move to Well",
+        "description": "Source manual well positioning through the durable global worker.",
+        "source_anchor": "manual_position_plan:manual_pipette_move",
+        "inputs": [
+            {"name": "location_id", "required": True, "type": "integer"},
+            {"name": "well", "required": True, "type": ["string", "integer"]},
+            {"name": "position_flag", "required": True, "type": "integer", "enum": [0, 1, 2]},
+        ],
+    })
     return actions, dispatch
 
 
@@ -2570,7 +2600,7 @@ _ROUTE_FAILURE_MESSAGES = {
     "route_http_failed": "Robot route reported an HTTP failure.",
     "action_failed": "Operator action failed; inspect retained evidence.",
     "action_rejected": "Operator action was rejected.",
-    "action_outcome_unknown": "Action outcome unknown; reconciliation required and retry forbidden",
+    "action_outcome_unknown": "Action outcome is uncertain; inspect the exact receipt and controller state. No automatic retry was performed.",
 }
 _DECK_DIAGNOSTICS = {
     "deck_bootstrap_semantic_location_unavailable", "deck_bootstrap_board_epochs_unavailable",
@@ -2633,7 +2663,7 @@ def _route_failure_code(status_code: int | None, response: Any) -> str:
             # This exact OEM diagnostic has a known meaning. Do not classify
             # arbitrary exception prose by substring or expose its text.
             if isinstance(value, str) and re.fullmatch(
-                r"(?:RuntimeError: |xy_intent_exception:OemMotionCompletionError:)"
+                r"(?:RuntimeError: |OemMotionCompletionError: |xy_intent_exception:OemMotionCompletionError:)"
                 r"Reach GZ position time out! board=[0-9]{1,3}; axis=[0-9]{1,3}; position=-?[0-9]{1,10}", value
             ):
                 return "controller_position_wait_timeout"
@@ -2651,8 +2681,8 @@ def _route_failure_message(status_code: int, response: Any) -> str:
 
 
 def _v1_catalog_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Canonical methods require the V2 request/receipt and authority contract."""
-    return [action for action in actions if action["kind"] != "canonical_method"]
+    """Queued deck actions require the V2 request/receipt and authority contract."""
+    return [action for action in actions if action["kind"] != "queued_action"]
 
 
 async def _dispatch_asgi(app: FastAPI, method: str, path_template: str, inputs: dict[str, Any], locations: Mapping[str, Mapping[str, Any]]) -> tuple[int, Any]:
@@ -2793,6 +2823,97 @@ class _OperatorStateReader:
         return await _drain_operator_work(pending)
 
 
+# Definition fields are install-time values. Unknown fields remain live by default.
+_CATALOG_DEFINITION_FIELDS = frozenset({
+    "action_id", "kind", "category", "description", "informational_method",
+    "informational_path", "inputs", "label", "requires_confirmation", "safety_class",
+    "source_anchor", "stages", "subsystem", "timeout_seconds", "required_provider_capability",
+    "aggregate_abort", "physical_scope", "x_only", "request_schema_version",
+    "response_schema_version", "interrupt",
+})
+
+
+def _catalog_definitions(rows):
+    return [{k: v for k, v in row.items() if k in _CATALOG_DEFINITION_FIELDS} for row in rows]
+
+
+def _catalog_revision(rows):
+    return hashlib.sha256(json.dumps(_catalog_definitions(rows), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _catalog_assessment(body, revision):
+    # Intern identical assessment objects within this response, not across time.
+    # This preserves every dependency/reason/alias, omission and unknown field.
+    states, indices, seen = [], [], {}
+    for row in body["actions"]:
+        state = {k: v for k, v in row.items() if k not in _CATALOG_DEFINITION_FIELDS}
+        key = json.dumps(state, sort_keys=True, separators=(",", ":"))
+        if key not in seen:
+            seen[key] = len(states)
+            states.append(state)
+        indices.append(seen[key])
+    return {**{k: v for k, v in body.items() if k != "actions"},
+            "catalog_view": "assessment", "metadata_revision": revision,
+            "action_states": states, "action_state_indices": indices}
+
+
+def _catalog_dashboard(dashboard):
+    """Omit unconsumed transaction/proof detail, not displayed pipette truth."""
+    result = dict(dashboard)
+    if "telemetry" in result:
+        result["telemetry"] = _catalog_dashboard(result["telemetry"])
+    pipettes = result.get("pipettes")
+    if isinstance(pipettes, Mapping):
+        pipettes = dict(pipettes)
+        for field, keys in (("last_group_transaction", {"outcome"}),
+                            ("latest_receipt", {"operation", "receipt_id"})):
+            if isinstance(pipettes.get(field), Mapping):
+                pipettes[field] = {k: v for k, v in pipettes[field].items() if k in keys}
+        if isinstance(pipettes.get("channels"), list):
+            channels = []
+            for channel in pipettes["channels"]:
+                if not isinstance(channel, Mapping):
+                    channels.append(channel)
+                    continue
+                channel = {k: v for k, v in channel.items() if k != "last_transaction"}
+                for field in ("hardware_tip_status", "hardware_pressure"):
+                    if isinstance(channel.get(field), Mapping):
+                        channel[field] = {k: v for k, v in channel[field].items()
+                                          if k in {"ok", "hardware_truth_level", "tip_loaded", "pressure"}}
+                channels.append(channel)
+            pipettes["channels"] = channels
+        result["pipettes"] = pipettes
+    return result
+
+
+def _catalog_changes(before, after, path=(), source_path=None):
+    """Lossless JSON tree updates; no guessed defaults or timestamp suppression."""
+    if source_path is None:
+        source_path = path
+    if type(before) is type(after) and isinstance(after, dict):
+        changes: list[list[Any]] = [[list(path + (key,))] for key in before.keys() - after.keys()]
+        for key, value in after.items():
+            changes.extend(_catalog_changes(before[key], value, path + (key,), source_path + (key,))
+                           if key in before else [[list(path + (key,)), value]])
+        return changes
+    if isinstance(before, list) and isinstance(after, list):
+        # Receipt queues shift when another client submits work. Reuse the
+        # baseline row by native identity instead of retransmitting the tail.
+        identities = {row["command_id"]: index for index, row in enumerate(before)
+                      if isinstance(row, dict) and isinstance(row.get("command_id"), str)}
+        changes = [[list(path + (index,))] for index in range(len(before) - 1, len(after) - 1, -1)]
+        for index, value in enumerate(after):
+            source = identities.get(value["command_id"], index) if isinstance(value, dict) and isinstance(value.get("command_id"), str) else index
+            if source < len(before):
+                if source != index:
+                    changes.append([list(path + (index,)), None, list(source_path + (source,))])
+                changes.extend(_catalog_changes(before[source], value, path + (index,), source_path + (source,)))
+            else:
+                changes.append([list(path + (index,)), value])
+        return changes
+    return [] if type(before) is type(after) and before == after else [[list(path), after]]
+
+
 class _OperatorPollCache:
     """One refresh in flight, with coalesced demand per finite polling view.
 
@@ -2814,7 +2935,55 @@ class _OperatorPollCache:
         self._pending = None
         self._pending_key = None
         self._cache = {}
+        # Current/previous immutable snapshots per native schema, never per
+        # caller/draft. Clients promote them in their existing QueryClient.
+        self._assessment_bases = {}
         self._closed = False
+
+    def assessment_wire(self, body, requested_base):
+        if requested_base is None or body.get("catalog_view") != "assessment":
+            return body
+        key = body.get("schema_version")
+        generation = body.get("ownership_generation", (body.get("dashboard") or {}).get("ownership_generation"))
+        identity = (generation, body.get("metadata_revision"))
+        with self._lock:
+            retained = self._assessment_bases.get(key)
+            current, previous = retained[1:] if retained and retained[0] == identity else (None, None)
+            # Resolve the request BEFORE promotion evicts the oldest slot:
+            # two staggered clients may each observe a different source update.
+            source = next((item for item in (current, previous) if item and item[0] == requested_base), None)
+            changes = _catalog_changes(current[1], body) if current else []
+            # These are request/display-only fields, not source advancement.
+            # Still transmit them losslessly below. Receipt times, deck state,
+            # recovery and every other source field DO advance the snapshot.
+            def material(change):
+                path = tuple(change[0])
+                return path not in {("dashboard", "generated_at"),
+                                    ("dashboard", "command_queue", "generated_at")} and path[:4] != (
+                                        "dashboard", "z_axis", "provider", "target_preview")
+            if current is None or any(material(change) for change in changes):
+                revision = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                previous, current = current, (revision, copy.deepcopy(body))
+                self._assessment_bases[key] = (identity, current, previous)
+                changes = []
+            revision, snapshot = current
+            result = {"catalog_view": "assessment", "assessment_revision": revision,
+                      "assessment_source_revision": source[0] if source else revision,
+                      "assessment_changes": _catalog_changes(source[1], snapshot) if source else [],
+                      "assessment_overlay": changes}
+            if source is None:
+                # Unknown/evicted clients get CURRENT state, never an old base
+                # plus its permanently accumulating history. Keep the shared
+                # revision stable for other clients and return display overlay.
+                result["assessment_base"] = copy.deepcopy(snapshot)
+            return result
+
+    def assessment_response(self, fn):
+        @wraps(fn)
+        async def served(*args, **kwargs):
+            requested_base = kwargs.pop("assessment_base", None)
+            return self.assessment_wire(await fn(*args, **kwargs), requested_base)
+        return served
 
     def close(self):
         with self._lock:
@@ -2825,14 +2994,15 @@ class _OperatorPollCache:
     def wrap(self, fn):
         @wraps(fn)
         async def poll(*args, **kwargs):
-            # Routes have only one optional, finite schema selector. Unknown
-            # selectors retain the V1 behavior, never allocate arbitrary keys.
+            # Schema and representation selectors allocate only finite views.
+            # Draft Z values remain outside this cache.
             schema = kwargs.get("schema_version")
             expected_schema = {"operator_dashboard": "bioxp.operator_dashboard.v2",
                                "control_catalog": "bioxp.operator_control_catalog.v2"}.get(fn.__name__)
             if schema != expected_schema:
                 schema = None
-            key = (fn.__name__, schema)
+            view = kwargs.get("view") if kwargs.get("view") in {"assessment", "metadata"} else "full"
+            key = (fn.__name__, schema, view) if view != "full" else (fn.__name__, schema)
             with self._lock:
                 if self._closed:
                     raise HTTPException(503, detail="operator_poll_closed")
@@ -2963,6 +3133,19 @@ def install_operator_control_plane(
     by_id = {row["action_id"]: row for row in actions}
     v2_canonical_action_ids = _v2_canonical_action_ids(actions, dispatch)
     store = OperatorReceiptStore()
+    def canonical_definition(action):
+        return {"action_id": str(action["action_id"]),
+                "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2",
+                "response_schema_version": "bioxp.operator_action_receipt.v2",
+                "interrupt": str(action["safety_class"]) == "stop",
+                **({"inputs": action["inputs"]} if action["action_id"] == "oem.deck.move_to_well" else {})}
+
+    catalog_metadata: dict[str, Any] = {"actions": _catalog_definitions(_v1_catalog_actions(actions))}
+    canonical_metadata: dict[str, Any] = {"actions": [canonical_definition(action) for action in actions
+                                      if str(action["action_id"]) in v2_canonical_action_ids]}
+    for metadata in (catalog_metadata, canonical_metadata):
+        metadata.update(catalog_view="metadata", metadata_revision=_catalog_revision(metadata["actions"]))
+
     poll_cache = _OperatorPollCache(lambda: int(hardware_state.ownership_epoch))
     app.state.operator_poll_cache = poll_cache
     from contextlib import AsyncExitStack, asynccontextmanager
@@ -2985,6 +3168,7 @@ def install_operator_control_plane(
             admission_state_reader.close()
             preview_state_reader.close()
             invoke_state_reader.close()
+            deck_display_reader.close()
             reconciliation_executor.shutdown(wait=False, cancel_futures=True)
 
     app.router.lifespan_context = polling_lifespan
@@ -3161,7 +3345,6 @@ def install_operator_control_plane(
     # non-v2 queue/recovery surfaces; direct canonical v2 routes stay primary.
     from .operator_command_plane import (
         OperatorCommandPlane,
-        OperatorMethodRequestV1,
     )
 
     command_plane = OperatorCommandPlane(
@@ -3171,6 +3354,29 @@ def install_operator_control_plane(
         dispatch=dispatch,
     )
     app.state.operator_command_plane = command_plane
+    # Location is committed SQLite state, not a hardware/history observation.
+    # Reuse the bounded metadata reader so a held full refresh cannot keep a
+    # completed arrival hidden, and no display read runs on the event loop.
+    deck_display_reader = _OperatorStateReader(command_plane.store.deck_display_state, metadata=True)
+    app.state.operator_deck_display_reader = deck_display_reader
+
+    def with_current_deck_display(fn):
+        @wraps(fn)
+        async def served(*args, **kwargs):
+            body = await fn(*args, **kwargs)
+            dashboard = body.get("dashboard", body)
+            if dashboard.get("schema_version") != "bioxp.operator_dashboard.v2":
+                return body
+            try:
+                display = await deck_display_reader.read()
+            except (HTTPException, SQLiteError, RuntimeError):
+                # Preserve the existing last-known warm view if the read is
+                # unavailable. Never change controls or add admission policy.
+                return body
+            dashboard["deck"].update(display)
+            return body
+        return served
+
     if oem_deck_provider is not None and oem_deck_position_table_provider is not None:
         from .oem_deck_movement import (
             make_deck_command_executor,
@@ -3843,7 +4049,7 @@ def install_operator_control_plane(
             "active_command": None, "interrupt_epoch": int(raw.get("interrupt_epoch") or 0), "latest_compact_receipt": None, "last_discrepancy_steps": raw.get("last_discrepancy_steps"), "state_version": max(1, int(raw.get("state_version") or 1)), "updated_at": float(raw.get("updated_at") or 0.0), "physical_position_verified": bool(raw.get("physical_position_verified", False)),
         }
 
-    def _v2_dashboard(state: Mapping[str, Any], queue_projection: Mapping[str, Any] | None = None, rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def _v2_dashboard(state: Mapping[str, Any], queue_projection: Mapping[str, Any] | None = None, rows: list[dict[str, Any]] | None = None, *, catalog: bool = False) -> dict[str, Any]:
         queue_projection = queue_projection or {}
         rows = rows or []
         compact = [_v2_compact_receipt(row) for row in rows]
@@ -3867,39 +4073,40 @@ def install_operator_control_plane(
         deck = {
             "current_location": deck_state.get("current_location"),
             "current_well": deck_state.get("current_well"),
+            "head_alignment": {key: deck_state.get(key) for key in (
+                "tip_location", "semantic_state_revision", "producer_operation",
+                "producer_command_id", "ownership_generation")},
             "semantic_state_revision": int(deck_state.get("semantic_state_revision") or 0),
             "position_table_revision": deck_authority.get("position_table_revision"),
             "destination_catalog_revision": deck_authority.get("destination_catalog_revision"),
             "ambiguity_state": str(deck_state.get("ambiguity_state") or "none"),
         }
-        return {"schema_version": "bioxp.operator_dashboard.v2", "generated_at": now, "ownership_generation": int(state.get("ownership_generation") or 0), "telemetry": _bounded_telemetry(state), "board4": board4, "y_axis": y_axis, "deck": deck, "active_commands": active, "command_queue": {"schema_version": "bioxp.oem_command_queue.v1", "generated_at": now, "items": queue_items}, "latest_receipts": compact[:100]}
+        return {"schema_version": "bioxp.operator_dashboard.v2", "generated_at": now, "ownership_generation": int(state.get("ownership_generation") or 0), "telemetry": _bounded_telemetry(state, catalog=catalog), "board4": board4, "y_axis": y_axis, "deck": deck, "active_commands": active, "command_queue": {"schema_version": "bioxp.oem_command_queue.v1", "generated_at": now, "items": queue_items}, "latest_receipts": compact[:100]}
 
     async def history_rows(limit: int, *, cursor: str | None = None) -> list[dict[str, Any]]:
         rows, _ = await asyncio.to_thread(read_history_page, store.root, limit, cursor)
         return rows
 
     @router.get("/v2/dashboard")
+    @with_current_deck_display
     @poll_cache.wrap
     async def operator_dashboard_v2() -> dict[str, Any]:
         state = machine_state()
         rows = await history_rows(25)
         return _v2_dashboard(state, {}, rows)
 
-    @router.get("/v2/control-catalog")
+    @with_current_deck_display
     @poll_cache.wrap
-    async def control_catalog_v2() -> dict[str, Any]:
+    async def control_catalog_v2(view: str = "full") -> dict[str, Any]:
         state = machine_state()
-        dashboard = _v2_dashboard(state, {}, await history_rows(25))
+        dashboard = _v2_dashboard(state, {}, await history_rows(25), catalog=view == "assessment")
         action_rows = []
         for action in actions:
             if str(action["action_id"]) not in v2_canonical_action_ids:
                 continue
-            assessment = deck_contract(state, intent_only=True) if action["action_id"] == "oem.deck.move_to_location" else assessed_action(action, state)
+            assessment = deck_contract(state, intent_only=True) if action["action_id"] in {"oem.deck.move_to_location", "oem.deck.move_to_well"} else assessed_action(action, state)
             action_rows.append({
-                "action_id": str(action["action_id"]),
-                "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2",
-                "response_schema_version": "bioxp.operator_action_receipt.v2",
-                "interrupt": str(action["safety_class"]) == "stop",
+                **canonical_definition(action),
                 "enabled": bool(assessment.get("enabled")),
                 "disabled_reason": assessment.get("disabled_reason"),
                 **({
@@ -3909,9 +4116,22 @@ def install_operator_control_plane(
                     "position_table_revision": assessment["position_table_revision"],
                     "destination_catalog_revision": assessment["destination_catalog_revision"],
                     "destination_options": assessment["destination_options"],
-                } if action["action_id"] == "oem.deck.move_to_location" else {}),
+                } if action["action_id"] in {"oem.deck.move_to_location", "oem.deck.move_to_well"} else {}),
             })
-        return {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": action_rows}
+        body = {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": action_rows}
+        if view == "assessment":
+            return _catalog_assessment(body, canonical_metadata["metadata_revision"])
+        return body
+
+    @router.get("/v2/control-catalog")
+    @poll_cache.assessment_response
+    async def control_catalog_v2_view(
+        view: str = Query(default="full", pattern="^(full|metadata|assessment)$"),
+        assessment_base: str | None = Query(default=None, max_length=64),
+    ):
+        if view == "metadata":
+            return canonical_metadata
+        return await control_catalog_v2(view=view)
 
     async def retain_direct_action(action_id: str, payload: InvokeRequest) -> dict[str, Any]:
         binding = {"action_id": action_id, **payload.model_dump()}
@@ -3991,7 +4211,7 @@ def install_operator_control_plane(
             # Keep the approved independent delivery and canonical v2 receipt.
             # invoke_action reconciles the deck queue only after delivery.
             return _v2_compact_receipt(await invoke_action(action_id, payload))
-        if action_id == "oem.deck.move_to_location":
+        if action_id in {"oem.deck.move_to_location", "oem.deck.move_to_well"}:
             if not isinstance(payload, OperatorActionRequestV2):
                 raise HTTPException(status_code=422, detail={"error": "normal_action_request_schema_required"})
             request = {**payload.model_dump(), "action_id": action_id}
@@ -4090,51 +4310,13 @@ def install_operator_control_plane(
         raw_return_layers["retry_forbidden"] = row.get("retry_forbidden") is True
         return {**compact, "canonical_inputs": dict(row.get("canonical_inputs") or {}), "requested_values": dict(row.get("requested_values") or {}), "effective_values": dict(row.get("effective_values") or {}), "observed_values": dict(row.get("observed_values") or {}), "raw_return_layers": raw_return_layers, "controller_evidence": dict(row.get("controller_evidence") or {}), "transport_artifacts": list(row.get("transport_artifacts") or []), "child_receipts": list(row.get("child_receipts") or []), "transitions": list(row.get("transitions") or []), "deck_movement": dict(row["deck_movement"]) if isinstance(row.get("deck_movement"), Mapping) else None}
 
-    async def _v2_method_receipt(
-        method: Mapping[str, Any], *, durable: bool = False,
-    ) -> dict[str, Any]:
-        raw_status = str(method.get("status") or "queued")
-        status = {"running": "active", "cancelled": "cleared", "stopped": "interrupted", "aborted": "interrupted", "recovery_required": "ambiguous"}.get(raw_status, raw_status)
-        method_reader = command_plane.store if durable else legacy_command_store
-        children = await asyncio.to_thread(method_reader.list_method_commands, str(method["method_id"]))
-        terminal = status in {"completed", "completed_partial", "failed", "cleared", "interrupted", "ambiguous"}
-        accepted_at = float(method.get("queued_at") or time.time())
-        return {
-            "schema_version": "bioxp.operator_method.v1",
-            "method_id": str(method["method_id"]),
-            "action_id": str(method.get("name") or ""),
-            "status": status,
-            "state_version": max(1, int(method.get("version") or 1)),
-            "child_receipts": [_v2_compact_receipt(row) for row in children],
-            "accepted_at": accepted_at,
-            "finished_at": float(method.get("updated_at") or accepted_at) if terminal else None,
-        }
-
-    @router.post("/v2/methods")
-    async def invoke_method_v2(payload: dict[str, Any]) -> dict[str, Any]:
-        try:
-            request = OperatorMethodRequestV1.model_validate(payload)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail={"error": "invalid_operator_method_request"}) from exc
-        method = await command_plane.admit_strict_method(request.model_dump())
-        return await _v2_method_receipt(method, durable=True)
-
-    @router.get("/v2/methods/{method_id}")
-    async def method_status_v2(method_id: str) -> dict[str, Any]:
-        method = await asyncio.to_thread(command_plane.store.get_method, method_id)
-        durable = method is not None
-        if method is None:
-            method = await asyncio.to_thread(legacy_command_store.get_method, method_id)
-        if method is None:
-            raise HTTPException(status_code=404, detail="operator method not found")
-        return await _v2_method_receipt(method, durable=durable)
 
     @router.get("/v2/commands/{command_id}")
     async def command_status_v2(command_id: str, detail: bool = True) -> dict[str, Any]:
         return await action_receipt_v2(command_id, detail=detail)
 
     @poll_cache.wrap
-    async def control_catalog(schema_version: str | None = Query(default=None)) -> dict[str, Any]:
+    async def control_catalog(schema_version: str | None = Query(default=None), view: str = "full") -> dict[str, Any]:
         state = machine_state()
         if schema_version == "bioxp.operator_control_catalog.v2":
             dashboard = _v2_dashboard(
@@ -4158,26 +4340,33 @@ def install_operator_control_plane(
                     if str(action["action_id"]) in v2_canonical_action_ids
                 ],
             }
-        return {
+        body = {
             "schema_name": "bioxp.operator_control_catalog",
             "schema_version": CATALOG_SCHEMA,
             "machine_serial": str(OEM_MACHINE_SERIAL),
             "ownership_generation": int(hardware_state.ownership_epoch),
             **authority(),
-            "dashboard": _dashboard_payload(state),
-            # Canonical methods require the V2 request/receipt and deck authority
+            "dashboard": _catalog_dashboard(_dashboard_payload(state)) if view == "assessment" else _dashboard_payload(state),
+            # Queued deck actions require the V2 request/receipt and deck authority
             # contract; they cannot be advertised as executable V1 primitives.
             "actions": [assessed_action(action, state) for action in _v1_catalog_actions(actions)],
         }
+        return _catalog_assessment(body, catalog_metadata["metadata_revision"]) if view == "assessment" else body
 
     @router.get("/control-catalog")
+    @poll_cache.assessment_response
+    @with_current_deck_display
     async def control_catalog_with_z_target(
         schema_version: str | None = Query(default=None),
         z_target_steps: int | None = Query(default=None, ge=-2147483648, le=2147483647),
+        view: str = Query(default="full", pattern="^(full|metadata|assessment)$"),
+        assessment_base: str | None = Query(default=None, max_length=64),
     ) -> dict[str, Any]:
         # Reuse the finite cached snapshot; draft values never allocate cache
         # entries or collect hardware. This is presentation, not admission.
-        catalog = await control_catalog(schema_version=schema_version)
+        if view == "metadata":
+            return catalog_metadata
+        catalog = await control_catalog(schema_version=schema_version, view=view)
         if z_target_steps is None or schema_version == "bioxp.operator_control_catalog.v2":
             return catalog
         from .oem_serial206_initialization import Serial206OemInitializationProvider
@@ -4195,6 +4384,7 @@ def install_operator_control_plane(
         return {**catalog, "dashboard": dashboard}
 
     @router.get("/dashboard")
+    @with_current_deck_display
     @poll_cache.wrap
     async def operator_dashboard(schema_version: str | None = Query(default=None)) -> dict[str, Any]:
         if schema_version == "bioxp.operator_dashboard.v2":
@@ -4853,7 +5043,7 @@ def install_operator_control_plane(
                     ) else "pass" if ok else "fail",
                     "response": full_response,
                     "error": (
-                        "Action outcome unknown; reconciliation required and retry forbidden"
+                        _ROUTE_FAILURE_MESSAGES["action_outcome_unknown"]
                         if completion_ambiguous
                         else None if ok else _route_failure_message(status_code, response)
                     ),

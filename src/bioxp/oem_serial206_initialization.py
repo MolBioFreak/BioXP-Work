@@ -498,7 +498,8 @@ def _aggregate_executed_controller_evidence(execution: Mapping[str, Any]) -> dic
                 visit(child)
 
     visit(execution.get("execution_results", []))
-    acknowledged = bool(leaves) and all(row.get("controller_command_acknowledged") is True for row in leaves)
+    required = [row for row in leaves if row.get("controller_command_required") is not False]
+    acknowledged = bool(required) and all(row.get("controller_command_acknowledged") is True for row in required)
     completed = bool(leaves) and all(
         row.get("controller_completion_verified") is True
         or row.get("controller_terminal_state_verified") is True
@@ -510,7 +511,9 @@ def _aggregate_executed_controller_evidence(execution: Mapping[str, Any]) -> dic
         "hardware_postcondition_verified": completed and all(
             row.get("hardware_postcondition_verified") is True for row in leaves
         ),
-        "required_executed_child_count": len(leaves),
+        "required_executed_child_count": len(required),
+        "executed_child_count": len(leaves),
+        "controller_command_required": bool(required),
     }
 
 
@@ -3072,6 +3075,10 @@ class Serial206ProductionPrimitiveAdapter:
             int(motor_current),
             motor=profile.get("motor", 0),
         )
+        # This source call deliberately changes run current. Keep the existing
+        # profile verifier's expected setting aligned for a subsequent explicit
+        # speed/retract instruction; do not restore current or add another write.
+        self._z_profile_overrides = {**getattr(self, "_z_profile_overrides", {}), 6: int(motor_current)}
         move = self.tester.motor_oem_move_absolute(
             board,
             effective,
@@ -3439,6 +3446,18 @@ class Serial206ProductionPrimitiveAdapter:
                 row["terminal"] and (row["acknowledged"] or not row["command_required"])
                 for row in child_evidence
             )
+            if controller_completion_verified:
+                # One arrival observation per axis, after all nested moves settle
+                # and before releasing this command owner. The bounded query-only
+                # path publishes fresh replies through the existing display sink.
+                for axis in ("x", "y", "z"):
+                    try:
+                        profile = self._axis_profile(axis)
+                        self.tester.query_only_tmcl(
+                            profile["board"], 6, 1, motor=profile.get("motor", 0))
+                    except Exception:
+                        # Display observation must never change completed motion.
+                        pass
             return {
                 "ok": all(isinstance(row, Mapping) and row.get("ok") is True for row in results),
                 "source_return_code": 0,
@@ -4257,7 +4276,8 @@ class Serial206ProductionPrimitiveAdapter:
         completed = controller_evidence["controller_completion_verified"]
         postcondition = controller_evidence["hardware_postcondition_verified"]
         return {
-            "ok": execution.get("ok") is True and acknowledged and completed,
+            "ok": execution.get("ok") is True,
+            "source_call_completed": execution.get("ok") is True,
             **controller_evidence,
             "plan": _json_safe(plan),
             "execution": _json_safe(execution),
@@ -4350,9 +4370,8 @@ class Serial206ProductionPrimitiveAdapter:
         )
         evidence = _aggregate_executed_controller_evidence(execution)
         return {
-            "ok": execution.get("ok") is True
-            and evidence["controller_command_acknowledged"]
-            and evidence["controller_completion_verified"],
+            "ok": execution.get("ok") is True,
+            "source_call_completed": execution.get("ok") is True,
             **evidence,
             "delivery_attempted": True,
             "plan_digest": plan_digest,
@@ -4368,6 +4387,8 @@ class Serial206OemInitializationProvider:
     _WP8_CHILD_BINDINGS: Mapping[str, str] = {
         "sourceDiagnosticDetectFluid": "wp8_diagnostic_detect_fluid",
         "sourceDiagnosticPipette": "wp8_diagnostic_pipette",
+        "sourceCavroApplication": "wp8_cavro_application",
+        "sourceReadBarcode": "wp8_read_barcode",
         "sourceForceToHighHome": "wp8_preparation_force_high_home",
         "sourceMoveTo": "wp8_source_move_to",
         "sourceImageGantryLoad": "wp8_source_image_gantry_load",
@@ -10174,6 +10195,12 @@ class Serial206OemInitializationProvider:
                     result = self.primitives.z_stop()
             except Exception as exc:
                 result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                # A Home may fail in its preliminary absolute move, before any
+                # homing sweep. Retain the driver's original attached facts for
+                # every Z intent; do not infer a home or change source outcome.
+                motion_evidence = getattr(exc, "motion_evidence", None)
+                if isinstance(motion_evidence, Mapping):
+                    result["motion_evidence"] = copy.deepcopy(dict(motion_evidence))
                 critical = getattr(exc, "critical_z_evidence", None)
                 if intent == "move_absolute" and isinstance(critical, Mapping):
                     result.update(critical)
@@ -11587,18 +11614,78 @@ class Serial206OemInitializationProvider:
             method(**arguments), source_anchor=f"ControlLib.movExecution:{operation}",
         )
 
-    def rPunchFoil(self, *, plate_name: int, location_id: int) -> dict[str, Any]:
-        return self._mov_named_leaf(
-            "rPunchFoil", plate_name=int(plate_name), location_id=int(location_id),
-        )
+    def _source_pierce(self, operation: str, *, destination: int,
+                       column: int = 0, row: int = 0, plate: int | None = None,
+                       source_fence: Callable[[str], Any] | None = None) -> dict[str, Any]:
+        """ClassControlInterface 4017-4135 through the existing motor owners."""
+        from .oem_deck_movement import DeckExecutionFailure
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+        target = load_bound_oem_position_table().resolve(location_id=LOCATION_ID_TO_NAME[destination])
+        coordinates = target.oem_move_to_coordinates(column=column, row=row, high_pos=False)
+        x, y, low = coordinates["x"], coordinates["y"], coordinates["z"]
+        steps = []
+        def z(value): steps.append({"op": "moveZ", "z": value})
+        def xx(value): steps.append({"op": "moveX", "x": value})
+        def yy(value): steps.append({"op": "moveY", "y": value})
+        def xy(a, b): steps.append({"op": "moveXY", "x": a, "y": b})
+        if operation == "rPunchFoil":
+            distance = {0: 11, 1: 11, 2: 21, 7: 16, 8: 16, 9: 16, 10: 16}.get(plate, 0)
+            z(low - distance * 2015)
+        elif operation == "hokeypokey":
+            high = low - 52800
+            z(high)
+            steps.append({"op": "setZaxisVmax", "value": 0})
+            for dx, dy in ((350, 350), (-350, -350), (-350, 350), (350, -350)):
+                xy(x + dx, y + dy); z(high + 30000); z(high)
+            xy(x, y); z(low); z(low - 5000)
+            xx(x + 175); yy(y + 175); xx(x - 175); yy(y - 175); xx(x + 175); yy(y + 175)
+            z(high)
+            steps.append({"op": "setZaxisVmax", "value": 0})
+        elif operation == "CirclePunch":
+            high = low - 22165
+            z(high); yy(y - 700); z(high + 4030); z(high)
+            yy(y + 700); z(high + 4030); z(high); yy(y)
+            xx(x - 700); z(high + 4030); z(high); xx(x + 700); z(high + 4030); z(high)
+            xx(x); yy(y + 700); xx(x - 700); yy(y); yy(y - 700); xx(x); xx(x + 700); yy(y); yy(y + 700); xx(x); yy(y)
+        else:
+            raise ValueError("unsupported source piercing operation")
+        results = []
+        try:
+            for index, step in enumerate(steps):
+                if source_fence is not None:
+                    source_fence(f"before:{operation}:{index}")
+                if step["op"] == "setZaxisVmax":
+                    value = self.primitives.z_set_vmax(step["value"])
+                else:
+                    pseudo = self._offset_deck_semantic_state(gripper_confirmed=False, pseudo_home_only=True)["pseudo_z_home"]
+                    value = _execute_oem_steps_live([step], self.primitives, wait_timeout_s=60.0,
+                        speed=None, acc=None, pseudo_z_home_steps=pseudo,
+                        source_context="ControlLib.MotionThread")
+                evidence = _aggregate_executed_controller_evidence(value) if "execution_results" in value else {}
+                results.append({"order": index, "operation": step["op"], "inputs": step, "result": {**value, **evidence}})
+                if source_fence is not None:
+                    source_fence(f"after:{operation}:{index}")
+                # The retained source ignores primitive scalar returns here.
+                # Missing ACK/readback remains evidence; thrown errors and the
+                # existing execution fences still unwind without replay.
+        except Exception as exc:
+            if isinstance(exc, DeckExecutionFailure):
+                raise
+            raise DeckExecutionFailure(str(exc), delivery_attempted=True, provider_results=results) from exc
+        execution = {"execution_results": [row["result"] for row in results]}
+        return {"ok": True, "source_call_completed": True, "source_return_code": 0,
+                "source_anchor": "ClassControlInterface." + operation + ":4017-4135",
+                "delivery_attempted": True, "source_children": results,
+                "physical_effect_verified": False, **_aggregate_executed_controller_evidence(execution)}
 
-    def hokeypokey(self, *, destination: int, column: int, row: int) -> dict[str, Any]:
-        return self._mov_named_leaf("hokeypokey", destination=int(destination), column=int(column), row=int(row))
+    def rPunchFoil(self, *, plate_name: int, location_id: int, source_fence=None) -> dict[str, Any]:
+        return self._source_pierce("rPunchFoil", plate=int(plate_name), destination=int(location_id), source_fence=source_fence)
 
-    def CirclePunch(self, *, destination: int, column: int, row: int) -> dict[str, Any]:
-        return self._mov_named_leaf(
-            "CirclePunch", destination=int(destination), column=int(column), row=int(row),
-        )
+    def hokeypokey(self, *, destination: int, column: int, row: int, source_fence=None) -> dict[str, Any]:
+        return self._source_pierce("hokeypokey", destination=int(destination), column=int(column), row=int(row), source_fence=source_fence)
+
+    def CirclePunch(self, *, destination: int, column: int, row: int, source_fence=None) -> dict[str, Any]:
+        return self._source_pierce("CirclePunch", destination=int(destination), column=int(column), row=int(row), source_fence=source_fence)
 
     def _mov_axis_leaf(self, operation: str, value: int) -> dict[str, Any]:
         key = "y" if operation == "moveY" else "z"
@@ -11636,9 +11723,8 @@ class Serial206OemInitializationProvider:
             if z_noop_verified:
                 evidence["hardware_postcondition_verified"] = True
         return {
-            "ok": execution.get("ok") is True
-            and (evidence["controller_command_acknowledged"] or z_noop_verified)
-            and evidence["controller_completion_verified"],
+            "ok": execution.get("ok") is True,
+            "source_call_completed": execution.get("ok") is True,
             **evidence, "delivery_attempted": True, "execution": _json_safe(execution),
         }
 
@@ -12536,6 +12622,12 @@ class Serial206OemInitializationProvider:
             owner_identity=owner_identity, state=self._manual_pipette_source_state,
             pipette_settings=self._manual_pipette_source_settings,
             calibration_settings=self._manual_calibration_settings)
+
+    def wp8_cavro_application(self, operation: str, arguments: Mapping[str, Any], *,
+            command_id: str, owner_identity: Mapping[str, Any], **_: Any) -> dict[str, Any]:
+        from .pipette.cavro_application import run_application_inline
+        return run_application_inline(self, arguments["application"], command_id=command_id,
+                                      owner_identity=owner_identity)
 
     def wp8_diagnostic_pipette(self, operation: str, arguments: Mapping[str, Any], *,
             command_id: str, owner_identity: Mapping[str, Any], **_: Any) -> dict[str, Any]:
@@ -13479,7 +13571,7 @@ class Serial206OemInitializationProvider:
         capture: Callable[..., Mapping[str, Any]],
         save: Callable[..., Mapping[str, Any]],
         led: Callable[..., Any], rgb: Callable[..., Any],
-        barcode: Callable[[bytes], str],
+        barcode: Callable[[bytes], str], rgb_state: Callable[[], Any] | None = None,
     ) -> None:
         """Bind the validated machine-bundle settings and shared camera owners.
 
@@ -13493,6 +13585,8 @@ class Serial206OemInitializationProvider:
         for name, callback in callbacks.items():
             if not callable(callback):
                 raise TypeError(f"OEM cover inspection {name} callback must be callable")
+        if rgb_state is not None:
+            callbacks["rgb_state"] = rgb_state
         self._oem_cover_inspection_callbacks = callbacks
 
     def _cover_inspection_callbacks(self) -> Mapping[str, Any]:
@@ -13608,6 +13702,78 @@ class Serial206OemInitializationProvider:
             "updateLocation", {"destination": location, "well": 0},
             command_id=command_id, child_order=child_order, plan_digest=plan_digest,
         )
+
+    def wp8_read_barcode(self, operation: str, arguments: Mapping[str, Any], *,
+            command_id: str, child_order: int, plan_digest: str,
+            owner_identity: Mapping[str, Any], **_: Any) -> dict[str, Any]:
+        """ControlLib.ReadBarcode 9088-9216, inline under the finite owner.
+
+        Source pose retries are not physical replay of a failed operation: only
+        a completed scan returning empty/BLACK selects the next authored source
+        pose. Exceptions retain partial attempts and never retry motion.
+        """
+        mode = arguments["mode"]
+        if mode not in {"job_id", "reagent_id"}:
+            raise ValueError("unsupported source barcode mode")
+        settings, callbacks = self._cover_inspection_settings(), self._cover_inspection_callbacks()
+        location = 2 if mode == "job_id" else 3
+        x = (-11847 if mode == "job_id" else -23930) + int(settings["CameraXOffset"])
+        y = 7582 + int(settings["CameraYOffset"])
+        z = int((-1350.5511600000034 if mode == "job_id" else 0) + int(settings["CameraZOffset"]))
+        poses = [(x, y), (x + 2000, y - 4000)]
+        if mode == "job_id":
+            poses.append((x - 2000, y))
+        attempts = []
+        result = {"kind": "source_barcode", "mode": mode, "attempts": attempts,
+                  "value": "", "decoded": False, "source_return": False,
+                  "physical_effect_verified": False, "ok": False}
+        read_rgb = callbacks.get("rgb_state")
+        previous = read_rgb() if callable(read_rgb) else None
+        result["previous_rgb"] = previous
+        try:
+            callbacks["rgb"](255, 255, 255)
+            callbacks["led"](channel=2, on=False)
+            for index, (offset_x, offset_y) in enumerate(poses):
+                identity = f"{owner_identity['source_identity']}:barcode:{index}"
+                self._wp8_execution_fence_checker(command_id, boundary=identity)
+                attempt = {"source_identity": identity, "location": location,
+                           "offset_x": offset_x, "offset_y": offset_y, "z": z, "status": "in_flight"}
+                attempts.append(attempt)
+                attempt["move"] = self._cover_inspection_move(location, offset_x, offset_y)
+                attempt["z_move"] = self._cover_inspection_move_z(z)
+                self._cover_inspection_location_publish(location, command_id=identity,
+                    child_order=child_order, plan_digest=plan_digest)
+                if index == 0:
+                    time.sleep(.2)
+                self._cover_inspection_profile("ScanBarCode")
+                time.sleep(.2)
+                capture = self._cover_inspection_capture(condition="read_" + mode, artifact_id=identity)
+                value = callbacks["barcode"](bytes(capture["frame"]))
+                self._cover_inspection_all_leds_off()
+                if type(value) is not str:
+                    raise RuntimeError("source_authority_invalid:barcode")
+                value = value.strip()
+                attempt.update(status="completed", barcode=value,
+                    frame_sha256=hashlib.sha256(bytes(capture["frame"])).hexdigest(),
+                    capture_evidence=capture.get("capture_evidence"))
+                self._wp8_execution_fence_checker(command_id, boundary=identity + ":complete")
+                if value and value != "BLACK":
+                    result.update(value=value.lower(), decoded=True, source_return=True)
+                    break
+                if index == len(poses) - 1:
+                    result["error_snapshot"] = self.wp8_snapshot_image("SnapshotImage", {"name": "barcode_read_error"},
+                        command_id=command_id, child_order=child_order, plan_digest=plan_digest)
+                    if mode == "job_id" and value == "BLACK":
+                        result.update(value="black", source_return=True)
+            # Missing decode is the source Boolean result, not a new failure gate.
+            if previous is not None:
+                callbacks["rgb"](*previous)
+            result.update(ok=True, rgb_restored=previous is not None)
+        except Exception as exc:
+            if attempts and attempts[-1]["status"] == "in_flight":
+                attempts[-1].update(status="failed", error=str(exc))
+            result.update(error=str(exc), exception_type=type(exc).__name__, partial_effects=True)
+        return result
 
     def _cover_inspection_read_reagent_barcode(
         self, *, command_id: str, child_order: int, plan_digest: str,

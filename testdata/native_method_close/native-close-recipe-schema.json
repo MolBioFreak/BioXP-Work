@@ -1,0 +1,1029 @@
+{
+  "$defs": {
+    "Air": {
+      "additionalProperties": false,
+      "properties": {
+        "volume_ul": {
+          "minimum": 0,
+          "title": "Volume Ul",
+          "type": "number"
+        },
+        "speed_ul_s": {
+          "exclusiveMinimum": 0,
+          "title": "Speed Ul S",
+          "type": "number"
+        }
+      },
+      "required": [
+        "volume_ul",
+        "speed_ul_s"
+      ],
+      "title": "Air",
+      "type": "object"
+    },
+    "Aliquot": {
+      "additionalProperties": false,
+      "properties": {
+        "before": {
+          "items": {
+            "discriminator": {
+              "mapping": {
+                "aspirate": "#/$defs/Stroke",
+                "delay": "#/$defs/Delay",
+                "dispense": "#/$defs/Stroke",
+                "empty": "#/$defs/Empty",
+                "leading_air": "#/$defs/Stroke",
+                "plld": "#/$defs/Plld",
+                "position": "#/$defs/Position",
+                "reaspirate": "#/$defs/Stroke",
+                "settings": "#/$defs/Settings",
+                "trailing_air": "#/$defs/Stroke",
+                "z_move": "#/$defs/ZMove"
+              },
+              "propertyName": "operation"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/Stroke"
+              },
+              {
+                "$ref": "#/$defs/Empty"
+              },
+              {
+                "$ref": "#/$defs/Settings"
+              },
+              {
+                "$ref": "#/$defs/Delay"
+              },
+              {
+                "$ref": "#/$defs/Position"
+              },
+              {
+                "$ref": "#/$defs/ZMove"
+              },
+              {
+                "$ref": "#/$defs/Plld"
+              }
+            ]
+          },
+          "title": "Before",
+          "type": "array"
+        },
+        "segments": {
+          "items": {
+            "$ref": "#/$defs/Segment"
+          },
+          "title": "Segments",
+          "type": "array"
+        },
+        "after": {
+          "items": {
+            "discriminator": {
+              "mapping": {
+                "aspirate": "#/$defs/Stroke",
+                "delay": "#/$defs/Delay",
+                "dispense": "#/$defs/Stroke",
+                "empty": "#/$defs/Empty",
+                "leading_air": "#/$defs/Stroke",
+                "plld": "#/$defs/Plld",
+                "position": "#/$defs/Position",
+                "reaspirate": "#/$defs/Stroke",
+                "settings": "#/$defs/Settings",
+                "trailing_air": "#/$defs/Stroke",
+                "z_move": "#/$defs/ZMove"
+              },
+              "propertyName": "operation"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/Stroke"
+              },
+              {
+                "$ref": "#/$defs/Empty"
+              },
+              {
+                "$ref": "#/$defs/Settings"
+              },
+              {
+                "$ref": "#/$defs/Delay"
+              },
+              {
+                "$ref": "#/$defs/Position"
+              },
+              {
+                "$ref": "#/$defs/ZMove"
+              },
+              {
+                "$ref": "#/$defs/Plld"
+              }
+            ]
+          },
+          "title": "After",
+          "type": "array"
+        }
+      },
+      "required": [
+        "before",
+        "segments",
+        "after"
+      ],
+      "title": "Aliquot",
+      "type": "object"
+    },
+    "Delay": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "delay",
+          "title": "Operation",
+          "type": "string"
+        },
+        "duration_ms": {
+          "minimum": 0,
+          "title": "Duration Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "operation",
+        "duration_ms"
+      ],
+      "title": "Delay",
+      "type": "object"
+    },
+    "Empty": {
+      "additionalProperties": false,
+      "properties": {
+        "channels": {
+          "items": {
+            "maximum": 3,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 4,
+          "minItems": 1,
+          "title": "Channels",
+          "type": "array"
+        },
+        "timeout_ms": {
+          "exclusiveMinimum": 0,
+          "title": "Timeout Ms",
+          "type": "integer"
+        },
+        "operation": {
+          "const": "empty",
+          "title": "Operation",
+          "type": "string"
+        },
+        "speed_ul_s": {
+          "exclusiveMinimum": 0,
+          "title": "Speed Ul S",
+          "type": "number"
+        }
+      },
+      "required": [
+        "channels",
+        "timeout_ms",
+        "operation",
+        "speed_ul_s"
+      ],
+      "title": "Empty",
+      "type": "object"
+    },
+    "Multi": {
+      "additionalProperties": false,
+      "properties": {
+        "sample_count": {
+          "minimum": 0,
+          "title": "Sample Count",
+          "type": "integer"
+        },
+        "sample_volume_ul": {
+          "minimum": 0,
+          "title": "Sample Volume Ul",
+          "type": "number"
+        },
+        "conditioning_volume_ul": {
+          "minimum": 0,
+          "title": "Conditioning Volume Ul",
+          "type": "number"
+        },
+        "conditioning_back_to_source_count": {
+          "minimum": 0,
+          "title": "Conditioning Back To Source Count",
+          "type": "integer"
+        },
+        "conditioning_speed_ul_s": {
+          "exclusiveMinimum": 0,
+          "title": "Conditioning Speed Ul S",
+          "type": "number"
+        },
+        "conditioning_before": {
+          "items": {
+            "discriminator": {
+              "mapping": {
+                "aspirate": "#/$defs/Stroke",
+                "delay": "#/$defs/Delay",
+                "dispense": "#/$defs/Stroke",
+                "empty": "#/$defs/Empty",
+                "leading_air": "#/$defs/Stroke",
+                "plld": "#/$defs/Plld",
+                "position": "#/$defs/Position",
+                "reaspirate": "#/$defs/Stroke",
+                "settings": "#/$defs/Settings",
+                "trailing_air": "#/$defs/Stroke",
+                "z_move": "#/$defs/ZMove"
+              },
+              "propertyName": "operation"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/Stroke"
+              },
+              {
+                "$ref": "#/$defs/Empty"
+              },
+              {
+                "$ref": "#/$defs/Settings"
+              },
+              {
+                "$ref": "#/$defs/Delay"
+              },
+              {
+                "$ref": "#/$defs/Position"
+              },
+              {
+                "$ref": "#/$defs/ZMove"
+              },
+              {
+                "$ref": "#/$defs/Plld"
+              }
+            ]
+          },
+          "title": "Conditioning Before",
+          "type": "array"
+        },
+        "conditioning_after": {
+          "items": {
+            "discriminator": {
+              "mapping": {
+                "aspirate": "#/$defs/Stroke",
+                "delay": "#/$defs/Delay",
+                "dispense": "#/$defs/Stroke",
+                "empty": "#/$defs/Empty",
+                "leading_air": "#/$defs/Stroke",
+                "plld": "#/$defs/Plld",
+                "position": "#/$defs/Position",
+                "reaspirate": "#/$defs/Stroke",
+                "settings": "#/$defs/Settings",
+                "trailing_air": "#/$defs/Stroke",
+                "z_move": "#/$defs/ZMove"
+              },
+              "propertyName": "operation"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/Stroke"
+              },
+              {
+                "$ref": "#/$defs/Empty"
+              },
+              {
+                "$ref": "#/$defs/Settings"
+              },
+              {
+                "$ref": "#/$defs/Delay"
+              },
+              {
+                "$ref": "#/$defs/Position"
+              },
+              {
+                "$ref": "#/$defs/ZMove"
+              },
+              {
+                "$ref": "#/$defs/Plld"
+              }
+            ]
+          },
+          "title": "Conditioning After",
+          "type": "array"
+        },
+        "excess_volume_ul": {
+          "minimum": 0,
+          "title": "Excess Volume Ul",
+          "type": "number"
+        },
+        "excess": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Aliquot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reaspiration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Air"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dispense_to_reaspiration_delay_ms": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Dispense To Reaspiration Delay Ms"
+        },
+        "aliquots": {
+          "items": {
+            "$ref": "#/$defs/Aliquot"
+          },
+          "title": "Aliquots",
+          "type": "array"
+        }
+      },
+      "required": [
+        "sample_count",
+        "sample_volume_ul",
+        "conditioning_volume_ul",
+        "conditioning_back_to_source_count",
+        "conditioning_speed_ul_s",
+        "conditioning_before",
+        "conditioning_after",
+        "excess_volume_ul",
+        "excess",
+        "reaspiration",
+        "dispense_to_reaspiration_delay_ms",
+        "aliquots"
+      ],
+      "title": "Multi",
+      "type": "object"
+    },
+    "Plld": {
+      "additionalProperties": false,
+      "properties": {
+        "channels": {
+          "items": {
+            "maximum": 3,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 4,
+          "minItems": 1,
+          "title": "Channels",
+          "type": "array"
+        },
+        "timeout_ms": {
+          "exclusiveMinimum": 0,
+          "title": "Timeout Ms",
+          "type": "integer"
+        },
+        "operation": {
+          "const": "plld",
+          "title": "Operation",
+          "type": "string"
+        },
+        "start_steps": {
+          "title": "Start Steps",
+          "type": "integer"
+        },
+        "search_target_steps": {
+          "title": "Search Target Steps",
+          "type": "integer"
+        },
+        "search_speed_native": {
+          "exclusiveMinimum": 0,
+          "title": "Search Speed Native",
+          "type": "integer"
+        },
+        "z_motor_current": {
+          "title": "Z Motor Current",
+          "type": "integer"
+        },
+        "after_detection_steps": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "After Detection Steps"
+        },
+        "after_detection_speed_native": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "After Detection Speed Native"
+        }
+      },
+      "required": [
+        "channels",
+        "timeout_ms",
+        "operation",
+        "start_steps",
+        "search_target_steps",
+        "search_speed_native",
+        "z_motor_current"
+      ],
+      "title": "Plld",
+      "type": "object"
+    },
+    "Position": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "position",
+          "title": "Operation",
+          "type": "string"
+        },
+        "positioning": {
+          "additionalProperties": true,
+          "title": "Positioning",
+          "type": "object"
+        }
+      },
+      "required": [
+        "operation",
+        "positioning"
+      ],
+      "title": "Position",
+      "type": "object"
+    },
+    "Segment": {
+      "additionalProperties": false,
+      "properties": {
+        "volume_ul": {
+          "minimum": 0,
+          "title": "Volume Ul",
+          "type": "number"
+        },
+        "speed_ul_s": {
+          "exclusiveMinimum": 0,
+          "title": "Speed Ul S",
+          "type": "number"
+        }
+      },
+      "required": [
+        "volume_ul",
+        "speed_ul_s"
+      ],
+      "title": "Segment",
+      "type": "object"
+    },
+    "Settings": {
+      "additionalProperties": false,
+      "properties": {
+        "channels": {
+          "items": {
+            "maximum": 3,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 4,
+          "minItems": 1,
+          "title": "Channels",
+          "type": "array"
+        },
+        "timeout_ms": {
+          "exclusiveMinimum": 0,
+          "title": "Timeout Ms",
+          "type": "integer"
+        },
+        "operation": {
+          "const": "settings",
+          "title": "Operation",
+          "type": "string"
+        },
+        "values": {
+          "additionalProperties": true,
+          "title": "Values",
+          "type": "object"
+        }
+      },
+      "required": [
+        "channels",
+        "timeout_ms",
+        "operation",
+        "values"
+      ],
+      "title": "Settings",
+      "type": "object"
+    },
+    "Stroke": {
+      "additionalProperties": false,
+      "properties": {
+        "channels": {
+          "items": {
+            "maximum": 3,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 4,
+          "minItems": 1,
+          "title": "Channels",
+          "type": "array"
+        },
+        "timeout_ms": {
+          "exclusiveMinimum": 0,
+          "title": "Timeout Ms",
+          "type": "integer"
+        },
+        "operation": {
+          "enum": [
+            "aspirate",
+            "dispense",
+            "leading_air",
+            "trailing_air",
+            "reaspirate"
+          ],
+          "title": "Operation",
+          "type": "string"
+        },
+        "volume_ul": {
+          "minimum": 0,
+          "title": "Volume Ul",
+          "type": "number"
+        },
+        "speed_ul_s": {
+          "exclusiveMinimum": 0,
+          "title": "Speed Ul S",
+          "type": "number"
+        },
+        "target_liquid_ul": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target Liquid Ul"
+        }
+      },
+      "required": [
+        "channels",
+        "timeout_ms",
+        "operation",
+        "volume_ul",
+        "speed_ul_s"
+      ],
+      "title": "Stroke",
+      "type": "object"
+    },
+    "ZMove": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "const": "z_move",
+          "title": "Operation",
+          "type": "string"
+        },
+        "target_steps": {
+          "title": "Target Steps",
+          "type": "integer"
+        },
+        "speed_native": {
+          "exclusiveMinimum": 0,
+          "title": "Speed Native",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "operation",
+        "target_steps",
+        "speed_native"
+      ],
+      "title": "ZMove",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "mode": {
+      "enum": [
+        "single",
+        "multi"
+      ],
+      "title": "Mode",
+      "type": "string"
+    },
+    "channels": {
+      "items": {
+        "type": "integer"
+      },
+      "title": "Channels",
+      "type": "array"
+    },
+    "timeout_ms": {
+      "exclusiveMinimum": 0,
+      "title": "Timeout Ms",
+      "type": "integer"
+    },
+    "target_liquid_ul": {
+      "minimum": 0,
+      "title": "Target Liquid Ul",
+      "type": "number"
+    },
+    "commanded_aspiration_ul": {
+      "minimum": 0,
+      "title": "Commanded Aspiration Ul",
+      "type": "number"
+    },
+    "aspiration_speed_ul_s": {
+      "exclusiveMinimum": 0,
+      "title": "Aspiration Speed Ul S",
+      "type": "number"
+    },
+    "aspiration_delay_ms": {
+      "minimum": 0,
+      "title": "Aspiration Delay Ms",
+      "type": "integer"
+    },
+    "leading_air": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Air"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "trailing_air": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Air"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "before_leading_air": {
+      "items": {
+        "discriminator": {
+          "mapping": {
+            "aspirate": "#/$defs/Stroke",
+            "delay": "#/$defs/Delay",
+            "dispense": "#/$defs/Stroke",
+            "empty": "#/$defs/Empty",
+            "leading_air": "#/$defs/Stroke",
+            "plld": "#/$defs/Plld",
+            "position": "#/$defs/Position",
+            "reaspirate": "#/$defs/Stroke",
+            "settings": "#/$defs/Settings",
+            "trailing_air": "#/$defs/Stroke",
+            "z_move": "#/$defs/ZMove"
+          },
+          "propertyName": "operation"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/Stroke"
+          },
+          {
+            "$ref": "#/$defs/Empty"
+          },
+          {
+            "$ref": "#/$defs/Settings"
+          },
+          {
+            "$ref": "#/$defs/Delay"
+          },
+          {
+            "$ref": "#/$defs/Position"
+          },
+          {
+            "$ref": "#/$defs/ZMove"
+          },
+          {
+            "$ref": "#/$defs/Plld"
+          }
+        ]
+      },
+      "title": "Before Leading Air",
+      "type": "array"
+    },
+    "before_liquid": {
+      "items": {
+        "discriminator": {
+          "mapping": {
+            "aspirate": "#/$defs/Stroke",
+            "delay": "#/$defs/Delay",
+            "dispense": "#/$defs/Stroke",
+            "empty": "#/$defs/Empty",
+            "leading_air": "#/$defs/Stroke",
+            "plld": "#/$defs/Plld",
+            "position": "#/$defs/Position",
+            "reaspirate": "#/$defs/Stroke",
+            "settings": "#/$defs/Settings",
+            "trailing_air": "#/$defs/Stroke",
+            "z_move": "#/$defs/ZMove"
+          },
+          "propertyName": "operation"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/Stroke"
+          },
+          {
+            "$ref": "#/$defs/Empty"
+          },
+          {
+            "$ref": "#/$defs/Settings"
+          },
+          {
+            "$ref": "#/$defs/Delay"
+          },
+          {
+            "$ref": "#/$defs/Position"
+          },
+          {
+            "$ref": "#/$defs/ZMove"
+          },
+          {
+            "$ref": "#/$defs/Plld"
+          }
+        ]
+      },
+      "title": "Before Liquid",
+      "type": "array"
+    },
+    "after_liquid": {
+      "items": {
+        "discriminator": {
+          "mapping": {
+            "aspirate": "#/$defs/Stroke",
+            "delay": "#/$defs/Delay",
+            "dispense": "#/$defs/Stroke",
+            "empty": "#/$defs/Empty",
+            "leading_air": "#/$defs/Stroke",
+            "plld": "#/$defs/Plld",
+            "position": "#/$defs/Position",
+            "reaspirate": "#/$defs/Stroke",
+            "settings": "#/$defs/Settings",
+            "trailing_air": "#/$defs/Stroke",
+            "z_move": "#/$defs/ZMove"
+          },
+          "propertyName": "operation"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/Stroke"
+          },
+          {
+            "$ref": "#/$defs/Empty"
+          },
+          {
+            "$ref": "#/$defs/Settings"
+          },
+          {
+            "$ref": "#/$defs/Delay"
+          },
+          {
+            "$ref": "#/$defs/Position"
+          },
+          {
+            "$ref": "#/$defs/ZMove"
+          },
+          {
+            "$ref": "#/$defs/Plld"
+          }
+        ]
+      },
+      "title": "After Liquid",
+      "type": "array"
+    },
+    "before_dispense": {
+      "items": {
+        "discriminator": {
+          "mapping": {
+            "aspirate": "#/$defs/Stroke",
+            "delay": "#/$defs/Delay",
+            "dispense": "#/$defs/Stroke",
+            "empty": "#/$defs/Empty",
+            "leading_air": "#/$defs/Stroke",
+            "plld": "#/$defs/Plld",
+            "position": "#/$defs/Position",
+            "reaspirate": "#/$defs/Stroke",
+            "settings": "#/$defs/Settings",
+            "trailing_air": "#/$defs/Stroke",
+            "z_move": "#/$defs/ZMove"
+          },
+          "propertyName": "operation"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/Stroke"
+          },
+          {
+            "$ref": "#/$defs/Empty"
+          },
+          {
+            "$ref": "#/$defs/Settings"
+          },
+          {
+            "$ref": "#/$defs/Delay"
+          },
+          {
+            "$ref": "#/$defs/Position"
+          },
+          {
+            "$ref": "#/$defs/ZMove"
+          },
+          {
+            "$ref": "#/$defs/Plld"
+          }
+        ]
+      },
+      "title": "Before Dispense",
+      "type": "array"
+    },
+    "after_dispense": {
+      "items": {
+        "discriminator": {
+          "mapping": {
+            "aspirate": "#/$defs/Stroke",
+            "delay": "#/$defs/Delay",
+            "dispense": "#/$defs/Stroke",
+            "empty": "#/$defs/Empty",
+            "leading_air": "#/$defs/Stroke",
+            "plld": "#/$defs/Plld",
+            "position": "#/$defs/Position",
+            "reaspirate": "#/$defs/Stroke",
+            "settings": "#/$defs/Settings",
+            "trailing_air": "#/$defs/Stroke",
+            "z_move": "#/$defs/ZMove"
+          },
+          "propertyName": "operation"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/Stroke"
+          },
+          {
+            "$ref": "#/$defs/Empty"
+          },
+          {
+            "$ref": "#/$defs/Settings"
+          },
+          {
+            "$ref": "#/$defs/Delay"
+          },
+          {
+            "$ref": "#/$defs/Position"
+          },
+          {
+            "$ref": "#/$defs/ZMove"
+          },
+          {
+            "$ref": "#/$defs/Plld"
+          }
+        ]
+      },
+      "title": "After Dispense",
+      "type": "array"
+    },
+    "dispense_segments": {
+      "items": {
+        "$ref": "#/$defs/Segment"
+      },
+      "title": "Dispense Segments",
+      "type": "array"
+    },
+    "final_empty_speed_ul_s": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Final Empty Speed Ul S"
+    },
+    "final_empty_before": {
+      "items": {
+        "discriminator": {
+          "mapping": {
+            "aspirate": "#/$defs/Stroke",
+            "delay": "#/$defs/Delay",
+            "dispense": "#/$defs/Stroke",
+            "empty": "#/$defs/Empty",
+            "leading_air": "#/$defs/Stroke",
+            "plld": "#/$defs/Plld",
+            "position": "#/$defs/Position",
+            "reaspirate": "#/$defs/Stroke",
+            "settings": "#/$defs/Settings",
+            "trailing_air": "#/$defs/Stroke",
+            "z_move": "#/$defs/ZMove"
+          },
+          "propertyName": "operation"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/Stroke"
+          },
+          {
+            "$ref": "#/$defs/Empty"
+          },
+          {
+            "$ref": "#/$defs/Settings"
+          },
+          {
+            "$ref": "#/$defs/Delay"
+          },
+          {
+            "$ref": "#/$defs/Position"
+          },
+          {
+            "$ref": "#/$defs/ZMove"
+          },
+          {
+            "$ref": "#/$defs/Plld"
+          }
+        ]
+      },
+      "title": "Final Empty Before",
+      "type": "array"
+    },
+    "multi": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Multi"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "phase_settings": {
+      "additionalProperties": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "propertyNames": {
+        "enum": [
+          "leading_air",
+          "aspirate",
+          "trailing_air",
+          "dispense"
+        ]
+      },
+      "title": "Phase Settings",
+      "type": "object"
+    },
+    "liquid_settings": {
+      "additionalProperties": true,
+      "title": "Liquid Settings",
+      "type": "object"
+    }
+  },
+  "required": [
+    "mode",
+    "channels",
+    "timeout_ms",
+    "target_liquid_ul",
+    "commanded_aspiration_ul",
+    "aspiration_speed_ul_s",
+    "aspiration_delay_ms",
+    "leading_air",
+    "trailing_air",
+    "before_leading_air",
+    "before_liquid",
+    "after_liquid",
+    "before_dispense",
+    "after_dispense",
+    "dispense_segments",
+    "final_empty_speed_ul_s",
+    "final_empty_before",
+    "multi"
+  ],
+  "title": "Recipe",
+  "type": "object"
+}

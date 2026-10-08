@@ -11,6 +11,7 @@ from .models import ProtocolActionKind, ProtocolDocument, OEM_OPERATION_FORMS, O
 _ACTION_CAPABILITY_MAP: dict[ProtocolActionKind, CapabilityName | None] = {
     ProtocolActionKind.MOVE: CapabilityName.MOTION,
     ProtocolActionKind.PIPETTE_POSITION: CapabilityName.MOTION,
+    ProtocolActionKind.PIPETTE_PIERCE: CapabilityName.MOTION,
     ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL: CapabilityName.MOTION,
     ProtocolActionKind.HOME: CapabilityName.MOTION,
     ProtocolActionKind.PIPETTE_INIT: CapabilityName.PIPETTE,
@@ -31,7 +32,8 @@ _ACTION_CAPABILITY_MAP: dict[ProtocolActionKind, CapabilityName | None] = {
     ProtocolActionKind.CHILLER_SETPOINT: CapabilityName.CHILLER,
     ProtocolActionKind.THERMAL_SETPOINT: CapabilityName.THERMAL,
     ProtocolActionKind.LOOP_MARKER: None,
-    ProtocolActionKind.SEAL_SEPARATE: CapabilityName.MOTION,
+    ProtocolActionKind.SEAL_SEPARATE: None,
+    ProtocolActionKind.PARK: CapabilityName.MOTION,
     ProtocolActionKind.LIQUID_ADJUST: CapabilityName.PIPETTE,
     ProtocolActionKind.TIP_EJECT: CapabilityName.PIPETTE,
 }
@@ -61,6 +63,41 @@ def validate_protocol_document(document: ProtocolDocument) -> ProtocolDocument:
             raise ValueError(f"Stage '{stage.stage_id}' must include at least one action")
 
         for action in stage.actions:
+            from .mechanisms import validate_mechanism
+            validate_mechanism(action.kind, action.params)
+            if action.kind == ProtocolActionKind.PARK:
+                if set(action.params) - {"rehome"} or ("rehome" in action.params and type(action.params["rehome"]) is not bool):
+                    raise ValueError("park accepts optional boolean rehome (source default false)")
+            if action.kind == ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL and action.params.get("operation") in {"cavro_application", "cavro_liquid_recipe"}:
+                from ..manual_pipetting import manual_physical_plan
+                manual_physical_plan(action.params)
+            if action.kind == ProtocolActionKind.PIPETTE_PIERCE:
+                from ..oem_deck_movement import canonical_plate_name, well_id_from_label
+                p = action.params
+                if set(p) != {"plate", "well", "pattern"} or type(p["plate"]) is not int:
+                    raise ValueError("pipette_pierce requires plate, well and pattern")
+                plate = canonical_plate_name(p["plate"])
+                well_id_from_label(p["well"])
+                patterns = {"d": {0, 1, 2, 7, 8, 9, 10}, "r": {0, 1, 2, 7, 8, 9, 10}, "h": {2}, "t": {0}}
+                if p["pattern"] not in patterns or plate not in patterns[p["pattern"]]:
+                    raise ValueError("pipette_pierce pattern is not source-supported for this plate")
+            custody_fields = {
+                ProtocolActionKind.PLATE_CATCH: ({"plate", "run_in_parallel"}, "plate"),
+                ProtocolActionKind.PLATE_RELEASE: ({"destination", "press_plate", "run_in_parallel"}, "destination"),
+                ProtocolActionKind.PLATE_PRESS: ({"plate", "run_in_parallel"}, "plate"),
+                ProtocolActionKind.CUT_SEAL: ({"count", "cut_z_offset_steps"}, "count"),
+            }
+            if action.kind in custody_fields:
+                fields, required = custody_fields[action.kind]
+                if set(action.params) - fields or type(action.params.get(required)) is not int:
+                    raise ValueError(f"{action.kind.value} requires native integer {required} and supported fields")
+                for field in {"press_plate", "run_in_parallel"} & set(action.params):
+                    if type(action.params[field]) is not bool:
+                        raise ValueError(f"{action.kind.value}.{field} requires boolean")
+                if action.kind == ProtocolActionKind.CUT_SEAL and action.params["count"] == 0:
+                    raise ValueError("cut_seal.count zero cannot represent source integer division")
+                if action.kind == ProtocolActionKind.CUT_SEAL and type(action.params.get("cut_z_offset_steps")) is not int:
+                    raise ValueError("cut_seal requires captured cut_z_offset_steps")
             if action.stage_id != stage.stage_id:
                 raise ValueError(
                     f"Action '{action.action_id}' is attached to stage '{action.stage_id}', expected '{stage.stage_id}'"

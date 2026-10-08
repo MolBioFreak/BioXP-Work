@@ -53,6 +53,12 @@ class TransferNative(OfflineNative):
             self.home = False
         return result
 
+    def motor_z_move_relative_strict(self, steps, *, timeout_s=20.0):
+        # Physical USB movement leaf; real adapter/preflight stays in the path.
+        result = self.motor_oem_move_absolute(4, self.positions[4, 1] + steps,
+                                              motor=1, wait_for_stop=True)
+        return {**result, 'command_sent': True}
+
     def motor_oem_home_axis(self, axis, **kwargs):
         assert axis == 'g'
         self.events.append(('home', axis))
@@ -86,12 +92,15 @@ def connected(retained_rig, monkeypatch):
         operator_label_serial=206, require_operator_label=True))
     qualify_test_references(references)
     native = TransferNative()
+    # Match the copied controller lifecycle before source inspection reads it.
+    native._oem_active_board_lifecycle_generation = provider._load_state()['z_lifecycle']['board_lifecycle_generation']
     adapter = object.__new__(mod.Serial206ProductionPrimitiveAdapter)
     adapter.tester, adapter.y_provider, adapter.reference_store = native, None, references
     from bioxp.serial206_y_provider import Serial206YProvider
     adapter.y_provider = Serial206YProvider(native, state_store=runtime,
         generation_provider=lambda: 3, reference_store=references)
     provider.primitives = adapter
+    provider.preparation_provider = adapter
     provider.bind_pipette_collection_state_reader(lambda: {'tip_exists': False})
     monkeypatch.setattr(mod.time, 'sleep', lambda seconds: None)
     stamps = provider.deck_owner_authority_stamps()
@@ -123,6 +132,9 @@ def connected(retained_rig, monkeypatch):
              'work_identity': 'child:8:coverInspectionRelocate', 'plan_digest': 'root-plan'}
     plan = compile_finite_plate_operation('cover_inspection', source_leaf_available=True,
         deck_inspection=True, screen_resolution_high=False, inspection_log_only=False)
+    # Explicit scratch predecessor, independent of retained capture history.
+    store.publish_deck_owner_state(source_operation='updatePlateLocation',
+        source_command_id='offline-empty-inspection', updates={'movable_plate_locations': {}}, **stamps)
     assert store.deck_semantic_state()['movable_plate_locations'] == {}
     # Real camera classifiers and location publications before relocation.
     for child in plan['children'][2:8]:
@@ -254,7 +266,7 @@ def test_reagent_return_exact_target_y_noop_still_lowers_and_releases(connected,
                for event in rig.native.events)
 
 
-def test_reagent_return_missing_command_ack_does_not_lower_or_publish(connected, monkeypatch):
+def test_reagent_return_missing_ack_remains_evidence_not_new_source_gate(connected, monkeypatch):
     rig = connected
     provider = rig.provider
     first = provider._wp8_compile_and_execute(
@@ -279,16 +291,16 @@ def test_reagent_return_missing_command_ack_does_not_lower_or_publish(connected,
         return original(board, target, motor=motor, wait_for_stop=wait_for_stop,
                         max_position=max_position)
     monkeypatch.setattr(rig.native, 'motor_oem_move_absolute', native_missing_ack)
-    with pytest.raises(RuntimeError, match='wp8_nested_child_failed:releasePlate'):
-        provider._wp8_compile_and_execute(
-            operation='move_plate',
-            inputs={'plate': 5, 'destination': 19, 'press_plate': False, 'run_in_parallel': True},
-            command_id='offline-reagent-lost-ack', owner_identity=rig.owner,
-        )
+    result = provider._wp8_compile_and_execute(
+        operation='move_plate',
+        inputs={'plate': 5, 'destination': 19, 'press_plate': False, 'run_in_parallel': True},
+        command_id='offline-reagent-lost-ack', owner_identity=rig.owner,
+    )
+    assert result['ok'] is True
+    assert "'controller_command_acknowledged': False" in repr(result)
     assert lost_ack == [44972]
-    assert ('move', 'z', 107496, 42788, 44972) not in rig.native.events
-    assert rig.store.deck_semantic_state()['plate_on_gantry'] == 5
-    assert rig.store.deck_semantic_state()['movable_plate_locations']['REAGENT_COVER'] == 'LOC_GANTRY'
+    assert rig.store.deck_semantic_state()['plate_on_gantry'] is None
+    assert rig.store.deck_semantic_state()['movable_plate_locations']['REAGENT_COVER'] == 'LOC_RC_COVER'
 
 
 @pytest.mark.parametrize('phase', ['catch', 'release'])

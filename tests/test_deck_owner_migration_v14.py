@@ -8,10 +8,18 @@ import pytest
 
 from bioxp import oem_deck_schema_v14 as migration
 from bioxp.oem_runtime_store import (
-    OEMRuntimeStore, canonical_runtime_schema_manifest, migrate_runtime_database_v2,
+    OEMRuntimeStore, canonical_runtime_schema_manifest,
+    _migrate_runtime_database_through_v14 as migrate_runtime_database_v2,
     verify_canonical_runtime_database, _runtime_physical_schema_sha256,
     _RUNTIME_PHYSICAL_SCHEMA_SHA256_BY_VERSION,
 )
+
+
+@pytest.fixture(autouse=True)
+def v14_migration_boundary(monkeypatch):
+    # Exercise this historical migration in isolation; V15 has its own suite.
+    from bioxp import oem_runtime_store as owner
+    monkeypatch.setattr(owner, 'migrate_runtime_database_v2', owner._migrate_runtime_database_through_v14)
 
 
 def records(db):
@@ -71,7 +79,7 @@ def test_fresh_v14_manifest_and_frozen_v8_identity(tmp_path):
         assert store._db.execute('PRAGMA user_version').fetchone()[0] == 14
         verify_canonical_runtime_database(store._db, full_data_check=True)
         old = canonical_runtime_schema_manifest(version=13)
-        new = canonical_runtime_schema_manifest()
+        new = canonical_runtime_schema_manifest(version=14)
         assert set(old) == set(new)
         assert {key for key in old if old[key] != new[key]} == {
             ('trigger', migration.DELIVERY_TRIGGER), ('trigger', migration.BACKGROUND_TRIGGER)}

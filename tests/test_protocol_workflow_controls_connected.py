@@ -57,10 +57,11 @@ def gated_workflow(installed_retained, monkeypatch, tmp_path):
     incomplete = json.loads(json.dumps(payload))
     incomplete["idempotency_key"] = "missing-tip-inventory"
     incomplete["document"]["metadata"]["source_model"]["tip_trays"][3]["wells"] = []
+    existing = {row["job_id"] for row in app.state.operator_command_plane.store.list_workflows()}
     denied = client.post("/protocol/execute", json=incomplete)
     assert denied.status_code == 409 and "captured tip-tray wells" in denied.text
     assert trace == []
-    assert app.state.operator_command_plane.store.list_workflows() == []
+    assert {row["job_id"] for row in app.state.operator_command_plane.store.list_workflows()} == existing
     accepted = client.post("/protocol/execute", json=payload)
     assert accepted.status_code == 202, accepted.text
     job_id = accepted.json()["job_id"]

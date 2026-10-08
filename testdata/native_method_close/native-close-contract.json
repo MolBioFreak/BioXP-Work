@@ -1,0 +1,3277 @@
+{
+  "schema_version": "bioxp.method_binding_contract.v1",
+  "scope": "ordinary native method additions; native validators remain authoritative",
+  "action_params": {
+    "park": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rehome": {
+          "type": "boolean"
+        }
+      },
+      "required": []
+    },
+    "led": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "red": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "green": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "blue": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        }
+      },
+      "required": [
+        "red",
+        "green",
+        "blue"
+      ]
+    },
+    "seal_separate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "required": []
+    },
+    "wait": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "seconds": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "seconds"
+      ]
+    },
+    "timer_start": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timer_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seconds": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "timer_id",
+        "seconds"
+      ]
+    },
+    "timer_wait": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timer_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "timer_id"
+      ]
+    },
+    "thermal_setpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bank": {
+          "enum": [
+            "nest",
+            "lid",
+            "pedestal"
+          ]
+        },
+        "target_temp_c": {
+          "type": "number"
+        },
+        "fan_speed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "cool_rate_c_s": {
+          "type": "number",
+          "minimum": -2,
+          "maximum": 0
+        },
+        "heat_rate_c_s": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2
+        }
+      },
+      "required": [
+        "bank",
+        "target_temp_c"
+      ],
+      "dependentRequired": {
+        "cool_rate_c_s": [
+          "heat_rate_c_s"
+        ],
+        "heat_rate_c_s": [
+          "cool_rate_c_s"
+        ]
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "bank": {
+                "const": "pedestal"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "cool_rate_c_s"
+                  ]
+                },
+                {
+                  "required": [
+                    "heat_rate_c_s"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "thermal_hold": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bank": {
+          "enum": [
+            "nest",
+            "lid",
+            "pedestal"
+          ]
+        },
+        "target_temp_c": {
+          "type": "number"
+        },
+        "fan_speed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "cool_rate_c_s": {
+          "type": "number",
+          "minimum": -2,
+          "maximum": 0
+        },
+        "heat_rate_c_s": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "duration_s": {
+          "type": "number",
+          "minimum": 0
+        },
+        "start": {
+          "enum": [
+            "dispatch",
+            "attainment"
+          ]
+        },
+        "tolerance_c": {},
+        "timeout_s": {}
+      },
+      "required": [
+        "bank",
+        "target_temp_c",
+        "duration_s",
+        "start"
+      ],
+      "dependentRequired": {
+        "cool_rate_c_s": [
+          "heat_rate_c_s"
+        ],
+        "heat_rate_c_s": [
+          "cool_rate_c_s"
+        ]
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "bank": {
+                "const": "pedestal"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "cool_rate_c_s"
+                  ]
+                },
+                {
+                  "required": [
+                    "heat_rate_c_s"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "start": {
+                "const": "attainment"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "tolerance_c",
+              "timeout_s"
+            ],
+            "properties": {
+              "tolerance_c": {
+                "type": "number",
+                "minimum": 0
+              },
+              "timeout_s": {
+                "type": "number",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "thermal_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "segments": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "bank": {
+                "enum": [
+                  "nest",
+                  "lid",
+                  "pedestal"
+                ]
+              },
+              "target_temp_c": {
+                "type": "number"
+              },
+              "fan_speed": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 255
+              },
+              "cool_rate_c_s": {
+                "type": "number",
+                "minimum": -2,
+                "maximum": 0
+              },
+              "heat_rate_c_s": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2
+              },
+              "duration_s": {
+                "type": "number",
+                "minimum": 0
+              },
+              "start": {
+                "enum": [
+                  "dispatch",
+                  "attainment"
+                ]
+              },
+              "tolerance_c": {},
+              "timeout_s": {}
+            },
+            "required": [
+              "bank",
+              "target_temp_c",
+              "duration_s",
+              "start"
+            ],
+            "dependentRequired": {
+              "cool_rate_c_s": [
+                "heat_rate_c_s"
+              ],
+              "heat_rate_c_s": [
+                "cool_rate_c_s"
+              ]
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "bank": {
+                      "const": "pedestal"
+                    }
+                  }
+                },
+                "then": {
+                  "not": {
+                    "anyOf": [
+                      {
+                        "required": [
+                          "cool_rate_c_s"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "heat_rate_c_s"
+                        ]
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "start": {
+                      "const": "attainment"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "tolerance_c",
+                    "timeout_s"
+                  ],
+                  "properties": {
+                    "tolerance_c": {
+                      "type": "number",
+                      "minimum": 0
+                    },
+                    "timeout_s": {
+                      "type": "number",
+                      "minimum": 0
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "repeat": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "segments",
+        "repeat"
+      ]
+    },
+    "chiller_setpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bank": {
+          "enum": [
+            "rc",
+            "oc"
+          ]
+        },
+        "target_temp_c": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "bank",
+        "target_temp_c"
+      ]
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "required": []
+    },
+    "camera_illumination": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "channel": {
+          "type": "integer",
+          "enum": [
+            1,
+            2,
+            3
+          ]
+        },
+        "on": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "channel",
+        "on"
+      ]
+    },
+    "barcode_read": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "stationary",
+            "job_id",
+            "reagent_id"
+          ]
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    },
+    "pipette_pierce": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "plate": {
+          "type": "integer"
+        },
+        "well": {
+          "type": "string"
+        },
+        "pattern": {
+          "enum": [
+            "d",
+            "r",
+            "h",
+            "t"
+          ]
+        }
+      },
+      "required": [
+        "plate",
+        "well",
+        "pattern"
+      ]
+    }
+  },
+  "manual_pipetting_request": {
+    "$defs": {
+      "DiagnosticDetectFluid": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "const": "diagnostic_detect_fluid",
+            "title": "Operation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "title": "DiagnosticDetectFluid",
+        "type": "object"
+      },
+      "DiagnosticEject": {
+        "additionalProperties": false,
+        "properties": {
+          "channels": {
+            "items": {
+              "maximum": 3,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 4,
+            "title": "Channels",
+            "type": "array"
+          },
+          "action": {
+            "const": "eject",
+            "title": "Action",
+            "type": "string"
+          }
+        },
+        "required": [
+          "channels",
+          "action"
+        ],
+        "title": "DiagnosticEject",
+        "type": "object"
+      },
+      "DiagnosticLiquid": {
+        "additionalProperties": false,
+        "properties": {
+          "channels": {
+            "items": {
+              "maximum": 3,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 4,
+            "title": "Channels",
+            "type": "array"
+          },
+          "action": {
+            "enum": [
+              "aspirate",
+              "dispense"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "volume_ul": {
+            "minimum": 0,
+            "title": "Volume Ul",
+            "type": "number"
+          },
+          "speed": {
+            "exclusiveMinimum": 0,
+            "title": "Speed",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "channels",
+          "action",
+          "volume_ul",
+          "speed"
+        ],
+        "title": "DiagnosticLiquid",
+        "type": "object"
+      },
+      "DiagnosticPlunger": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "plunger_up",
+              "plunger_down"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "steps": {
+            "maximum": 2147483647,
+            "minimum": 0,
+            "title": "Steps",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "action",
+          "steps"
+        ],
+        "title": "DiagnosticPlunger",
+        "type": "object"
+      },
+      "DiagnosticSimple": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "dispense_all",
+              "diagnoses",
+              "initialize",
+              "get_data",
+              "last_error"
+            ],
+            "title": "Action",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "DiagnosticSimple",
+        "type": "object"
+      },
+      "ManualCalwithFluid": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "const": "source_calwith_fluid",
+            "title": "Operation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "title": "ManualCalwithFluid",
+        "type": "object"
+      },
+      "ManualCavroApplication": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "const": "cavro_application",
+            "title": "Operation",
+            "type": "string"
+          },
+          "application": {
+            "additionalProperties": true,
+            "title": "Application",
+            "type": "object"
+          }
+        },
+        "required": [
+          "operation",
+          "application"
+        ],
+        "title": "ManualCavroApplication",
+        "type": "object"
+      },
+      "ManualCavroRecipe": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "const": "cavro_liquid_recipe",
+            "title": "Operation",
+            "type": "string"
+          },
+          "recipe": {
+            "additionalProperties": true,
+            "title": "Recipe",
+            "type": "object"
+          }
+        },
+        "required": [
+          "operation",
+          "recipe"
+        ],
+        "title": "ManualCavroRecipe",
+        "type": "object"
+      },
+      "ManualDiagnosticPipette": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "const": "diagnostic_pipette",
+            "title": "Operation",
+            "type": "string"
+          },
+          "diagnostic": {
+            "discriminator": {
+              "mapping": {
+                "aspirate": "#/$defs/DiagnosticLiquid",
+                "diagnoses": "#/$defs/DiagnosticSimple",
+                "dispense": "#/$defs/DiagnosticLiquid",
+                "dispense_all": "#/$defs/DiagnosticSimple",
+                "eject": "#/$defs/DiagnosticEject",
+                "get_data": "#/$defs/DiagnosticSimple",
+                "initialize": "#/$defs/DiagnosticSimple",
+                "last_error": "#/$defs/DiagnosticSimple",
+                "plunger_down": "#/$defs/DiagnosticPlunger",
+                "plunger_up": "#/$defs/DiagnosticPlunger"
+              },
+              "propertyName": "action"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/DiagnosticLiquid"
+              },
+              {
+                "$ref": "#/$defs/DiagnosticEject"
+              },
+              {
+                "$ref": "#/$defs/DiagnosticSimple"
+              },
+              {
+                "$ref": "#/$defs/DiagnosticPlunger"
+              }
+            ],
+            "title": "Diagnostic"
+          }
+        },
+        "required": [
+          "operation",
+          "diagnostic"
+        ],
+        "title": "ManualDiagnosticPipette",
+        "type": "object"
+      },
+      "ManualFluidOffset": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "const": "source_fluid_offset",
+            "title": "Operation",
+            "type": "string"
+          },
+          "plate": {
+            "enum": [
+              "TC",
+              "MS",
+              "OC",
+              "RC",
+              "STRIP",
+              "OCMS"
+            ],
+            "title": "Plate",
+            "type": "string"
+          },
+          "speed": {
+            "default": 300,
+            "title": "Speed",
+            "type": "integer"
+          },
+          "transfer_fluid": {
+            "default": true,
+            "title": "Transfer Fluid",
+            "type": "boolean"
+          },
+          "skip_steps": {
+            "default": 4,
+            "minimum": 1,
+            "title": "Skip Steps",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "operation",
+          "plate"
+        ],
+        "title": "ManualFluidOffset",
+        "type": "object"
+      },
+      "ManualLift": {
+        "additionalProperties": false,
+        "properties": {
+          "location_id": {
+            "title": "Location Id",
+            "type": "integer"
+          },
+          "operation": {
+            "const": "lift",
+            "title": "Operation",
+            "type": "string"
+          },
+          "height_steps": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Height Steps"
+          }
+        },
+        "required": [
+          "location_id",
+          "operation",
+          "height_steps"
+        ],
+        "title": "ManualLift",
+        "type": "object"
+      },
+      "ManualLiquid": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "enum": [
+              "aspirate",
+              "dispense"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "channels": {
+            "items": {
+              "maximum": 3,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 4,
+            "minItems": 1,
+            "title": "Channels",
+            "type": "array"
+          },
+          "volume_ul": {
+            "title": "Volume Ul",
+            "type": "number"
+          },
+          "speed": {
+            "title": "Speed",
+            "type": "number"
+          }
+        },
+        "required": [
+          "operation",
+          "channels",
+          "volume_ul",
+          "speed"
+        ],
+        "title": "ManualLiquid",
+        "type": "object"
+      },
+      "ManualLoadTip": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "const": "load_tip",
+            "title": "Operation",
+            "type": "string"
+          },
+          "tray": {
+            "maximum": 5,
+            "minimum": 1,
+            "title": "Tray",
+            "type": "integer"
+          },
+          "well": {
+            "pattern": "^[ABab](?:[1-9]|1[0-2])$",
+            "title": "Well",
+            "type": "string"
+          },
+          "overpress": {
+            "default": false,
+            "title": "Overpress",
+            "type": "boolean"
+          },
+          "lift_z": {
+            "default": false,
+            "title": "Lift Z",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "operation",
+          "tray",
+          "well"
+        ],
+        "title": "ManualLoadTip",
+        "type": "object"
+      },
+      "ManualLower": {
+        "additionalProperties": false,
+        "properties": {
+          "location_id": {
+            "title": "Location Id",
+            "type": "integer"
+          },
+          "operation": {
+            "const": "lower",
+            "title": "Operation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "location_id",
+          "operation"
+        ],
+        "title": "ManualLower",
+        "type": "object"
+      },
+      "ManualMeasureFluidHeight": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "const": "measure_fluid_height",
+            "title": "Operation",
+            "type": "string"
+          },
+          "speed": {
+            "default": 300,
+            "title": "Speed",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "title": "ManualMeasureFluidHeight",
+        "type": "object"
+      },
+      "ManualMix": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "const": "mix",
+            "title": "Operation",
+            "type": "string"
+          },
+          "channels": {
+            "items": {
+              "maximum": 3,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 4,
+            "minItems": 1,
+            "title": "Channels",
+            "type": "array"
+          },
+          "volume_ul": {
+            "title": "Volume Ul",
+            "type": "number"
+          },
+          "aspirate_speed": {
+            "title": "Aspirate Speed",
+            "type": "number"
+          },
+          "dispense_speed": {
+            "title": "Dispense Speed",
+            "type": "number"
+          },
+          "cycles": {
+            "maximum": 50,
+            "minimum": 1,
+            "title": "Cycles",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "operation",
+          "channels",
+          "volume_ul",
+          "aspirate_speed",
+          "dispense_speed",
+          "cycles"
+        ],
+        "title": "ManualMix",
+        "type": "object"
+      },
+      "ManualMove": {
+        "additionalProperties": false,
+        "properties": {
+          "location_id": {
+            "title": "Location Id",
+            "type": "integer"
+          },
+          "operation": {
+            "const": "move",
+            "title": "Operation",
+            "type": "string"
+          },
+          "well": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "title": "Well"
+          },
+          "position_flag": {
+            "enum": [
+              0,
+              1,
+              2
+            ],
+            "title": "Position Flag",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "location_id",
+          "operation",
+          "well",
+          "position_flag"
+        ],
+        "title": "ManualMove",
+        "type": "object"
+      },
+      "SourceAir": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "enum": [
+              "source_aspirate_air",
+              "source_dispense_air"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "volume_ul": {
+            "title": "Volume Ul",
+            "type": "number"
+          }
+        },
+        "required": [
+          "operation",
+          "volume_ul"
+        ],
+        "title": "SourceAir",
+        "type": "object"
+      },
+      "SourceLoadTips": {
+        "additionalProperties": false,
+        "description": "newloadTips, not calibration loadTips or manual tray/well pickup.\n\nA matching tip type with force_new_tip=False returns without realignment.\nPipette is the OEM zero-based index; -1 is the fixed four-head group.",
+        "properties": {
+          "operation": {
+            "const": "source_load_tips",
+            "title": "Operation",
+            "type": "string"
+          },
+          "tip_type": {
+            "enum": [
+              50,
+              200
+            ],
+            "title": "Tip Type",
+            "type": "integer"
+          },
+          "pipette": {
+            "maximum": 3,
+            "minimum": -1,
+            "title": "Pipette",
+            "type": "integer"
+          },
+          "force_new_tip": {
+            "title": "Force New Tip",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "operation",
+          "tip_type",
+          "pipette",
+          "force_new_tip"
+        ],
+        "title": "SourceLoadTips",
+        "type": "object"
+      },
+      "SourceMix": {
+        "additionalProperties": false,
+        "description": "ControlLib.mmix scientific procedure, not repeated manual strokes.",
+        "properties": {
+          "operation": {
+            "const": "source_mix",
+            "title": "Operation",
+            "type": "string"
+          },
+          "volume_ul": {
+            "title": "Volume Ul",
+            "type": "number"
+          },
+          "air_ul": {
+            "default": 15.0,
+            "title": "Air Ul",
+            "type": "number"
+          },
+          "aspirate_speed": {
+            "default": 100.0,
+            "title": "Aspirate Speed",
+            "type": "number"
+          },
+          "dispense_speed": {
+            "default": 20.0,
+            "title": "Dispense Speed",
+            "type": "number"
+          },
+          "aspirate_delay_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Aspirate Delay Ms"
+          },
+          "dispense_delay_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Dispense Delay Ms"
+          },
+          "cycles": {
+            "default": 2,
+            "minimum": 0,
+            "title": "Cycles",
+            "type": "integer"
+          },
+          "mix_type": {
+            "default": "N",
+            "enum": [
+              "N",
+              "H",
+              "C"
+            ],
+            "title": "Mix Type",
+            "type": "string"
+          },
+          "tip_dip": {
+            "default": true,
+            "title": "Tip Dip",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "operation",
+          "volume_ul"
+        ],
+        "title": "SourceMix",
+        "type": "object"
+      },
+      "SourcePurge": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "const": "source_purge",
+            "title": "Operation",
+            "type": "string"
+          },
+          "speed": {
+            "default": 30.0,
+            "title": "Speed",
+            "type": "number"
+          },
+          "amp": {
+            "default": false,
+            "title": "Amp",
+            "type": "boolean"
+          },
+          "ntd": {
+            "default": false,
+            "title": "Ntd",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "title": "SourcePurge",
+        "type": "object"
+      }
+    },
+    "additionalProperties": false,
+    "properties": {
+      "protocol_id": {
+        "minLength": 1,
+        "title": "Protocol Id",
+        "type": "string"
+      },
+      "steps": {
+        "items": {
+          "discriminator": {
+            "mapping": {
+              "aspirate": "#/$defs/ManualLiquid",
+              "cavro_application": "#/$defs/ManualCavroApplication",
+              "cavro_liquid_recipe": "#/$defs/ManualCavroRecipe",
+              "diagnostic_detect_fluid": "#/$defs/DiagnosticDetectFluid",
+              "diagnostic_pipette": "#/$defs/ManualDiagnosticPipette",
+              "dispense": "#/$defs/ManualLiquid",
+              "lift": "#/$defs/ManualLift",
+              "load_tip": "#/$defs/ManualLoadTip",
+              "lower": "#/$defs/ManualLower",
+              "measure_fluid_height": "#/$defs/ManualMeasureFluidHeight",
+              "mix": "#/$defs/ManualMix",
+              "move": "#/$defs/ManualMove",
+              "source_aspirate_air": "#/$defs/SourceAir",
+              "source_calwith_fluid": "#/$defs/ManualCalwithFluid",
+              "source_dispense_air": "#/$defs/SourceAir",
+              "source_fluid_offset": "#/$defs/ManualFluidOffset",
+              "source_load_tips": "#/$defs/SourceLoadTips",
+              "source_mix": "#/$defs/SourceMix",
+              "source_purge": "#/$defs/SourcePurge"
+            },
+            "propertyName": "operation"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ManualMove"
+            },
+            {
+              "$ref": "#/$defs/ManualLower"
+            },
+            {
+              "$ref": "#/$defs/ManualLift"
+            },
+            {
+              "$ref": "#/$defs/ManualLiquid"
+            },
+            {
+              "$ref": "#/$defs/ManualMix"
+            },
+            {
+              "$ref": "#/$defs/ManualLoadTip"
+            },
+            {
+              "$ref": "#/$defs/ManualMeasureFluidHeight"
+            },
+            {
+              "$ref": "#/$defs/ManualFluidOffset"
+            },
+            {
+              "$ref": "#/$defs/DiagnosticDetectFluid"
+            },
+            {
+              "$ref": "#/$defs/ManualCalwithFluid"
+            },
+            {
+              "$ref": "#/$defs/SourceLoadTips"
+            },
+            {
+              "$ref": "#/$defs/SourceMix"
+            },
+            {
+              "$ref": "#/$defs/SourceAir"
+            },
+            {
+              "$ref": "#/$defs/SourcePurge"
+            },
+            {
+              "$ref": "#/$defs/ManualDiagnosticPipette"
+            },
+            {
+              "$ref": "#/$defs/ManualCavroApplication"
+            },
+            {
+              "$ref": "#/$defs/ManualCavroRecipe"
+            }
+          ]
+        },
+        "minItems": 1,
+        "title": "Steps",
+        "type": "array"
+      }
+    },
+    "required": [
+      "protocol_id",
+      "steps"
+    ],
+    "title": "ManualPipettingRequest",
+    "type": "object"
+  },
+  "cavro_application": {
+    "$defs": {
+      "Delay": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "const": "delay",
+            "title": "Operation",
+            "type": "string"
+          },
+          "duration_ms": {
+            "minimum": 0,
+            "title": "Duration Ms",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "operation",
+          "duration_ms"
+        ],
+        "title": "Delay",
+        "type": "object"
+      },
+      "Empty": {
+        "additionalProperties": false,
+        "properties": {
+          "channels": {
+            "items": {
+              "maximum": 3,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 4,
+            "minItems": 1,
+            "title": "Channels",
+            "type": "array"
+          },
+          "timeout_ms": {
+            "exclusiveMinimum": 0,
+            "title": "Timeout Ms",
+            "type": "integer"
+          },
+          "operation": {
+            "const": "empty",
+            "title": "Operation",
+            "type": "string"
+          },
+          "speed_ul_s": {
+            "exclusiveMinimum": 0,
+            "title": "Speed Ul S",
+            "type": "number"
+          }
+        },
+        "required": [
+          "channels",
+          "timeout_ms",
+          "operation",
+          "speed_ul_s"
+        ],
+        "title": "Empty",
+        "type": "object"
+      },
+      "Plld": {
+        "additionalProperties": false,
+        "properties": {
+          "channels": {
+            "items": {
+              "maximum": 3,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 4,
+            "minItems": 1,
+            "title": "Channels",
+            "type": "array"
+          },
+          "timeout_ms": {
+            "exclusiveMinimum": 0,
+            "title": "Timeout Ms",
+            "type": "integer"
+          },
+          "operation": {
+            "const": "plld",
+            "title": "Operation",
+            "type": "string"
+          },
+          "start_steps": {
+            "title": "Start Steps",
+            "type": "integer"
+          },
+          "search_target_steps": {
+            "title": "Search Target Steps",
+            "type": "integer"
+          },
+          "search_speed_native": {
+            "exclusiveMinimum": 0,
+            "title": "Search Speed Native",
+            "type": "integer"
+          },
+          "z_motor_current": {
+            "title": "Z Motor Current",
+            "type": "integer"
+          },
+          "after_detection_steps": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "After Detection Steps"
+          },
+          "after_detection_speed_native": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "After Detection Speed Native"
+          }
+        },
+        "required": [
+          "channels",
+          "timeout_ms",
+          "operation",
+          "start_steps",
+          "search_target_steps",
+          "search_speed_native",
+          "z_motor_current"
+        ],
+        "title": "Plld",
+        "type": "object"
+      },
+      "Position": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "const": "position",
+            "title": "Operation",
+            "type": "string"
+          },
+          "positioning": {
+            "additionalProperties": true,
+            "title": "Positioning",
+            "type": "object"
+          }
+        },
+        "required": [
+          "operation",
+          "positioning"
+        ],
+        "title": "Position",
+        "type": "object"
+      },
+      "Settings": {
+        "additionalProperties": false,
+        "properties": {
+          "channels": {
+            "items": {
+              "maximum": 3,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 4,
+            "minItems": 1,
+            "title": "Channels",
+            "type": "array"
+          },
+          "timeout_ms": {
+            "exclusiveMinimum": 0,
+            "title": "Timeout Ms",
+            "type": "integer"
+          },
+          "operation": {
+            "const": "settings",
+            "title": "Operation",
+            "type": "string"
+          },
+          "values": {
+            "additionalProperties": true,
+            "title": "Values",
+            "type": "object"
+          }
+        },
+        "required": [
+          "channels",
+          "timeout_ms",
+          "operation",
+          "values"
+        ],
+        "title": "Settings",
+        "type": "object"
+      },
+      "Stroke": {
+        "additionalProperties": false,
+        "properties": {
+          "channels": {
+            "items": {
+              "maximum": 3,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 4,
+            "minItems": 1,
+            "title": "Channels",
+            "type": "array"
+          },
+          "timeout_ms": {
+            "exclusiveMinimum": 0,
+            "title": "Timeout Ms",
+            "type": "integer"
+          },
+          "operation": {
+            "enum": [
+              "aspirate",
+              "dispense",
+              "leading_air",
+              "trailing_air",
+              "reaspirate"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "volume_ul": {
+            "minimum": 0,
+            "title": "Volume Ul",
+            "type": "number"
+          },
+          "speed_ul_s": {
+            "exclusiveMinimum": 0,
+            "title": "Speed Ul S",
+            "type": "number"
+          },
+          "target_liquid_ul": {
+            "anyOf": [
+              {
+                "minimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Target Liquid Ul"
+          }
+        },
+        "required": [
+          "channels",
+          "timeout_ms",
+          "operation",
+          "volume_ul",
+          "speed_ul_s"
+        ],
+        "title": "Stroke",
+        "type": "object"
+      },
+      "ZMove": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "const": "z_move",
+            "title": "Operation",
+            "type": "string"
+          },
+          "target_steps": {
+            "title": "Target Steps",
+            "type": "integer"
+          },
+          "speed_native": {
+            "exclusiveMinimum": 0,
+            "title": "Speed Native",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "operation",
+          "target_steps",
+          "speed_native"
+        ],
+        "title": "ZMove",
+        "type": "object"
+      }
+    },
+    "additionalProperties": false,
+    "properties": {
+      "implementation": {
+        "const": "original-adp.application.v1",
+        "title": "Implementation",
+        "type": "string"
+      },
+      "operations": {
+        "items": {
+          "discriminator": {
+            "mapping": {
+              "aspirate": "#/$defs/Stroke",
+              "delay": "#/$defs/Delay",
+              "dispense": "#/$defs/Stroke",
+              "empty": "#/$defs/Empty",
+              "leading_air": "#/$defs/Stroke",
+              "plld": "#/$defs/Plld",
+              "position": "#/$defs/Position",
+              "reaspirate": "#/$defs/Stroke",
+              "settings": "#/$defs/Settings",
+              "trailing_air": "#/$defs/Stroke",
+              "z_move": "#/$defs/ZMove"
+            },
+            "propertyName": "operation"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Stroke"
+            },
+            {
+              "$ref": "#/$defs/Empty"
+            },
+            {
+              "$ref": "#/$defs/Settings"
+            },
+            {
+              "$ref": "#/$defs/Delay"
+            },
+            {
+              "$ref": "#/$defs/Position"
+            },
+            {
+              "$ref": "#/$defs/ZMove"
+            },
+            {
+              "$ref": "#/$defs/Plld"
+            }
+          ]
+        },
+        "title": "Operations",
+        "type": "array"
+      },
+      "liquid_settings": {
+        "additionalProperties": true,
+        "title": "Liquid Settings",
+        "type": "object"
+      },
+      "event_policy": {
+        "default": "stop",
+        "enum": [
+          "stop",
+          "pause_for_operator"
+        ],
+        "title": "Event Policy",
+        "type": "string"
+      }
+    },
+    "required": [
+      "implementation",
+      "operations"
+    ],
+    "title": "ApplicationRequest",
+    "type": "object"
+  },
+  "cavro_liquid_recipe": {
+    "$defs": {
+      "Air": {
+        "additionalProperties": false,
+        "properties": {
+          "volume_ul": {
+            "minimum": 0,
+            "title": "Volume Ul",
+            "type": "number"
+          },
+          "speed_ul_s": {
+            "exclusiveMinimum": 0,
+            "title": "Speed Ul S",
+            "type": "number"
+          }
+        },
+        "required": [
+          "volume_ul",
+          "speed_ul_s"
+        ],
+        "title": "Air",
+        "type": "object"
+      },
+      "Aliquot": {
+        "additionalProperties": false,
+        "properties": {
+          "before": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "aspirate": "#/$defs/Stroke",
+                  "delay": "#/$defs/Delay",
+                  "dispense": "#/$defs/Stroke",
+                  "empty": "#/$defs/Empty",
+                  "leading_air": "#/$defs/Stroke",
+                  "plld": "#/$defs/Plld",
+                  "position": "#/$defs/Position",
+                  "reaspirate": "#/$defs/Stroke",
+                  "settings": "#/$defs/Settings",
+                  "trailing_air": "#/$defs/Stroke",
+                  "z_move": "#/$defs/ZMove"
+                },
+                "propertyName": "operation"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Stroke"
+                },
+                {
+                  "$ref": "#/$defs/Empty"
+                },
+                {
+                  "$ref": "#/$defs/Settings"
+                },
+                {
+                  "$ref": "#/$defs/Delay"
+                },
+                {
+                  "$ref": "#/$defs/Position"
+                },
+                {
+                  "$ref": "#/$defs/ZMove"
+                },
+                {
+                  "$ref": "#/$defs/Plld"
+                }
+              ]
+            },
+            "title": "Before",
+            "type": "array"
+          },
+          "segments": {
+            "items": {
+              "$ref": "#/$defs/Segment"
+            },
+            "title": "Segments",
+            "type": "array"
+          },
+          "after": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "aspirate": "#/$defs/Stroke",
+                  "delay": "#/$defs/Delay",
+                  "dispense": "#/$defs/Stroke",
+                  "empty": "#/$defs/Empty",
+                  "leading_air": "#/$defs/Stroke",
+                  "plld": "#/$defs/Plld",
+                  "position": "#/$defs/Position",
+                  "reaspirate": "#/$defs/Stroke",
+                  "settings": "#/$defs/Settings",
+                  "trailing_air": "#/$defs/Stroke",
+                  "z_move": "#/$defs/ZMove"
+                },
+                "propertyName": "operation"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Stroke"
+                },
+                {
+                  "$ref": "#/$defs/Empty"
+                },
+                {
+                  "$ref": "#/$defs/Settings"
+                },
+                {
+                  "$ref": "#/$defs/Delay"
+                },
+                {
+                  "$ref": "#/$defs/Position"
+                },
+                {
+                  "$ref": "#/$defs/ZMove"
+                },
+                {
+                  "$ref": "#/$defs/Plld"
+                }
+              ]
+            },
+            "title": "After",
+            "type": "array"
+          }
+        },
+        "required": [
+          "before",
+          "segments",
+          "after"
+        ],
+        "title": "Aliquot",
+        "type": "object"
+      },
+      "Delay": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "const": "delay",
+            "title": "Operation",
+            "type": "string"
+          },
+          "duration_ms": {
+            "minimum": 0,
+            "title": "Duration Ms",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "operation",
+          "duration_ms"
+        ],
+        "title": "Delay",
+        "type": "object"
+      },
+      "Empty": {
+        "additionalProperties": false,
+        "properties": {
+          "channels": {
+            "items": {
+              "maximum": 3,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 4,
+            "minItems": 1,
+            "title": "Channels",
+            "type": "array"
+          },
+          "timeout_ms": {
+            "exclusiveMinimum": 0,
+            "title": "Timeout Ms",
+            "type": "integer"
+          },
+          "operation": {
+            "const": "empty",
+            "title": "Operation",
+            "type": "string"
+          },
+          "speed_ul_s": {
+            "exclusiveMinimum": 0,
+            "title": "Speed Ul S",
+            "type": "number"
+          }
+        },
+        "required": [
+          "channels",
+          "timeout_ms",
+          "operation",
+          "speed_ul_s"
+        ],
+        "title": "Empty",
+        "type": "object"
+      },
+      "Multi": {
+        "additionalProperties": false,
+        "properties": {
+          "sample_count": {
+            "minimum": 0,
+            "title": "Sample Count",
+            "type": "integer"
+          },
+          "sample_volume_ul": {
+            "minimum": 0,
+            "title": "Sample Volume Ul",
+            "type": "number"
+          },
+          "conditioning_volume_ul": {
+            "minimum": 0,
+            "title": "Conditioning Volume Ul",
+            "type": "number"
+          },
+          "conditioning_back_to_source_count": {
+            "minimum": 0,
+            "title": "Conditioning Back To Source Count",
+            "type": "integer"
+          },
+          "conditioning_speed_ul_s": {
+            "exclusiveMinimum": 0,
+            "title": "Conditioning Speed Ul S",
+            "type": "number"
+          },
+          "conditioning_before": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "aspirate": "#/$defs/Stroke",
+                  "delay": "#/$defs/Delay",
+                  "dispense": "#/$defs/Stroke",
+                  "empty": "#/$defs/Empty",
+                  "leading_air": "#/$defs/Stroke",
+                  "plld": "#/$defs/Plld",
+                  "position": "#/$defs/Position",
+                  "reaspirate": "#/$defs/Stroke",
+                  "settings": "#/$defs/Settings",
+                  "trailing_air": "#/$defs/Stroke",
+                  "z_move": "#/$defs/ZMove"
+                },
+                "propertyName": "operation"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Stroke"
+                },
+                {
+                  "$ref": "#/$defs/Empty"
+                },
+                {
+                  "$ref": "#/$defs/Settings"
+                },
+                {
+                  "$ref": "#/$defs/Delay"
+                },
+                {
+                  "$ref": "#/$defs/Position"
+                },
+                {
+                  "$ref": "#/$defs/ZMove"
+                },
+                {
+                  "$ref": "#/$defs/Plld"
+                }
+              ]
+            },
+            "title": "Conditioning Before",
+            "type": "array"
+          },
+          "conditioning_after": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "aspirate": "#/$defs/Stroke",
+                  "delay": "#/$defs/Delay",
+                  "dispense": "#/$defs/Stroke",
+                  "empty": "#/$defs/Empty",
+                  "leading_air": "#/$defs/Stroke",
+                  "plld": "#/$defs/Plld",
+                  "position": "#/$defs/Position",
+                  "reaspirate": "#/$defs/Stroke",
+                  "settings": "#/$defs/Settings",
+                  "trailing_air": "#/$defs/Stroke",
+                  "z_move": "#/$defs/ZMove"
+                },
+                "propertyName": "operation"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Stroke"
+                },
+                {
+                  "$ref": "#/$defs/Empty"
+                },
+                {
+                  "$ref": "#/$defs/Settings"
+                },
+                {
+                  "$ref": "#/$defs/Delay"
+                },
+                {
+                  "$ref": "#/$defs/Position"
+                },
+                {
+                  "$ref": "#/$defs/ZMove"
+                },
+                {
+                  "$ref": "#/$defs/Plld"
+                }
+              ]
+            },
+            "title": "Conditioning After",
+            "type": "array"
+          },
+          "excess_volume_ul": {
+            "minimum": 0,
+            "title": "Excess Volume Ul",
+            "type": "number"
+          },
+          "excess": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Aliquot"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reaspiration": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Air"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "dispense_to_reaspiration_delay_ms": {
+            "anyOf": [
+              {
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dispense To Reaspiration Delay Ms"
+          },
+          "aliquots": {
+            "items": {
+              "$ref": "#/$defs/Aliquot"
+            },
+            "title": "Aliquots",
+            "type": "array"
+          }
+        },
+        "required": [
+          "sample_count",
+          "sample_volume_ul",
+          "conditioning_volume_ul",
+          "conditioning_back_to_source_count",
+          "conditioning_speed_ul_s",
+          "conditioning_before",
+          "conditioning_after",
+          "excess_volume_ul",
+          "excess",
+          "reaspiration",
+          "dispense_to_reaspiration_delay_ms",
+          "aliquots"
+        ],
+        "title": "Multi",
+        "type": "object"
+      },
+      "Plld": {
+        "additionalProperties": false,
+        "properties": {
+          "channels": {
+            "items": {
+              "maximum": 3,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 4,
+            "minItems": 1,
+            "title": "Channels",
+            "type": "array"
+          },
+          "timeout_ms": {
+            "exclusiveMinimum": 0,
+            "title": "Timeout Ms",
+            "type": "integer"
+          },
+          "operation": {
+            "const": "plld",
+            "title": "Operation",
+            "type": "string"
+          },
+          "start_steps": {
+            "title": "Start Steps",
+            "type": "integer"
+          },
+          "search_target_steps": {
+            "title": "Search Target Steps",
+            "type": "integer"
+          },
+          "search_speed_native": {
+            "exclusiveMinimum": 0,
+            "title": "Search Speed Native",
+            "type": "integer"
+          },
+          "z_motor_current": {
+            "title": "Z Motor Current",
+            "type": "integer"
+          },
+          "after_detection_steps": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "After Detection Steps"
+          },
+          "after_detection_speed_native": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "After Detection Speed Native"
+          }
+        },
+        "required": [
+          "channels",
+          "timeout_ms",
+          "operation",
+          "start_steps",
+          "search_target_steps",
+          "search_speed_native",
+          "z_motor_current"
+        ],
+        "title": "Plld",
+        "type": "object"
+      },
+      "Position": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "const": "position",
+            "title": "Operation",
+            "type": "string"
+          },
+          "positioning": {
+            "additionalProperties": true,
+            "title": "Positioning",
+            "type": "object"
+          }
+        },
+        "required": [
+          "operation",
+          "positioning"
+        ],
+        "title": "Position",
+        "type": "object"
+      },
+      "Segment": {
+        "additionalProperties": false,
+        "properties": {
+          "volume_ul": {
+            "minimum": 0,
+            "title": "Volume Ul",
+            "type": "number"
+          },
+          "speed_ul_s": {
+            "exclusiveMinimum": 0,
+            "title": "Speed Ul S",
+            "type": "number"
+          }
+        },
+        "required": [
+          "volume_ul",
+          "speed_ul_s"
+        ],
+        "title": "Segment",
+        "type": "object"
+      },
+      "Settings": {
+        "additionalProperties": false,
+        "properties": {
+          "channels": {
+            "items": {
+              "maximum": 3,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 4,
+            "minItems": 1,
+            "title": "Channels",
+            "type": "array"
+          },
+          "timeout_ms": {
+            "exclusiveMinimum": 0,
+            "title": "Timeout Ms",
+            "type": "integer"
+          },
+          "operation": {
+            "const": "settings",
+            "title": "Operation",
+            "type": "string"
+          },
+          "values": {
+            "additionalProperties": true,
+            "title": "Values",
+            "type": "object"
+          }
+        },
+        "required": [
+          "channels",
+          "timeout_ms",
+          "operation",
+          "values"
+        ],
+        "title": "Settings",
+        "type": "object"
+      },
+      "Stroke": {
+        "additionalProperties": false,
+        "properties": {
+          "channels": {
+            "items": {
+              "maximum": 3,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 4,
+            "minItems": 1,
+            "title": "Channels",
+            "type": "array"
+          },
+          "timeout_ms": {
+            "exclusiveMinimum": 0,
+            "title": "Timeout Ms",
+            "type": "integer"
+          },
+          "operation": {
+            "enum": [
+              "aspirate",
+              "dispense",
+              "leading_air",
+              "trailing_air",
+              "reaspirate"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "volume_ul": {
+            "minimum": 0,
+            "title": "Volume Ul",
+            "type": "number"
+          },
+          "speed_ul_s": {
+            "exclusiveMinimum": 0,
+            "title": "Speed Ul S",
+            "type": "number"
+          },
+          "target_liquid_ul": {
+            "anyOf": [
+              {
+                "minimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Target Liquid Ul"
+          }
+        },
+        "required": [
+          "channels",
+          "timeout_ms",
+          "operation",
+          "volume_ul",
+          "speed_ul_s"
+        ],
+        "title": "Stroke",
+        "type": "object"
+      },
+      "ZMove": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "const": "z_move",
+            "title": "Operation",
+            "type": "string"
+          },
+          "target_steps": {
+            "title": "Target Steps",
+            "type": "integer"
+          },
+          "speed_native": {
+            "exclusiveMinimum": 0,
+            "title": "Speed Native",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "operation",
+          "target_steps",
+          "speed_native"
+        ],
+        "title": "ZMove",
+        "type": "object"
+      }
+    },
+    "additionalProperties": false,
+    "properties": {
+      "mode": {
+        "enum": [
+          "single",
+          "multi"
+        ],
+        "title": "Mode",
+        "type": "string"
+      },
+      "channels": {
+        "items": {
+          "type": "integer"
+        },
+        "title": "Channels",
+        "type": "array"
+      },
+      "timeout_ms": {
+        "exclusiveMinimum": 0,
+        "title": "Timeout Ms",
+        "type": "integer"
+      },
+      "target_liquid_ul": {
+        "minimum": 0,
+        "title": "Target Liquid Ul",
+        "type": "number"
+      },
+      "commanded_aspiration_ul": {
+        "minimum": 0,
+        "title": "Commanded Aspiration Ul",
+        "type": "number"
+      },
+      "aspiration_speed_ul_s": {
+        "exclusiveMinimum": 0,
+        "title": "Aspiration Speed Ul S",
+        "type": "number"
+      },
+      "aspiration_delay_ms": {
+        "minimum": 0,
+        "title": "Aspiration Delay Ms",
+        "type": "integer"
+      },
+      "leading_air": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/Air"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "trailing_air": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/Air"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "before_leading_air": {
+        "items": {
+          "discriminator": {
+            "mapping": {
+              "aspirate": "#/$defs/Stroke",
+              "delay": "#/$defs/Delay",
+              "dispense": "#/$defs/Stroke",
+              "empty": "#/$defs/Empty",
+              "leading_air": "#/$defs/Stroke",
+              "plld": "#/$defs/Plld",
+              "position": "#/$defs/Position",
+              "reaspirate": "#/$defs/Stroke",
+              "settings": "#/$defs/Settings",
+              "trailing_air": "#/$defs/Stroke",
+              "z_move": "#/$defs/ZMove"
+            },
+            "propertyName": "operation"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Stroke"
+            },
+            {
+              "$ref": "#/$defs/Empty"
+            },
+            {
+              "$ref": "#/$defs/Settings"
+            },
+            {
+              "$ref": "#/$defs/Delay"
+            },
+            {
+              "$ref": "#/$defs/Position"
+            },
+            {
+              "$ref": "#/$defs/ZMove"
+            },
+            {
+              "$ref": "#/$defs/Plld"
+            }
+          ]
+        },
+        "title": "Before Leading Air",
+        "type": "array"
+      },
+      "before_liquid": {
+        "items": {
+          "discriminator": {
+            "mapping": {
+              "aspirate": "#/$defs/Stroke",
+              "delay": "#/$defs/Delay",
+              "dispense": "#/$defs/Stroke",
+              "empty": "#/$defs/Empty",
+              "leading_air": "#/$defs/Stroke",
+              "plld": "#/$defs/Plld",
+              "position": "#/$defs/Position",
+              "reaspirate": "#/$defs/Stroke",
+              "settings": "#/$defs/Settings",
+              "trailing_air": "#/$defs/Stroke",
+              "z_move": "#/$defs/ZMove"
+            },
+            "propertyName": "operation"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Stroke"
+            },
+            {
+              "$ref": "#/$defs/Empty"
+            },
+            {
+              "$ref": "#/$defs/Settings"
+            },
+            {
+              "$ref": "#/$defs/Delay"
+            },
+            {
+              "$ref": "#/$defs/Position"
+            },
+            {
+              "$ref": "#/$defs/ZMove"
+            },
+            {
+              "$ref": "#/$defs/Plld"
+            }
+          ]
+        },
+        "title": "Before Liquid",
+        "type": "array"
+      },
+      "after_liquid": {
+        "items": {
+          "discriminator": {
+            "mapping": {
+              "aspirate": "#/$defs/Stroke",
+              "delay": "#/$defs/Delay",
+              "dispense": "#/$defs/Stroke",
+              "empty": "#/$defs/Empty",
+              "leading_air": "#/$defs/Stroke",
+              "plld": "#/$defs/Plld",
+              "position": "#/$defs/Position",
+              "reaspirate": "#/$defs/Stroke",
+              "settings": "#/$defs/Settings",
+              "trailing_air": "#/$defs/Stroke",
+              "z_move": "#/$defs/ZMove"
+            },
+            "propertyName": "operation"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Stroke"
+            },
+            {
+              "$ref": "#/$defs/Empty"
+            },
+            {
+              "$ref": "#/$defs/Settings"
+            },
+            {
+              "$ref": "#/$defs/Delay"
+            },
+            {
+              "$ref": "#/$defs/Position"
+            },
+            {
+              "$ref": "#/$defs/ZMove"
+            },
+            {
+              "$ref": "#/$defs/Plld"
+            }
+          ]
+        },
+        "title": "After Liquid",
+        "type": "array"
+      },
+      "before_dispense": {
+        "items": {
+          "discriminator": {
+            "mapping": {
+              "aspirate": "#/$defs/Stroke",
+              "delay": "#/$defs/Delay",
+              "dispense": "#/$defs/Stroke",
+              "empty": "#/$defs/Empty",
+              "leading_air": "#/$defs/Stroke",
+              "plld": "#/$defs/Plld",
+              "position": "#/$defs/Position",
+              "reaspirate": "#/$defs/Stroke",
+              "settings": "#/$defs/Settings",
+              "trailing_air": "#/$defs/Stroke",
+              "z_move": "#/$defs/ZMove"
+            },
+            "propertyName": "operation"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Stroke"
+            },
+            {
+              "$ref": "#/$defs/Empty"
+            },
+            {
+              "$ref": "#/$defs/Settings"
+            },
+            {
+              "$ref": "#/$defs/Delay"
+            },
+            {
+              "$ref": "#/$defs/Position"
+            },
+            {
+              "$ref": "#/$defs/ZMove"
+            },
+            {
+              "$ref": "#/$defs/Plld"
+            }
+          ]
+        },
+        "title": "Before Dispense",
+        "type": "array"
+      },
+      "after_dispense": {
+        "items": {
+          "discriminator": {
+            "mapping": {
+              "aspirate": "#/$defs/Stroke",
+              "delay": "#/$defs/Delay",
+              "dispense": "#/$defs/Stroke",
+              "empty": "#/$defs/Empty",
+              "leading_air": "#/$defs/Stroke",
+              "plld": "#/$defs/Plld",
+              "position": "#/$defs/Position",
+              "reaspirate": "#/$defs/Stroke",
+              "settings": "#/$defs/Settings",
+              "trailing_air": "#/$defs/Stroke",
+              "z_move": "#/$defs/ZMove"
+            },
+            "propertyName": "operation"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Stroke"
+            },
+            {
+              "$ref": "#/$defs/Empty"
+            },
+            {
+              "$ref": "#/$defs/Settings"
+            },
+            {
+              "$ref": "#/$defs/Delay"
+            },
+            {
+              "$ref": "#/$defs/Position"
+            },
+            {
+              "$ref": "#/$defs/ZMove"
+            },
+            {
+              "$ref": "#/$defs/Plld"
+            }
+          ]
+        },
+        "title": "After Dispense",
+        "type": "array"
+      },
+      "dispense_segments": {
+        "items": {
+          "$ref": "#/$defs/Segment"
+        },
+        "title": "Dispense Segments",
+        "type": "array"
+      },
+      "final_empty_speed_ul_s": {
+        "anyOf": [
+          {
+            "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "title": "Final Empty Speed Ul S"
+      },
+      "final_empty_before": {
+        "items": {
+          "discriminator": {
+            "mapping": {
+              "aspirate": "#/$defs/Stroke",
+              "delay": "#/$defs/Delay",
+              "dispense": "#/$defs/Stroke",
+              "empty": "#/$defs/Empty",
+              "leading_air": "#/$defs/Stroke",
+              "plld": "#/$defs/Plld",
+              "position": "#/$defs/Position",
+              "reaspirate": "#/$defs/Stroke",
+              "settings": "#/$defs/Settings",
+              "trailing_air": "#/$defs/Stroke",
+              "z_move": "#/$defs/ZMove"
+            },
+            "propertyName": "operation"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Stroke"
+            },
+            {
+              "$ref": "#/$defs/Empty"
+            },
+            {
+              "$ref": "#/$defs/Settings"
+            },
+            {
+              "$ref": "#/$defs/Delay"
+            },
+            {
+              "$ref": "#/$defs/Position"
+            },
+            {
+              "$ref": "#/$defs/ZMove"
+            },
+            {
+              "$ref": "#/$defs/Plld"
+            }
+          ]
+        },
+        "title": "Final Empty Before",
+        "type": "array"
+      },
+      "multi": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/Multi"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "phase_settings": {
+        "additionalProperties": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "propertyNames": {
+          "enum": [
+            "leading_air",
+            "aspirate",
+            "trailing_air",
+            "dispense"
+          ]
+        },
+        "title": "Phase Settings",
+        "type": "object"
+      },
+      "liquid_settings": {
+        "additionalProperties": true,
+        "title": "Liquid Settings",
+        "type": "object"
+      }
+    },
+    "required": [
+      "mode",
+      "channels",
+      "timeout_ms",
+      "target_liquid_ul",
+      "commanded_aspiration_ul",
+      "aspiration_speed_ul_s",
+      "aspiration_delay_ms",
+      "leading_air",
+      "trailing_air",
+      "before_leading_air",
+      "before_liquid",
+      "after_liquid",
+      "before_dispense",
+      "after_dispense",
+      "dispense_segments",
+      "final_empty_speed_ul_s",
+      "final_empty_before",
+      "multi"
+    ],
+    "title": "Recipe",
+    "type": "object"
+  },
+  "cavro_capabilities": {
+    "implementation": "original-adp.application.v1",
+    "controller_family": "original Cavro ADP",
+    "installed_firmware": null,
+    "installed_options": null,
+    "schema": {
+      "$defs": {
+        "Delay": {
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "delay",
+              "title": "Operation",
+              "type": "string"
+            },
+            "duration_ms": {
+              "minimum": 0,
+              "title": "Duration Ms",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "operation",
+            "duration_ms"
+          ],
+          "title": "Delay",
+          "type": "object"
+        },
+        "Empty": {
+          "additionalProperties": false,
+          "properties": {
+            "channels": {
+              "items": {
+                "maximum": 3,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 4,
+              "minItems": 1,
+              "title": "Channels",
+              "type": "array"
+            },
+            "timeout_ms": {
+              "exclusiveMinimum": 0,
+              "title": "Timeout Ms",
+              "type": "integer"
+            },
+            "operation": {
+              "const": "empty",
+              "title": "Operation",
+              "type": "string"
+            },
+            "speed_ul_s": {
+              "exclusiveMinimum": 0,
+              "title": "Speed Ul S",
+              "type": "number"
+            }
+          },
+          "required": [
+            "channels",
+            "timeout_ms",
+            "operation",
+            "speed_ul_s"
+          ],
+          "title": "Empty",
+          "type": "object"
+        },
+        "Plld": {
+          "additionalProperties": false,
+          "properties": {
+            "channels": {
+              "items": {
+                "maximum": 3,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 4,
+              "minItems": 1,
+              "title": "Channels",
+              "type": "array"
+            },
+            "timeout_ms": {
+              "exclusiveMinimum": 0,
+              "title": "Timeout Ms",
+              "type": "integer"
+            },
+            "operation": {
+              "const": "plld",
+              "title": "Operation",
+              "type": "string"
+            },
+            "start_steps": {
+              "title": "Start Steps",
+              "type": "integer"
+            },
+            "search_target_steps": {
+              "title": "Search Target Steps",
+              "type": "integer"
+            },
+            "search_speed_native": {
+              "exclusiveMinimum": 0,
+              "title": "Search Speed Native",
+              "type": "integer"
+            },
+            "z_motor_current": {
+              "title": "Z Motor Current",
+              "type": "integer"
+            },
+            "after_detection_steps": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "After Detection Steps"
+            },
+            "after_detection_speed_native": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "After Detection Speed Native"
+            }
+          },
+          "required": [
+            "channels",
+            "timeout_ms",
+            "operation",
+            "start_steps",
+            "search_target_steps",
+            "search_speed_native",
+            "z_motor_current"
+          ],
+          "title": "Plld",
+          "type": "object"
+        },
+        "Position": {
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "position",
+              "title": "Operation",
+              "type": "string"
+            },
+            "positioning": {
+              "additionalProperties": true,
+              "title": "Positioning",
+              "type": "object"
+            }
+          },
+          "required": [
+            "operation",
+            "positioning"
+          ],
+          "title": "Position",
+          "type": "object"
+        },
+        "Settings": {
+          "additionalProperties": false,
+          "properties": {
+            "channels": {
+              "items": {
+                "maximum": 3,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 4,
+              "minItems": 1,
+              "title": "Channels",
+              "type": "array"
+            },
+            "timeout_ms": {
+              "exclusiveMinimum": 0,
+              "title": "Timeout Ms",
+              "type": "integer"
+            },
+            "operation": {
+              "const": "settings",
+              "title": "Operation",
+              "type": "string"
+            },
+            "values": {
+              "additionalProperties": true,
+              "title": "Values",
+              "type": "object"
+            }
+          },
+          "required": [
+            "channels",
+            "timeout_ms",
+            "operation",
+            "values"
+          ],
+          "title": "Settings",
+          "type": "object"
+        },
+        "Stroke": {
+          "additionalProperties": false,
+          "properties": {
+            "channels": {
+              "items": {
+                "maximum": 3,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 4,
+              "minItems": 1,
+              "title": "Channels",
+              "type": "array"
+            },
+            "timeout_ms": {
+              "exclusiveMinimum": 0,
+              "title": "Timeout Ms",
+              "type": "integer"
+            },
+            "operation": {
+              "enum": [
+                "aspirate",
+                "dispense",
+                "leading_air",
+                "trailing_air",
+                "reaspirate"
+              ],
+              "title": "Operation",
+              "type": "string"
+            },
+            "volume_ul": {
+              "minimum": 0,
+              "title": "Volume Ul",
+              "type": "number"
+            },
+            "speed_ul_s": {
+              "exclusiveMinimum": 0,
+              "title": "Speed Ul S",
+              "type": "number"
+            },
+            "target_liquid_ul": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Target Liquid Ul"
+            }
+          },
+          "required": [
+            "channels",
+            "timeout_ms",
+            "operation",
+            "volume_ul",
+            "speed_ul_s"
+          ],
+          "title": "Stroke",
+          "type": "object"
+        },
+        "ZMove": {
+          "additionalProperties": false,
+          "properties": {
+            "operation": {
+              "const": "z_move",
+              "title": "Operation",
+              "type": "string"
+            },
+            "target_steps": {
+              "title": "Target Steps",
+              "type": "integer"
+            },
+            "speed_native": {
+              "exclusiveMinimum": 0,
+              "title": "Speed Native",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "operation",
+            "target_steps",
+            "speed_native"
+          ],
+          "title": "ZMove",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "implementation": {
+          "const": "original-adp.application.v1",
+          "title": "Implementation",
+          "type": "string"
+        },
+        "operations": {
+          "items": {
+            "discriminator": {
+              "mapping": {
+                "aspirate": "#/$defs/Stroke",
+                "delay": "#/$defs/Delay",
+                "dispense": "#/$defs/Stroke",
+                "empty": "#/$defs/Empty",
+                "leading_air": "#/$defs/Stroke",
+                "plld": "#/$defs/Plld",
+                "position": "#/$defs/Position",
+                "reaspirate": "#/$defs/Stroke",
+                "settings": "#/$defs/Settings",
+                "trailing_air": "#/$defs/Stroke",
+                "z_move": "#/$defs/ZMove"
+              },
+              "propertyName": "operation"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/Stroke"
+              },
+              {
+                "$ref": "#/$defs/Empty"
+              },
+              {
+                "$ref": "#/$defs/Settings"
+              },
+              {
+                "$ref": "#/$defs/Delay"
+              },
+              {
+                "$ref": "#/$defs/Position"
+              },
+              {
+                "$ref": "#/$defs/ZMove"
+              },
+              {
+                "$ref": "#/$defs/Plld"
+              }
+            ]
+          },
+          "title": "Operations",
+          "type": "array"
+        },
+        "liquid_settings": {
+          "additionalProperties": true,
+          "title": "Liquid Settings",
+          "type": "object"
+        },
+        "event_policy": {
+          "default": "stop",
+          "enum": [
+            "stop",
+            "pause_for_operator"
+          ],
+          "title": "Event Policy",
+          "type": "string"
+        }
+      },
+      "required": [
+        "implementation",
+        "operations"
+      ],
+      "title": "ApplicationRequest",
+      "type": "object"
+    },
+    "pressure_parameters": {
+      "plld_threshold_adc": {
+        "selector": 0,
+        "minimum": 1,
+        "maximum": 1000,
+        "published_default": 15,
+        "unit": "ADC counts",
+        "source": "399155 V1.0 p3",
+        "automatically_applied": false
+      },
+      "plld_persistence_ms": {
+        "selector": 1,
+        "minimum": 1,
+        "maximum": 100,
+        "published_default": 5,
+        "unit": "ms",
+        "source": "399155 V1.0 p3",
+        "automatically_applied": false
+      },
+      "plld_start_position_increments": {
+        "selector": 2,
+        "minimum": 0,
+        "maximum": 44000,
+        "published_default": 0,
+        "unit": "increments",
+        "source": "399155 V1.0 p3",
+        "automatically_applied": false
+      },
+      "plld_speed_increments_s": {
+        "selector": 3,
+        "minimum": 100,
+        "maximum": 1000,
+        "published_default": 150,
+        "unit": "increments/s",
+        "source": "399155 V1.0 p3",
+        "automatically_applied": false
+      },
+      "plld_travel_increments": {
+        "selector": 4,
+        "minimum": 500,
+        "maximum": 44000,
+        "published_default": 44000,
+        "unit": "increments",
+        "source": "399155 V1.0 p3",
+        "automatically_applied": false
+      },
+      "plld_direction": {
+        "selector": 5,
+        "minimum": 0,
+        "maximum": 1,
+        "published_default": 0,
+        "unit": "0 aspirate; 1 dispense",
+        "source": "399155 V1.0 p3",
+        "automatically_applied": false
+      },
+      "pressure_interval_ms": {
+        "selector": 6,
+        "minimum": 1,
+        "maximum": 20,
+        "published_default": 20,
+        "unit": "ms",
+        "source": "399155 V1.0 p3",
+        "automatically_applied": false
+      },
+      "pressure_samples_per_can": {
+        "selector": 7,
+        "minimum": 1,
+        "maximum": 3,
+        "published_default": 3,
+        "unit": "samples",
+        "source": "399155 V1.0 p3",
+        "automatically_applied": false
+      },
+      "hybrid_interval_ms": {
+        "selector": 8,
+        "minimum": 1,
+        "maximum": 100,
+        "published_default": 50,
+        "unit": "ms",
+        "source": "399155 V1.0 p3",
+        "automatically_applied": false
+      }
+    },
+    "slope": {
+      "wire": "Ln1,n2R",
+      "source": "399156 V1.0 p5",
+      "phase": "explicit ordered settings instruction"
+    },
+    "start_cutoff_speed": {
+      "status": "implemented",
+      "source": "30053815-C pp35\u201337,45",
+      "source_url": "https://www.docin.com/p-4632231525.html",
+      "unit": "uL/s",
+      "decimal_places": 3,
+      "automatically_applied": false,
+      "start_speed_ul_s": {
+        "wire": "vn,1R",
+        "minimum": 2.5,
+        "maximum": 100
+      },
+      "cutoff_speed_ul_s": {
+        "wire": "cn,1R",
+        "minimum": 2.5,
+        "maximum": 200
+      },
+      "phase": "explicit ordered settings; applies to subsequent plunger moves until changed",
+      "controller_conversion": "configured maximum volume; increments/s rounded to nearest integer",
+      "controller_interaction": "actual start/cutoff temporarily limited by top speed; readback reports programmed value",
+      "persistence": "working memory only; no NVRAM save emitted",
+      "advisory": "30053815-C p36 discourages cutoff >100 uL/s (lost steps/overload), especially adjacent moves without >10 ms delay; 399156 p9 uses 200 uL/s. No cap or delay is inserted."
+    },
+    "existing_native_families": {
+      "diagnostic_pipette": [
+        "aspirate",
+        "dispense",
+        "dispense_all",
+        "diagnoses",
+        "initialize",
+        "get_data",
+        "last_error",
+        "eject",
+        "plunger_up",
+        "plunger_down"
+      ],
+      "pipette_manual_physical": [
+        "load_tip",
+        "source_load_tips",
+        "measure_fluid_height",
+        "source_fluid_offset",
+        "source_calwith_fluid",
+        "source_mix",
+        "source_purge"
+      ]
+    },
+    "raw_pressure_streaming": {
+      "status": "implemented",
+      "classifier": false,
+      "samples_owner": "existing NovoRouter pressure observation/receipt path",
+      "verdict": null
+    },
+    "clot_classifier": {
+      "status": "unsupported",
+      "verdict": null
+    },
+    "air_classifier": {
+      "status": "unsupported",
+      "verdict": null
+    },
+    "adp_detect": {
+      "status": "different_controller_generation"
+    },
+    "tip_profiles": {
+      "T10": {
+        "design_intent": true,
+        "physical_fit_verified": false,
+        "pickup_mapping": "existing OEM T50/T200 only"
+      },
+      "T50": {
+        "design_intent": true,
+        "physical_fit_verified": false,
+        "pickup_mapping": "existing OEM T50/T200 only"
+      },
+      "T200": {
+        "design_intent": true,
+        "physical_fit_verified": false,
+        "pickup_mapping": "existing OEM T50/T200 only"
+      },
+      "T1000": {
+        "design_intent": true,
+        "physical_fit_verified": false,
+        "pickup_mapping": "existing OEM T50/T200 only"
+      }
+    }
+  },
+  "bindings": {
+    "cavro_liquid_recipe": {
+      "kind": "pipette_manual_physical",
+      "operation": "cavro_liquid_recipe",
+      "field": "recipe",
+      "compiler": "bioxp.pipette.cavro_liquid.compile_liquid_recipe",
+      "finite_operation": "cavro_application",
+      "finite_child": "sourceCavroApplication"
+    },
+    "park": {
+      "finite_operation": "park_gantry",
+      "finite_child": "parkGantry",
+      "omitted_rehome": false,
+      "source": "ControlLib.parkGantry:7071-7122",
+      "side_effects": [
+        "source tip ejection/query when TipExist",
+        "optional authored rehome",
+        "source Park location publication"
+      ]
+    },
+    "led": {
+      "owner": "BioXpTester.strip_set_rgb",
+      "camera_illumination": false
+    },
+    "seal_separate": {
+      "source": "ControlLib.scriptInterpretor.default SS",
+      "execution": "source_noop",
+      "physical_seal_separation": false,
+      "operator_completion_verified": null
+    },
+    "pipette_pierce": {
+      "owner": "ControlLib.movExecution",
+      "pattern_plate_ordinals": {
+        "d": [
+          0,
+          1,
+          2,
+          7,
+          8,
+          9,
+          10
+        ],
+        "r": [
+          0,
+          1,
+          2,
+          7,
+          8,
+          9,
+          10
+        ],
+        "h": [
+          2
+        ],
+        "t": [
+          0
+        ]
+      }
+    }
+  },
+  "physical_qualification": false
+}

@@ -2382,7 +2382,11 @@ class BioXpTester:
             return self._send_thermal(command, cmd_type, motor, value, **kwargs)
         if board_id == int(self.BOARD_CHILLER):
             return self._send_chiller(command, cmd_type, motor, value, **kwargs)
-        return self._send_motor(board_id, command, cmd_type, motor, value, **kwargs)
+        observation_binding = getattr(self, "_axis_position_observer", (None, None))
+        ack = self._send_motor(board_id, command, cmd_type, motor, value, **kwargs)
+        if int(command) == 6 and int(cmd_type) == 1 and self._tmcl_success(ack):
+            self._publish_axis_position(observation_binding, board_id, motor, ack.get("value"))
+        return ack
 
     def query_only_transport_state(self):
         """Return ownership/open state only; do not infer it from board replies."""
@@ -2707,7 +2711,31 @@ class BioXpTester:
             "ok": source_return_code == 0,
         }
 
+    def set_axis_position_observer(self, observer, *, ownership_generation):
+        """Bind a display-only sink; it must not perform I/O or admit motion."""
+        self._axis_position_observer = (observer, ownership_generation)
+
+    def _publish_axis_position(self, binding, board_id, motor, position):
+        observer, generation = binding
+        if not callable(observer) or type(position) is not int:
+            return
+        observed_at = time.time()
+        key = (int(board_id), int(motor))
+        axis = next((name for name in ("x", "y", "z")
+                     if (self.MOTOR_AXIS_PRESETS[name]["board"],
+                         self.MOTOR_AXIS_PRESETS[name]["motor"]) == key), None)
+        if axis is not None:
+            try:
+                observer(axis=axis, position_steps=position,
+                         observed_at=observed_at, ownership_generation=generation)
+            except Exception:
+                # Display delivery is never a physical prerequisite.
+                pass
+
     def motor_get_position(self, board_id, motor=0):
+        # Capture the binding BEFORE the query: reconnect must not relabel an
+        # in-flight old-owner reply with the replacement owner's generation.
+        observation_binding = getattr(self, "_axis_position_observer", (None, None))
         # GAP param 1 = actual position (from prior direct experiments).
         row = self.motor_get_axis_param(board_id, 1, motor=motor)
         key = (int(board_id), int(motor))
@@ -2720,6 +2748,7 @@ class BioXpTester:
             position = int(row["value"])
             cache[key] = position
             position_source = "controller_reply"
+            self._publish_axis_position(observation_binding, board_id, motor, position)
         elif row.get("ack") is None:
             position = int(cache.get(key, -1000))
             position_source = "oem_cached"

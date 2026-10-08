@@ -1526,22 +1526,13 @@ class OperatorReceiptStore:
 
 
 _LEGACY_COMMAND_COLUMNS = frozenset({
-    "command_id", "stream_sequence", "method_id", "method_sequence", "action_id",
+    "command_id", "stream_sequence", "action_id",
     "requested_json", "effective_json", "status", "version", "ownership_generation",
     "queued_at", "dispatched_at", "finished_at", "source_noop", "source_noop_reason",
     "remote_acknowledged", "controller_acknowledged", "physical_effect_verified", "terminal_json",
 })
-_LEGACY_METHOD_COLUMNS = frozenset({
-    "method_id", "name", "digest", "failure_policy", "status", "version",
-    "ownership_generation", "expanded_count", "first_stream_sequence",
-    "last_stream_sequence", "queued_at", "updated_at",
-})
 _LEGACY_NONTERMINAL_COMMAND_STATES = frozenset({
     "queued", "dispatched", "issued_pending", "stop_requested", "abort_requested",
-})
-_LEGACY_NONTERMINAL_METHOD_STATES = frozenset({
-    "queued", "running", "pause_requested", "paused", "cancel_requested",
-    "stopping", "aborting", "recovery_required",
 })
 
 
@@ -1625,12 +1616,12 @@ class OperatorHistoryReader:
                 (command_id,),
             ).fetchone()
             transition_sequence = selected[0] if selected and selected[0] is not None else None
-        return {
+        response = {
             "schema_version": "bioxp.operator_command_receipt.v1",
             "source": "legacy_operator_plane",
             "command_id": command_id,
-            "method_id": row["method_id"],
-            "method_sequence": row["method_sequence"],
+            "method_id": dict(row).get("method_id"),
+            "method_sequence": dict(row).get("method_sequence"),
             "stream_sequence": int(row["stream_sequence"]),
             "action_id": str(row["action_id"]),
             "status": "ambiguous" if nonterminal else stored_status,
@@ -1658,6 +1649,14 @@ class OperatorHistoryReader:
             "completion_class": terminal.get("completion_class") if isinstance(terminal, Mapping) else None,
             "transition_sequence": transition_sequence,
         }
+        if self._table_columns("runtime_retired_records") is not None:
+            from .runtime_method_retirement_v15 import command_history
+            history = command_history(self.connection, command_id)
+            if history is not None:
+                response["retired_method_history"] = history
+                response["method_id"] = history["original_command"]["method_id"]
+                response["method_sequence"] = history["original_command"]["method_sequence"]
+        return response
 
     def get_command(self, command_id: str) -> dict[str, Any] | None:
         with self.lock:
@@ -1718,42 +1717,7 @@ class OperatorHistoryReader:
             })
             return projection
 
-    def get_method(self, method_id: str) -> dict[str, Any] | None:
-        with self.lock:
-            if self.connection is None or not self._require_schema("operator_plane_methods", _LEGACY_METHOD_COLUMNS):
-                return None
-            row = self.connection.execute(
-                "SELECT * FROM operator_plane_methods WHERE method_id=?", (str(method_id),)
-            ).fetchone()
-            if row is None:
-                return None
-            stored_status = str(row["status"])
-            nonterminal = stored_status in _LEGACY_NONTERMINAL_METHOD_STATES
-            return {
-                "schema_version": "bioxp.operator_method_receipt.v1",
-                "source": "legacy_operator_plane",
-                "method_id": str(row["method_id"]), "name": str(row["name"]),
-                "method_digest": str(row["digest"]),
-                "status": "ambiguous" if nonterminal else stored_status,
-                "stored_status": stored_status, "recovery_required": nonterminal,
-                "automatic_retry": False, "version": int(row["version"]),
-                "ownership_generation": int(row["ownership_generation"]),
-                "expanded_count": int(row["expanded_count"]),
-                "first_stream_sequence": row["first_stream_sequence"],
-                "last_stream_sequence": row["last_stream_sequence"],
-                "queued_at": float(row["queued_at"]), "updated_at": float(row["updated_at"]),
-                "failure_policy": str(row["failure_policy"]),
-            }
 
-    def list_method_commands(self, method_id: str) -> list[dict[str, Any]]:
-        with self.lock:
-            if self.connection is None or not self._require_schema("operator_plane_commands", _LEGACY_COMMAND_COLUMNS):
-                return []
-            rows = self.connection.execute(
-                "SELECT * FROM operator_plane_commands WHERE method_id=? "
-                "ORDER BY method_sequence,stream_sequence", (str(method_id),),
-            ).fetchall()
-            return [self._command_projection(row) for row in rows]
 
     def close(self) -> None:
         with self.lock:
