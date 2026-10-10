@@ -677,6 +677,11 @@ class BioXpCanDriver:
         if address not in ids:
             raise ValueError(f"Unknown pipette CAN address kind: {address!r}")
         self._pipette_last_command = command_name or f"pipette:{ascii_command}"
+        if address != "report":
+            # Passive revision only: legacy commands retain their exact send,
+            # wait and accounting behavior; typed buffer evidence detects an
+            # intervening unmodelled command rather than assuming continuity.
+            self._pipette_buffer_revision = getattr(self, "_pipette_buffer_revision", 0) + 1
         return self._send_ascii_packet(
             ids[address],
             ascii_command,
@@ -694,18 +699,26 @@ class BioXpCanDriver:
         from .pipette.cavro_receiving import decode_report
         mode = compiled["wait_mode"]
         address = {0: "control", 1: "command", 6: "report"}[compiled["can_command_type"]]
-        ack_mode = "query" if mode == "report" else "ack" if mode in {"ack", "control"} else "command"
-        result = self._send_pipette_command(
-            compiled["ascii"], address=address, ack_mode=ack_mode,
-            command_name=("cavro_active_diagnostic" if str(compiled.get("report_kind") or "").startswith("diagnostic_")
-                          else "cavro_device_" + mode),
-            wait_for_completion=mode == "report", response_timeout_s=timeout_ms / 1000.0)
+        observe_answers = mode == "control" and bool(compiled.get("response_descriptors"))
+        ack_mode = "query" if mode == "report" else "ack" if mode in {"ack", "control"} and not observe_answers else "command"
+        from contextlib import nullcontext
+        router = getattr(self.bus, "router", None)
+        descriptors = compiled.get("response_descriptors") or []
+        scope = router.typed_pipette_responses(descriptors) if router is not None else nullcontext()
+        with scope:
+            result = self._send_pipette_command(
+                compiled["ascii"], address=address, ack_mode=ack_mode,
+                command_name=("cavro_active_diagnostic" if str(compiled.get("report_kind") or "").startswith("diagnostic_")
+                              else "cavro_device_" + mode),
+                wait_for_completion=mode == "report", response_timeout_s=timeout_ms / 1000.0)
         provenance = result.get("provenance") or {}
-        if mode == "completion":
+        if mode == "completion" or observe_answers:
             self._pipette_completion_owner_token = provenance.get("completion_owner_token")
         result.update({key: compiled.get(key) for key in
                        ("wait_mode", "report_kind", "units", "persistent", "warnings", "requested",
-                        "command_effects", "program", "buffer_action", "effects_deferred")})
+                        "command_effects", "program", "buffer_action", "effects_deferred",
+                        "response_descriptors", "buffer_context", "completion_attribution_unknown")})
+        result["observation_completion_only"] = observe_answers
         result["physical_effect_verified"] = False
         if mode == "report":
             report = decode_report(compiled, result.get("ack", {}).get("data", []))

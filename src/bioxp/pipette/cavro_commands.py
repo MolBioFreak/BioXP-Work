@@ -634,6 +634,16 @@ def compile_device_program(payload: DeviceProgram | dict) -> dict:
     special = not effects or any(e["kind"] in ("halt", "control_transfer") or e["command"] == "loop_end" and Decimal(numeric_spelling(e["requested"]["repetitions"])) == 0 for e in effects)
     result = _envelope(wire, r, wait_mode="ack" if program.mode == "append" else ("control" if special else "completion"),
                        persistent=program.mode == "execute" and any(e["persistent_write"] and e["reachable_in_authored_string"] for e in effects), warnings=warnings)
+    responses = []
+    has_loop = any(e["command"] in {"loop_start", "loop_end"} for e in effects)
+    for index, member in enumerate(program.commands):
+        item = compile_device_command(member)
+        if effects[index]["reachable_in_authored_string"] and str(item.get("report_kind") or "").startswith("diagnostic_"):
+            responses.append({"command_index": index, "ascii": item["ascii"], "report_kind": item["report_kind"],
+                              "units": item["units"], "requested": item["requested"],
+                              "attribution_unknown": has_loop,
+                              "terminal_answer": index == len(program.commands) - 1 and not special and not has_loop})
+    result["response_descriptors"] = responses
     result.update(program=r, command_effects=effects, buffer_action="append" if program.mode == "append" else "append_and_execute",
                   effects_deferred=program.mode == "append")
     return result
@@ -668,6 +678,9 @@ def device_command_catalog() -> dict:
                                         for name, v in LLD_PARAMETERS.items()],
                      "semantics": {"ack_is_completion": False, "persistent_means": "explicit NVRAM write requested, not verified",
                                    "append_effects": "deferred until explicit execution", "halt_ready_is_completion": False,
+                                   "program_diagnostics": {"source": "30053815-C p56", "response_descriptors": "ordered authored command indices, report_kind, units and terminal_answer",
+                                       "received_reports": "ordered active answers retained with ingress provenance; intermediate answer is not whole-program completion",
+                                       "loop_attribution": "raw ordered answers retained; occurrence attribution unknown without a proven cursor"},
                                    "automatic_reset": False, "automatic_retry": False,
                                    "reports_while_busy": True, "q_minimum_poll_ms": 100,
                                    "error_during_execution": "terminates execution and erases buffer",

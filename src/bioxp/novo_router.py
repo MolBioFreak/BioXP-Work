@@ -95,6 +95,9 @@ class _PipetteCompletion:
     event: threading.Event = field(default_factory=threading.Event)
     ack_frame: NovoFrame | None = None
     frame: NovoFrame | None = None
+    response_descriptors: list = field(default_factory=list)
+    active_answers: list = field(default_factory=list)
+    active_answer_overflow_count: int = 0
     duplicate_terminal_count: int = 0
     rejected_reason: str | None = None
 
@@ -132,6 +135,7 @@ class NovoRouter:
         self._pending_lock = threading.Lock()
         self._pending: _PendingTransaction | None = None
         self._completion_lock = threading.Lock()
+        self._typed_receive_context = threading.local()
         self._pipette_completions: dict[int, _PipetteCompletion] = {}
         self._interrupted_pipette_completions: dict[tuple[int, str], _PipetteCompletion] = {}
         self._pipette_completion_taints: dict[int, dict[str, Any]] = {}
@@ -465,6 +469,23 @@ class NovoRouter:
                 ):
                     if frame.dlc == 0:
                         completion.ack_frame = frame
+                        completion_matched = True
+                    elif (completion.response_descriptors and 2 < frame.dlc <= 8
+                          and len(frame.data) == frame.dlc):
+                        # p56: each d returns an answer. Only the last authored
+                        # diagnostic at the end of the string may finish it.
+                        index = len(completion.active_answers)
+                        if index < 256:
+                            completion.active_answers.append(frame)
+                        else:
+                            completion.active_answer_overflow_count += 1
+                        descriptor = (completion.response_descriptors[index]
+                                      if index < len(completion.response_descriptors) else {})
+                        if completion.frame is None and (frame.data[0] != 0x20 or
+                            index == len(completion.response_descriptors) - 1
+                            and descriptor.get("terminal_answer")):
+                            completion.frame = frame
+                            completion.event.set()
                         completion_matched = True
                     elif (frame.dlc == 2 and len(frame.data) == 2) or (
                         completion.command_name == "cavro_active_diagnostic"
@@ -868,6 +889,19 @@ class NovoRouter:
             "started_at": self._pressure_epoch_started_at,
         }
 
+    def typed_pipette_responses(self, descriptors):
+        """Scope typed metadata to this sender thread; no routing/send gate."""
+        from contextlib import contextmanager
+        @contextmanager
+        def scoped():
+            prior = getattr(self._typed_receive_context, "descriptors", None)
+            self._typed_receive_context.descriptors = descriptors
+            try:
+                yield
+            finally:
+                self._typed_receive_context.descriptors = prior
+        return scoped()
+
     def prepare_pipette_completion(
         self,
         channel: int,
@@ -937,6 +971,7 @@ class NovoRouter:
                 command_family=None if command_family is None else int(command_family),
                 command_name=None if command_name is None else str(command_name),
                 expected_rx_id=expected_rx_id,
+                response_descriptors=list(getattr(self._typed_receive_context, "descriptors", None) or []),
                 transaction_id="legacy-unbound-owner" if legacy_owner else None,
                 tx_started_at=registered_at if legacy_owner else None,
             )
@@ -974,6 +1009,16 @@ class NovoRouter:
                 raise NovoRouterError(f"pipette {channel} completion is already bound")
             completion.transaction_id = str(transaction_id)
             completion.tx_started_at = float(tx_started_at)
+
+    def snapshot_pipette_answers(self, channel, *, owner_token):
+        """Read already-received answers without waiting/consuming the owner."""
+        with self._completion_lock:
+            owner = self._pipette_completions.get(int(channel))
+            if owner is None or owner.owner_token != owner_token:
+                owner = self._interrupted_pipette_completions.get((int(channel), owner_token))
+            if owner is None:
+                return []
+            return [frame.provenance() for frame in owner.active_answers]
 
     def wait_pipette_completion(
         self,
@@ -1037,7 +1082,7 @@ class NovoRouter:
                 or frame.arbitration_id == completion.expected_rx_id
             )
             and (frame.arbitration_id & 0x7) == completion.command_family
-            and (frame.dlc == 2 or (completion.command_name == "cavro_active_diagnostic" and 2 <= frame.dlc <= 8))
+            and (frame.dlc == 2 or ((completion.command_name == "cavro_active_diagnostic" or completion.response_descriptors) and 2 <= frame.dlc <= 8))
             and len(frame.data) == frame.dlc
             and frame.data[0] == 0x20
         )
@@ -1071,6 +1116,9 @@ class NovoRouter:
             "receive_timestamp": frame.received_at if frame is not None else None,
             "immediate_ack_received": completion.ack_frame is not None,
             "immediate_ack": completion.ack_frame.provenance() if completion.ack_frame is not None else None,
+            **({"active_answers": [answer.provenance() for answer in completion.active_answers],
+                "response_descriptors": completion.response_descriptors,
+                "active_answer_overflow_count": completion.active_answer_overflow_count} if completion.response_descriptors else {}),
             "duplicate_terminal_count": completion.duplicate_terminal_count,
             "outcome": "completion" if valid else (
                 completion.rejected_reason
