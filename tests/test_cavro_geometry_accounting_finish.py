@@ -73,11 +73,16 @@ def accounting(known=True):
 
 def authored(tapered=False, known=True):
     r = recipe()
+    destination = surface(False, '0')
+    destination['reference']['vessel']['vessel_id'] = 'destination'
+    destination['intent'] = 'contact'
     r.update(channels=[2], target_liquid_ul='20', commanded_aspiration_ul='22',
         leading_air={'volume_ul': '2', 'speed_ul_s': '30'},
         trailing_air={'volume_ul': '1', 'speed_ul_s': '30'},
-        before_liquid=[surface(tapered, '16' if tapered else '20')],
-        after_liquid=[], before_dispense=[], after_dispense=[],
+        before_liquid=[{'operation': 'position', 'rack_transform': rack(),
+            'positioning': {'operation': 'move', 'location_id': 2, 'well': 'A1', 'position_flag': 1}},
+            surface(tapered, '16' if tapered else '20')],
+        after_liquid=[], before_dispense=[destination], after_dispense=[],
         final_empty_speed_ul_s=None, shared_head=head(), accounting_context=accounting(known),
         aspiration_intent={'role': 'sample', 'channel_vessels': {'2': 'source'}},
         dispense_segments=[{'volume_ul': '5', 'speed_ul_s': '30', 'target_liquid_ul': '4',
@@ -205,7 +210,7 @@ def test_request_recipe_real_finite_transport_stores_http(wire_rig, installed_re
     r = authored(tapered, known)
     if known is None:
         r['accounting_context']['vessels'][0]['fill_ul'] = None
-        r['before_liquid'][0]['reference']['vessel']['fill_ul'] = None
+        r['before_liquid'][-1]['reference']['vessel']['fill_ul'] = None
     job = submit(app, client, [action('pipette_manual_physical', {'operation': 'cavro_liquid_recipe', 'recipe': r})],
                  key=f'finish-{tapered}-{known}')
     done = await_job(client, job, lambda r: r['command']['terminal'])
@@ -213,6 +218,12 @@ def test_request_recipe_real_finite_transport_stores_http(wire_rig, installed_re
     export(f'finish-{tapered}-{known}', {'request': r, 'result': done, 'wire': wire_rig.wire, 'moves': native.moves})
     assert source.get('ok'), source.get('error', done)
     assert ('z', 39050 if known is None else 39650 if tapered else 39850, True) in native.moves
+    assert ('z', 40050, True) in native.moves  # explicit destination contact
+    assert any(m[0] == 'x' and m[1] == 1800 for m in native.moves)
+    references = [e['result'] for e in source['events'] if e['operation'] == 'surface_reference']
+    assert references[0]['mounted_tip_footprints'][1]['coordinate_known']
+    assert references[0]['mounted_tip_footprints'][1]['tip_reference_steps']['z'] == str(references[0]['target_steps'] + 1000)
+    assert references[1]['detection']['vessel_state']['vessel_id'] == 'destination'
     event = [e for e in source['events'] if e['operation'] == 'dispense'][-1]
     channel = event['result']['channels'][0]
     # Follow actual transport publication rather than an invented success row.
@@ -309,7 +320,7 @@ def test_label_only_changes_no_commands():
 def test_multi_roles_labels_and_exact_completed_travel(wire_rig):
     r = authored()
     r.update(mode='multi', target_liquid_ul='30', commanded_aspiration_ul='35',
-             before_liquid=[], dispense_segments=[])
+             before_liquid=[], before_dispense=[], dispense_segments=[])
     r['accounting_context']['vessels'][0]['fill_ul'] = '60'
     segment = {'volume_ul': '4', 'speed_ul_s': '30', 'target_liquid_ul': '3',
                'accounting_intent': {'role': 'sample', 'channel_vessels': {'2': 'destination'}}}
