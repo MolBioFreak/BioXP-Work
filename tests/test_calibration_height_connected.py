@@ -29,6 +29,7 @@ def test_composed_height_full_before_partial_save_later_edit_restore(installed_r
     from bioxp.oem_runtime_store import OEMRuntimeStore
     from bioxp.oem_calibration_settings import CalibrationSettingsService, CalibrationSettingsPatch, load_saved_calibration
     app,provider,primitives,references,root=installed_retained
+    monkeypatch.setenv("BIOXP_PROTOCOL_JOBS_ROOT", str(tmp_path / "artifacts"))
     snapshot=bind_serial206_oem_snapshot(monkeypatch)
     snapshot=replace(snapshot,fields={**snapshot.fields,"machine.calibrated":replace(snapshot.fields["machine.calibrated"],value=machine_calibrated)})
     settings_store=OEMRuntimeStore(root)

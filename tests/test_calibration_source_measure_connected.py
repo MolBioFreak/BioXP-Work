@@ -122,6 +122,7 @@ def test_measurement_hold_preserves_prior_values_on_termination(installed_retain
     from tests.test_calibration_measurements import prompt
     from fastapi.testclient import TestClient
     app,*_=installed_retained
+    monkeypatch.setenv("BIOXP_PROTOCOL_JOBS_ROOT", str(tmp_path / "artifacts"))
     mount_protocol_routes(app)
     app.add_api_route("/protocol/jobs/{job_id}/control",api.protocol_job_control,methods=["POST"])
     client=TestClient(app)
