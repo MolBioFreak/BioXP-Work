@@ -355,7 +355,7 @@ def resolve_rack_transform(transform: Mapping[str, Any], shared_head=None, chann
               "mounted_tip_footprints": [], "physical_fit_verified": False, "shared_z": True}
     try:
         with localcontext() as ctx:
-            ctx.prec = decimal_work_precision(transform) * 2
+            ctx.prec = decimal_work_precision(transform, shared_head) * 2
             ctx.traps[Inexact] = True
             axes = ("x", "y", "z")
             wells = transform["channel_wells"]
@@ -393,7 +393,9 @@ def resolve_rack_transform(transform: Mapping[str, Any], shared_head=None, chann
                         row["well_offset_mm"] = {a: format(xyz[a] - center[a], "f") for a in axes}
                 result["mounted_tip_footprints"].append(row)
     except (ValueError, ArithmeticError) as exc:
-        result.update(geometry_used=False, observation=str(exc))
+        # Once the exact rack target is resolved, optional observation failure
+        # cannot deselect it or choose a different physical fallback.
+        result.update(observation=str(exc))
     return result
 
 

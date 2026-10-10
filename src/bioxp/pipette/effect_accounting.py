@@ -11,6 +11,25 @@ from typing import Literal
 from pydantic import Field
 from .cavro_geometry import GeometryInput, VesselGeometry, vessel_state, decimal_work_precision
 from .cavro_commands import Number
+from contextvars import ContextVar
+from contextlib import contextmanager
+
+
+application_accounting_context: ContextVar[tuple[str, Mapping] | None] = ContextVar('application_accounting_context', default=None)
+
+
+@contextmanager
+def accounting_occurrence(scope, context):
+    """Bind optional evidence to the inline occurrence, including device paths.
+
+    Reset on every exit; subsequent ordinary commands must never inherit a
+    declared initial state or vessel context from a finished application.
+    """
+    token = application_accounting_context.set((scope, context) if context is not None else None)
+    try:
+        yield
+    finally:
+        application_accounting_context.reset(token)
 
 
 class Compartment(GeometryInput):
@@ -139,7 +158,8 @@ def application_accounting(events, context, *, incomplete):
 
 
 class CompletedEffectAccount:
-    def __init__(self, initial=None, vessels=()):
+    def __init__(self, initial=None, vessels=(), *, track_inventory=True):
+        self.track_inventory = track_inventory
         self.pneumatic_delta = Decimal(0)
         self.intended_delta = Decimal(0)
         self.unknown_liquid_effect = False
@@ -189,27 +209,28 @@ class CompletedEffectAccount:
                 self.intended_delta += intended
             else:
                 self.unknown_liquid_effect = True
-            context = result.get('accounting_intent') or {}
-            role = context.get('role') or result.get('liquid_phase') or operation
-            front = (result.get('dispense_type') == 1 if outgoing else
-                     result.get('front_air', True) and operation != 'cavro_reaspirate')
-            kind = ('front_air' if front else 'rear_air') if air else 'liquid'
-            # Pneumatic 'liquid' means a stroke labelled liquid, not actual liquid.
-            p = self.pneumatic.apply(pneumatic, kind, context.get('label'))
-            # Air interfaces in the intent inventory use explicit air commands,
-            # but liquid traversals use only target_liquid_ul, never volume_ul.
-            intent_amount = pneumatic if air else intended
-            i = self.intent.apply(intent_amount, kind, context.get('label'), selected_kind_only=True)
-            transitions = {'pneumatic': p, 'authored_liquid_intent': i}
-            totals = self.roles.setdefault(role, {'count': 0, 'pneumatic_travel_ul': Decimal(0), 'liquid_intent_travel_ul': Decimal(0)})
-            totals['count'] += 1
-            totals['pneumatic_travel_ul'] += abs(pneumatic or Decimal(0))
-            totals['liquid_intent_travel_ul'] += abs(intended or Decimal(0))
-            endpoint = result.get('accounting_vessel_id')
-            if endpoint in self.vessel_deltas and intended is not None:
-                self.vessel_deltas[endpoint] -= intended
-            elif endpoint in self.vessel_deltas:
-                self.unknown_vessels.add(endpoint)
+            if self.track_inventory:
+                context = result.get('accounting_intent') or {}
+                role = context.get('role') or result.get('liquid_phase') or operation
+                front = (result.get('dispense_type') == 1 if outgoing else
+                         result.get('front_air', True) and operation != 'cavro_reaspirate')
+                kind = ('front_air' if front else 'rear_air') if air else 'liquid'
+                # Pneumatic 'liquid' means a stroke labelled liquid, not actual liquid.
+                p = self.pneumatic.apply(pneumatic, kind, context.get('label'))
+                # Air interfaces in the intent inventory use explicit air commands,
+                # but liquid traversals use only target_liquid_ul, never volume_ul.
+                intent_amount = pneumatic if air else intended
+                i = self.intent.apply(intent_amount, kind, context.get('label'), selected_kind_only=True)
+                transitions = {'pneumatic': p, 'authored_liquid_intent': i}
+                totals = self.roles.setdefault(role, {'count': 0, 'pneumatic_travel_ul': Decimal(0), 'liquid_intent_travel_ul': Decimal(0)})
+                totals['count'] += 1
+                totals['pneumatic_travel_ul'] += abs(pneumatic or Decimal(0))
+                totals['liquid_intent_travel_ul'] += abs(intended or Decimal(0))
+                endpoint = result.get('accounting_vessel_id')
+                if endpoint in self.vessel_deltas and intended is not None:
+                    self.vessel_deltas[endpoint] -= intended
+                elif endpoint in self.vessel_deltas:
+                    self.unknown_vessels.add(endpoint)
         return {
             'basis': 'completed_command_intent_not_measured_liquid',
             'initial_fill_known': self.pneumatic.initially_known,
@@ -221,12 +242,12 @@ class CompletedEffectAccount:
             'unknown_liquid_effect': self.unknown_liquid_effect,
             'unknown_pneumatic_effect': self.unknown_pneumatic_effect,
             'measured_liquid_ul': None,
-            'occupancy': {'pneumatic': self.pneumatic.snapshot(), 'authored_liquid_intent': self.intent.snapshot(),
+            **({'occupancy': {'pneumatic': self.pneumatic.snapshot(), 'authored_liquid_intent': self.intent.snapshot(),
                 'initial_state': deepcopy(self.initial),
                 'transitions': transitions, 'completed_strokes': self.completed_strokes,
                 'roles': {k: {f: format(v, "f") if isinstance(v, Decimal) else v for f, v in row.items()} for k, row in self.roles.items()},
                 'vessels': [dict(vessel_state(v if k not in self.unknown_vessels else dict(v, fill_ul=None), self.vessel_deltas[k]),
                                  unknown_completed_liquid_effect=k in self.unknown_vessels,
                                  scope='per_channel_endpoint_intent_not_aggregate_vessel') for k, v in self.vessels.items()],
-                'physical_delivery_verified': False, 'capacity_enforced': False},
+                'physical_delivery_verified': False, 'capacity_enforced': False}} if self.track_inventory else {}),
         }

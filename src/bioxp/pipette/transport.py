@@ -264,12 +264,14 @@ class CanPipetteTransport:
         """Apply deterministic host accounting only after correlated completion."""
         operation = str(command).replace(" ", "_")
         volume = float(result.get("volume_ul", 0.0) or 0.0)
-        from .effect_accounting import CompletedEffectAccount
-        if not hasattr(self, "_effect_account"):
-            self._effect_account = CompletedEffectAccount()
-        scope = result.get("accounting_scope")
-        if scope is not None and getattr(self, "_effect_account_scope", None) != scope:
-            self._effect_account = CompletedEffectAccount(result.get("accounting_initial"), result.get("accounting_vessels", []))
+        from .effect_accounting import CompletedEffectAccount, application_accounting_context
+        occurrence = application_accounting_context.get()
+        scope, context = occurrence if occurrence is not None else (None, None)
+        if not hasattr(self, "_effect_account") or getattr(self, "_effect_account_scope", None) != scope:
+            initial = next((row for row in (context or {}).get("initial_channels", [])
+                            if row["channel"] == self._pipette_id), None)
+            self._effect_account = CompletedEffectAccount(initial, (context or {}).get("vessels", []),
+                                                           track_inventory=context is not None)
             self._effect_account_scope = scope
         account_operation, account_result = operation, result
         if operation == "cavro_device_command":

@@ -416,10 +416,6 @@ def _send_wire(group, channels, wire, timeout_ms, *, after_sends=None, effect="c
         # earlier channels to exceptions; keep the failing raw response too.
         transport._assert_driver_result(effect, raw)
         values = dict(inputs or {})
-        context = values.get("accounting_context")
-        if context is not None:
-            values["accounting_initial"] = next((v for v in context.get("initial_channels", []) if v["channel"] == channel), None)
-            values["accounting_vessels"] = context.get("vessels", [])
         intent = values.get("accounting_intent") or {}
         values["accounting_vessel_id"] = intent.get("channel_vessels", {}).get(str(channel))
         return {"ok": raw.get("ok") is True, "driver_result": raw,
@@ -442,7 +438,13 @@ def _send_wire(group, channels, wire, timeout_ms, *, after_sends=None, effect="c
 
 def run_application_inline(provider, request: Mapping[str, Any], *, command_id: str,
                            owner_identity: Mapping[str, Any]) -> dict[str, Any]:
+    from .effect_accounting import accounting_occurrence
     plan = compile_application(request)
+    with accounting_occurrence(command_id + ":" + owner_identity["source_identity"], plan["requested"].get("accounting_context")):
+        return _run_application_inline(provider, plan, command_id=command_id, owner_identity=owner_identity)
+
+
+def _run_application_inline(provider, plan, *, command_id, owner_identity):
     request = plan["requested"]
     result = {"kind": "cavro_application", "implementation": IMPLEMENTATION,
               "requested": plan["requested"], "liquid_settings": plan.get("liquid_settings", {}),
@@ -494,18 +496,26 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                 getattr(exc, "detail", getattr(exc, "pipette_partial_result", None))))
             raise
 
+    def trajectory_evidence(body, targets, transform=None, channels=()):
+        if request.get("shared_head") is not None:
+            try:
+                body.update(mounted_trajectory(request["shared_head"], targets, transform, channels))
+            except Exception as exc:
+                body["observation_error"] = str(exc)
+        return body
+
     def z_move(target, speed):
         record("z_speed", lambda: provider.primitives.z_set_max_speed(speed), inputs={"speed_native": speed})
-        body = record("z_move", lambda: provider.moveZ(target), inputs={"target_steps": target})
-        head_targets["z"] = target
+        head_targets.pop("z", None)
+        body = record("z_move", lambda: trajectory_evidence(provider.moveZ(target),
+            {**head_targets, "z": target}, last_rack), inputs={"target_steps": target})
+        if body.get("ok") is True:
+            head_targets["z"] = target
         return body
 
     def footprints(geometry, move, channels=()):
-        if request.get("shared_head") is not None:
-            transform = move["reference"].get("transform") if move["reference"]["kind"] == "rack" else last_rack
-            geometry.update(mounted_trajectory(request["shared_head"],
-                {**head_targets, "z": geometry["target_steps"]}, transform, channels))
-        return geometry
+        transform = move["reference"].get("transform") if move["reference"]["kind"] == "rack" else last_rack
+        return trajectory_evidence(geometry, {**head_targets, "z": geometry["target_steps"]}, transform, channels)
 
     try:
         for index, op in enumerate(plan["operations"]):
@@ -530,11 +540,14 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
             elif kind == "position":
                 if op.get("resolved_rack") is not None:
                     record("rack_geometry", lambda: {"ok": True, **op["resolved_rack"]}, inputs=op)
-                record("position", lambda: provider._wp8_execute_nested_plan(
+                # Legacy positioning can move/retract several axes. Do not
+                # reuse the preceding rack pose as current coordinates.
+                head_targets.clear()
+                positioned = record("position", lambda: provider._wp8_execute_nested_plan(
                     plan=op["native_plan"], command_id=command_id,
                     owner_identity={**owner_identity, "source_identity":
                         f"{owner_identity['source_identity']}:cavro:position:{index}"}), inputs=op["positioning"])
-                if (op.get("resolved_rack") or {}).get("geometry_used"):
+                if (op.get("resolved_rack") or {}).get("geometry_used") and positioned.get("ok") is True:
                     last_rack = op["rack_transform"]
                     head_targets.update({a: op["resolved_rack"]["target_steps"][a] for a in ("x", "y")})
             elif kind == "profile_pickup":
@@ -543,11 +556,12 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                 # Explicit general-purpose pickup. Retain existing station/well
                 # routing and finite ownership; do not assign OEM T50/T200 type,
                 # inventory or tip-location from a requested profile.
-                record("profile_pickup_position", lambda: provider._wp8_execute_nested_plan(
+                head_targets.clear()
+                positioned = record("profile_pickup_position", lambda: provider._wp8_execute_nested_plan(
                     plan=op["native_plan"], command_id=command_id, owner_identity={**owner_identity,
                         "source_identity": f"{owner_identity['source_identity']}:cavro:pickup:{index}"}),
                     inputs=op["calibration"])
-                if (op.get("resolved_rack") or {}).get("geometry_used"):
+                if (op.get("resolved_rack") or {}).get("geometry_used") and positioned.get("ok") is True:
                     last_rack = op["calibration"]["rack_transform"]
                     head_targets.update({a: op["resolved_rack"]["target_steps"][a] for a in ("x", "y")})
                 geometry = resolve_surface_move(op["calibration"]["pickup"], detections)
@@ -577,6 +591,7 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                     state = provider._offset_deck_semantic_state(gripper_confirmed=False, pseudo_home_only=True)
                     def dispatch():
                         search["z_search_attempted"] = True
+                        head_targets.pop("z", None)
                         return provider.primitives.oem_move_z(op["search_target_steps"],
                             pseudo_home_steps=state["pseudo_z_home"],
                             motor_current=op["z_motor_current"], wait_for_stop=False)
@@ -603,6 +618,8 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                 position = record("plld_z_position", lambda: {
                     "ok": True, "position_steps": provider.primitives._read_axis_position("z"),
                     "source_return_completed": True}, inputs={})
+                head_targets["z"] = position["position_steps"]
+                trajectory_evidence(position, dict(head_targets), last_rack, op["channels"])
                 timestamps = {}
                 for row in detected.get("channels", []):
                     stamp = (row.get("completion", {}).get("pipette_message_state") or {}).get("fluid_timestamp")
@@ -625,6 +642,7 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                     record("z_speed", lambda: provider.primitives.z_set_max_speed(tracking["speed_native"]),
                            inputs={"speed_native": tracking["speed_native"]})
                 def start_tracking():
+                    head_targets.pop("z", None)
                     state = provider._offset_deck_semantic_state(gripper_confirmed=False, pseudo_home_only=True)
                     return record("tracking_z_start", lambda: provider.primitives.oem_move_z(
                         tracking["target_steps"], pseudo_home_steps=state["pseudo_z_home"],
@@ -640,9 +658,6 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                     inputs = {"volume_ul": op.get("volume_ul"), "front_air": kind == "leading_air",
                               "target_liquid_ul": op.get("target_liquid_ul"),
                               "commanded_displacement_ul": op.get("volume_ul"), "liquid_phase": kind}
-                    if request.get("accounting_context") is not None:
-                        inputs.update(accounting_context=request["accounting_context"],
-                                      accounting_scope=command_id + ":" + owner_identity["source_identity"])
                     if op.get("accounting_intent") is not None:
                         inputs["accounting_intent"] = op["accounting_intent"]
                     record(effect, lambda t, w=wire, e=effect, values=inputs:
@@ -651,8 +666,10 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                         inputs={"operation_index": index, "field": field, "ascii": wire,
                                 "channels": op["channels"], **inputs}, pipette=True)
                 if tracking:
-                    record("tracking_z_wait", lambda: provider.wp8_wait_z("waitZ",
+                    waited = record("tracking_z_wait", lambda: provider.wp8_wait_z("waitZ",
                         {"timeout_ms": op["z_timeout_ms"]}), inputs={"timeout_ms": op["z_timeout_ms"]})
+                    if waited.get("ok") is True:
+                        head_targets["z"] = tracking["target_steps"]
         result.update(ok=True, completed=True, source_return_completed=True,
                       has_unknown_outcomes=any(e["status"] == "unknown" for e in events))
     except Exception as exc:
