@@ -15,14 +15,33 @@ from decimal import Decimal, InvalidOperation
 import time
 from typing import Annotated, Any, Literal, Mapping, Union
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 
 from .models import PipetteCommandError
 from .cavro_geometry import (SurfaceMove, SharedHead, ProfilePickup, resolve_surface_move,
                              resolve_displacement, shared_head_evidence)
-from .cavro_commands import DeviceCommand, DeviceProgram, compile_device_command, compile_device_program
+from .cavro_commands import Number, DeviceCommand, DeviceProgram, compile_device_command, compile_device_program
+from .pressure_capture import PressureCaptureRequest
 
 IMPLEMENTATION = "original-adp.application.v1"
+
+
+def _nonnegative_number(value):
+    if Decimal(str(value)) < 0:
+        raise ValueError("expected a nonnegative number")
+    return value
+
+
+def _positive_number(value):
+    if Decimal(str(value)) <= 0:
+        raise ValueError("expected a positive number")
+    return value
+
+
+# Decimal text preserves native analysis output through the existing wire
+# encoder. Existing numeric requests retain their values and range semantics.
+NonnegativeNumber = Annotated[Number, AfterValidator(_nonnegative_number)]
+PositiveNumber = Annotated[Number, AfterValidator(_positive_number)]
 
 
 class _Input(BaseModel):
@@ -43,14 +62,14 @@ class _Selected(_Input):
 
 class Stroke(_Selected):
     operation: Literal["aspirate", "dispense", "leading_air", "trailing_air", "reaspirate"]
-    volume_ul: float = Field(ge=0)
-    speed_ul_s: float = Field(gt=0)
-    target_liquid_ul: float | None = Field(default=None, ge=0)
+    volume_ul: NonnegativeNumber
+    speed_ul_s: PositiveNumber
+    target_liquid_ul: NonnegativeNumber | None = None
 
 
 class Empty(_Selected):
     operation: Literal["empty"]
-    speed_ul_s: float = Field(gt=0)
+    speed_ul_s: PositiveNumber
 
 
 class Settings(_Selected):
@@ -97,9 +116,9 @@ class Plld(_Selected):
 
 class TrackedAspirate(_Selected):
     operation: Literal["tracked_aspirate"]
-    volume_ul: float = Field(ge=0)
-    speed_ul_s: float = Field(gt=0)
-    target_liquid_ul: float | None = Field(default=None, ge=0)
+    volume_ul: NonnegativeNumber
+    speed_ul_s: PositiveNumber
+    target_liquid_ul: NonnegativeNumber | None = None
     trajectory: SurfaceMove
     z_motor_current: int
     z_timeout_ms: int = Field(gt=0)
@@ -115,9 +134,14 @@ class DeviceProgramInstruction(_Selected):
     program: DeviceProgram
 
 
+class PressureCapture(_Input):
+    operation: Literal["pressure_capture"]
+    capture: PressureCaptureRequest
+
+
 Instruction = Annotated[Union[Stroke, Empty, Settings, Delay, Position, ZMove, Plld,
                               SurfaceMove, TrackedAspirate, DeviceCommandInstruction, DeviceProgramInstruction,
-                              ProfilePickup],
+                              ProfilePickup, PressureCapture],
                         Field(discriminator="operation")]
 _INSTRUCTION = TypeAdapter(Instruction)
 
@@ -327,7 +351,10 @@ def capability_catalog() -> dict[str, Any]:
                 "pipette_manual_physical": ["load_tip", "source_load_tips", "measure_fluid_height", "source_fluid_offset", "source_calwith_fluid", "source_mix", "source_purge"]},
             "raw_pressure_streaming": {"status": "implemented",
                 "enable_wire": "o0,1R", "implicit_heartbeat_nvram_write": False,
-                "samples_owner": "existing NovoRouter pressure observation/receipt path"},
+                "samples_owner": "existing NovoRouter pressure observation/receipt path",
+                "capture_operation": "pressure_capture",
+                "capture_effects": "listen only; stream selection and sample settings remain separately authored",
+                "readback": "/pipettes/pressure-captures/{stream_session_id}"},
             "surface_coordination": {"operations": ["surface_move", "tracked_aspirate"],
                 "axis_units": ["steps", "mm with authored calibration"],
                 "independent_channel_z": False, "automatic_geometry": False,
@@ -438,6 +465,9 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
             if kind in {"device_command", "device_program"}:
                 record(kind, lambda t: t.run_cavro_command(op["compiled_command"],
                     channels=op["channels"], timeout_ms=op["timeout_ms"]), inputs=op, pipette=True)
+            elif kind == "pressure_capture":
+                record("pressure_capture", lambda t: t.capture_pressure(op["capture"]),
+                       inputs=op, pipette=True)
             elif kind == "delay":
                 deadline = time.monotonic() + op["duration_ms"] / 1000
                 while True:

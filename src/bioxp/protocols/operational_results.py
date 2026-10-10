@@ -52,6 +52,10 @@ def application_outcome(value):
         'pneumatic_displacement_delta_ul', 'intended_liquid_delta_ul',
         'initial_fill_known', 'measured_liquid_ul', 'known_pneumatic_delta_ul',
         'known_intended_liquid_delta_ul', 'unknown_liquid_effect', 'unknown_pneumatic_effect', 'basis',
+        'target_steps', 'reference_steps', 'speed_native', 'physical_surface_verified',
+        'shared_head', 'shared_z', 'inactive_mounted_tips_move', 'independent_channel_z',
+        'unequal_authored_surface_references', 'geometry_limit', 'start_mode',
+        'commanded_displacement_ul', 'liquid_phase',
     })
     if isinstance(value, Mapping):
         return {k: (v if k in {"failure_details", "source_timeout_termination", "requested", "warnings", "command_effects", "program"}

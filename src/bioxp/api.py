@@ -11002,6 +11002,17 @@ from .calibration_analysis import AnalysisRequest, AnalysisResult, analyze as an
 from .calibration_workflow import calibration_contract
 
 
+@app.get("/pipettes/pressure-captures/{stream_session_id}")
+async def scientific_pressure_capture_read(stream_session_id: str):
+    """Read a requested scientific capture; never query or enable the device."""
+    if _pipette_receipts is None:
+        raise HTTPException(status_code=503, detail="Pipette result store is unavailable")
+    result = await run_in_threadpool(_pipette_receipts.scientific_pressure_capture, stream_session_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Scientific pressure capture not found")
+    return result
+
+
 @app.get("/protocol/calibration/schema")
 async def protocol_calibration_schema():
     return {**calibration_contract(), "review_request": ProtocolReviewRequest.model_json_schema()}

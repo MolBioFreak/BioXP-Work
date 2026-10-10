@@ -13,13 +13,13 @@ from typing import Annotated, Any, Literal, Union
 from pydantic import Field, ValidationError
 
 from .cavro_application import (_Input, ApplicationRequest, IMPLEMENTATION,
-                                 Instruction, compile_application, _json_copy)
+                                 Instruction, NonnegativeNumber, PositiveNumber, Number, compile_application, _json_copy)
 from .cavro_geometry import SurfaceMove, SharedHead
 
 
 class CorrectionPoint(_Input):
-    target_ul: float = Field(ge=0)
-    commanded_ul: float = Field(ge=0)
+    target_ul: NonnegativeNumber
+    commanded_ul: NonnegativeNumber
 
 
 class PointCorrection(_Input):
@@ -29,8 +29,8 @@ class PointCorrection(_Input):
 
 class AffineCorrection(_Input):
     kind: Literal["affine"]
-    scale: float
-    offset_ul: float
+    scale: Number
+    offset_ul: Number
 
 
 class SelectedCorrection(_Input):
@@ -47,13 +47,13 @@ class AspirationTracking(_Input):
 
 
 class Segment(_Input):
-    volume_ul: float = Field(ge=0)
-    speed_ul_s: float = Field(gt=0)
+    volume_ul: NonnegativeNumber
+    speed_ul_s: PositiveNumber
 
 
 class Air(_Input):
-    volume_ul: float = Field(ge=0)
-    speed_ul_s: float = Field(gt=0)
+    volume_ul: NonnegativeNumber
+    speed_ul_s: PositiveNumber
 
 
 class Aliquot(_Input):
@@ -83,10 +83,10 @@ class Recipe(_Input):
     mode: Literal["single", "multi"]
     channels: list[int]
     timeout_ms: int = Field(gt=0)
-    target_liquid_ul: float = Field(ge=0)
+    target_liquid_ul: NonnegativeNumber
     # Mandatory corrected total displacement even for multi. No guessed sum of
     # sample/conditioning/excess can masquerade as a manufacturer correction.
-    commanded_aspiration_ul: float | None = Field(default=None, ge=0)
+    commanded_aspiration_ul: NonnegativeNumber | None = None
     selected_correction: SelectedCorrection | None = None
     aspiration_tracking: AspirationTracking | None = None
     shared_head: SharedHead | None = None
@@ -148,9 +148,10 @@ def compile_liquid_recipe(request: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("select correction OR explicit commanded_aspiration_ul, not both; correction is applied once")
             selected = r.selected_correction.model_dump()
             exact = correction_at_target(r.target_liquid_ul, selected["function"])
-            commanded = float(exact)
-            if Decimal(str(commanded)) != Decimal(exact):
-                raise ValueError("corrected displacement cannot be represented without rounding")
+            # The analysis producer returns exact decimal coefficients. Keep
+            # the evaluated displacement as text through Stroke and wire
+            # encoding; a binary-float round trip is not an execution gate.
+            commanded = exact
             correction_evidence = {"selected": selected, "target_liquid_ul": r.target_liquid_ul,
                 "commanded_aspiration_ul": exact, "application_count": 1, "measured_liquid_ul": None}
         elif commanded is None:
