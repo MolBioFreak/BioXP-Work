@@ -205,12 +205,21 @@ class Diagnostic(CommandModel):
     test: Literal["minimum_moving_current", "step_loss_detection", "pressure_sensor"]
 
 
-# Stored programs contain the same real command types, not raw ASCII strings.
-# Recursive storage itself is excluded structurally at compile time.
+# Only commands that the original manual permits inside a device string.
+# Sharing this union makes program schemas as precise as their compiler: report
+# and immediate-control forms remain available only as separate DeviceCommands.
+ProgramCommand = Annotated[Union[
+    Initialize, EjectTip, PlungerMove, Speed, SpeedDefault, Slope, Backlash, BeginLld,
+    LldParameter, DigitalOutput, EventSubscription, LoopStart, LoopEnd, Delay, Halt,
+    UserByteWrite, StoredProgramRun, SaveSettings, RestoreSettings, Configuration,
+    HeartbeatPeriod, Diagnostic,
+], Field(discriminator="command")]
+
+
 class StoredProgramWrite(CommandModel):
     command: Literal["stored_program_write"]
     location: StrictInt
-    commands: list[DeviceCommand]
+    commands: list[ProgramCommand]
 
 
 DeviceCommand = Annotated[Union[
@@ -232,7 +241,7 @@ class DeviceProgram(CommandModel):
     content, initialization, physical effects or completion.
     """
     mode: Literal["append", "execute"]
-    commands: list[DeviceCommand]
+    commands: list[ProgramCommand]
 
 
 DEVICE_PROGRAM_ADAPTER = TypeAdapter(DeviceProgram)

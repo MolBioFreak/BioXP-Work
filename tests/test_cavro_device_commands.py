@@ -308,8 +308,13 @@ def test_endless_loop_halt_and_control_transfer_not_false_completion():
     {"command": "stored_program_write", "location": 0, "commands": []},
 ])
 def test_reports_and_immediate_controls_cannot_be_embedded(payload):
-    with pytest.raises(ValueError, match="not a buffer member"):
-        program({"mode": "execute", "commands": [payload]})
+    authored = {"mode": "execute", "commands": [payload]}
+    with pytest.raises(ValidationError, match="union_tag_invalid"):
+        DEVICE_PROGRAM_ADAPTER.validate_python(authored)
+    with pytest.raises(ValidationError, match="union_tag_invalid"):
+        program(authored)
+    with pytest.raises(ValidationError, match="union_tag_invalid"):
+        command({"command": "stored_program_write", "location": 0, "commands": [payload]})
 
 
 @pytest.mark.parametrize("commands", [[{"command": "loop_start"}], [{"command": "loop_end", "repetitions": 2}]])
@@ -395,6 +400,11 @@ def test_real_schemas_and_examples_round_trip_with_producer():
     assert set(schema["$defs"]["Report"]["properties"]["selector"]["enum"]) == set(REPORT_SELECTORS)
     assert schema["$defs"]["Configuration"]["properties"]["setting"]["enum"] == [x[0] for x in CONFIGS]
     assert device_program_schema()["properties"]["mode"]["enum"] == ["append", "execute"]
+    members = set(device_program_schema()["properties"]["commands"]["items"]["discriminator"]["mapping"])
+    stored_members = set(schema["$defs"]["StoredProgramWrite"]["properties"]["commands"]["items"]["discriminator"]["mapping"])
+    assert members == stored_members
+    assert {"halt", "loop_start", "loop_end", "diagnostic", "stored_program_run"} <= members
+    assert not {"report", "status", "buffer_execute", "reset", "stored_program_write", "terminate"} & members
     examples = device_command_examples()
     for example in examples["commands"]:
         assert command(example["request"]) == example["compiled"]
