@@ -1004,7 +1004,15 @@ def review_protocol_job(
     if command_store is not None and command_store.get_workflow(job_id) is not None:
         if request is None:
             raise ProtocolLiveContractError("Live review requires canonical target, generation, key and occurrence.")
-        control_protocol_job(job_id, {**dict(request), "action": "review", "reviewer": reviewer, "note": note}, command_store=command_store)
+        control = control_protocol_job(job_id, {**dict(request), "action": "review", "reviewer": reviewer, "note": note}, command_store=command_store)
+        if control.get("accepted") is False:
+            # A cached rejected HOST response is not an accepted review. Keep
+            # canonical idempotency intact; deliberate resubmission uses a new
+            # response key against the same held occurrence, never a new job.
+            raise ProtocolLiveContractError(
+                "The canonical review response was rejected.",
+                details={"error": "workflow_review_rejected", "control": control},
+            )
         return command_store.get_workflow(job_id)
     active_store = store or ProtocolOperatorBundleStore()
     with active_store.live_creation_lock(job_id):

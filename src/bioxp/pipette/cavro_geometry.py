@@ -7,7 +7,17 @@ steps/speed units exactly, rather than silently rounding scientific inputs.
 from __future__ import annotations
 from decimal import Decimal, localcontext
 from typing import Annotated, Any, Literal, Mapping, Union
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+from .cavro_commands import Number
+
+
+def _positive_number(value):
+    if Decimal(str(value)) <= 0:
+        raise ValueError("expected a positive number")
+    return value
+
+
+PositiveNumber = Annotated[Number, AfterValidator(_positive_number)]
 
 
 class GeometryInput(BaseModel):
@@ -16,8 +26,8 @@ class GeometryInput(BaseModel):
 
 class AxisCalibration(GeometryInput):
     calibration_id: str = Field(min_length=1)
-    steps_per_mm: float = Field(gt=0)
-    native_speed_per_mm_s: float = Field(gt=0)
+    steps_per_mm: PositiveNumber
+    native_speed_per_mm_s: PositiveNumber
     positive_steps_direction: Literal["down", "up"]
 
 
@@ -47,10 +57,10 @@ class NativeOffset(GeometryInput):
 
 class MetricOffset(GeometryInput):
     unit: Literal["mm"]
-    depth_mm: float  # positive into liquid, negative retract
-    speed_mm_s: float = Field(gt=0)
+    depth_mm: Number  # positive into liquid, negative retract
+    speed_mm_s: PositiveNumber
     calibration: AxisCalibration
-    tip_offset_mm: float  # signed head-coordinate correction, explicitly authored
+    tip_offset_mm: Number  # signed head-coordinate correction, explicitly authored
 
 
 SurfaceOffset = Annotated[Union[NativeOffset, MetricOffset], Field(discriminator="unit")]
