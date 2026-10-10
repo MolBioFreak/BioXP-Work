@@ -157,6 +157,12 @@ def test_real_finite_factory_geometry_tracking_and_partial_store(wire_rig, insta
             "function": {"kind": "affine", "scale": 1, "offset_ul": 2.5}},
         aspiration_tracking={k: v for k, v in tracked().items()
             if k in {"trajectory", "z_motor_current", "z_timeout_ms"}})
+    authored["shared_head"] = {"context_id": "unequal-test-only", "trajectory_policy": "authored_common_z",
+        "mounted_tips": [{"channel": channel, "well_id": well, "surface_steps": coordinate,
+            "tip_offset_steps": offset, "profile": {"profile_id": f"fixture-{channel}",
+                "nominal_volume_ul": nominal, "manufacturer": "test only", "sku": "fixture",
+                "filtered": False}} for channel, well, coordinate, offset, nominal in
+            [(0, "A1", 88000, 0, 10), (1, "B1", 88500, 100, 1000), (3, "D1", 89000, 0, 50)]]}
     params = {"operation": "cavro_liquid_recipe", "recipe": authored}
     job = submit(app, client, [action("pipette_manual_physical", {"operation": "cavro_application",
         "application": application} if fault else params), action("note")], key="geometry-" + str(fault))
@@ -180,6 +186,11 @@ def test_real_finite_factory_geometry_tracking_and_partial_store(wire_rig, insta
         assert any(t[0] == "pump_wait" and (1, "P22.5,1R") in t[2] for t in trace[start + 1:])
         assert any(e["operation"] == "tracking_z_wait" for e in source["events"])
         assert source["liquid_settings"]["selected_correction"]["application_count"] == 1
+        geometry = next(e["inputs"] for e in source["events"] if e["operation"] == "tracking_z_start")
+        assert geometry["shared_head"]["unequal_authored_surface_references"]
+        assert geometry["shared_head"]["pump_channels"] == [0, 1]
+        assert geometry["shared_head"]["inactive_mounted_tips_move"]
+        assert not geometry["shared_head"]["independent_channel_z"]
     store = app.state.operator_command_plane.store
     ids = done["execution"]["runtime_state"]["workflow"]["child_command_ids"]
     finite = [cid for cid in ids if not cid.startswith("pipette_")]
