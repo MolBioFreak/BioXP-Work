@@ -54,7 +54,7 @@ def test_cavro_native_factory_store_api(wire_rig, installed_retained, monkeypatc
     assert source['events'][0]['origin'] == 'native_device'
     events = done['execution']['runtime_state']['events']
     assert [e['detail'] for e in events if e['event'] == 'cavro_application_event'] == source['events']
-    assert {e['inputs'].get('field') for e in source['events'][:3]} == {'slope', 'pressure_streaming'}
+    assert {e['inputs'].get('field') for e in source['events'][:2]} == {'slope', 'pressure_streaming'}
     assert source['events'][0]['result']['channels']
     assert source['events'][0]['reported_applied']['readback'] is None
     if failure:
@@ -69,7 +69,7 @@ def test_cavro_native_factory_store_api(wire_rig, installed_retained, monkeypatc
         assert done['command']['status'] == 'completed', done
         assert source['ok'] and len(rows) == 2
         assert [command for channel, command in wire_rig.wire if channel == 0] == [
-            'b15R', 'o0,1R', 'L1,2R', 'V50,1R', 'P22.5,1R', 'V375,1R', 'D12.5,1R', 'V875,1R', 'D10,1R']
+            'o0,1R', 'L1,2R', 'V50,1R', 'P22.5,1R', 'V375,1R', 'D12.5,1R', 'V875,1R', 'D10,1R']
     store = app.state.operator_command_plane.store
     child_ids = done['execution']['runtime_state']['workflow']['child_command_ids']
     finite_ids = [cid for cid in child_ids if not cid.startswith('pipette_')]

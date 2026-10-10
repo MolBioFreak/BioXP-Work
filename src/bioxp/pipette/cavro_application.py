@@ -18,6 +18,8 @@ from typing import Annotated, Any, Literal, Mapping, Union
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 
 from .models import PipetteCommandError
+from .cavro_geometry import SurfaceMove, SharedHead, ProfilePickup, resolve_surface_move, shared_head_evidence
+from .cavro_commands import DeviceCommand, DeviceProgram, compile_device_command, compile_device_program
 
 IMPLEMENTATION = "original-adp.application.v1"
 
@@ -74,6 +76,8 @@ class ZMove(_Input):
 
 class Plld(_Selected):
     operation: Literal["plld"]
+    start_mode: Literal[0, 1] = 0
+    detection_id: str = Field(default="last_detection", min_length=1)
     start_steps: int
     search_target_steps: int
     search_speed_native: int = Field(gt=0)
@@ -82,8 +86,37 @@ class Plld(_Selected):
     after_detection_steps: int | None = None
     after_detection_speed_native: int | None = Field(default=None, gt=0)
 
+    @field_validator("start_mode", mode="before")
+    @classmethod
+    def integer_mode(cls, value):
+        if type(value) is not int:
+            raise ValueError("start_mode must be integer 0 or 1")
+        return value
 
-Instruction = Annotated[Union[Stroke, Empty, Settings, Delay, Position, ZMove, Plld],
+
+class TrackedAspirate(_Selected):
+    operation: Literal["tracked_aspirate"]
+    volume_ul: float = Field(ge=0)
+    speed_ul_s: float = Field(gt=0)
+    target_liquid_ul: float | None = Field(default=None, ge=0)
+    trajectory: SurfaceMove
+    z_motor_current: int
+    z_timeout_ms: int = Field(gt=0)
+
+
+class DeviceCommandInstruction(_Selected):
+    operation: Literal["device_command"]
+    command: DeviceCommand
+
+
+class DeviceProgramInstruction(_Selected):
+    operation: Literal["device_program"]
+    program: DeviceProgram
+
+
+Instruction = Annotated[Union[Stroke, Empty, Settings, Delay, Position, ZMove, Plld,
+                              SurfaceMove, TrackedAspirate, DeviceCommandInstruction, DeviceProgramInstruction,
+                              ProfilePickup],
                         Field(discriminator="operation")]
 _INSTRUCTION = TypeAdapter(Instruction)
 
@@ -94,6 +127,7 @@ class ApplicationRequest(_Input):
     # Resolved class ledger is inert metadata, never a hidden executable input.
     liquid_settings: dict[str, Any] = Field(default_factory=dict)
     event_policy: Literal["stop", "pause_for_operator"] = "stop"
+    shared_head: SharedHead | None = None
 
 
 # 399155 p3: numeric selector, domain, published default, unit. These defaults
@@ -140,10 +174,9 @@ def setting_commands(values: Mapping[str, Any]) -> list[tuple[str, str]]:
         elif field == "pressure_streaming":
             if type(value) is not bool:
                 raise ValueError("pressure_streaming: expected Boolean")
-            # ClassPipette.enablePressureStream: b15 then o0. Separate receipt
-            # for setup, so a failure cannot be hidden behind the final result.
-            if value:
-                commands.append((field, "b15R"))
+            # b automatically persists heartbeat periodicity (30053815-C p53).
+            # Stream selection is only o; heartbeat is a separate explicit
+            # device command, never an implicit persistent setting.
             wire = "o0,1R" if value else "o0,0R"
         elif field in {"start_speed_ul_s", "cutoff_speed_ul_s"}:
             # Original ADP Operating Manual 30053815-C pp35–37, not ADP Detect:
@@ -180,6 +213,26 @@ def _json_copy(value):
     return deepcopy(value)
 
 
+def _wire_advisories(operations):
+    """Document certain original-manual domains without changing legacy IO."""
+    warnings = []
+    for index, operation in enumerate(operations):
+        for command in operation.get("wire_commands", []):
+            wire = command["ascii"]
+            if wire.startswith("V"):
+                number = Decimal(wire[1:-3])
+                if not Decimal("0.025") <= number <= 1000 or len(_number(number).partition(".")[2]) > 3:
+                    warnings.append({"code": "documented_top_speed_domain", "operation_index": index,
+                        "ascii": wire, "source": "30053815-C p35", "execution_unchanged": True,
+                        "message": "Published V microliter range .025..1000.000, at most three decimals; device behavior unmeasured."})
+            elif wire.startswith("L"):
+                if any(not 1 <= int(v) <= 40 for v in wire[1:-1].split(",")):
+                    warnings.append({"code": "documented_slope_domain", "operation_index": index,
+                        "ascii": wire, "source": "30053815-C p37", "execution_unchanged": True,
+                        "message": "Published L components 1..40; device behavior unmeasured."})
+    return warnings
+
+
 def compile_application(request: Mapping[str, Any]) -> dict[str, Any]:
     raw = _json_copy(request)
     issues = []
@@ -204,7 +257,7 @@ def compile_application(request: Mapping[str, Any]) -> dict[str, Any]:
                         pointer = name.replace("~", "~0").replace("/", "~1")
                         issues.append({"code": "unrepresentable_setting", "category": "representation",
                             "path": f"/operations/{index}/values/{pointer}", "message": str(exc)})
-            elif isinstance(instruction, Stroke):
+            elif isinstance(instruction, (Stroke, TrackedAspirate)):
                 prefix = "D" if instruction.operation == "dispense" else "P"
                 op["wire_commands"] = [{"field": "speed_ul_s", "ascii": f"V{_number(instruction.speed_ul_s)},1R"},
                                        {"field": "volume_ul", "ascii": f"{prefix}{_number(instruction.volume_ul)},1R"}]
@@ -217,13 +270,24 @@ def compile_application(request: Mapping[str, Any]) -> dict[str, Any]:
             elif isinstance(instruction, Plld):
                 if (instruction.after_detection_steps is None) != (instruction.after_detection_speed_native is None):
                     raise ValueError("after_detection_steps and after_detection_speed_native must be specified together")
-                op["wire_commands"] = [{"field": "plld", "ascii": "BR"}]
+                op["wire_commands"] = [{"field": "plld", "ascii": "B1R" if instruction.start_mode == 1 else "BR"}]
+            elif isinstance(instruction, SurfaceMove):
+                if instruction.reference.kind == "authored":
+                    op["resolved_geometry"] = resolve_surface_move(op, {})
+            elif isinstance(instruction, DeviceCommandInstruction):
+                op["compiled_command"] = compile_device_command(op["command"])
+            elif isinstance(instruction, DeviceProgramInstruction):
+                op["compiled_command"] = compile_device_program(op["program"])
+            elif isinstance(instruction, ProfilePickup):
+                from ..manual_pipetting import manual_position_plan
+                op["native_plan"] = manual_position_plan(op["calibration"]["positioning"])
             emitted.append(op)
         except (ValueError, TypeError) as exc:
             issues.append({"code": "unrepresentable_application", "category": "representation",
                            "path": f"/operations/{index}", "message": str(exc)})
     return {"implementation": IMPLEMENTATION, "requested": raw,
             "operations": None if issues else emitted, "issues": issues,
+            "warnings": _wire_advisories(emitted),
             "liquid_settings": deepcopy(parsed.liquid_settings),
             "physical_effect_verified": False}
 
@@ -255,9 +319,16 @@ def capability_catalog() -> dict[str, Any]:
                 "diagnostic_pipette": ["aspirate", "dispense", "dispense_all", "diagnoses", "initialize", "get_data", "last_error", "eject", "plunger_up", "plunger_down"],
                 "pipette_manual_physical": ["load_tip", "source_load_tips", "measure_fluid_height", "source_fluid_offset", "source_calwith_fluid", "source_mix", "source_purge"]},
             "raw_pressure_streaming": {"status": "implemented",
+                "enable_wire": "o0,1R", "implicit_heartbeat_nvram_write": False,
                 "samples_owner": "existing NovoRouter pressure observation/receipt path"},
+            "surface_coordination": {"operations": ["surface_move", "tracked_aspirate"],
+                "axis_units": ["steps", "mm with authored calibration"],
+                "independent_channel_z": False, "automatic_geometry": False,
+                "tracking": "Authored constant-speed shared-Z trajectory starts after selected pump sends and before their completion waits; not continuous level feedback."},
             "tip_profiles": {name: {"design_intent": True, "physical_fit_verified": False,
-                "pickup_mapping": "existing OEM T50/T200 only"} for name in ("T10", "T50", "T200", "T1000")}}
+                "pickup_mapping": "source T50/T200 or explicit existing manual tray/well pickup; no inferred rack geometry",
+                "profile_context": "shared_head.mounted_tips; metric surface_move requires explicit tip_offset_mm"}
+                for name in ("T10", "T50", "T200", "T1000")}}
 
 
 def _send_wire(group, channels, wire, timeout_ms, *, after_sends=None, effect="cavro_settings", inputs=None):
@@ -303,6 +374,7 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
     request = plan["requested"]
     result = {"kind": "cavro_application", "implementation": IMPLEMENTATION,
               "requested": plan["requested"], "liquid_settings": plan.get("liquid_settings", {}),
+              "warnings": plan.get("warnings", []),
               "events": [], "ok": False, "completed": False,
               "physical_effect_verified": False, "delivery_attempted": False}
     if plan["issues"]:
@@ -310,6 +382,8 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
     group = provider.primitives.pipette_transport
     epoch = group._interrupt_epoch
     events = result["events"]
+    detections = {}
+    result["shared_head"] = shared_head_evidence(request.get("shared_head"), [])
 
     def fence(identity):
         provider._wp8_execution_fence_checker(command_id, boundary=identity)
@@ -354,7 +428,10 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
         for index, op in enumerate(plan["operations"]):
             result["operation_index"] = index
             kind = op["operation"]
-            if kind == "delay":
+            if kind in {"device_command", "device_program"}:
+                record(kind, lambda t: t.run_cavro_command(op["compiled_command"],
+                    channels=op["channels"], timeout_ms=op["timeout_ms"]), inputs=op, pipette=True)
+            elif kind == "delay":
                 deadline = time.monotonic() + op["duration_ms"] / 1000
                 while True:
                     fence(f"{owner_identity['source_identity']}:delay:{index}")
@@ -369,8 +446,29 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                     plan=op["native_plan"], command_id=command_id,
                     owner_identity={**owner_identity, "source_identity":
                         f"{owner_identity['source_identity']}:cavro:position:{index}"}), inputs=op["positioning"])
+            elif kind == "profile_pickup":
+                # Explicit general-purpose pickup. Retain existing station/well
+                # routing and finite ownership; do not assign OEM T50/T200 type,
+                # inventory or tip-location from a requested profile.
+                record("profile_pickup_position", lambda: provider._wp8_execute_nested_plan(
+                    plan=op["native_plan"], command_id=command_id, owner_identity={**owner_identity,
+                        "source_identity": f"{owner_identity['source_identity']}:cavro:pickup:{index}"}),
+                    inputs=op["calibration"])
+                geometry = resolve_surface_move(op["calibration"]["pickup"], detections)
+                record("profile_pickup_geometry", lambda: {"ok": True, **geometry,
+                    "profile": op["profile"], "calibration": op["calibration"],
+                    "physical_fit_verified": False}, inputs=op)
+                z_move(geometry["target_steps"], geometry["speed_native"])
+                record("query_tip_status_all", lambda t: t.query_tip_status_all(), inputs=op, pipette=True)
+                if op["calibration"]["retract"] is not None:
+                    geometry = resolve_surface_move(op["calibration"]["retract"], detections)
+                    z_move(geometry["target_steps"], geometry["speed_native"])
             elif kind == "z_move":
                 z_move(op["target_steps"], op["speed_native"])
+            elif kind == "surface_move":
+                geometry = resolve_surface_move(op, detections)
+                record("surface_reference", lambda: {"ok": True, **geometry}, inputs=geometry)
+                z_move(geometry["target_steps"], geometry["speed_native"])
             elif kind == "plld":
                 z_move(op["start_steps"], op["search_speed_native"])
                 search = {"z_search_attempted": False, "z_stop_attempted": False,
@@ -386,7 +484,7 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                             motor_current=op["z_motor_current"], wait_for_stop=False)
                     search["start_result"] = record("plld_z_start", dispatch, inputs=op)
                 def detect(t):
-                    body = _send_wire(t, op["channels"], "BR", op["timeout_ms"],
+                    body = _send_wire(t, op["channels"], op["wire_commands"][0]["ascii"], op["timeout_ms"],
                                       after_sends=start_z, effect="fluid detection")
                     if body.get("ok") is False and not body.get("interrupted_by_terminate"):
                         # ControlLib.detectFluidLevel:7901: false wait terminates
@@ -414,22 +512,43 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                     group._fluid_detection_timestamps[row["channel"]] = stamp
                 search.update(channels=detected.get("channels", []), z=position,
                               final_position_steps=position["position_steps"], fluid_timestamps=timestamps)
+                search["shared_head"] = shared_head_evidence(request.get("shared_head"), op["channels"])
+                search["start_mode"] = op.get("start_mode", 0)
+                detections[op.get("detection_id", "last_detection")] = deepcopy(search)
                 if op.get("after_detection_steps") is not None:
                     z_move(op["after_detection_steps"], op["after_detection_speed_native"])
             else:
+                tracking = None
+                if kind == "tracked_aspirate":
+                    tracking = resolve_surface_move(op["trajectory"], detections)
+                    tracking["shared_head"] = shared_head_evidence(request.get("shared_head"), op["channels"])
+                    record("tracking_reference", lambda: {"ok": True, **tracking}, inputs=op)
+                    record("z_speed", lambda: provider.primitives.z_set_max_speed(tracking["speed_native"]),
+                           inputs={"speed_native": tracking["speed_native"]})
+                def start_tracking():
+                    state = provider._offset_deck_semantic_state(gripper_confirmed=False, pseudo_home_only=True)
+                    return record("tracking_z_start", lambda: provider.primitives.oem_move_z(
+                        tracking["target_steps"], pseudo_home_steps=state["pseudo_z_home"],
+                        motor_current=op["z_motor_current"], wait_for_stop=False), inputs=tracking)
                 for command in op["wire_commands"]:
                     field, wire = command["field"], command["ascii"]
                     effect = ("set_top_speed" if field == "speed_ul_s" else
-                              "aspirate" if kind == "aspirate" else
+                              "aspirate" if kind in {"aspirate", "tracked_aspirate"} else
                               "cavro_reaspirate" if kind == "reaspirate" else
                               "aspirate air" if kind in {"leading_air", "trailing_air"} else
                               "dispense" if kind == "dispense" else
                               "dispense_all" if kind == "empty" else "cavro_settings")
-                    inputs = {"volume_ul": op.get("volume_ul"), "front_air": kind == "leading_air"}
+                    inputs = {"volume_ul": op.get("volume_ul"), "front_air": kind == "leading_air",
+                              "target_liquid_ul": op.get("target_liquid_ul"),
+                              "commanded_displacement_ul": op.get("volume_ul"), "liquid_phase": kind}
                     record(effect, lambda t, w=wire, e=effect, values=inputs:
-                        _send_wire(t, op["channels"], w, op["timeout_ms"], effect=e, inputs=values),
+                        _send_wire(t, op["channels"], w, op["timeout_ms"], effect=e, inputs=values,
+                                   after_sends=start_tracking if tracking is not None and e == "aspirate" else None),
                         inputs={"operation_index": index, "field": field, "ascii": wire,
-                                "channels": op["channels"]}, pipette=True)
+                                "channels": op["channels"], **inputs}, pipette=True)
+                if tracking is not None:
+                    record("tracking_z_wait", lambda: provider.wp8_wait_z("waitZ",
+                        {"timeout_ms": op["z_timeout_ms"]}), inputs={"timeout_ms": op["z_timeout_ms"]})
         result.update(ok=True, completed=True, source_return_completed=True,
                       has_unknown_outcomes=any(e["status"] == "unknown" for e in events))
     except Exception as exc:
