@@ -2819,12 +2819,13 @@ class RuntimeAuditDatabase:
             raise
 
     @serialized_runtime_write
-    def finish_pressure_stream(self, stream_session_id: str, *, loss_count: int) -> None:
+    def finish_pressure_stream(self, stream_session_id: str, *, loss_count: int,
+                               terminal_state: str = "completed") -> None:
         owns_transaction = self._begin_write()
         try:
             self.connection.execute(
                 "UPDATE pipette_pressure_streams SET terminal_state=?,loss_count=? WHERE stream_session_id=?",
-                ("completed", int(loss_count), stream_session_id))
+                (str(terminal_state), int(loss_count), stream_session_id))
             self._commit_write(owns_transaction)
         except Exception:
             self._rollback_write(owns_transaction)

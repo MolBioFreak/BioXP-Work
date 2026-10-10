@@ -691,9 +691,19 @@ class PipetteReceiptStore:
         status: str = "failed",
         requested_inputs: Mapping[str, Any] | None = None,
         runtime_binding: Mapping[str, Any] | None = None,
+        partial_result: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if partial_result is not None and partial_result.get("kind") == "scientific_pressure_capture":
+            try:
+                partial_result["scientific_pressure"] = self.retain_scientific_pressure_capture(
+                    partial_result, command_id=command_id, pipette_operation_id=pipette_operation_id,
+                    source_generation=(runtime_binding or {}).get("connection_generation"),
+                    terminal_state="interrupted" if partial_result.get("interrupted") else "failed")
+            except Exception as exc:
+                partial_result["scientific_pressure"] = {"observation_error": repr(exc)}
         outcome_unknown = status in {"outcome_unknown", "reconciliation_required"}
         result = {
+            **critical_receipt(_redact(dict(partial_result or {}))),
             "ok": False,
             "outcome": "outcome_unknown" if outcome_unknown else "rejected" if status == "rejected" else "failed",
             "error": str(message),
@@ -762,7 +772,8 @@ class PipetteReceiptStore:
 
     def retain_scientific_pressure_capture(self, result: Mapping[str, Any], *,
                                           command_id: str, pipette_operation_id: str,
-                                          source_generation: int | None = None) -> dict[str, Any]:
+                                          source_generation: int | None = None,
+                                          terminal_state: str | None = None) -> dict[str, Any]:
         """Finite-caller-only write; ordinary receipt sanitization stays unchanged."""
         stream_id = self.record_pressure_stream(
             command_id=command_id, pipette_operation_id=pipette_operation_id,
@@ -771,14 +782,29 @@ class PipetteReceiptStore:
             source_generation=source_generation, reader_generation=result["reader_generation"])
         metadata = {key: value for key, value in result.items() if key != "channels"}
         chunks = []
-        for row in result["channels"]:
-            chunks.append(self._audit_database.record_pressure_chunk(
-                stream_session_id=stream_id, channel=row["channel"], chunk_sequence=0,
-                samples=row["samples"], units=result["units"], offset_identity=None,
-                chunk_schema="scientific_pressure_capture_v1",
-                scientific_result={**metadata, "baseline_statistics": row["baseline_statistics"]}))
-        self._audit_database.finish_pressure_stream(stream_id, loss_count=result["lost_frame_count"])
-        return {"stream_session_id": stream_id, "chunk_ids": chunks, **metadata}
+        state = terminal_state or ("interrupted" if result.get("interrupted")
+            else "failed" if result.get("ok") is False else "completed")
+        observation = {}
+        try:
+            for row in result["channels"]:
+                chunks.append(self._audit_database.record_pressure_chunk(
+                    stream_session_id=stream_id, channel=row["channel"], chunk_sequence=0,
+                    samples=row["samples"], units=result["units"], offset_identity=None,
+                    chunk_schema="scientific_pressure_capture_v1",
+                    scientific_result={**metadata, "baseline_statistics": row["baseline_statistics"]}))
+        except Exception as exc:
+            # Keep identities of chunks already retained. Do not retry writes or
+            # leave a known failed finite retention labelled as running/completed.
+            state = "failed"
+            observation["observation_error"] = repr(exc)
+        try:
+            self._audit_database.finish_pressure_stream(
+                stream_id, loss_count=result["lost_frame_count"], terminal_state=state)
+            observation["terminal_state"] = state
+        except Exception as exc:
+            observation["observation_error"] = (
+                observation.get("observation_error", "") + "; terminal state persistence: " + repr(exc))
+        return {"stream_session_id": stream_id, "chunk_ids": chunks, **metadata, **observation}
 
     def scientific_pressure_capture(self, stream_session_id: str) -> dict[str, Any] | None:
         stream = self.connection.execute(

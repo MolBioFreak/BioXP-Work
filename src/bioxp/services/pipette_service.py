@@ -168,6 +168,7 @@ def _persist_failure(
     requested_inputs: dict[str, Any],
     runtime_binding: dict[str, Any] | None,
     outcome_may_have_occurred: bool = False,
+    partial_result: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if receipt_store is None or claim_record is None or not hasattr(receipt_store, "record_failure"):
         return None
@@ -186,6 +187,7 @@ def _persist_failure(
             status=str(status),
             requested_inputs=requested_inputs,
             runtime_binding=runtime_binding,
+            **({"partial_result": partial_result} if partial_result is not None else {}),
         )
         linked = persisted.get(_LINKED_FINALIZATION_KEY) if isinstance(persisted, Mapping) else None
         if isinstance(linked, Mapping):
@@ -385,6 +387,52 @@ async def _run_transport_call(
     failure_claim_record = claim_record if claim_created else None
     preflight_payload: dict[str, Any] | None = None
     stage = "admission"
+
+    def partial_failure(exc: Exception) -> HTTPException:
+        # The transport owns the acquired/sent evidence. Retain it before the
+        # critical projection; an observation failure must not replace its error.
+        from ..critical_logging import critical_receipt
+
+        partial = dict(getattr(exc, "pipette_partial_result"))
+        status = "rejected" if stage == "admission" else "failed"
+        failure_code = "admission_exception" if stage == "admission" else "transport_exception"
+        status_code = 400 if stage == "admission" else 503
+        detail: dict[str, Any] = {"error": "pipette_operation_failed", "message": str(exc)}
+        if isinstance(exc, PipetteError):
+            failure_code, status_code, detail = exc.code, exc.status_code, exc.to_payload()
+        elif isinstance(exc, ValueError):
+            failure_code = "validation_error" if stage == "admission" else "malformed_response"
+            status_code = 422 if stage == "admission" else 502
+            detail["error"] = failure_code
+        elif isinstance(exc, asyncio.TimeoutError):
+            failure_code, status, status_code = "outcome_unknown", "reconciliation_required", 504
+            detail.update(error="pipette_operation_completion_ambiguous",
+                          completion_ambiguous=True, retry_forbidden=True)
+        try:
+            _persist_failure(
+                receipt_store=receipt_store, claim_record=failure_claim_record,
+                operation_name=operation_name or label,
+                failure_code=failure_code,
+                message=exc.message if isinstance(exc, PipetteError) else str(exc),
+                status=status, requested_inputs=requested_for_receipt,
+                runtime_binding=effective_runtime_binding,
+                outcome_may_have_occurred=stage == "dispatch", partial_result=partial)
+        except HTTPException as observation:
+            retained: dict[str, Any] = dict(observation.detail) if isinstance(observation.detail, Mapping) else {}
+            if _LINKED_FINALIZATION_KEY in retained:
+                detail[_LINKED_FINALIZATION_KEY] = retained[_LINKED_FINALIZATION_KEY]
+            else:
+                partial["observation_error"] = dict(retained) or str(observation)
+        except Exception as observation:
+            partial["observation_error"] = repr(observation)
+        partial = critical_receipt(partial)
+        detail["pipette_partial_result"] = partial
+        propagated = HTTPException(status_code=status_code, detail=detail)
+        # Application events consume the same original transport evidence, not
+        # a reconstruction from the last driver's error details.
+        setattr(propagated, "pipette_partial_result", partial)
+        return propagated
+
     try:
         _validate_oem_admission(operation_name, command)
         if preflight is not None:
@@ -430,6 +478,8 @@ async def _run_transport_call(
                 raise
         raise
     except PipetteError as exc:
+        if isinstance(getattr(exc, "pipette_partial_result", None), Mapping):
+            raise partial_failure(exc) from exc
         if (operation_name in {"tip_status", "query_tip_status", "query_all_pipette_tip_states"} and stage == "dispatch"
                 and isinstance(exc.details.get("observed_channels"), list)):
             # Retain every actual return, including strict-invalid rows. Only
@@ -455,6 +505,8 @@ async def _run_transport_call(
             )
             raise _pipette_error_to_http_exception(exc) from exc
     except ValueError as exc:
+        if isinstance(getattr(exc, "pipette_partial_result", None), Mapping):
+            raise partial_failure(exc) from exc
         failure_code = "validation_error" if stage == "admission" else "malformed_response"
         status = "rejected" if stage == "admission" else "failed"
         _persist_failure(
@@ -502,6 +554,8 @@ async def _run_transport_call(
             detail={"error": "pipette_operation_failed", "message": str(exc.detail)},
         ) from exc
     except asyncio.TimeoutError as exc:
+        if isinstance(getattr(exc, "pipette_partial_result", None), Mapping):
+            raise partial_failure(exc) from exc
         _persist_failure(
             receipt_store=receipt_store,
             claim_record=failure_claim_record,
@@ -523,6 +577,8 @@ async def _run_transport_call(
             },
         ) from exc
     except Exception as exc:
+        if isinstance(getattr(exc, "pipette_partial_result", None), Mapping):
+            raise partial_failure(exc) from exc
         _persist_failure(
             receipt_store=receipt_store,
             claim_record=failure_claim_record,

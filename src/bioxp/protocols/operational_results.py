@@ -55,10 +55,11 @@ def application_outcome(value):
         'target_steps', 'reference_steps', 'speed_native', 'physical_surface_verified',
         'shared_head', 'shared_z', 'inactive_mounted_tips_move', 'independent_channel_z',
         'unequal_authored_surface_references', 'geometry_limit', 'start_mode',
-        'commanded_displacement_ul', 'liquid_phase',
+        'commanded_displacement_ul', 'liquid_phase', 'terminal_state',
+        'source_return_completed', 'pipette_partial_result', 'message', 'failure_code',
     })
     if isinstance(value, Mapping):
-        return {k: (v if k in {"failure_details", "source_timeout_termination", "requested", "warnings", "command_effects", "program"}
+        return {k: (v if k in {"failure_details", "source_timeout_termination", "requested", "warnings", "command_effects", "program", "observation_error"}
                     else application_outcome(v)) for k, v in value.items() if k in fields}
     if isinstance(value, (list, tuple)):
         return [application_outcome(row) for row in value]
