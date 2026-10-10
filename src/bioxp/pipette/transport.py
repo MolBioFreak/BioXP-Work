@@ -264,6 +264,16 @@ class CanPipetteTransport:
         """Apply deterministic host accounting only after correlated completion."""
         operation = str(command).replace(" ", "_")
         volume = float(result.get("volume_ul", 0.0) or 0.0)
+        from .effect_accounting import CompletedEffectAccount
+        if not hasattr(self, "_effect_account"):
+            self._effect_account = CompletedEffectAccount()
+        account_operation, account_result = operation, result
+        if operation == "cavro_device_command":
+            requested = result.get("requested") or {}
+            if requested.get("command") in {"plunger_aspirate", "plunger_dispense"} and requested.get("unit") == "ul":
+                account_operation = requested["command"].removeprefix("plunger_")
+                account_result = {"volume_ul": requested["value"]}
+        accounting = self._effect_account.apply(account_operation, account_result)
         if operation == "aspirate":
             self._liquid_level_ul += volume
         elif operation == "dispense":
@@ -280,8 +290,8 @@ class CanPipetteTransport:
             self._liquid_level_ul = 0.0
             self._front_air_level_ul = 0.0
             self._rear_air_level_ul = 0.0
-        elif operation == "aspirate_air":
-            if bool(result.get("front_air", True)):
+        elif operation in {"aspirate_air", "cavro_reaspirate"}:
+            if operation != "cavro_reaspirate" and bool(result.get("front_air", True)):
                 self._front_air_level_ul += volume
             else:
                 self._rear_air_level_ul += volume
@@ -300,8 +310,10 @@ class CanPipetteTransport:
             else:
                 self._rear_air_level_ul -= volume
         return {
-            "state_reconciled": True,
+            "state_reconciled": operation != "cavro_device_command",
             "state_reconciliation_source": "correlated_controller_completion_accounting",
+            "accounting": accounting,
+            "legacy_counter_basis": "command_displacement_shadow_not_measured_liquid",
             "liquid_level_ul": self._liquid_level_ul,
             "front_air_level_ul": self._front_air_level_ul,
             "rear_air_level_ul": self._rear_air_level_ul,
@@ -1830,6 +1842,58 @@ class FourPipetteTransport:
         rows = [{"channel": channel, "result": transport.heartbeat(command)} for channel, transport in enumerate(self._transports)]
         return {"ok": all(row["result"].get("ok") for row in rows), "channels": rows, "requested": command.to_payload()}
 
+
+    def capture_pressure(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Explicit finite host acquisition; stream configuration remains authored."""
+        from .pressure_capture import PressureCaptureRequest
+        selected = PressureCaptureRequest.model_validate(request)
+        router = self._transports[selected.channels[0]]._get_driver().bus.router
+        capture = router.begin_scientific_pressure_capture(selected.model_dump())
+        epoch = self._interrupt_epoch
+        try:
+            remaining = selected.duration_ms / 1000.0
+            while remaining > 0:
+                if epoch != self._interrupt_epoch or self._forceabort():
+                    raise PipetteCommandError("Pressure capture interrupted; no replay")
+                interval = min(remaining, 0.05)
+                self._sleep(interval)
+                remaining -= interval
+        except Exception as exc:
+            partial = router.finish_scientific_pressure_capture(capture)
+            partial.update(ok=False, interrupted=True, source_return_completed=False)
+            setattr(exc, "pipette_partial_result", partial)
+            raise
+        return router.finish_scientific_pressure_capture(capture)
+
+    def run_cavro_command(self, compiled: Mapping[str, Any], *, channels: list[int],
+                          timeout_ms: int) -> dict[str, Any]:
+        """Run typed service within the existing finite caller/receipt owner."""
+        selected = self._selected_channels(channels)
+        def send(channel, transport, deferred):
+            result = transport._get_driver().send_cavro_command(compiled, timeout_ms=timeout_ms)
+            transport._last_transaction = result
+            if deferred:
+                transport._assert_driver_result("cavro_device_command", result)
+            # Report/ACK false is preserved as a channel outcome; actuator send
+            # failures use the same partial-exception path as legacy Cavro.
+            return result
+        result = self._run_group_liquid_operation(
+            "cavro_device_command", selected, send, timeout_ms=timeout_ms,
+            defer_completion=compiled["wait_mode"] == "completion", set_allow_to_stop=False)
+        if compiled["wait_mode"] == "completion" and compiled.get("report_kind"):
+            from .cavro_receiving import decode_report
+            for row in result["channels"]:
+                row["result"]["report"] = decode_report(compiled, (row.get("completion") or {}).get("data", []))
+        result["semantic_query_response_verified"] = bool(
+            compiled["wait_mode"] == "report" and all(
+                row["result"].get("semantic_query_response_verified") is True for row in result["channels"]))
+        if compiled["wait_mode"] != "completion":
+            for row in result["channels"]:
+                row["completion_owner_token"] = None
+        result.update({key: compiled.get(key) for key in
+                       ("wait_mode", "report_kind", "units", "persistent", "warnings", "requested",
+                        "command_effects", "program", "buffer_action", "effects_deferred")})
+        return result
 
     def _run_group_liquid_operation(
         self,

@@ -271,6 +271,7 @@ class NovoUsbCanBus:
         wait_for_completion: bool = True,
         replace_completion_owner_token: str | None = None,
         completion_replacement_reason: str | None = None,
+        ack_only: bool = False,
     ) -> dict[str, Any]:
         router = self._current_router()
         tx_id = int(getattr(msg, "arbitration_id"))
@@ -289,7 +290,7 @@ class NovoUsbCanBus:
                 f"pipette TX tuple does not derive expected RX ID: tx=0x{tx_id:03x} expected=0x{derived_rx_id:03x}"
             )
         completion_owner_token: str | None = None
-        if int(expected_function) in {0, 1}:
+        if int(expected_function) in {0, 1} and not ack_only:
             completion_owner_token = router.prepare_pipette_completion(
                 int(channel),
                 float(completion_timeout_s),
@@ -305,7 +306,7 @@ class NovoUsbCanBus:
                 matcher=router.pipette_matcher(
                     channel=int(channel),
                     expected_function=int(expected_function),
-                    initialization=completion_owner_token is not None,
+                    initialization=completion_owner_token is not None or ack_only,
                     allow_multipart=bool(allow_multipart),
                 ),
                 matcher_name=matcher_name,
@@ -323,6 +324,12 @@ class NovoUsbCanBus:
                     "completion_owner_token": completion_owner_token,
                 },
             )
+            if ack_only:
+                acknowledged = bool(response.get("ack_received") and response.get("outcome") == "ack")
+                return {**response, "ok": acknowledged,
+                        "immediate_ack_received": acknowledged,
+                        "controller_acknowledged": acknowledged,
+                        "completion_received": False, "completion_deferred": False}
             return self._finish_pipette_response(
                 router=router,
                 response=response,
@@ -352,6 +359,7 @@ class NovoUsbCanBus:
         completion_timeout_s: float = 60.0,
         allow_multipart: bool = True,
         wait_for_completion: bool = True,
+        ack_only: bool = False,
     ) -> dict[str, Any]:
         router = self._current_router()
         if len(messages) < 2:
@@ -381,7 +389,7 @@ class NovoUsbCanBus:
                 f"pipette final TX tuple does not derive expected RX ID: expected=0x{derived_rx_id:03x}"
             )
         completion_owner_token: str | None = None
-        if int(expected_function) in {0, 1}:
+        if int(expected_function) in {0, 1} and not ack_only:
             completion_owner_token = router.prepare_pipette_completion(
                 int(channel),
                 float(completion_timeout_s),
@@ -395,7 +403,7 @@ class NovoUsbCanBus:
                 matcher=router.pipette_matcher(
                     channel=int(channel),
                     expected_function=int(expected_function),
-                    initialization=completion_owner_token is not None,
+                    initialization=completion_owner_token is not None or ack_only,
                     allow_multipart=bool(allow_multipart),
                 ),
                 matcher_name=matcher_name,
@@ -411,6 +419,12 @@ class NovoUsbCanBus:
                     "completion_owner_token": completion_owner_token,
                 },
             )
+            if ack_only:
+                acknowledged = bool(response.get("ack_received") and response.get("outcome") == "ack")
+                return {**response, "ok": acknowledged,
+                        "immediate_ack_received": acknowledged,
+                        "controller_acknowledged": acknowledged,
+                        "completion_received": False, "completion_deferred": False}
             return self._finish_pipette_response(
                 router=router,
                 response=response,

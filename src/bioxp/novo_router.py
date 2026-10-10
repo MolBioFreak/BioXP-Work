@@ -390,6 +390,9 @@ class NovoRouter:
                     "duplicate_receive_record" if frame.receive_owner == self._receive_owner
                     and frame.owner_generation == self._reader_generation else "previous_receive_owner"})
                 return
+        capture = getattr(self, "_scientific_pressure_capture", None)
+        if frame.arbitration_id in PRESSURE_STREAM_IDS and capture is not None:
+            capture.offer(frame)
         matched = False
         with self._pending_lock:
             pending = self._pending
@@ -809,6 +812,21 @@ class NovoRouter:
         cleared = len(queue)
         queue.clear()
         return cleared
+
+    def begin_scientific_pressure_capture(self, request):
+        from .pipette.pressure_capture import ScientificPressureCapture
+        prior = getattr(self, "_scientific_pressure_capture", None)
+        if prior is not None and not prior.closed:
+            raise ValueError("an explicit scientific pressure capture is already active")
+        capture = ScientificPressureCapture(request, reader_generation=self.reader_generation, clock=self._clock)
+        self._scientific_pressure_capture = capture
+        return capture
+
+    def finish_scientific_pressure_capture(self, capture):
+        # Detach first; finishing/persistence belongs to the caller, not reader.
+        if getattr(self, "_scientific_pressure_capture", None) is capture:
+            self._scientific_pressure_capture = None
+        return capture.finish()
 
     def calculate_pressure_offset_evidence(self) -> dict[int, dict[str, Any]]:
         samples: dict[int, list[float]] = {channel: [] for channel in range(4)}

@@ -39,9 +39,22 @@ def application_outcome(value):
         'transaction_id', 'timeout_ms', 'state_reconciled', 'state_reconciliation_source',
         'volume_ul', 'liquid_level_ul', 'front_air_level_ul', 'rear_air_level_ul',
         'position_steps', 'source_occurrence_id', 'fluid_timestamp', 'pipette_message_state',
+        'failed_channel', 'failure_details', 'completion_wait_started', 'source_timeout_termination',
+        'wait_mode', 'report', 'report_kind', 'units', 'value', 'raw_ascii', 'raw_bytes', 'parsed',
+        'command_effects', 'program', 'buffer_action', 'effects_deferred', 'legacy_counter_basis',
+        'scientific_pressure', 'stream_session_id', 'chunk_ids', 'observation_error',
+        'baseline_statistics', 'count', 'mean', 'sample_standard_deviation', 'min', 'max',
+        'retained_frame_count', 'lost_frame_count', 'malformed_frame_count', 'lost_sample_count',
+        'controller_timestamps_available', 'sample_period_basis', 'analysis_basis',
+        'anomaly_model', 'classification', 'started_at', 'finished_at', 'reader_generation',
+        'persistent', 'warnings', 'requested', 'accounting', 'target_liquid_ul',
+        'pneumatic_displacement_delta_ul', 'intended_liquid_delta_ul',
+        'initial_fill_known', 'measured_liquid_ul', 'known_pneumatic_delta_ul',
+        'known_intended_liquid_delta_ul', 'unknown_liquid_effect', 'unknown_pneumatic_effect', 'basis',
     })
     if isinstance(value, Mapping):
-        return {k: application_outcome(v) for k, v in value.items() if k in fields}
+        return {k: (v if k in {"failure_details", "source_timeout_termination", "requested", "warnings", "command_effects", "program"}
+                    else application_outcome(v)) for k, v in value.items() if k in fields}
     if isinstance(value, (list, tuple)):
         return [application_outcome(row) for row in value]
     return value

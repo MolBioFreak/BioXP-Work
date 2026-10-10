@@ -2819,6 +2819,18 @@ class RuntimeAuditDatabase:
             raise
 
     @serialized_runtime_write
+    def finish_pressure_stream(self, stream_session_id: str, *, loss_count: int) -> None:
+        owns_transaction = self._begin_write()
+        try:
+            self.connection.execute(
+                "UPDATE pipette_pressure_streams SET terminal_state=?,loss_count=? WHERE stream_session_id=?",
+                ("completed", int(loss_count), stream_session_id))
+            self._commit_write(owns_transaction)
+        except Exception:
+            self._rollback_write(owns_transaction)
+            raise
+
+    @serialized_runtime_write
     def record_pressure_chunk(
         self,
         *,
@@ -2831,8 +2843,11 @@ class RuntimeAuditDatabase:
         chunk_schema: str,
         lost_sample_count: int = 0,
         evidence_artifact_id: str | None = None,
+        scientific_result: Mapping[str, Any] | None = None,
     ) -> str:
         normalized = [dict(sample) for sample in samples]
+        if scientific_result is not None and len(normalized) > 12288:
+            raise ValueError("scientific pressure chunk exceeds bounded capture size")
         raw_bytes = canonical_json(normalized).encode("utf-8")
         raw_values = [float(sample["raw_pressure"]) for sample in normalized if sample.get("raw_pressure") is not None]
         corrected_values = [float(sample["corrected_pressure"]) for sample in normalized if sample.get("corrected_pressure") is not None]
@@ -2878,7 +2893,9 @@ class RuntimeAuditDatabase:
                     len(raw_bytes),
                     hashlib.sha256(raw_bytes).hexdigest(),
                     evidence_artifact_id,
-                    canonical_json({"first_sequence": min(sequences) if sequences else None, "last_sequence": max(sequences) if sequences else None}),
+                    canonical_json({"first_sequence": min(sequences) if sequences else None, "last_sequence": max(sequences) if sequences else None,
+                                    **({"scientific_result": dict(scientific_result), "samples": normalized}
+                                       if scientific_result is not None else {})}),
                 ),
             )
             if evidence_artifact_id is not None:
