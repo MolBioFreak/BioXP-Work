@@ -5,6 +5,7 @@ Physical inputs are controlled fixture frames; no robot or instrument is used.
 import json
 import os
 import time
+import pytest
 from decimal import Decimal, localcontext
 from pathlib import Path
 
@@ -123,3 +124,59 @@ def test_public_capture_instruction_actual_finite_sqlite_and_http_readback(wire_
     assert wire_rig.wire == before  # Listening/readback never enables streaming.
     assert client.get("/protocol/jobs/" + job).json()["execution"]["runtime_state"] == done["execution"]["runtime_state"]
     export("pressure-public-receiving", {"application": application, "job": done, "capture": readback, "wire": wire_rig.wire})
+
+
+from tests.test_cavro_transport_repairs import receiver
+from tests.test_cavro_failure_receiving import fresh_read
+
+
+@pytest.mark.parametrize("partial_failure", [False, True])
+def test_buffered_diagnostic_public_finite_result_and_cold_receipt(
+        receiver, installed_retained, monkeypatch, tmp_path, partial_failure):
+    """Connect D2 answers with D3 failed receipts and the protocol projection."""
+    app, client = mount(installed_retained, monkeypatch, tmp_path)
+    provider, root = installed_retained[1], installed_retained[4]
+    provider.primitives.pipette_transport = receiver.group
+    receipts = PipetteReceiptStore(root)
+    monkeypatch.setattr(api, "_pipette_receipts", receipts)
+    if partial_failure:
+        receiver.fault["missing"] = 1
+    before = {r["command_id"] for r in receipts.connection.execute("SELECT command_id FROM pipette_operations")}
+    op = {"operation": "device_program", "channels": [0, 1] if partial_failure else [0],
+          "timeout_ms": 20, "program": {"mode": "execute", "commands": [
+              {"command": "diagnostic", "test": "minimum_moving_current"}]}}
+    job_id = submit(app, client, [action("pipette_manual_physical", {
+        "operation": "cavro_application", "application": request(op)})],
+        key="integrated-diagnostic-" + str(partial_failure))
+    job = await_job(client, job_id, lambda r: r["command"]["terminal"])
+    outcome = job["execution"]["runtime_state"]["action_results"][0]["pipette_result"]
+    assert outcome["ok"] is not partial_failure
+    event = outcome["events"][0]
+    returned = event["partial"]["pipette_partial_result"] if partial_failure else event["result"]
+    emitted = returned["channels"][0]["result"]
+    reports = emitted["reports"]
+    assert len(reports) == 1 and reports[0]["value"] == 123
+    assert reports[0]["units"] == "ma" and reports[0]["command_index"] == 0
+    assert reports[0]["response"]["receive_sequence"] is not None
+    assert emitted["buffer_context"]["preloaded_contents_verified"] is False
+    assert emitted["response_descriptors"][0]["report_kind"].startswith("diagnostic_")
+    rows = [dict(r) for r in receipts.connection.execute(
+        "SELECT command_id,pipette_operation_id,status,receipt_json FROM pipette_operations ORDER BY command_id")
+        if r["command_id"] not in before]
+    assert len(rows) == 1
+    retained = json.loads(rows[0]["receipt_json"])
+    retained = retained if partial_failure else retained["result"]
+    assert retained["channels"][0]["result"]["reports"] == reports
+    if partial_failure:
+        assert returned["failed_channel"] == retained["failed_channel"] == 1
+        assert rows[0]["status"] == "failed"
+    else:
+        assert rows[0]["status"] == "completed"
+        assert returned["completion_verified"] is True
+        assert returned["channels"][0]["completion"]["active_answers"]
+    cold = fresh_read(root)
+    assert [r for r in cold["rows"] if r["command_id"] not in before] == rows
+    assert client.get("/protocol/jobs/" + job_id).json()["execution"]["runtime_state"] == job["execution"]["runtime_state"]
+    assert len(receiver.wire) == (2 if partial_failure else 1)
+    export("integrated-public-diagnostic-" + str(partial_failure),
+           {"job": job, "receipts": rows, "cold": cold, "wire": receiver.wire})

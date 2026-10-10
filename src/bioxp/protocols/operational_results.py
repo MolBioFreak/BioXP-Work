@@ -1,6 +1,7 @@
 """Lossless operational projections, separate from bounded diagnostic trees."""
 import json
 from collections.abc import Mapping
+from ..critical_logging import critical_receipt
 
 OUTCOME_FIELDS = frozenset({
     'ok', 'source_return', 'source_return_completed', 'source_call_completed',
@@ -57,9 +58,12 @@ def application_outcome(value):
         'unequal_authored_surface_references', 'geometry_limit', 'start_mode',
         'commanded_displacement_ul', 'liquid_phase', 'terminal_state',
         'source_return_completed', 'pipette_partial_result', 'message', 'failure_code',
+        'reports', 'response_descriptors', 'buffer_context', 'completion_attribution_unknown',
+        'active_answers', 'active_answer_overflow_count', 'observation_completion_only',
     })
     if isinstance(value, Mapping):
-        return {k: (v if k in {"failure_details", "source_timeout_termination", "requested", "warnings", "command_effects", "program", "observation_error"}
+        return {k: (critical_receipt(v) if k in {"reports", "response_descriptors", "buffer_context", "active_answers"}
+                    else v if k in {"failure_details", "source_timeout_termination", "requested", "warnings", "command_effects", "program", "observation_error"}
                     else application_outcome(v)) for k, v in value.items() if k in fields}
     if isinstance(value, (list, tuple)):
         return [application_outcome(row) for row in value]
