@@ -9,18 +9,32 @@ from __future__ import annotations
 
 from copy import deepcopy
 from decimal import Decimal
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Literal, Union, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, StrictStr, TypeAdapter
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictFloat, StrictInt, StrictStr, TypeAdapter, field_validator
 
 # Decimal strings retain authored zeros and precision. JSON numbers retain their
 # Python shortest round-trip spelling, without a second binary-float conversion.
 DecimalText = Annotated[StrictStr, Field(pattern=r"^-?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$")]
-Number = Union[StrictInt, Annotated[StrictFloat, Field(allow_inf_nan=False)], DecimalText]
+
+
+def _preserve_decimal(value: Any) -> Any:
+    return format(value, "f") if isinstance(value, Decimal) else value
+
+
+Number = Annotated[Union[StrictInt, Annotated[StrictFloat, Field(allow_inf_nan=False)], DecimalText],
+                   BeforeValidator(_preserve_decimal)]
 
 
 class CommandModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+    @field_validator("selector", "start_mode", mode="before", check_fields=False)
+    @classmethod
+    def _integer_selector(cls, value: Any) -> Any:
+        if type(value) is not int:
+            raise ValueError("Selector must be an integer, not a boolean or coerced number")
+        return value
 
 
 class Initialize(CommandModel):
@@ -47,6 +61,11 @@ class Slope(CommandModel):
     command: Literal["slope"]
     ramp_up: Number
     ramp_down: Number
+
+
+class SpeedDefault(CommandModel):
+    command: Literal["speed_default"]
+    speed: Literal["top", "start", "cutoff"]
 
 
 class Backlash(CommandModel):
@@ -195,7 +214,7 @@ class StoredProgramWrite(CommandModel):
 
 
 DeviceCommand = Annotated[Union[
-    Initialize, EjectTip, PlungerMove, Speed, Slope, Backlash, BeginLld, LldParameter,
+    Initialize, EjectTip, PlungerMove, Speed, SpeedDefault, Slope, Backlash, BeginLld, LldParameter,
     DigitalOutput, EventSubscription, BufferControl, LoopStart, LoopEnd, Delay, Halt,
     UserByteWrite, UserByteRead, StoredProgramRun, StoredProgramWrite, SaveSettings,
     RestoreSettings, Status, Firmware, Report, ErrorLog, CommandLog, RawPressure,
@@ -238,7 +257,7 @@ LLD_PARAMETERS = {
 }
 EVENTS = {name: n for n, name in enumerate(("pressure", "tip_loss", "digital_rising",
           "digital_falling", "clld_rising", "clld_falling", "lld_success"))}
-CONFIGURATION_CODES = dict(zip(Configuration.model_fields["setting"].annotation.__args__,
+CONFIGURATION_CODES = dict(zip(get_args(Configuration.model_fields["setting"].annotation),
     (1, 2, 3, 30, 31, 35, 36, 37, 41, 47, 48, 51, 52, 53, 54, 55, 60, 61,
      70, 71, 72, 73, 74, 75, 76, 77, 80, 81, 82, 83, 90, 91, 92, 93)))
 RESET_REQUIRED_CODES = {1, 2, 3, 30, 31, 35, 36, 37, 41, 47, 48, 51, 52, 53, 54, 55, 90, 91, 92, 93}
@@ -290,6 +309,40 @@ REPORT_FIELDS = {
     77: ["digital_input_mode", "digital_output_mode", "pressure_streaming", "pressure_module", "tip_module"],
 }
 
+# Documentary data, not Pydantic admission constraints. Shared by the encoder
+# and public catalog so a UI can display domains without inventing gates.
+SPEED_DOMAINS = {
+    "top_speed": {
+        "increments_per_second": ("1.0", "40000.0", 1, 35),
+        "ul_per_second": ("0.025", "1000.000", 3, 35)},
+    "start_speed": {
+        "increments_per_second": ("100", "4000", 0, 36),
+        "ul_per_second": ("2.500", "100.000", 3, 36)},
+    "cutoff_speed": {
+        "increments_per_second": ("100", "8000", 0, 36),
+        "ul_per_second": ("2.500", "200.000", 3, 36)},
+}
+
+
+def _numeric_domain_catalog() -> list[dict]:
+    rows = [{"command": command, "field": "value", "units": units,
+             "minimum": domain[0], "maximum": domain[1], "decimal_places": domain[2],
+             "printed_page": domain[3]} for command, domains in SPEED_DOMAINS.items()
+            for units, domain in domains.items()]
+    rows.extend({"command": "lld_parameter", "parameter": name, "field": "value",
+                 "units": domain[3], "minimum": str(domain[1]), "maximum": str(domain[2]),
+                 "decimal_places": 0, "printed_page": 55} for name, domain in LLD_PARAMETERS.items())
+    rows.extend({"command": name, "field": field, "minimum": str(low), "maximum": str(high),
+                 "decimal_places": 0, "printed_page": page} for name, field, low, high, page in [
+        ("slope", "ramp_up", 1, 40, 37), ("slope", "ramp_down", 1, 40, 37),
+        ("backlash", "increments", 0, 500, 38), ("loop_end", "repetitions", 0, 50000, 39),
+        ("delay", "milliseconds", 0, 30000, 40), ("user_byte_write", "location", 0, 15, 38),
+        ("user_byte_write", "value", 0, 255, 38), ("user_byte_read", "location", 0, 15, 44),
+        ("stored_program_write", "location", 0, 15, 42), ("stored_program_run", "location", 0, 15, 42),
+        ("error_log", "index", 1, 100, 44), ("command_log", "index", 1, 1000, 44),
+        ("command_log", "length", 1, 256, 44), ("heartbeat_period", "half_seconds", 1, 20, 53)])
+    return [{**row, "source": "30053815-C", "blocking": False} for row in rows]
+
 
 def _warning(code: str, message: str, page: int, **details: Any) -> dict:
     return {"code": code, "message": message, "source": "30053815-C",
@@ -303,7 +356,9 @@ def _domain(warnings: list, field: str, value: Number, low: Any, high: Any,
     if not Decimal(str(low)) <= number <= Decimal(str(high)):
         warnings.append(_warning("documented_range", "Authored value outside published range; unchanged.",
                                  page, field=field, value=spelling, minimum=str(low), maximum=str(high)))
-    if max(0, -number.as_tuple().exponent) > places:
+    exponent = number.as_tuple().exponent
+    assert isinstance(exponent, int)  # Number's schema excludes NaN/Infinity.
+    if max(0, -exponent) > places:
         warnings.append(_warning("documented_precision", "Authored spelling exceeds published decimal places; unchanged.",
                                  page, field=field, value=spelling, decimal_places=places))
 
@@ -341,11 +396,8 @@ def compile_device_command(payload: DeviceCommand | dict) -> dict:
         ul = model.unit == "ul_per_second"
         wire += numeric_spelling(model.value) + (",1" if ul else ",0")
         units = model.unit
-        low, high = ({"top_speed": ("0.025", 1000), "start_speed": ("2.500", 100),
-                      "cutoff_speed": ("2.500", 200)} if ul else
-                     {"top_speed": (1, 40000), "start_speed": (100, 4000), "cutoff_speed": (100, 8000)})[name]
-        _domain(warnings, "value", model.value, low, high, 3 if ul else (1 if name == "top_speed" else 0),
-                35 if name == "top_speed" else 36)
+        low, high, places, page = SPEED_DOMAINS[name][model.unit]
+        _domain(warnings, "value", model.value, low, high, places, page)
         if ul:
             warnings.append(_warning("device_unit_conversion", "Controller converts using configured maximum volume; host leaves value unchanged.",
                                      35 if name == "top_speed" else 36,
@@ -353,6 +405,10 @@ def compile_device_command(payload: DeviceCommand | dict) -> dict:
         warnings.append(_warning("programmed_not_effective_speed", "Controller may temporarily limit start/cutoff to top speed while reporting programmed values.", 37))
         if name == "cutoff_speed" and Decimal(numeric_spelling(model.value)) > Decimal(100 if ul else 4000):
             warnings.append(_warning("manufacturer_recommendation", "p36 advises against cutoff above 100 ul/s; contextual pipetting guide recipes differ. No refusal.", 36))
+    elif isinstance(model, SpeedDefault):
+        wire = {"top": "V", "start": "v", "cutoff": "c"}[model.speed]
+        units = "increments_per_second"
+        warnings.append(_warning("documentary_default_not_readback", "Omitted speed parameter restores documented increment-unit default; no device value is inferred.", 35 if model.speed == "top" else 36))
     elif isinstance(model, Slope):
         wire = "L" + numeric_spelling(model.ramp_up) + "," + numeric_spelling(model.ramp_down)
         units = "slope_code_20000_increments_per_second_squared"
@@ -383,9 +439,11 @@ def compile_device_command(payload: DeviceCommand | dict) -> dict:
         wait = "control"
     elif isinstance(model, LoopStart):
         wire = "g"
-        warnings.append(_warning("loop_context", "Loop marker requires a matching G in a device program.", 39))
+        suffix, wait = "", "ack"
+        warnings.append(_warning("loop_context", "Append marker only; pair with G and explicit R in a device program.", 39))
     elif isinstance(model, LoopEnd):
         wire = "G" + numeric_spelling(model.repetitions)
+        suffix, wait = "", "ack"
         _domain(warnings, "repetitions", model.repetitions, 0, 50000, 0, 39)
         if Decimal(numeric_spelling(model.repetitions)) == 0:
             warnings.append(_warning("endless_loop", "G0 repeats until an explicit terminate; no automatic Stop or retry.", 39))
@@ -416,6 +474,7 @@ def compile_device_command(payload: DeviceCommand | dict) -> dict:
             warnings.append(_warning("documented_program_length", "Stored string exceeds 128 ASCII bytes; unchanged.", 42, length=len(body)))
     elif isinstance(model, StoredProgramRun):
         wire = "e" + str(model.location)
+        wait = "control"
         _domain(warnings, "location", model.location, 0, 15, 0, 42)
         warnings.append(_warning("control_transfer", "Loads stored string into buffer and transfers control; contents and their persistence/motion effects are unknown until separately read.", 42))
     elif isinstance(model, SaveSettings):
@@ -492,6 +551,14 @@ def command_effects(payload: DeviceCommand | dict) -> dict:
         effect.update(kind="control_transfer", target_location=c.location, target_effects="unknown")
     elif isinstance(c, StoredProgramWrite):
         effect.update(kind="store_program", target_location=c.location, stored_commands_executed=False)
+    elif isinstance(c, Configuration):
+        code = CONFIGURATION_CODES[c.setting]
+        effect.update(kind="configuration", code=code, reset_required=code in RESET_REQUIRED_CODES,
+                      reset_added=False, setting=c.setting)
+    elif isinstance(c, EventSubscription):
+        effect.update(kind="event_subscription", event=c.event, mode=c.mode, nvram_save_supported=False)
+    elif isinstance(c, HeartbeatPeriod):
+        effect.update(kind="heartbeat_period", half_seconds=r["half_seconds"], auto_saved_by_device=True)
     elif isinstance(c, Diagnostic):
         effect.update(kind="active_diagnostic", returns_answer=True, may_move=True)
     elif compiled["wait_mode"] == "report":
@@ -513,9 +580,12 @@ def _compile_members(commands: list, *, stored: bool = False) -> tuple[str, list
     transferred = False
     for index, payload in enumerate(commands):
         c = DEVICE_COMMAND_ADAPTER.validate_python(payload)
-        compiled = compile_device_command(c)
-        if c.command in _NON_EMBEDDABLE or compiled["can_command_type"] == 6:
+        if c.command in _NON_EMBEDDABLE:
             raise ValueError(f"{c.command} is not a buffer member; submit separately")
+        compiled = compile_device_command(c)
+        if compiled["can_command_type"] == 6:
+            raise ValueError(f"{c.command} is not a buffer member; submit separately")
+        reachable = not transferred
         if transferred:
             warnings.append(_warning("unreachable_after_transfer", "Commands after e are not executed in the original string.", 42, command_index=index))
             if stored:
@@ -529,9 +599,10 @@ def _compile_members(commands: list, *, stored: bool = False) -> tuple[str, list
                 raise ValueError("loop_end without loop_start")
         elif c.command == "stored_program_run":
             transferred = True
-        pieces.append(compiled["ascii"][:-1])  # only R-requiring members reach this branch
+        pieces.append(compiled["ascii"].removesuffix("R"))
         effect = command_effects(c)
-        effect.update(command_index=index, disposition="authored_not_observed")
+        effect.update(command_index=index, disposition="authored_not_observed",
+                      reachable_in_authored_string=reachable)
         effects.append(effect)
         warnings.extend({**w, "command_index": index} for w in compiled["warnings"] if w["code"] != "loop_context")
     if depth:
@@ -551,9 +622,9 @@ def compile_device_program(payload: DeviceProgram | dict) -> dict:
     if len(wire.encode("ascii")) > 256:
         warnings.append(_warning("documented_buffer_length", "Authored string exceeds 256 characters; unchanged. Prior buffer contents remain unknown.", 32, length=len(wire)))
     warnings.append(_warning("prior_buffer_unknown", "Append/execute can extend a previously loaded buffer; codec neither clears nor reads it automatically.", 32))
-    special = any(e["kind"] in ("halt", "control_transfer") or e["command"] == "loop_end" and Decimal(numeric_spelling(e["requested"]["repetitions"])) == 0 for e in effects)
+    special = not effects or any(e["kind"] in ("halt", "control_transfer") or e["command"] == "loop_end" and Decimal(numeric_spelling(e["requested"]["repetitions"])) == 0 for e in effects)
     result = _envelope(wire, r, wait_mode="ack" if program.mode == "append" else ("control" if special else "completion"),
-                       persistent=program.mode == "execute" and any(e["persistent_write"] for e in effects), warnings=warnings)
+                       persistent=program.mode == "execute" and any(e["persistent_write"] and e["reachable_in_authored_string"] for e in effects), warnings=warnings)
     result.update(program=r, command_effects=effects, buffer_action="append" if program.mode == "append" else "append_and_execute",
                   effects_deferred=program.mode == "append")
     return result
@@ -572,6 +643,12 @@ def device_command_catalog() -> dict:
     from .cavro_command_catalog import FAMILY_COVERAGE
     return deepcopy({"schema_version": 1, "generation": "original_adp", "manual": "30053815-C",
                      "families": FAMILY_COVERAGE,
+                     "numeric_domains": _numeric_domain_catalog(),
+                     "source_unresolved_numeric_domains": ["plunger_absolute", "plunger_aspirate", "plunger_dispense", "drive_current_setter"],
+                     "reduced_pressure_report": {"command": "raw_pressure", "ascii": "#", "can_command_type": 6,
+                         "status_byte": False, "payload": "four ASCII hexadecimal digits, signed 16-bit two's-complement ADC counts",
+                         "units": "adc_counts", "source": "30053815-C", "printed_pages": [49, 50],
+                         "oem_rs485_etx_present": False, "oem_sequence_optional": True, "oem_repeat_flag_allowed": False},
                      "reports": [{"selector": n, "name": v[0], "units": v[1], "printed_page": v[2],
                                   "fields": REPORT_FIELDS.get(n), "can_command_type": 6,
                                   "status_byte": True} for n, v in REPORTS.items()],

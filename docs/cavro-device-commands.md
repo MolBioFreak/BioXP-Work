@@ -22,7 +22,8 @@ union discriminated by `command`; `DEVICE_COMMAND_ADAPTER` validates it.
   Documented `T` is emitted without R (frame 1; frame 0 is also documented).
   Existing legacy TR and error-log encoders are untouched.
 - `wait_mode=report` never means actuator completion; `ack` only means buffer
-  append acknowledgment. `control` includes R/X/C/T/reset/H and programs with
+  append acknowledgment (including standalone g/G markers, which have no R).
+  `control` includes R/X/C/T/reset/H/e and programs with
   halt/endless loop/control transfer: READY alone cannot establish completion.
 - Diagnostics use frame 1 with R, `completion` and a non-null diagnostic
   `report_kind`; transport must retain the diagnostic answer as well as lifecycle.
@@ -54,11 +55,16 @@ compile_device_command({"command": "buffer_clear"})    # C
 ## Numeric and program boundaries
 
 Use decimal strings for exact authored spelling (including trailing zeros).
+Python Decimal input is preserved as a fixed-point string, never routed through
+binary float. `speed_default` explicitly emits V/v/c with omitted parameters;
+these restore manufacturer increment-unit defaults, not inferred installed values.
 Finite JSON numbers are supported; their shortest round-trip decimal is emitted
 without silent clamping, unit conversion or rounding. Structural ASCII-injection,
 unknown command/selector, nonfinite values and nonembeddable commands are rejected
 only in this new typed surface. Numeric manufacturer range/precision/length and
-applicability diagnostics are **nonblocking** and source/page linked. Legacy paths
+applicability diagnostics are **nonblocking** and source/page linked. The catalog's
+`numeric_domains` exposes numeric bounds/precision as documentary data, not schema
+admission limits. Legacy paths
 are unchanged. Missing A/P/D action headings do not justify universal bounds.
 
 Programs preserve order and firmware g/G loops without host expansion. Loops must
@@ -66,7 +72,10 @@ balance within the typed string; reports and immediate controls remain separate.
 A stored string contains typed commands; `stored_program_write` writes sN,...R but
 does not execute those stored commands. e transfers control, not a subroutine
 return. Host commands after e receive unreachable diagnostics; stored e must be
-last. A prior device buffer is unknown. R can append and execute it; C is never
+last. Effects after a host e retain authored fields but are marked unreachable in
+that string; the target stored program's effects remain unknown. An empty execute
+is R with control semantics, not proof of a finite program. A prior device buffer
+is unknown. R can append and execute it; C is never
 inserted automatically. H reports READY while halted. M is device timing, not
 host sleep; source p40 defines R/T/X differences. Errors erase the executed buffer.
 
