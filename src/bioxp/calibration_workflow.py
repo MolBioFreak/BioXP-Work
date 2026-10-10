@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 from pydantic import Field, TypeAdapter
 
 from .calibration_analysis import AnalysisRequest, ANALYSIS_ADAPTER, AnalysisResult, analyze
-from .calibration_measurements import Input, Identity, Operand, ResultReference, operand, resolve_reference, MeasurementForm, MeasurementResponse
+from .calibration_measurements import Input, Identity, Operand, ResultReference, operand, resolve_reference, MeasurementForm, MeasurementResponse, PendingMeasurement, PendingMeasurementReview, MeasurementRecord
 from .oem_calibration_settings import CalibrationSettingsPatch, PositionCalibrationPatch, CalibrationRunResponse
 
 
@@ -90,6 +90,9 @@ ID_NAMES = {2: "LOC_TC", 0: "LOC_MS", 1: "LOC_OC", 3: "LOC_RC",
 def calibration_contract():
     return {"measurement_form": MeasurementForm.model_json_schema(),
             "measurement_response": MeasurementResponse.model_json_schema(),
+            "pending_measurement": PendingMeasurement.model_json_schema(),
+            "pending_review": PendingMeasurementReview.model_json_schema(),
+            "measurement_record": MeasurementRecord.model_json_schema(),
             "analysis_request": ANALYSIS_ADAPTER.json_schema(),
             "analysis_result": AnalysisResult.model_json_schema(),
             "action_params": CALIBRATION_ACTION_ADAPTER.json_schema(),

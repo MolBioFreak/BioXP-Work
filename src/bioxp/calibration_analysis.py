@@ -27,6 +27,11 @@ class PipetteSample(Input):
     observation: Annotated[VolumeObservation | MassObservation, Field(discriminator="kind")]
 
 
+class CorrectionDomain(Input):
+    minimum_ul: ExactNumber
+    maximum_ul: ExactNumber
+
+
 class PipetteAnalysis(Input):
     kind: Literal["pipette"]
     # Exact-point additive correction and inverse linear response are different
@@ -35,6 +40,8 @@ class PipetteAnalysis(Input):
     context: dict
     samples: list[PipetteSample] = Field(min_length=1)
     evaluate_targets_ul: list[ExactNumber] = Field(default_factory=list)
+    domain_ul: CorrectionDomain | None = None
+    verification_samples: list[PipetteSample] = Field(default_factory=list)
 
 
 class ThermalSample(Input):
@@ -92,6 +99,21 @@ Correction = Annotated[ExactPointCorrection | AffineCorrection, Field(discrimina
 class CorrectionEvaluation(Input):
     target_ul: ExactNumber
     commanded_ul: str
+    outside_authored_domain: bool | None = None
+
+
+class FitResidual(Input):
+    point_id: str
+    measured_mean_ul: str
+    predicted_ul: str
+    residual_ul: str
+
+
+class AffineFit(Input):
+    response_slope: str
+    response_intercept_ul: str
+    weighting: Literal["equal_point_means"] = "equal_point_means"
+    residuals: list[FitResidual]
 
 
 class AnalysisResult(Input):
@@ -103,6 +125,8 @@ class AnalysisResult(Input):
     correction: Correction | None
     evaluated: list[CorrectionEvaluation] = Field(default_factory=list)
     applied: Literal[False] = False
+    affine_fit: AffineFit | None = None
+    verification_points: list[PointStatistics] = Field(default_factory=list)
     thermal_application: Literal["source_write_semantics_unresolved"] | None = None
 
 
@@ -167,7 +191,14 @@ def analyze(request, state=None):
         points = [statistics(k, identity[0], identity[1], values) for k, (identity, values) in groups.items()]
         correction = None
         evaluated = []
+        affine_fit = None
+        verification_points = []
         if isinstance(req, PipetteAnalysis):
+            if req.domain_ul is not None and number(req.domain_ul.minimum_ul) > number(req.domain_ul.maximum_ul):
+                raise ValueError("authored correction domain has inverted bounds")
+            if req.verification_samples:
+                verification_points = analyze({"kind":"pipette", "model":"descriptive", "context":req.context,
+                    "samples":[s.model_dump(mode="json", exclude_unset=True) for s in req.verification_samples]}, state)["points"]
             if req.model == "exact_point_offset":
                 if len({Decimal(p.target) for p in points}) != len(points):
                     raise ValueError("exact-point correction requires unique targets")
@@ -186,6 +217,10 @@ def analyze(request, state=None):
                     raise ValueError("constant measured response has no inverse affine correction")
                 intercept = ymean - slope * xmean
                 correction = {"kind": "affine", "scale": text(1 / slope), "offset_ul": text(-intercept / slope)}
+                affine_fit = {"response_slope":text(slope), "response_intercept_ul":text(intercept),
+                    "residuals":[{"point_id":p.point_id, "measured_mean_ul":p.mean,
+                        "predicted_ul":text(slope * Decimal(p.commanded) + intercept),
+                        "residual_ul":text(Decimal(p.mean) - (slope * Decimal(p.commanded) + intercept))} for p in points]}
             if req.evaluate_targets_ul and correction is None:
                 raise ValueError("evaluation requires an explicitly selected correction model")
             if correction is not None:
@@ -193,9 +228,11 @@ def analyze(request, state=None):
                 # authority. This action returns a selected model, never edits a
                 # recipe, controller or settings and never applies it twice.
                 from .pipette.cavro_liquid import correction_at_target
-                evaluated = [{"target_ul": t, "commanded_ul": correction_at_target(t, correction)}
+                evaluated = [{"target_ul": t, "commanded_ul": correction_at_target(t, correction),
+                    "outside_authored_domain":None if req.domain_ul is None else not (number(req.domain_ul.minimum_ul) <= number(t) <= number(req.domain_ul.maximum_ul))}
                              for t in req.evaluate_targets_ul]
         result = AnalysisResult(kind=req.kind, requested=req.model_dump(mode="json", exclude_unset=True),
             resolved_samples=resolved, points=points, correction=correction, evaluated=evaluated,
+            affine_fit=affine_fit, verification_points=verification_points,
             thermal_application="source_write_semantics_unresolved" if isinstance(req, ThermalAnalysis) else None)
         return result.model_dump(mode="json")

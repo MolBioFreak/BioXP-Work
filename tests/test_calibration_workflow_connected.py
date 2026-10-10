@@ -28,16 +28,19 @@ def test_thermal_prompt_real_handlers_same_job_and_store_reopen(installed_retain
     app, provider, primitives, references, root = installed_retained
     monkeypatch.setenv("BIOXP_PROTOCOL_JOBS_ROOT", str(tmp_path / "artifacts"))
     calls = []
+    last_target = [None]
     # Fixture-only physical leaves. Real API binding, thermal mechanism, timers,
     # executor, controls and durable job all remain connected.
     def set_temp(selected, target, **kw):
         calls.append((selected, target, kw))
+        last_target[0] = target
         return {"ok": True, "fixture_only": True, "authored_target": target}
     tester = SimpleNamespace(THERMAL_BANK_NEST=0, THERMAL_BANK_LID=1,
         CHILLER_BANK_RC=0, CHILLER_BANK_OC=1,
         chiller_activate=lambda: calls.append("activate"),
         chiller_set_target_temp=set_temp, thermal_set_target_temp=set_temp,
-        thermal_set_ped_temp=lambda target, **kw: set_temp("pedestal", target, **kw))
+        thermal_set_ped_temp=lambda target, **kw: set_temp("pedestal", target, **kw),
+        thermal_read_temp_gp=lambda selected: {"ok": True, "temp_c":last_target[0] - .1, "fixture_only":True})
     monkeypatch.setattr(api, "_get_tester", lambda: tester)
     mount_protocol_routes(app)
     app.add_api_route("/protocol/calibration/schema",api.protocol_calibration_schema,methods=["GET"])
@@ -48,6 +51,9 @@ def test_thermal_prompt_real_handlers_same_job_and_store_reopen(installed_retain
         pid = f"probe{index}"
         actions.append({"action_id":f"heat{index}", "kind":"chiller_setpoint" if module != "tc" else "thermal_setpoint",
                         "params":{"bank":bank,"target_temp_c":target}})
+        if bank == "nest":
+            actions[-1]["kind"]="thermal_hold"
+            actions[-1]["params"].update(duration_s=0,start="attainment",tolerance_c=.2,timeout_s=2)
         actions.extend([{"action_id":f"timer{index}","kind":"timer_start","params":{"timer_id":f"t{index}","seconds":0}},
                         {"action_id":f"wait{index}","kind":"timer_wait","params":{"timer_id":f"t{index}"}}])
         p = prompt(pid,module)
@@ -55,7 +61,10 @@ def test_thermal_prompt_real_handlers_same_job_and_store_reopen(installed_retain
         actions.append(p)
         for repeat in range(2):
             samples.append({"point_id":pid,"module":module,"zone":bank,"target_c":str(target),"commanded_c":str(target),
-                            "measured_c":reference(pid,repeat)})
+                            "measured_c":reference(pid,repeat),
+                            **({"controller_reported_c":{"stage_id":"one","action_id":f"heat{index}",
+                               "source_occurrence_id":f"heat{index}","output":"result","path":["last_temperature","temp_c"]}}
+                               if bank == "nest" else {})})
     actions.append({"action_id":"analysis","kind":"calibration","params":{"operation":"analyze","analysis":{"kind":"thermal","samples":samples}}})
     request = request_payload(f"measurement-{module}-{bank}", actions)
     response = client.post("/protocol/execute",json=request)
@@ -82,6 +91,22 @@ def test_thermal_prompt_real_handlers_same_job_and_store_reopen(installed_retain
               "reviewer":"external-probe-fixture","measurements":{"probe":["30.9000",31.1] if index == 0 else ["36.9000",37.1]}}
         wrong=client.post(f"/protocol/jobs/{job}/review",json={**body,"idempotency_key":f"wrong-{index}","source_occurrence_id":"wrong"})
         assert wrong.status_code == 409,wrong.text
+        if module == "rc" and index == 0:
+            store=app.state.operator_command_plane.store
+            original_publish=store.publish_workflow
+            def fail_response_write(command_id, *, payload):
+                if payload["execution"]["runtime_state"]["measurement_reviews"]:
+                    raise OSError("injected scratch response persistence failure")
+                return original_publish(command_id,payload=payload)
+            monkeypatch.setattr(store,"publish_workflow",fail_response_write)
+            with TestClient(app,raise_server_exceptions=False) as failing_client:
+                failed=failing_client.post(f"/protocol/jobs/{job}/review",json={**body,"idempotency_key":"write-failed"})
+                assert failed.status_code == 500
+            monkeypatch.setattr(store,"publish_workflow",original_publish)
+            still_held=client.get(f"/protocol/jobs/{job}").json()
+            assert still_held["operator"]["pending_review"] == pending
+            assert still_held["execution"]["runtime_state"]["measurement_reviews"] == []
+            assert sum(isinstance(c,tuple) for c in calls) == 1
         acknowledgment=client.post(f"/protocol/jobs/{job}/review",json=body)
         assert acknowledgment.status_code == 200,acknowledgment.text
         acknowledgments.append(body)
@@ -93,6 +118,8 @@ def test_thermal_prompt_real_handlers_same_job_and_store_reopen(installed_retain
     assert analysis["thermal_application"] == "source_write_semantics_unresolved"
     assert analysis["correction"] is None and analysis["applied"] is False
     assert analysis["resolved_samples"][0]["measured_c"] == "30.9000"
+    if bank == "nest":
+        assert analysis["resolved_samples"][0]["controller_reported_c"] == 31.15
     assert sum(isinstance(c,tuple) for c in calls) == 2
     for body in acknowledgments:
         replay=client.post(f"/protocol/jobs/{job}/review",json=body)

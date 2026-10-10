@@ -20,7 +20,8 @@ def finite_number(value):
 
 # Strings retain the operator's exact decimal spelling; JSON numbers retain
 # their value/type. Never coerce a bool into a scientific numeric value.
-ExactNumber = Annotated[StrictStr | StrictInt | StrictFloat, AfterValidator(finite_number)]
+NumericText = Annotated[StrictStr, Field(pattern=r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$")]
+ExactNumber = Annotated[NumericText | StrictInt | StrictFloat, AfterValidator(finite_number)]
 Identity = Annotated[str, Field(strict=True, min_length=1)]
 
 
@@ -54,6 +55,25 @@ class MeasurementForm(Input):
 
 class MeasurementResponse(Input):
     measurements: dict[str, list[ExactNumber]]
+
+
+class PendingMeasurement(Input):
+    stage_id: Identity
+    action_id: Identity
+    source_occurrence_id: Identity
+    measurement_form: MeasurementForm
+
+
+class PendingMeasurementReview(PendingMeasurement):
+    reason: str | None
+
+
+class MeasurementRecord(PendingMeasurement):
+    measurements: dict[str, list[ExactNumber]]
+    reviewer: str
+    note: str | None
+    job_id: str | None
+    source: Literal["operator_external_measurement"]
 
 
 class ResultReference(Input):
@@ -92,6 +112,7 @@ def accept_measurements(state, measurements, *, reviewer, note=None):
     record = {**deepcopy(pending), "measurements": deepcopy(response.measurements),
               "reviewer": reviewer, "note": note, "job_id": state.job_id,
               "source": "operator_external_measurement"}
+    MeasurementRecord.model_validate(record)
     state.measurement_reviews.append(record)
     state.pending_measurement = None
     return record

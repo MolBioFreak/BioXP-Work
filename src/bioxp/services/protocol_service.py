@@ -658,7 +658,11 @@ def bind_protocol_dispatcher(command_store, *, binding_factory, artifact_store=N
                                     **({"measurements": request["measurements"]} if "measurements" in request else {}),
                                     **({"decision": request["decision"]} if "decision" in request else {}),
                                     "control_command_id": control_id})
-                    publish(state)
+                    try:
+                        publish(state)
+                    except Exception:
+                        reviews.pop()
+                        raise
                 executor.acknowledge_review(control_id=control_id, gate_id=state.workflow.gate_id,
                     decision=request.get("decision"), measurements=request.get("measurements"),
                     reviewer=request["reviewer"], note=request.get("note"), on_accepted=retain_review)

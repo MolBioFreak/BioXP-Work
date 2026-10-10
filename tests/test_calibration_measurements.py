@@ -43,7 +43,7 @@ def test_exact_values_descriptive_and_selected_point_correction():
     assert point["mean"] == "20.1" and point["bias"] == "0.10"
     assert Decimal(point["sample_sd"]) > 0 and point["count"] == 2
     assert result["correction"] == {"kind": "points", "points": [{"target_ul": "20.00", "commanded_ul": "20.90"}]}
-    assert result["evaluated"] == [{"target_ul": "20.00", "commanded_ul": "20.90"}]
+    assert result["evaluated"] == [{"target_ul": "20.00", "commanded_ul": "20.90", "outside_authored_domain":None}]
     assert result["resolved_samples"][0]["observation"]["mass_mg"] == "19.8"
     assert result["applied"] is False
     # Evaluation is the existing producer; no inferred interpolation.
@@ -61,6 +61,16 @@ def test_affine_model_must_be_explicit_and_invertible():
     assert result["correction"] == {"kind": "affine", "scale": "0.5", "offset_ul": "-0.5"}
     assert result["evaluated"][0]["commanded_ul"] == "12.0"
     assert all(p["sample_sd"] is None for p in result["points"])
+    req["domain_ul"] = {"minimum_ul":"10", "maximum_ul":"20"}
+    req["verification_samples"] = [{"point_id":"held-out", "target_ul":"25", "commanded_ul":"12",
+                                   "observation":{"kind":"volume","measured_ul":"24.5"}}]
+    with_verification = analyze(req)
+    assert with_verification["correction"] == result["correction"]
+    assert with_verification["evaluated"][0]["outside_authored_domain"] is True
+    assert with_verification["evaluated"][0]["commanded_ul"] == "12.0"
+    assert with_verification["verification_points"][0]["bias"] == "-0.5"
+    assert with_verification["affine_fit"]["response_slope"] == "2"
+    assert all(r["residual_ul"] == "0" for r in with_verification["affine_fit"]["residuals"])
     req["samples"] = req["samples"][:1]
     with pytest.raises(ValueError, match="distinct commanded"):
         analyze(req)

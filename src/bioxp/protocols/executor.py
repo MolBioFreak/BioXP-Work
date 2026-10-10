@@ -429,9 +429,18 @@ class ProtocolExecutor:
             if not preparation and decision is not None:
                 raise ValueError("Inspection decision requires the preparation review gate")
             from ..calibration_measurements import accept_measurements
+            pending_measurement = self._state.pending_measurement
+            measurement_count = len(self._state.measurement_reviews)
             accept_measurements(self._state, measurements, reviewer=reviewer, note=note)
-            if on_accepted is not None:
-                on_accepted()
+            try:
+                if on_accepted is not None:
+                    on_accepted()
+            except Exception:
+                # Keep the original authored hold on a failed durable write;
+                # neither advance heating nor lose the response form on retry.
+                self._state.pending_measurement = pending_measurement
+                del self._state.measurement_reviews[measurement_count:]
+                raise
             self._controls[control_id] = request
             self._review_released = decision != "abort"
             if decision == "abort":

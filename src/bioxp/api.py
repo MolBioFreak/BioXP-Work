@@ -11004,7 +11004,7 @@ from .calibration_workflow import calibration_contract
 
 @app.get("/protocol/calibration/schema")
 async def protocol_calibration_schema():
-    return calibration_contract()
+    return {**calibration_contract(), "review_request": ProtocolReviewRequest.model_json_schema()}
 
 
 @app.post("/protocol/calibration/analyze", response_model=AnalysisResult)
