@@ -267,6 +267,10 @@ class CanPipetteTransport:
         from .effect_accounting import CompletedEffectAccount
         if not hasattr(self, "_effect_account"):
             self._effect_account = CompletedEffectAccount()
+        scope = result.get("accounting_scope")
+        if scope is not None and getattr(self, "_effect_account_scope", None) != scope:
+            self._effect_account = CompletedEffectAccount(result.get("accounting_initial"), result.get("accounting_vessels", []))
+            self._effect_account_scope = scope
         account_operation, account_result = operation, result
         if operation == "cavro_device_command":
             requested = result.get("requested") or {}

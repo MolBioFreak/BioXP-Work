@@ -60,10 +60,13 @@ def application_outcome(value):
         'source_return_completed', 'pipette_partial_result', 'message', 'failure_code',
         'reports', 'response_descriptors', 'buffer_context', 'completion_attribution_unknown',
         'active_answers', 'active_answer_overflow_count', 'observation_completion_only',
+        'occupancy', 'detection', 'geometry_used', 'observation', 'vessel_state',
+        'height_mm', 'head_mm', 'head_target_steps', 'mounted_tip_footprints', 'authored', 'physical_fit_verified',
     })
     if isinstance(value, Mapping):
         return {k: (critical_receipt(v) if k in {"reports", "response_descriptors", "buffer_context", "active_answers"}
-                    else v if k in {"failure_details", "source_timeout_termination", "requested", "warnings", "command_effects", "program", "observation_error"}
+                    else v if k in {"failure_details", "source_timeout_termination", "requested", "warnings", "command_effects", "program", "observation_error",
+                                   "occupancy", "detection", "vessel_state", "head_mm", "head_target_steps", "mounted_tip_footprints", "authored", "target_steps"}
                     else application_outcome(v)) for k, v in value.items() if k in fields}
     if isinstance(value, (list, tuple)):
         return [application_outcome(row) for row in value]

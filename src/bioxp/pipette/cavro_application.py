@@ -22,6 +22,8 @@ from .cavro_geometry import (SurfaceMove, SharedHead, ProfilePickup, resolve_sur
                              resolve_displacement, shared_head_evidence)
 from .cavro_commands import Number, DeviceCommand, DeviceProgram, compile_device_command, compile_device_program
 from .pressure_capture import PressureCaptureRequest
+from .cavro_geometry import RackTransform, resolve_rack_transform, mounted_trajectory
+from .effect_accounting import AccountingContext, StrokeIntent
 
 IMPLEMENTATION = "original-adp.application.v1"
 
@@ -65,6 +67,7 @@ class Stroke(_Selected):
     volume_ul: NonnegativeNumber
     speed_ul_s: PositiveNumber
     target_liquid_ul: NonnegativeNumber | None = None
+    accounting_intent: StrokeIntent | None = None
 
 
 class Empty(_Selected):
@@ -86,6 +89,7 @@ class Delay(_Input):
 class Position(_Input):
     operation: Literal["position"]
     positioning: dict[str, Any]
+    rack_transform: RackTransform | None = None
 
 
 class ZMove(_Input):
@@ -119,6 +123,7 @@ class TrackedAspirate(_Selected):
     volume_ul: NonnegativeNumber
     speed_ul_s: PositiveNumber
     target_liquid_ul: NonnegativeNumber | None = None
+    accounting_intent: StrokeIntent | None = None
     trajectory: SurfaceMove
     z_motor_current: int
     z_timeout_ms: int = Field(gt=0)
@@ -153,6 +158,7 @@ class ApplicationRequest(_Input):
     liquid_settings: dict[str, Any] = Field(default_factory=dict)
     event_policy: Literal["stop", "pause_for_operator"] = "stop"
     shared_head: SharedHead | None = None
+    accounting_context: AccountingContext | None = None
 
 
 # 399155 p3: numeric selector, domain, published default, unit. These defaults
@@ -294,13 +300,19 @@ def compile_application(request: Mapping[str, Any]) -> dict[str, Any]:
             elif isinstance(instruction, Position):
                 from ..manual_pipetting import manual_position_plan
                 op["native_plan"] = manual_position_plan(instruction.positioning)
+                if instruction.rack_transform is not None:
+                    op["resolved_rack"] = resolve_rack_transform(op["rack_transform"], raw.get("shared_head"))
+                    if op["resolved_rack"]["geometry_used"]:
+                        from ..oem_deck_movement import compile_finite_plate_operation
+                        xyz = op["resolved_rack"]["target_steps"]
+                        op["native_plan"] = compile_finite_plate_operation("pipette_move_xy", source_leaf_available=True, x=xyz["x"], y=xyz["y"])
             elif isinstance(instruction, Plld):
                 if (instruction.after_detection_steps is None) != (instruction.after_detection_speed_native is None):
                     raise ValueError("after_detection_steps and after_detection_speed_native must be specified together")
                 op["wire_commands"] = [{"field": "plld", "ascii": "B1R" if instruction.start_mode == 1 else "BR"}]
             elif isinstance(instruction, SurfaceMove):
                 resolve_displacement(op["displacement"])
-                if instruction.reference.kind == "authored":
+                if instruction.reference.kind in {"authored", "vessel", "rack"}:
                     op["resolved_geometry"] = resolve_surface_move(op, {})
             elif isinstance(instruction, DeviceCommandInstruction):
                 op["compiled_command"] = compile_device_command(op["command"])
@@ -309,6 +321,12 @@ def compile_application(request: Mapping[str, Any]) -> dict[str, Any]:
             elif isinstance(instruction, ProfilePickup):
                 from ..manual_pipetting import manual_position_plan
                 op["native_plan"] = manual_position_plan(op["calibration"]["positioning"])
+                if op["calibration"].get("rack_transform") is not None:
+                    op["resolved_rack"] = resolve_rack_transform(op["calibration"]["rack_transform"], raw.get("shared_head"))
+                    if op["resolved_rack"]["geometry_used"]:
+                        from ..oem_deck_movement import compile_finite_plate_operation
+                        xyz = op["resolved_rack"]["target_steps"]
+                        op["native_plan"] = compile_finite_plate_operation("pipette_move_xy", source_leaf_available=True, x=xyz["x"], y=xyz["y"])
                 for phase in ("pickup", "retract"):
                     if op["calibration"][phase] is not None:
                         resolve_displacement(op["calibration"][phase]["displacement"])
@@ -359,6 +377,19 @@ def capability_catalog() -> dict[str, Any]:
                 "axis_units": ["steps", "mm with authored calibration"],
                 "independent_channel_z": False, "automatic_geometry": False,
                 "tracking": "Authored constant-speed shared-Z trajectory starts after selected pump sends and before their completion waits; not continuous level feedback."},
+            "geometry_context": {"status": "implemented_explicit_opt_in",
+                "surface_references": ["authored", "detected", "vessel", "rack"],
+                "cross_section_models": ["constant", "linear_area"],
+                "volume_height_units": "uL = mm^3; exact Decimal integration/inversion",
+                "rack_transform": "Signed measured 3D basis and affine native-step rows; explicit reference channel; XY and Z selected separately",
+                "missing_or_nonintegral_geometry": "Nonblocking observation; retain explicit authored fallback",
+                "mounted_tips": "All supplied mounted tips, including inactive and mixed lengths; predicted common-head footprints, not collision or fit proof"},
+            "completed_effect_accounting": {"status": "implemented_nonblocking_observations",
+                "context": "Optional per-channel explicit pneumatic/liquid-intent initial compartments; null means unknown, empty list means authored empty",
+                "inventories": ["commanded_pneumatic", "authored_liquid_intent"],
+                "evidence": ["interfaces", "peak_occupancy", "cumulative_travel", "phase_roles", "vessel_accessibility", "completed_prefix"],
+                "physical_delivery_verified": False, "capacity_enforced": False,
+                "correction_apportioned_to_liquid": False},
             "tip_profiles": {name: {"design_intent": True, "physical_fit_verified": False,
                 "pickup_mapping": "source T50/T200 or explicit existing manual tray/well pickup; no inferred rack geometry",
                 "profile_context": "shared_head.mounted_tips; metric surface_move requires explicit tip_offset_mm"}
@@ -384,8 +415,15 @@ def _send_wire(group, channels, wire, timeout_ms, *, after_sends=None, effect="c
         # Reuse the existing send-failure semantics. The collection attaches
         # earlier channels to exceptions; keep the failing raw response too.
         transport._assert_driver_result(effect, raw)
+        values = dict(inputs or {})
+        context = values.get("accounting_context")
+        if context is not None:
+            values["accounting_initial"] = next((v for v in context.get("initial_channels", []) if v["channel"] == channel), None)
+            values["accounting_vessels"] = context.get("vessels", [])
+        intent = values.get("accounting_intent") or {}
+        values["accounting_vessel_id"] = intent.get("channel_vessels", {}).get(str(channel))
         return {"ok": raw.get("ok") is True, "driver_result": raw,
-                **transport._driver_evidence(raw), **(inputs or {})}
+                **transport._driver_evidence(raw), **values}
     try:
         outcome = group._run_group_liquid_operation(effect, channels, send,
             timeout_ms=timeout_ms, after_sends=after_sends,
@@ -417,6 +455,8 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
     epoch = group._interrupt_epoch
     events = result["events"]
     detections = {}
+    last_rack = None
+    head_targets = {}
     result["shared_head"] = shared_head_evidence(request.get("shared_head"), [])
 
     def fence(identity):
@@ -456,7 +496,16 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
 
     def z_move(target, speed):
         record("z_speed", lambda: provider.primitives.z_set_max_speed(speed), inputs={"speed_native": speed})
-        return record("z_move", lambda: provider.moveZ(target), inputs={"target_steps": target})
+        body = record("z_move", lambda: provider.moveZ(target), inputs={"target_steps": target})
+        head_targets["z"] = target
+        return body
+
+    def footprints(geometry, move, channels=()):
+        if request.get("shared_head") is not None:
+            transform = move["reference"].get("transform") if move["reference"]["kind"] == "rack" else last_rack
+            geometry.update(mounted_trajectory(request["shared_head"],
+                {**head_targets, "z": geometry["target_steps"]}, transform, channels))
+        return geometry
 
     try:
         for index, op in enumerate(plan["operations"]):
@@ -479,11 +528,18 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                 events.append({"operation": "delay", "origin": "robot_orchestration",
                                "inputs": op, "status": "completed", "result": {"ok": True}})
             elif kind == "position":
+                if op.get("resolved_rack") is not None:
+                    record("rack_geometry", lambda: {"ok": True, **op["resolved_rack"]}, inputs=op)
                 record("position", lambda: provider._wp8_execute_nested_plan(
                     plan=op["native_plan"], command_id=command_id,
                     owner_identity={**owner_identity, "source_identity":
                         f"{owner_identity['source_identity']}:cavro:position:{index}"}), inputs=op["positioning"])
+                if (op.get("resolved_rack") or {}).get("geometry_used"):
+                    last_rack = op["rack_transform"]
+                    head_targets.update({a: op["resolved_rack"]["target_steps"][a] for a in ("x", "y")})
             elif kind == "profile_pickup":
+                if op.get("resolved_rack") is not None:
+                    record("rack_geometry", lambda: {"ok": True, **op["resolved_rack"]}, inputs=op)
                 # Explicit general-purpose pickup. Retain existing station/well
                 # routing and finite ownership; do not assign OEM T50/T200 type,
                 # inventory or tip-location from a requested profile.
@@ -491,7 +547,11 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                     plan=op["native_plan"], command_id=command_id, owner_identity={**owner_identity,
                         "source_identity": f"{owner_identity['source_identity']}:cavro:pickup:{index}"}),
                     inputs=op["calibration"])
+                if (op.get("resolved_rack") or {}).get("geometry_used"):
+                    last_rack = op["calibration"]["rack_transform"]
+                    head_targets.update({a: op["resolved_rack"]["target_steps"][a] for a in ("x", "y")})
                 geometry = resolve_surface_move(op["calibration"]["pickup"], detections)
+                footprints(geometry, op["calibration"]["pickup"])
                 record("profile_pickup_geometry", lambda: {"ok": True, **geometry,
                     "profile": op["profile"], "calibration": op["calibration"],
                     "physical_fit_verified": False}, inputs=op)
@@ -504,6 +564,7 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                 z_move(op["target_steps"], op["speed_native"])
             elif kind == "surface_move":
                 geometry = resolve_surface_move(op, detections)
+                footprints(geometry, op)
                 record("surface_reference", lambda: {"ok": True, **geometry}, inputs=geometry)
                 z_move(geometry["target_steps"], geometry["speed_native"])
             elif kind == "plld":
@@ -558,6 +619,7 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                 tracking: dict[str, Any] = {}
                 if kind == "tracked_aspirate":
                     tracking = resolve_surface_move(op["trajectory"], detections)
+                    footprints(tracking, op["trajectory"], op["channels"])
                     tracking["shared_head"] = shared_head_evidence(request.get("shared_head"), op["channels"])
                     record("tracking_reference", lambda: {"ok": True, **tracking}, inputs=op)
                     record("z_speed", lambda: provider.primitives.z_set_max_speed(tracking["speed_native"]),
@@ -578,6 +640,11 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                     inputs = {"volume_ul": op.get("volume_ul"), "front_air": kind == "leading_air",
                               "target_liquid_ul": op.get("target_liquid_ul"),
                               "commanded_displacement_ul": op.get("volume_ul"), "liquid_phase": kind}
+                    if request.get("accounting_context") is not None:
+                        inputs.update(accounting_context=request["accounting_context"],
+                                      accounting_scope=command_id + ":" + owner_identity["source_identity"])
+                    if op.get("accounting_intent") is not None:
+                        inputs["accounting_intent"] = op["accounting_intent"]
                     record(effect, lambda t, w=wire, e=effect, values=inputs:
                         _send_wire(t, op["channels"], w, op["timeout_ms"], effect=e, inputs=values,
                                    after_sends=start_tracking if tracking and e == "aspirate" else None),
@@ -594,4 +661,10 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                       event_policy=request.get("event_policy", "stop"),
                       requested_control=request.get("event_policy", "stop"),
                       partial_effects=True)
+    if request.get("accounting_context") is not None:
+        from .effect_accounting import application_accounting
+        try:
+            result["accounting_summary"] = application_accounting(events, request["accounting_context"], incomplete=not result["completed"])
+        except Exception as exc:
+            result["accounting_observation_error"] = str(exc)
     return result
