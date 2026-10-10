@@ -18,7 +18,8 @@ from typing import Annotated, Any, Literal, Mapping, Union
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 
 from .models import PipetteCommandError
-from .cavro_geometry import SurfaceMove, SharedHead, ProfilePickup, resolve_surface_move, shared_head_evidence
+from .cavro_geometry import (SurfaceMove, SharedHead, ProfilePickup, resolve_surface_move,
+                             resolve_displacement, shared_head_evidence)
 from .cavro_commands import DeviceCommand, DeviceProgram, compile_device_command, compile_device_program
 
 IMPLEMENTATION = "original-adp.application.v1"
@@ -258,6 +259,8 @@ def compile_application(request: Mapping[str, Any]) -> dict[str, Any]:
                         issues.append({"code": "unrepresentable_setting", "category": "representation",
                             "path": f"/operations/{index}/values/{pointer}", "message": str(exc)})
             elif isinstance(instruction, (Stroke, TrackedAspirate)):
+                if isinstance(instruction, TrackedAspirate):
+                    resolve_displacement(op["trajectory"]["displacement"])
                 prefix = "D" if instruction.operation == "dispense" else "P"
                 op["wire_commands"] = [{"field": "speed_ul_s", "ascii": f"V{_number(instruction.speed_ul_s)},1R"},
                                        {"field": "volume_ul", "ascii": f"{prefix}{_number(instruction.volume_ul)},1R"}]
@@ -272,6 +275,7 @@ def compile_application(request: Mapping[str, Any]) -> dict[str, Any]:
                     raise ValueError("after_detection_steps and after_detection_speed_native must be specified together")
                 op["wire_commands"] = [{"field": "plld", "ascii": "B1R" if instruction.start_mode == 1 else "BR"}]
             elif isinstance(instruction, SurfaceMove):
+                resolve_displacement(op["displacement"])
                 if instruction.reference.kind == "authored":
                     op["resolved_geometry"] = resolve_surface_move(op, {})
             elif isinstance(instruction, DeviceCommandInstruction):
@@ -281,6 +285,9 @@ def compile_application(request: Mapping[str, Any]) -> dict[str, Any]:
             elif isinstance(instruction, ProfilePickup):
                 from ..manual_pipetting import manual_position_plan
                 op["native_plan"] = manual_position_plan(op["calibration"]["positioning"])
+                for phase in ("pickup", "retract"):
+                    if op["calibration"][phase] is not None:
+                        resolve_displacement(op["calibration"][phase]["displacement"])
             emitted.append(op)
         except (ValueError, TypeError) as exc:
             issues.append({"code": "unrepresentable_application", "category": "representation",
@@ -518,7 +525,7 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                 if op.get("after_detection_steps") is not None:
                     z_move(op["after_detection_steps"], op["after_detection_speed_native"])
             else:
-                tracking = None
+                tracking: dict[str, Any] = {}
                 if kind == "tracked_aspirate":
                     tracking = resolve_surface_move(op["trajectory"], detections)
                     tracking["shared_head"] = shared_head_evidence(request.get("shared_head"), op["channels"])
@@ -543,10 +550,10 @@ def run_application_inline(provider, request: Mapping[str, Any], *, command_id: 
                               "commanded_displacement_ul": op.get("volume_ul"), "liquid_phase": kind}
                     record(effect, lambda t, w=wire, e=effect, values=inputs:
                         _send_wire(t, op["channels"], w, op["timeout_ms"], effect=e, inputs=values,
-                                   after_sends=start_tracking if tracking is not None and e == "aspirate" else None),
+                                   after_sends=start_tracking if tracking and e == "aspirate" else None),
                         inputs={"operation_index": index, "field": field, "ascii": wire,
                                 "channels": op["channels"], **inputs}, pipette=True)
-                if tracking is not None:
+                if tracking:
                     record("tracking_z_wait", lambda: provider.wp8_wait_z("waitZ",
                         {"timeout_ms": op["z_timeout_ms"]}), inputs={"timeout_ms": op["z_timeout_ms"]})
         result.update(ok=True, completed=True, source_return_completed=True,

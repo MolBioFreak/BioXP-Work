@@ -7,7 +7,7 @@ pickup, implicit geometry, or inferred total multi aspiration is performed.
 from __future__ import annotations
 
 from copy import deepcopy
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Annotated, Any, Literal, Union
 
 from pydantic import Field, ValidationError
@@ -123,7 +123,13 @@ def correction_at_target(target_ul: Any, correction: dict[str, Any]) -> str:
             raise ValueError("exact unique correction point required; no interpolation")
         value = Decimal(str(matches[0]["commanded_ul"]))
     elif correction.get("kind") == "affine":
-        value = target * Decimal(str(correction["scale"])) + Decimal(str(correction["offset_ul"]))
+        scale, offset = Decimal(str(correction["scale"])), Decimal(str(correction["offset_ul"]))
+        if not scale.is_finite() or not offset.is_finite():
+            raise ValueError("nonfinite correction coefficient")
+        with localcontext() as context:
+            context.prec = sum(len(v.as_tuple().digits) + abs(int(v.as_tuple().exponent))
+                               for v in (target, scale, offset)) + 20
+            value = target * scale + offset
     else:
         raise ValueError("unsupported correction function")
     if not value.is_finite() or value < 0:

@@ -56,6 +56,11 @@ def test_exact_geometry_and_no_invented_scale():
     assert out["target_steps"] == 39900 and out["speed_native"] == 60
     op["displacement"]["depth_mm"] = .001
     assert compile_application(request(op))["issues"]
+    op["reference"] = surface()["reference"]
+    assert compile_application(request(op))["issues"]  # known scale error, no search needed
+    track = tracked()
+    track["trajectory"] = op
+    assert compile_application(request(track))["issues"]
     with pytest.raises(ValueError, match="operand unavailable"):
         resolve_surface_move(surface(), {})
 
@@ -65,6 +70,8 @@ def test_b_modes_and_stream_no_hidden_nvram():
         assert compile_application(request(search(mode)))["operations"][0]["wire_commands"][0]["ascii"] == wire
     old = search(); old.pop("start_mode")
     assert compile_application(request(old))["operations"][0]["wire_commands"][0]["ascii"] == "BR"
+    for invalid in (True, 1.0, "1"):
+        assert compile_application(request(search(invalid)))["issues"]
     out = compile_application(request({"operation": "settings", "channels": [0], "timeout_ms": 30,
         "values": {"pressure_streaming": True, "slope": [0, 41]}}, stroke(speed=1001)))
     assert not out["issues"] and len(out["warnings"]) == 2

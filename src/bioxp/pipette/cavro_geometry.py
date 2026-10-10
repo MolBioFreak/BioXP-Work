@@ -5,7 +5,7 @@ independently measured meniscus. Decimal conversions must encode whole native
 steps/speed units exactly, rather than silently rounding scientific inputs.
 """
 from __future__ import annotations
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Annotated, Any, Literal, Mapping, Union
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -114,8 +114,25 @@ def exact_native(value: Decimal, label: str) -> int:
     return int(value)
 
 
+def resolve_displacement(offset: Mapping[str, Any]) -> tuple[int, int]:
+    if offset["unit"] == "steps":
+        delta, speed = offset["offset_steps"], offset["speed_native"]
+    else:
+        calibration = offset["calibration"]
+        sign = 1 if calibration["positive_steps_direction"] == "down" else -1
+        depth, tip, scale, velocity, speed_scale = [Decimal(str(v)) for v in (
+            offset["depth_mm"], offset["tip_offset_mm"], calibration["steps_per_mm"],
+            offset["speed_mm_s"], calibration["native_speed_per_mm_s"])]
+        with localcontext() as context:
+            context.prec = sum(len(v.as_tuple().digits) + abs(int(v.as_tuple().exponent))
+                               for v in (depth, tip, scale, velocity, speed_scale)) + 20
+            delta = exact_native((depth * sign + tip) * scale, "Z displacement")
+            speed = exact_native(velocity * speed_scale, "Z speed")
+    return delta, speed
+
+
 def resolve_surface_move(move: Mapping[str, Any], detections: Mapping[str, Any]) -> dict[str, Any]:
-    reference, offset = move["reference"], move["displacement"]
+    reference = move["reference"]
     if reference["kind"] == "authored":
         base = reference["position_steps"]
         observation = None
@@ -124,14 +141,7 @@ def resolve_surface_move(move: Mapping[str, Any], detections: Mapping[str, Any])
         if observation is None or type(observation.get("final_position_steps")) is not int:
             raise ValueError(f"surface reference operand unavailable: {reference['detection_id']}")
         base = observation["final_position_steps"] + (reference.get("penetration_correction_steps") or 0)
-    if offset["unit"] == "steps":
-        delta, speed = offset["offset_steps"], offset["speed_native"]
-    else:
-        calibration = offset["calibration"]
-        sign = 1 if calibration["positive_steps_direction"] == "down" else -1
-        delta = exact_native((Decimal(str(offset["depth_mm"])) * sign + Decimal(str(offset["tip_offset_mm"])))
-                             * Decimal(str(calibration["steps_per_mm"])), "Z displacement")
-        speed = exact_native(Decimal(str(offset["speed_mm_s"])) * Decimal(str(calibration["native_speed_per_mm_s"])), "Z speed")
+    delta, speed = resolve_displacement(move["displacement"])
     return {"target_steps": base + delta, "speed_native": speed,
             "reference_steps": base, "authored": dict(move), "detection": observation,
             "physical_surface_verified": False, "shared_z": True,
