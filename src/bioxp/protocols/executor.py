@@ -221,6 +221,7 @@ class ProtocolExecutor:
                         "stage_id": stage.stage_id,
                         "action_id": action.action_id,
                         "kind": action.kind.value,
+                        "source_occurrence_id": action.source_occurrence_id or action.action_id,
                         **action_result,
                     }
                 )
@@ -244,7 +245,9 @@ class ProtocolExecutor:
                     detail=dict(action_result),
                 )
 
-                if action.review_required:
+                if action.review_required or action.kind == ProtocolActionKind.PAUSE_REVIEW:
+                    from ..calibration_measurements import pending_measurement
+                    runtime_state.pending_measurement = pending_measurement(action)
                     return self._pause_for_review(
                         runtime_state,
                         stage_id=stage.stage_id,
@@ -405,9 +408,11 @@ class ProtocolExecutor:
                 "gate": workflow.gate, "gate_id": workflow.gate_id}
 
     def acknowledge_review(self, *, control_id: str, gate_id: str,
-                           decision: str | None = None) -> dict[str, Any]:
+                           decision: str | None = None, measurements=None,
+                           reviewer="operator", note=None, on_accepted=None) -> dict[str, Any]:
         with self._condition:
             request = {"action": "review", "gate_id": gate_id,
+                       "measurements": measurements, "reviewer": reviewer, "note": note,
                        **({"decision": decision} if decision is not None else {})}
             if control_id in self._controls:
                 if self._controls[control_id] != request:
@@ -423,13 +428,17 @@ class ProtocolExecutor:
                 raise ValueError("Preparation review requires explicit Ignore or Abort")
             if not preparation and decision is not None:
                 raise ValueError("Inspection decision requires the preparation review gate")
+            from ..calibration_measurements import accept_measurements
+            accept_measurements(self._state, measurements, reviewer=reviewer, note=note)
+            if on_accepted is not None:
+                on_accepted()
             self._controls[control_id] = request
             self._review_released = decision != "abort"
             if decision == "abort":
                 self._termination = "abort"
             self._release_gate = control_id
             workflow.last_control_id = control_id
-            workflow.requested_control = dict(request)
+            workflow.requested_control = {"action": "review", "gate_id": gate_id}
             self._condition.notify_all()
             return self._control_result(control_id)
 
@@ -1077,6 +1086,8 @@ class ProtocolExecutor:
                     self._dispatch(action, document)
                     if action.review_required or action.kind == ProtocolActionKind.PAUSE_REVIEW:
                         self.wait_for_domains(ALL_DOMAINS)
+                        from ..calibration_measurements import pending_measurement
+                        state.pending_measurement = pending_measurement(action)
                         self._gate("review", state.workflow.source_occurrence_id)
                 if stage.review_required:
                     self.wait_for_domains(ALL_DOMAINS)

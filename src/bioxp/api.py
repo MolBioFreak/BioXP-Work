@@ -3004,12 +3004,17 @@ ProtocolControlRequest = Annotated[
 ]
 
 
+from .calibration_measurements import ExactNumber
+
+
 class ProtocolReviewRequest(ProtocolControlTarget):
     reviewer: str = Field("operator", min_length=1, max_length=120)
     note: Optional[str] = Field(None, max_length=4000)
     stage_id: StrictStr = Field(..., min_length=1)
     action_id: StrictStr | None = None
     decision: Literal["ignore", "abort"] | None = None
+    source_occurrence_id: StrictStr | None = None
+    measurements: dict[str, list[ExactNumber]] | None = None
 
 
 class LedRgbRequest(BaseModel):
@@ -10699,7 +10704,9 @@ def _protocol_bindings(bundle, *, source_executor=None):
     native = {}
     lifecycle = {}
     if metadata.get("input_mode") != "oem_prepared":
-        return {**_protocol_live_handlers(), **_protocol_mechanism_handlers(source_executor)}, {}, {}
+        from .calibration_workflow import calibration_handler
+        return {**_protocol_live_handlers(), **_protocol_mechanism_handlers(source_executor),
+                ProtocolActionKind.CALIBRATION: calibration_handler(_calibration_settings_service)}, {}, {}
     capabilities = set()
     if callable(getattr(FourPipetteTransport, "dispense_air_for_oem_script", None)):
         capabilities.add("dispense_air_for_oem_script")
@@ -10989,6 +10996,23 @@ async def protocol_execute(req: ProtocolExecuteRequest):
         raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+from .calibration_analysis import AnalysisRequest, AnalysisResult, analyze as analyze_calibration
+from .calibration_workflow import calibration_contract
+
+
+@app.get("/protocol/calibration/schema")
+async def protocol_calibration_schema():
+    return calibration_contract()
+
+
+@app.post("/protocol/calibration/analyze", response_model=AnalysisResult)
+async def protocol_calibration_analyze(req: AnalysisRequest):
+    try:
+        return analyze_calibration(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def _calibration_settings_service() -> CalibrationSettingsService:

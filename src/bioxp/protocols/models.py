@@ -83,6 +83,7 @@ class ProtocolActionKind(str, Enum):
     BARCODE_READ = "barcode_read"
     PAUSE_REVIEW = "pause_review"
     NOTE = "note"
+    CALIBRATION = "calibration"
     LED = "led"
     PARK = "park"
     WAIT = "wait"
@@ -136,6 +137,12 @@ class ProtocolAction:
         object.__setattr__(self, "kind", normalize_action_kind(self.kind))
         object.__setattr__(self, "params", _capture(self.params))
         object.__setattr__(self, "metadata", _capture(self.metadata))
+        if self.kind == ProtocolActionKind.CALIBRATION:
+            from ..calibration_workflow import CALIBRATION_ACTION_ADAPTER
+            CALIBRATION_ACTION_ADAPTER.validate_python(_payload(self.params))
+        if self.kind == ProtocolActionKind.PAUSE_REVIEW and "measurement_form" in self.params:
+            from ..calibration_measurements import MeasurementForm
+            MeasurementForm.model_validate(_payload(self.params["measurement_form"]))
         if self.on_error not in {"stop", "pause_for_operator"}:
             raise ValueError("on_error must be stop or pause_for_operator")
 
