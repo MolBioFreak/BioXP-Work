@@ -11,6 +11,7 @@ OUTCOME_FIELDS = frozenset({
     'error', 'exception', 'exception_type', 'failure', 'source_identity',
     'command_id', 'receipt_id', 'operation_index', 'requested_control', 'partial_effects',
     'source_anchor', 'source_return_code', 'reason',
+    'failed_channel', 'failure_details', 'completion_wait_started', 'source_timeout_termination',
 })
 
 

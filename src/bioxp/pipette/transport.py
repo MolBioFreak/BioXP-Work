@@ -1869,8 +1869,17 @@ class FourPipetteTransport:
                           timeout_ms: int) -> dict[str, Any]:
         """Run typed service within the existing finite caller/receipt owner."""
         selected = self._selected_channels(channels)
+        explicit_termination = (compiled.get("requested") or {}).get("command") in {"terminate", "reset"}
         def send(channel, transport, deferred):
-            result = transport._get_driver().send_cavro_command(compiled, timeout_ms=timeout_ms)
+            driver = transport._get_driver()
+            if explicit_termination:
+                # Authored selected-channel T/reset is not the all-channel global
+                # Stop. Detach the exact old wait so its completion cannot be
+                # confused with this control's response; global Stop is unchanged.
+                router = getattr(driver.bus, "router", None)
+                if router is not None:
+                    router.interrupt_pipette_completion(channel, owner_token=self._completion_owner_token(transport))
+            result = driver.send_cavro_command(compiled, timeout_ms=timeout_ms)
             transport._last_transaction = result
             if deferred:
                 transport._assert_driver_result("cavro_device_command", result)

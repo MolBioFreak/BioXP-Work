@@ -49,8 +49,9 @@ def receiver(monkeypatch):
         else:
             rx(txid | 0x400, [])
             # Append/control deliberately receive ACK only, no invented completion.
-            if command.endswith(b'R') and command not in (b'!R', b'R'):
-                rx(txid | 0x400, [33 if fault.get('device') == ch else 32, 96])
+            if command.endswith(b'R') and command not in (b'!R', b'R') and not fault.get('hold'):
+                reply = ([32, 96] + list(b'123')) if command == b'd0R' else [33 if fault.get('device') == ch else 32, 96]
+                rx(txid | 0x400, reply)
         return len(raw)
     router.ep_out = SimpleNamespace(write=write)
     shared = SimpleNamespace(novo_router=router, ep_in=object(), ep_out=router.ep_out)
@@ -99,6 +100,28 @@ def test_real_codec_reports_completion_ack_control(receiver):
     assert control['ok'] and not control['completion_verified']
     assert any(tx & 7 == 3 for tx, _ in receiver.wire)
     export('typed-receiving.json', {'report': raw, 'move': move, 'append': appended, 'control': control, 'wire': receiver.wire})
+
+
+def test_active_diagnostic_answer_and_explicit_heartbeat(receiver):
+    result = receiver.group.run_cavro_command(compile_command({'command':'diagnostic','test':'minimum_moving_current'}), channels=[0], timeout_ms=20)
+    assert result['ok'] and result['completion_verified']
+    assert result['channels'][0]['result']['report']['value'] == 123
+    assert result['channels'][0]['result']['report']['units'] == 'ma'
+    result = receiver.group.run_cavro_command(compile_command({'command':'heartbeat_period','half_seconds':15}), channels=[0], timeout_ms=20)
+    assert result['ok'] and result['persistent']
+    assert receiver.wire[-1][1] == 'b15R'
+
+
+def test_typed_terminate_detaches_exact_old_completion(receiver):
+    receiver.fault['hold'] = True
+    driver = receiver.group._transports[0]._get_driver()
+    sent = driver.send_cavro_command(compile_command({'command':'plunger_aspirate','value':1,'unit':'ul'}), timeout_ms=20)
+    owner = sent['provenance']['completion_owner_token']
+    result = receiver.group.run_cavro_command(compile_command({'command':'terminate'}), channels=[0], timeout_ms=20)
+    assert result['ok'] and not result['completion_verified']
+    previous = receiver.router.wait_pipette_completion(0, 0, owner_token=owner)
+    assert not previous['ok'] and previous['outcome'] == 'interrupted_by_terminate'
+    assert receiver.wire[-1][1] == 'T'
 
 
 def test_real_partial_completion_and_missing_report(receiver):
@@ -203,6 +226,8 @@ def test_compaction_failure_detail_survives():
     value = {'failed_channel': 2, 'failure_details': {'specific_fault': 'fixture'},
              'completion_wait_started': False, 'source_timeout_termination': {'allow_to_stop': True, 'channels': []}}
     assert application_outcome(value) == value
+    from bioxp.protocols.operational_results import compact_operational
+    assert compact_operational(value) == value
 
 
 def test_stream_no_implicit_nvram_and_psi(receiver):
@@ -235,6 +260,8 @@ def test_bounded_pressure_real_receiver_sqlite(rig):
 
 
 def test_capture_finite_receipt_serialization(rig):
+    from bioxp.pipette.pressure_capture import PressureCaptureRequest
+    export('pressure-capture-request.schema.json', PressureCaptureRequest.model_json_schema())
     capture_request = {'channels': [0], 'max_frames': 2, 'duration_ms': 20}
     def inject(_):
         data = b'1\x00\x08'

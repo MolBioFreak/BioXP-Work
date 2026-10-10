@@ -697,7 +697,8 @@ class BioXpCanDriver:
         ack_mode = "query" if mode == "report" else "ack" if mode in {"ack", "control"} else "command"
         result = self._send_pipette_command(
             compiled["ascii"], address=address, ack_mode=ack_mode,
-            command_name="cavro_device_" + mode,
+            command_name=("cavro_active_diagnostic" if str(compiled.get("report_kind") or "").startswith("diagnostic_")
+                          else "cavro_device_" + mode),
             wait_for_completion=mode == "report", response_timeout_s=timeout_ms / 1000.0)
         provenance = result.get("provenance") or {}
         if mode == "completion":

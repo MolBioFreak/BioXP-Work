@@ -466,7 +466,9 @@ class NovoRouter:
                     if frame.dlc == 0:
                         completion.ack_frame = frame
                         completion_matched = True
-                    elif frame.dlc == 2 and len(frame.data) == 2:
+                    elif (frame.dlc == 2 and len(frame.data) == 2) or (
+                        completion.command_name == "cavro_active_diagnostic"
+                        and 2 <= frame.dlc <= 8 and len(frame.data) == frame.dlc):
                         if completion.frame is None:
                             completion.frame = frame
                         else:
@@ -941,6 +943,18 @@ class NovoRouter:
             return owner_token
 
 
+    def interrupt_pipette_completion(self, channel: int, *, owner_token: str | None) -> bool:
+        """Detach the exact existing owner for an explicitly authored T/reset."""
+        with self._completion_lock:
+            existing = self._pipette_completions.get(channel)
+            if existing is None or not owner_token or existing.owner_token != owner_token or existing.event.is_set():
+                return False
+            existing.rejected_reason = "interrupted_by_terminate"
+            existing.event.set()
+            self._interrupted_pipette_completions[(channel, owner_token)] = existing
+            self._pipette_completions.pop(channel, None)
+            return True
+
     def bind_pipette_completion(
         self,
         channel: int,
@@ -1023,8 +1037,8 @@ class NovoRouter:
                 or frame.arbitration_id == completion.expected_rx_id
             )
             and (frame.arbitration_id & 0x7) == completion.command_family
-            and frame.dlc == 2
-            and len(frame.data) == 2
+            and (frame.dlc == 2 or (completion.command_name == "cavro_active_diagnostic" and 2 <= frame.dlc <= 8))
+            and len(frame.data) == frame.dlc
             and frame.data[0] == 0x20
         )
         if valid:
