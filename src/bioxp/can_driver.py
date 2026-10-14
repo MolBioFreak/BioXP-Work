@@ -384,6 +384,8 @@ class BioXpCanDriver:
                     "allow_multipart": ack_mode == "query",
                     "wait_for_completion": wait_for_completion,
                 }
+                if ack_mode == "ack":
+                    transact_kwargs["ack_only"] = True
                 if interrupt_completion_owner_token is not None:
                     transact_kwargs.update({
                         "replace_completion_owner_token": interrupt_completion_owner_token,
@@ -422,6 +424,8 @@ class BioXpCanDriver:
             )
             if ack_mode == "query":
                 ack_ok = bool(provenance_ok and self._ack_ok(data, ack_mode=ack_mode))
+            elif ack_mode == "ack":
+                ack_ok = bool(immediate_ack_received and provenance_ok)
             elif wait_for_completion:
                 ack_ok = bool(immediate_ack_received and provenance_ok and completion_received)
             else:
@@ -454,14 +458,14 @@ class BioXpCanDriver:
                 "delivery_verified": True,
                 "immediate_ack_received": immediate_ack_received,
                 "controller_acknowledged": immediate_ack_received,
-                "completion_verified": bool(ack_mode != "query" and wait_for_completion and ack_ok),
+                "completion_verified": bool(ack_mode == "command" and wait_for_completion and ack_ok),
                 "query_response_correlated": bool(
                     ack_mode == "query"
                     and isinstance(provenance, dict)
                     and provenance.get("query_response_correlated") is True
                 ),
                 "semantic_query_response_verified": False,
-                "completion_deferred": bool(ack_mode != "query" and not wait_for_completion and ack_ok),
+                "completion_deferred": bool(ack_mode == "command" and not wait_for_completion and ack_ok),
                 "ack": ack,
                 "provenance": provenance,
                 "pipette_message_state": message_state,
@@ -565,6 +569,7 @@ class BioXpCanDriver:
                 completion_timeout_s=10.0 if command_name == "pipette_initiate_group" else 60.0,
                 allow_multipart=ack_mode == "query",
                 wait_for_completion=wait_for_completion,
+                **({"ack_only": True} if ack_mode == "ack" else {}),
             )
             frames = list(provenance.get("frames", []))
             data = [int(byte) for frame in frames for byte in frame.get("data", [])]
@@ -590,6 +595,8 @@ class BioXpCanDriver:
             )
             if ack_mode == "query":
                 ack_ok = bool(provenance_ok and self._ack_ok(data, ack_mode=ack_mode))
+            elif ack_mode == "ack":
+                ack_ok = bool(immediate_ack_received and provenance_ok)
             elif wait_for_completion:
                 ack_ok = bool(immediate_ack_received and provenance_ok and completion_received)
             else:
@@ -621,14 +628,14 @@ class BioXpCanDriver:
                 "delivery_verified": True,
                 "immediate_ack_received": immediate_ack_received,
                 "controller_acknowledged": immediate_ack_received,
-                "completion_verified": bool(ack_mode != "query" and wait_for_completion and ack_ok),
+                "completion_verified": bool(ack_mode == "command" and wait_for_completion and ack_ok),
                 "query_response_correlated": bool(
                     ack_mode == "query"
                     and isinstance(provenance, dict)
                     and provenance.get("query_response_correlated") is True
                 ),
                 "semantic_query_response_verified": False,
-                "completion_deferred": bool(ack_mode != "query" and not wait_for_completion and ack_ok),
+                "completion_deferred": bool(ack_mode == "command" and not wait_for_completion and ack_ok),
                 "ack": ack,
                 "provenance": provenance,
                 "pipette_message_state": message_state,
@@ -670,6 +677,11 @@ class BioXpCanDriver:
         if address not in ids:
             raise ValueError(f"Unknown pipette CAN address kind: {address!r}")
         self._pipette_last_command = command_name or f"pipette:{ascii_command}"
+        if address != "report":
+            # Passive revision only: legacy commands retain their exact send,
+            # wait and accounting behavior; typed buffer evidence detects an
+            # intervening unmodelled command rather than assuming continuity.
+            self._pipette_buffer_revision = getattr(self, "_pipette_buffer_revision", 0) + 1
         return self._send_ascii_packet(
             ids[address],
             ascii_command,
@@ -681,6 +693,39 @@ class BioXpCanDriver:
             wait_for_completion=wait_for_completion,
             interrupt_completion_owner_token=interrupt_completion_owner_token,
         )
+
+    def send_cavro_command(self, compiled: Mapping[str, Any], *, timeout_ms: int) -> dict[str, Any]:
+        """Consume the shared pure codec; no implicit retries/settings/readback."""
+        from .pipette.cavro_receiving import decode_report
+        mode = compiled["wait_mode"]
+        address = {0: "control", 1: "command", 6: "report"}[compiled["can_command_type"]]
+        observe_answers = mode == "control" and bool(compiled.get("response_descriptors"))
+        ack_mode = "query" if mode == "report" else "ack" if mode in {"ack", "control"} and not observe_answers else "command"
+        from contextlib import nullcontext
+        router = getattr(self.bus, "router", None)
+        descriptors = compiled.get("response_descriptors") or []
+        scope = router.typed_pipette_responses(descriptors) if router is not None else nullcontext()
+        with scope:
+            result = self._send_pipette_command(
+                compiled["ascii"], address=address, ack_mode=ack_mode,
+                command_name=("cavro_active_diagnostic" if str(compiled.get("report_kind") or "").startswith("diagnostic_")
+                              else "cavro_device_" + mode),
+                wait_for_completion=mode == "report", response_timeout_s=timeout_ms / 1000.0)
+        provenance = result.get("provenance") or {}
+        if mode == "completion" or observe_answers:
+            self._pipette_completion_owner_token = provenance.get("completion_owner_token")
+        result.update({key: compiled.get(key) for key in
+                       ("wait_mode", "report_kind", "units", "persistent", "warnings", "requested",
+                        "command_effects", "program", "buffer_action", "effects_deferred",
+                        "response_descriptors", "buffer_context", "completion_attribution_unknown")})
+        result["observation_completion_only"] = observe_answers
+        result["physical_effect_verified"] = False
+        if mode == "report":
+            report = decode_report(compiled, result.get("ack", {}).get("data", []))
+            result["report"] = report
+            result["semantic_query_response_verified"] = bool(
+                result.get("query_response_correlated") and report["parsed"])
+        return result
 
     def _set_collection_tip_state(self, loaded: bool, *, verified: bool, source_proof=None) -> None:
         """Source setter metadata only; the receiver never persists authority."""
@@ -1033,7 +1078,8 @@ class BioXpCanDriver:
         }
 
     def enable_pressure_stream(self, enabled: bool):
-        setup = self._send_pipette_command("b15R", command_name="set_pressure_stream_parameter") if enabled else None
+        # b changes NVRAM heartbeat periodicity, not transient pressure sampling.
+        setup = None
         result = self._send_pipette_command("o0,1R" if enabled else "o0,0R", command_name="enable_pressure_stream")
         result["parameter_setup"] = setup
         return result
@@ -1096,7 +1142,7 @@ class BioXpCanDriver:
             "reply_received": reply_received,
             "error": result.get("error") if semantic_ok else "malformed_pressure_reply",
             "pressure": pressure,
-            "pressure_units": "controller_pressure_counts",
+            "pressure_units": "psi",
             "semantic_ok": semantic_ok,
             "hardware_truth_level": "hardware_query" if reply_received and pressure is not None else ("unparsed_hardware_reply" if reply_received else "no_readback"),
             "oem_source_anchor": "ClassPipette.QueryPressure: ?57",

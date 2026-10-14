@@ -1,6 +1,7 @@
 """Lossless operational projections, separate from bounded diagnostic trees."""
 import json
 from collections.abc import Mapping
+from ..critical_logging import critical_receipt
 
 OUTCOME_FIELDS = frozenset({
     'ok', 'source_return', 'source_return_completed', 'source_call_completed',
@@ -11,6 +12,7 @@ OUTCOME_FIELDS = frozenset({
     'error', 'exception', 'exception_type', 'failure', 'source_identity',
     'command_id', 'receipt_id', 'operation_index', 'requested_control', 'partial_effects',
     'source_anchor', 'source_return_code', 'reason',
+    'failed_channel', 'failure_details', 'completion_wait_started', 'source_timeout_termination',
 })
 
 
@@ -39,9 +41,33 @@ def application_outcome(value):
         'transaction_id', 'timeout_ms', 'state_reconciled', 'state_reconciliation_source',
         'volume_ul', 'liquid_level_ul', 'front_air_level_ul', 'rear_air_level_ul',
         'position_steps', 'source_occurrence_id', 'fluid_timestamp', 'pipette_message_state',
+        'failed_channel', 'failure_details', 'completion_wait_started', 'source_timeout_termination',
+        'wait_mode', 'report', 'report_kind', 'units', 'value', 'raw_ascii', 'raw_bytes', 'parsed',
+        'command_effects', 'program', 'buffer_action', 'effects_deferred', 'legacy_counter_basis',
+        'scientific_pressure', 'stream_session_id', 'chunk_ids', 'observation_error',
+        'baseline_statistics', 'count', 'mean', 'sample_standard_deviation', 'min', 'max',
+        'retained_frame_count', 'lost_frame_count', 'malformed_frame_count', 'lost_sample_count',
+        'controller_timestamps_available', 'sample_period_basis', 'analysis_basis',
+        'anomaly_model', 'classification', 'started_at', 'finished_at', 'reader_generation',
+        'persistent', 'warnings', 'requested', 'accounting', 'target_liquid_ul',
+        'pneumatic_displacement_delta_ul', 'intended_liquid_delta_ul',
+        'initial_fill_known', 'measured_liquid_ul', 'known_pneumatic_delta_ul',
+        'known_intended_liquid_delta_ul', 'unknown_liquid_effect', 'unknown_pneumatic_effect', 'basis',
+        'target_steps', 'reference_steps', 'speed_native', 'physical_surface_verified',
+        'shared_head', 'shared_z', 'inactive_mounted_tips_move', 'independent_channel_z',
+        'unequal_authored_surface_references', 'geometry_limit', 'start_mode',
+        'commanded_displacement_ul', 'liquid_phase', 'terminal_state',
+        'source_return_completed', 'pipette_partial_result', 'message', 'failure_code',
+        'reports', 'response_descriptors', 'buffer_context', 'completion_attribution_unknown',
+        'active_answers', 'active_answer_overflow_count', 'observation_completion_only',
+        'occupancy', 'detection', 'geometry_used', 'observation', 'vessel_state',
+        'height_mm', 'head_mm', 'head_target_steps', 'mounted_tip_footprints', 'authored', 'physical_fit_verified',
     })
     if isinstance(value, Mapping):
-        return {k: application_outcome(v) for k, v in value.items() if k in fields}
+        return {k: (critical_receipt(v) if k in {"reports", "response_descriptors", "buffer_context", "active_answers"}
+                    else v if k in {"failure_details", "source_timeout_termination", "requested", "warnings", "command_effects", "program", "observation_error",
+                                   "occupancy", "detection", "vessel_state", "head_mm", "head_target_steps", "mounted_tip_footprints", "authored", "target_steps"}
+                    else application_outcome(v)) for k, v in value.items() if k in fields}
     if isinstance(value, (list, tuple)):
         return [application_outcome(row) for row in value]
     return value

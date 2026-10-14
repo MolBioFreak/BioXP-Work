@@ -16,6 +16,7 @@ from .oem_compat.pathing import LOCATION_ID_TO_NAME
 from .oem_compat.position_table import well_id_from_label
 from .oem_deck_movement import compile_finite_plate_operation
 from .pipette.oem_diagnostics import DiagnosticRequest
+from .pipette.cavro_geometry import ProfilePickup
 from .pipette.models import PipetteAspirateCommand, PipetteDispenseCommand, PipetteValidationError
 from .protocols.models import ProtocolAction, ProtocolActionKind, ProtocolDocument, ProtocolStage
 from .protocols.validators import validate_protocol_document
@@ -198,7 +199,7 @@ class ManualCalwithFluid(_Request):
 ManualStep = Annotated[Union[ManualMove, ManualLower, ManualLift, ManualLiquid, ManualMix,
     ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset, DiagnosticDetectFluid,
     ManualCalwithFluid, SourceLoadTips, SourceMix, SourceAir, SourcePurge,
-    ManualDiagnosticPipette, ManualCavroApplication, ManualCavroRecipe], Field(discriminator="operation")]
+    ManualDiagnosticPipette, ManualCavroApplication, ManualCavroRecipe, ProfilePickup], Field(discriminator="operation")]
 
 
 class ManualPipettingRequest(_Request):
@@ -233,7 +234,7 @@ def compile_manual_pipetting(request: ManualPipettingRequest | Mapping[str, Any]
             add(ProtocolActionKind.PIPETTE_POSITION, step.model_dump(), index)
         elif isinstance(step, (ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset,
                                DiagnosticDetectFluid, ManualCalwithFluid, ManualDiagnosticPipette,
-                               SourceLoadTips, SourceMix, SourceAir, SourcePurge, ManualCavroApplication, ManualCavroRecipe)):
+                               SourceLoadTips, SourceMix, SourceAir, SourcePurge, ManualCavroApplication, ManualCavroRecipe, ProfilePickup)):
             add(ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL, step.model_dump(), index)
         elif isinstance(step, ManualLiquid):
             liquid(step.operation, step.channels, step.volume_ul, step.speed, index)
@@ -288,6 +289,15 @@ def bind_manual_position_handler(*, command_store: Any, execute_plan: Callable,
 
 
 def manual_physical_plan(params: Mapping[str, Any]) -> dict[str, Any]:
+    if params.get("operation") == "profile_pickup":
+        from .pipette.cavro_application import IMPLEMENTATION, compile_application, _json_copy
+        step = ProfilePickup.model_validate(_json_copy(params))
+        application = {"implementation": IMPLEMENTATION, "operations": [step.model_dump()]}
+        compiled = compile_application(application)
+        if compiled["issues"]:
+            raise ValueError(str(compiled["issues"]))
+        return compile_finite_plate_operation("cavro_application", source_leaf_available=True,
+                                             application=application)
     if params.get("operation") == "cavro_liquid_recipe":
         from .pipette.cavro_liquid import compile_liquid_recipe
         step = ManualCavroRecipe.model_validate(dict(params))

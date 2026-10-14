@@ -7,23 +7,56 @@ pickup, implicit geometry, or inferred total multi aspiration is performed.
 from __future__ import annotations
 
 from copy import deepcopy
-from decimal import Decimal
-from typing import Any, Literal
+from decimal import Decimal, localcontext
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import Field, ValidationError
 
 from .cavro_application import (_Input, ApplicationRequest, IMPLEMENTATION,
-                                 Instruction, compile_application, _json_copy)
+                                 Instruction, NonnegativeNumber, PositiveNumber, Number, compile_application, _json_copy)
+from .cavro_geometry import SurfaceMove, SharedHead, decimal_work_precision
+from .effect_accounting import AccountingContext, StrokeIntent
+
+
+class CorrectionPoint(_Input):
+    target_ul: NonnegativeNumber
+    commanded_ul: NonnegativeNumber
+
+
+class PointCorrection(_Input):
+    kind: Literal["points"]
+    points: list[CorrectionPoint] = Field(min_length=1)
+
+
+class AffineCorrection(_Input):
+    kind: Literal["affine"]
+    scale: Number
+    offset_ul: Number
+
+
+class SelectedCorrection(_Input):
+    calibration_id: str = Field(min_length=1)
+    revision: str = Field(min_length=1)
+    context: dict[str, Any]
+    function: Annotated[Union[PointCorrection, AffineCorrection], Field(discriminator="kind")]
+
+
+class AspirationTracking(_Input):
+    trajectory: SurfaceMove
+    z_motor_current: int
+    z_timeout_ms: int = Field(gt=0)
 
 
 class Segment(_Input):
-    volume_ul: float = Field(ge=0)
-    speed_ul_s: float = Field(gt=0)
+    volume_ul: NonnegativeNumber
+    speed_ul_s: PositiveNumber
+    target_liquid_ul: NonnegativeNumber | None = None
+    accounting_intent: StrokeIntent | None = None
 
 
 class Air(_Input):
-    volume_ul: float = Field(ge=0)
-    speed_ul_s: float = Field(gt=0)
+    volume_ul: NonnegativeNumber
+    speed_ul_s: PositiveNumber
 
 
 class Aliquot(_Input):
@@ -35,13 +68,15 @@ class Aliquot(_Input):
 
 class Multi(_Input):
     sample_count: int = Field(ge=0)
-    sample_volume_ul: float = Field(ge=0)
-    conditioning_volume_ul: float = Field(ge=0)
+    sample_volume_ul: NonnegativeNumber
+    conditioning_volume_ul: NonnegativeNumber
     conditioning_back_to_source_count: int = Field(ge=0)
-    conditioning_speed_ul_s: float = Field(gt=0)
+    conditioning_speed_ul_s: PositiveNumber
+    conditioning_target_liquid_ul: NonnegativeNumber | None = None
+    conditioning_intent: StrokeIntent | None = None
     conditioning_before: list[Instruction]
     conditioning_after: list[Instruction]
-    excess_volume_ul: float = Field(ge=0)
+    excess_volume_ul: NonnegativeNumber
     # None explicitly retains excess; otherwise an authored destination/motion.
     excess: Aliquot | None
     reaspiration: Air | None
@@ -53,10 +88,15 @@ class Recipe(_Input):
     mode: Literal["single", "multi"]
     channels: list[int]
     timeout_ms: int = Field(gt=0)
-    target_liquid_ul: float = Field(ge=0)
+    target_liquid_ul: NonnegativeNumber
     # Mandatory corrected total displacement even for multi. No guessed sum of
     # sample/conditioning/excess can masquerade as a manufacturer correction.
-    commanded_aspiration_ul: float = Field(ge=0)
+    commanded_aspiration_ul: NonnegativeNumber | None = None
+    selected_correction: SelectedCorrection | None = None
+    aspiration_tracking: AspirationTracking | None = None
+    shared_head: SharedHead | None = None
+    accounting_context: AccountingContext | None = None
+    aspiration_intent: StrokeIntent | None = None
     aspiration_speed_ul_s: float = Field(gt=0)
     aspiration_delay_ms: int = Field(ge=0)
     leading_air: Air | None
@@ -90,7 +130,13 @@ def correction_at_target(target_ul: Any, correction: dict[str, Any]) -> str:
             raise ValueError("exact unique correction point required; no interpolation")
         value = Decimal(str(matches[0]["commanded_ul"]))
     elif correction.get("kind") == "affine":
-        value = target * Decimal(str(correction["scale"])) + Decimal(str(correction["offset_ul"]))
+        scale, offset = Decimal(str(correction["scale"])), Decimal(str(correction["offset_ul"]))
+        if not scale.is_finite() or not offset.is_finite():
+            raise ValueError("nonfinite correction coefficient")
+        with localcontext() as context:
+            context.prec = sum(len(v.as_tuple().digits) + abs(int(v.as_tuple().exponent))
+                               for v in (target, scale, offset)) + 20
+            value = target * scale + offset
     else:
         raise ValueError("unsupported correction function")
     if not value.is_finite() or value < 0:
@@ -102,6 +148,21 @@ def compile_liquid_recipe(request: dict[str, Any]) -> dict[str, Any]:
     raw = _json_copy(request)
     try:
         r = Recipe.model_validate(raw)
+        commanded = r.commanded_aspiration_ul
+        correction_evidence = None
+        if r.selected_correction is not None:
+            if commanded is not None:
+                raise ValueError("select correction OR explicit commanded_aspiration_ul, not both; correction is applied once")
+            selected = r.selected_correction.model_dump()
+            exact = correction_at_target(r.target_liquid_ul, selected["function"])
+            # The analysis producer returns exact decimal coefficients. Keep
+            # the evaluated displacement as text through Stroke and wire
+            # encoding; a binary-float round trip is not an execution gate.
+            commanded = exact
+            correction_evidence = {"selected": selected, "target_liquid_ul": r.target_liquid_ul,
+                "commanded_aspiration_ul": exact, "application_count": 1, "measured_liquid_ul": None}
+        elif commanded is None:
+            raise ValueError("explicit commanded_aspiration_ul or selected_correction required")
         if (r.mode == "multi") != (r.multi is not None):
             raise ValueError("multi parameters required exactly for multi mode")
         if r.multi is not None:
@@ -112,24 +173,37 @@ def compile_liquid_recipe(request: dict[str, Any]) -> dict[str, Any]:
             if r.multi.reaspiration is not None and r.multi.dispense_to_reaspiration_delay_ms is None:
                 raise ValueError("re-aspiration requires an explicit dispense-to-re-aspiration delay")
         operations = []
+        phase_emission = {}
         base = {"channels": r.channels, "timeout_ms": r.timeout_ms}
         def append_motion(values):
             operations.extend(v.model_dump(exclude_unset=True) for v in values)
         def settings(phase):
             if phase in r.phase_settings:
                 operations.append({"operation": "settings", **base, "values": r.phase_settings[phase]})
+                phase_emission[phase] = {"requested": r.phase_settings[phase], "emitted": True,
+                                         "operation_index": len(operations) - 1, "reported_applied": None}
         def stroke(kind, volume, speed, **extra):
+            if r.accounting_context is not None:
+                role = {"leading_air": "front_air", "trailing_air": "rear_air", "reaspirate": "reaspiration"}.get(kind)
+                if role is not None:
+                    extra.setdefault("accounting_intent", {"role": role})
             operations.append({"operation": kind, **base, "volume_ul": volume, "speed_ul_s": speed, **extra})
-        def dispense(segments):
+        def dispense(segments, role="sample"):
             for s in segments:
-                stroke("dispense", s.volume_ul, s.speed_ul_s)
+                extra = {k: v for k, v in s.model_dump(exclude_unset=True).items() if k not in {"volume_ul", "speed_ul_s"}}
+                if r.accounting_context is not None:
+                    extra.setdefault("accounting_intent", {"role": role})
+                stroke("dispense", s.volume_ul, s.speed_ul_s, **extra)
         append_motion(r.before_leading_air)
         if r.leading_air is not None:
             settings("leading_air")
             stroke("leading_air", r.leading_air.volume_ul, r.leading_air.speed_ul_s)
         append_motion(r.before_liquid)
         settings("aspirate")
-        stroke("aspirate", r.commanded_aspiration_ul, r.aspiration_speed_ul_s, target_liquid_ul=r.target_liquid_ul)
+        stroke("tracked_aspirate" if r.aspiration_tracking else "aspirate", commanded,
+               r.aspiration_speed_ul_s, target_liquid_ul=r.target_liquid_ul,
+               **({"accounting_intent": r.aspiration_intent.model_dump()} if r.aspiration_intent else {}),
+               **(r.aspiration_tracking.model_dump() if r.aspiration_tracking else {}))
         operations.append({"operation": "delay", "duration_ms": r.aspiration_delay_ms})
         append_motion(r.after_liquid)
         if r.trailing_air is not None:
@@ -144,7 +218,14 @@ def compile_liquid_recipe(request: dict[str, Any]) -> dict[str, Any]:
             m = r.multi
             append_motion(m.conditioning_before)
             for _ in range(m.conditioning_back_to_source_count):
-                stroke("dispense", m.conditioning_volume_ul, m.conditioning_speed_ul_s)
+                context = {}
+                if m.conditioning_target_liquid_ul is not None:
+                    context["target_liquid_ul"] = m.conditioning_target_liquid_ul
+                if m.conditioning_intent is not None:
+                    context["accounting_intent"] = m.conditioning_intent.model_dump()
+                elif r.accounting_context is not None:
+                    context["accounting_intent"] = {"role": "conditioning"}
+                stroke("dispense", m.conditioning_volume_ul, m.conditioning_speed_ul_s, **context)
             append_motion(m.conditioning_after)
             append_motion(r.before_dispense)
             for aliquot in m.aliquots:
@@ -156,14 +237,47 @@ def compile_liquid_recipe(request: dict[str, Any]) -> dict[str, Any]:
                 append_motion(aliquot.after)
             if m.excess is not None:
                 append_motion(m.excess.before)
-                dispense(m.excess.segments)
+                dispense(m.excess.segments, role="excess")
                 append_motion(m.excess.after)
             append_motion(r.after_dispense)
         append_motion(r.final_empty_before)
         if r.final_empty_speed_ul_s is not None:
             operations.append({"operation": "empty", **base, "speed_ul_s": r.final_empty_speed_ul_s})
+        for phase, values in r.phase_settings.items():
+            phase_emission.setdefault(phase, {"requested": values, "emitted": False,
+                "reason": "phase_absent", "reported_applied": None})
+        ledger = {**r.liquid_settings, "resolved_recipe": raw,
+                  "phase_settings_emission": phase_emission}
+        if correction_evidence is not None:
+            ledger["selected_correction"] = correction_evidence
+        if r.accounting_context is not None and r.multi is not None:
+            m = r.multi
+            def total(segments, field):
+                values = [getattr(s, field) for s in segments]
+                if any(v is None for v in values):
+                    return None
+                with localcontext() as ctx:
+                    ctx.prec = decimal_work_precision(values)
+                    return str(sum((Decimal(str(v)) for v in values), Decimal(0)))
+            samples = [s for a in m.aliquots for s in a.segments]
+            intent = total(samples, "target_liquid_ul")
+            with localcontext() as ctx:
+                ctx.prec = decimal_work_precision(raw)
+                label = str(Decimal(str(m.sample_volume_ul)) * m.sample_count)
+            ledger["accounting_labels"] = {"sample_label_total_ul": label,
+                "explicit_sample_intent_total_ul": intent,
+                "sample_commanded_total_ul": total(samples, "volume_ul"),
+                "sample_label_differs_from_explicit_intent": None if intent is None else Decimal(label) != Decimal(intent),
+                "excess_label_ul": m.excess_volume_ul,
+                "excess_commanded_total_ul": None if m.excess is None else total(m.excess.segments, "volume_ul"),
+                "retained_liquid_ul": None, "measured_liquid_ul": None,
+                "basis": "labels_and_explicit_strokes_are_separate_not_volume_measurements"}
         application = {"implementation": IMPLEMENTATION, "operations": operations,
-                       "liquid_settings": {**r.liquid_settings, "resolved_recipe": raw}}
+                       "liquid_settings": ledger}
+        if r.shared_head is not None:
+            application["shared_head"] = r.shared_head.model_dump()
+        if r.accounting_context is not None:
+            application["accounting_context"] = r.accounting_context.model_dump()
         compiled = compile_application(application)
         return {**compiled, "recipe_requested": raw,
                 "application": None if compiled["issues"] else application}

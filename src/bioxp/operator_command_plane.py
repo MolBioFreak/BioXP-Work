@@ -3317,9 +3317,11 @@ class OperatorCommandStore(CommandReceiptReader):
         if operation == "updateLocation":
             merged["current_tray"] = self._oem_update_location_current_tray(
                 merged["current_location"], merged["movable_plate_locations"], merged["current_tray"])
-        # Location-only publication carries unknown tip metadata unchanged;
-        # the existing actual tip-state publishers retain their validation.
-        if (operation != "updateLocation" and merged["tip_loaded"] is True
+        # Location and thermal-door publications do not consume tip metadata.
+        # Preserve unknown observations, as OEM ThermalDoorOpen's plain setter
+        # does; keep the existing tip-state publisher validation unchanged.
+        if (operation not in {"updateLocation", "updateThermalDoorOpen"}
+                and merged["tip_loaded"] is True
                 and merged["tip_location"] not in {-1, 0, 1, 2, 3}):
             if not (operation == "pipette_owner" and "tip_location" in values
                     and values["tip_location"] is None):

@@ -287,6 +287,8 @@ def _job_status_from_state(state: ProtocolRuntimeState) -> str:
 def _pending_review_payload(state: ProtocolRuntimeState) -> dict[str, Any] | None:
     if not state.awaiting_review:
         return None
+    if state.pending_measurement is not None:
+        return {**state.pending_measurement, "reason": state.pause_reason}
     if state.workflow is not None and state.workflow.gate_id == "lifecycle:prepare":
         preparation = next((row for row in state.action_results if row.get("hook") == "prepare"), {})
         return {"stage_id": "lifecycle:prepare", "action_id": "lifecycle:prepare",
@@ -644,13 +646,26 @@ def bind_protocol_dispatcher(command_store, *, binding_factory, artifact_store=N
                 pending = _pending_review_payload(state)
                 if not pending or pending["stage_id"] != request.get("stage_id") or pending["action_id"] != request.get("action_id"):
                     raise ProtocolLiveContractError("Review occurrence is not current.")
+                if pending.get("measurement_form") is not None and request.get("source_occurrence_id") != pending["source_occurrence_id"]:
+                    raise ProtocolLiveContractError("Measurement occurrence is not current.")
+                # Retain response and review before the executor can enter the
+                # next authored action. No thermal/liquid action is replayed.
+                def retain_review():
+                    reviews.append({"reviewed_at": _utc_now_iso(), "reviewer": request["reviewer"],
+                                    "note": request.get("note"), "stage_id": request["stage_id"],
+                                    "action_id": request.get("action_id"),
+                                    **({"source_occurrence_id": request["source_occurrence_id"]} if "source_occurrence_id" in request else {}),
+                                    **({"measurements": request["measurements"]} if "measurements" in request else {}),
+                                    **({"decision": request["decision"]} if "decision" in request else {}),
+                                    "control_command_id": control_id})
+                    try:
+                        publish(state)
+                    except Exception:
+                        reviews.pop()
+                        raise
                 executor.acknowledge_review(control_id=control_id, gate_id=state.workflow.gate_id,
-                                            decision=request.get("decision"))
-                reviews.append({"reviewed_at": _utc_now_iso(), "reviewer": request["reviewer"],
-                                "note": request.get("note"), "stage_id": request["stage_id"],
-                                "action_id": request.get("action_id"),
-                                **({"decision": request["decision"]} if "decision" in request else {}),
-                                "control_command_id": control_id})
+                    decision=request.get("decision"), measurements=request.get("measurements"),
+                    reviewer=request["reviewer"], note=request.get("note"), on_accepted=retain_review)
             else:
                 executor.request_control(request["action"], control_id=control_id,
                                          **{key: request[key] for key in ("mode", "gate", "gate_id") if key in request})
@@ -679,7 +694,7 @@ def bind_protocol_dispatcher(command_store, *, binding_factory, artifact_store=N
 
 def control_protocol_job(job_id: str, request: Mapping[str, Any], *, command_store) -> dict[str, Any]:
     variants = {"pause": {"mode"}, "wake": {"gate_id"}, "continue": {"gate", "gate_id"},
-                "safe_stop": set(), "abort": set(), "review": {"reviewer", "note", "stage_id", "action_id", "decision"}}
+                "safe_stop": set(), "abort": set(), "review": {"reviewer", "note", "stage_id", "action_id", "decision", "measurements", "source_occurrence_id"}}
     action = request.get("action")
     common = {"action", "idempotency_key", "command_id", "expected_ownership_generation"}
     if action not in variants or set(request) - (common | variants[action]):
@@ -837,6 +852,8 @@ def _review_protocol_job_locked(
     reviewer: str = "operator",
     note: str | None = None,
     active_store: ProtocolOperatorBundleStore,
+    measurements=None,
+    source_occurrence_id=None,
     handlers: Mapping[Any, Any] | None = None,
 ) -> dict[str, Any]:
     loaded_bundle = active_store.load(job_id)
@@ -883,11 +900,18 @@ def _review_protocol_job_locked(
         and reviews
         and reviews[-1].get("reviewer") == reviewer
         and reviews[-1].get("note") == note
+        and reviews[-1].get("measurements") == measurements
+        and reviews[-1].get("source_occurrence_id") == source_occurrence_id
     ):
         return bundle
     if bundle.get("status") != "awaiting_review" or not state.awaiting_review:
         raise ValueError(f"Protocol job '{job_id}' is not awaiting review.")
 
+    pending = _pending_review_payload(state)
+    if state.pending_measurement and source_occurrence_id != state.pending_measurement["source_occurrence_id"]:
+        raise ValueError("Measurement occurrence is not current")
+    from ..calibration_measurements import accept_measurements
+    measurement_record = accept_measurements(state, measurements, reviewer=reviewer, note=note)
     stage_id = state.current_stage_id
     if stage_id and stage_id in state.stage_states:
         stage_state = state.stage_states[stage_id]
@@ -925,6 +949,7 @@ def _review_protocol_job_locked(
     claimed_bundle["status"] = "review_dispatching"
     claimed_bundle["updated_at"] = _utc_now_iso()
     claimed_execution = dict(claimed_bundle.get("execution") or {})
+    claimed_execution["runtime_state"] = state.to_payload()
     claimed_execution["review_claim"] = {
         "claim_id": claim_id,
         "claimed_at": claimed_bundle["updated_at"],
@@ -949,6 +974,8 @@ def _review_protocol_job_locked(
             "reviewer": reviewer,
             "note": note,
             "stage_id": stage_id,
+            **({"action_id": pending["action_id"], "source_occurrence_id": source_occurrence_id,
+                "measurements": measurements} if measurement_record is not None else {}),
         }
     )
     updated_bundle = _build_operator_bundle(
@@ -977,7 +1004,15 @@ def review_protocol_job(
     if command_store is not None and command_store.get_workflow(job_id) is not None:
         if request is None:
             raise ProtocolLiveContractError("Live review requires canonical target, generation, key and occurrence.")
-        control_protocol_job(job_id, {**dict(request), "action": "review", "reviewer": reviewer, "note": note}, command_store=command_store)
+        control = control_protocol_job(job_id, {**dict(request), "action": "review", "reviewer": reviewer, "note": note}, command_store=command_store)
+        if control.get("accepted") is False:
+            # A cached rejected HOST response is not an accepted review. Keep
+            # canonical idempotency intact; deliberate resubmission uses a new
+            # response key against the same held occurrence, never a new job.
+            raise ProtocolLiveContractError(
+                "The canonical review response was rejected.",
+                details={"error": "workflow_review_rejected", "control": control},
+            )
         return command_store.get_workflow(job_id)
     active_store = store or ProtocolOperatorBundleStore()
     with active_store.live_creation_lock(job_id):
@@ -986,5 +1021,7 @@ def review_protocol_job(
             reviewer=reviewer,
             note=note,
             active_store=active_store,
+            measurements=None if request is None else request.get("measurements"),
+            source_occurrence_id=None if request is None else request.get("source_occurrence_id"),
             handlers=handlers,
         )

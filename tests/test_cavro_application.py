@@ -142,7 +142,7 @@ def test_real_driver_service_store_segmented_and_phase_air(rig):
         stroke("dispense", 12.5, 375), stroke("dispense", 10, 875),
         {"operation": "empty", "channels": [0, 1], "timeout_ms": 30, "speed_ul_s": 875})
     out = run(rig, payload)
-    assert out["ok"], out
+    assert out["ok"], out.get("error")
     assert [w for ch, w in rig.wire if ch == 0] == [
         "V30,1R", "P20,1R", "V50,1R", "P22.5,1R", "V40,1R", "P1.25,1R",
         "V375,1R", "D12.5,1R", "V875,1R", "D10,1R", "V875,1R", "A0R"]
@@ -189,7 +189,7 @@ def test_settings_every_p_parameter_slope_and_no_water_invention():
     assert not out["issues"]
     wires = [c["ascii"] for c in out["operations"][0]["wire_commands"]]
     assert wires == ["p0,15R", "p1,5R", "p2,0R", "p3,150R", "p4,44000R", "p5,0R",
-                     "p6,20R", "p7,3R", "p8,50R", "L20,10R", "b15R", "o0,1R"]
+                     "p6,20R", "p7,3R", "p8,50R", "L20,10R", "o0,1R"]
 
 
 @pytest.mark.parametrize("field,value", [("start_speed_ul_s", 100.001), ("cutoff_speed_ul_s", 200.001),

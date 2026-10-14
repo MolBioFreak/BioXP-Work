@@ -6,6 +6,8 @@ and source enum/location geometry remain native parser responsibilities.
 from ..manual_pipetting import ManualPipettingRequest
 from ..pipette.cavro_application import ApplicationRequest, capability_catalog
 from ..pipette.cavro_liquid import Recipe
+from ..pipette.cavro_commands import device_command_catalog
+from ..calibration_workflow import calibration_contract
 
 
 def method_contract():
@@ -30,7 +32,9 @@ def method_contract():
         'if': {'properties': {'start': {'const': 'attainment'}}},
         'then': {'required': ['tolerance_c', 'timeout_s'],
                  'properties': {'tolerance_c': nonnegative, 'timeout_s': nonnegative}}}]
+    calibration = calibration_contract()
     params = {
+        'calibration': calibration['action_params'],
         'park': obj({'rehome': boolean}),
         'led': obj(dict.fromkeys(('red', 'green', 'blue'), color), ('red', 'green', 'blue')),
         'seal_separate': obj({}),
@@ -54,7 +58,12 @@ def method_contract():
             'cavro_application': ApplicationRequest.model_json_schema(),
             'cavro_liquid_recipe': Recipe.model_json_schema(),
             'cavro_capabilities': capability_catalog(),
+            'device_commands': device_command_catalog(),
+            'calibration': calibration,
             'bindings': {
+                'calibration': {'kind': 'calibration', 'owner': 'bioxp.calibration_workflow.calibration_handler',
+                    'measurement_owner': 'existing pause_review and same-job review response',
+                    'references': 'exact earlier stage/action/source occurrence within the current job'},
                 'cavro_liquid_recipe': {'kind': 'pipette_manual_physical', 'operation': 'cavro_liquid_recipe',
                     'field': 'recipe', 'compiler': 'bioxp.pipette.cavro_liquid.compile_liquid_recipe',
                     'finite_operation': 'cavro_application', 'finite_child': 'sourceCavroApplication'},

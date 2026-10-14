@@ -119,7 +119,7 @@ class ProtocolWorkflowState:
         if control is not None:
             if not isinstance(control, dict) or set(control) - {"action", "mode", "gate", "gate_id"}:
                 raise ValueError("Invalid workflow requested_control")
-            if control.get("action") not in {"pause", "wake", "continue", "safe_stop", "abort"}:
+            if control.get("action") not in {"pause", "wake", "continue", "safe_stop", "abort", "review"}:
                 raise ValueError("Unknown workflow requested control")
             if control.get("action") == "pause" and control.get("mode") not in {"ordinary", "deferred"}:
                 raise ValueError("Invalid workflow pause mode")
@@ -478,6 +478,9 @@ class ProtocolRuntimeState:
     action_results: list[dict[str, Any]] = field(default_factory=list)
     workflow: ProtocolWorkflowState | None = None
     source_model: ProtocolSourceModel = field(default_factory=ProtocolSourceModel)
+    pending_measurement: dict[str, Any] | None = None
+    measurement_reviews: list[dict[str, Any]] = field(default_factory=list)
+    calibration_scopes: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_document(
@@ -530,6 +533,9 @@ class ProtocolRuntimeState:
             workflow=(ProtocolWorkflowState.from_payload(payload["workflow"])
                       if payload.get("workflow") is not None else None),
             source_model=ProtocolSourceModel.from_payload(payload.get("source_model") or {}),
+            pending_measurement=payload.get("pending_measurement"),
+            measurement_reviews=list(payload.get("measurement_reviews") or []),
+            calibration_scopes=dict(payload.get("calibration_scopes") or {}),
         )
 
     def record_event(
@@ -557,6 +563,9 @@ class ProtocolRuntimeState:
             "job_id": self.job_id,
             "workflow": None if self.workflow is None else self.workflow.to_payload(),
             "source_model": self.source_model.to_payload(),
+            "pending_measurement": self.pending_measurement,
+            "measurement_reviews": self.measurement_reviews,
+            "calibration_scopes": dict(self.calibration_scopes),
             "current_stage_id": self.current_stage_id,
             "paused": bool(self.paused),
             "awaiting_review": bool(self.awaiting_review),

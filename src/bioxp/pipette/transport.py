@@ -264,6 +264,22 @@ class CanPipetteTransport:
         """Apply deterministic host accounting only after correlated completion."""
         operation = str(command).replace(" ", "_")
         volume = float(result.get("volume_ul", 0.0) or 0.0)
+        from .effect_accounting import CompletedEffectAccount, application_accounting_context
+        occurrence = application_accounting_context.get()
+        scope, context = occurrence if occurrence is not None else (None, None)
+        if not hasattr(self, "_effect_account") or getattr(self, "_effect_account_scope", None) != scope:
+            initial = next((row for row in (context or {}).get("initial_channels", [])
+                            if row["channel"] == self._pipette_id), None)
+            self._effect_account = CompletedEffectAccount(initial, (context or {}).get("vessels", []),
+                                                           track_inventory=context is not None)
+            self._effect_account_scope = scope
+        account_operation, account_result = operation, result
+        if operation == "cavro_device_command":
+            requested = result.get("requested") or {}
+            if requested.get("command") in {"plunger_aspirate", "plunger_dispense"} and requested.get("unit") == "ul":
+                account_operation = requested["command"].removeprefix("plunger_")
+                account_result = {"volume_ul": requested["value"]}
+        accounting = self._effect_account.apply(account_operation, account_result)
         if operation == "aspirate":
             self._liquid_level_ul += volume
         elif operation == "dispense":
@@ -280,8 +296,8 @@ class CanPipetteTransport:
             self._liquid_level_ul = 0.0
             self._front_air_level_ul = 0.0
             self._rear_air_level_ul = 0.0
-        elif operation == "aspirate_air":
-            if bool(result.get("front_air", True)):
+        elif operation in {"aspirate_air", "cavro_reaspirate"}:
+            if operation != "cavro_reaspirate" and bool(result.get("front_air", True)):
                 self._front_air_level_ul += volume
             else:
                 self._rear_air_level_ul += volume
@@ -300,8 +316,10 @@ class CanPipetteTransport:
             else:
                 self._rear_air_level_ul -= volume
         return {
-            "state_reconciled": True,
+            "state_reconciled": operation != "cavro_device_command",
             "state_reconciliation_source": "correlated_controller_completion_accounting",
+            "accounting": accounting,
+            "legacy_counter_basis": "command_displacement_shadow_not_measured_liquid",
             "liquid_level_ul": self._liquid_level_ul,
             "front_air_level_ul": self._front_air_level_ul,
             "rear_air_level_ul": self._rear_air_level_ul,
@@ -1831,6 +1849,193 @@ class FourPipetteTransport:
         return {"ok": all(row["result"].get("ok") for row in rows), "channels": rows, "requested": command.to_payload()}
 
 
+    def capture_pressure(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Explicit finite host acquisition; stream configuration remains authored."""
+        from .pressure_capture import PressureCaptureRequest
+        selected = PressureCaptureRequest.model_validate(request)
+        router = self._transports[selected.channels[0]]._get_driver().bus.router
+        capture = router.begin_scientific_pressure_capture(selected.model_dump())
+        epoch = self._interrupt_epoch
+        try:
+            remaining = selected.duration_ms / 1000.0
+            while remaining > 0:
+                if epoch != self._interrupt_epoch or self._forceabort():
+                    raise PipetteCommandError("Pressure capture interrupted; no replay")
+                interval = min(remaining, 0.05)
+                self._sleep(interval)
+                remaining -= interval
+        except Exception as exc:
+            partial = router.finish_scientific_pressure_capture(capture)
+            partial.update(ok=False, interrupted=True, source_return_completed=False)
+            setattr(exc, "pipette_partial_result", partial)
+            raise
+        return router.finish_scientific_pressure_capture(capture)
+
+    @staticmethod
+    def _decode_cavro_answers(result, answers):
+        from .cavro_receiving import decode_report
+        descriptors = result.get("response_descriptors") or []
+        reports = []
+        for index, answer in enumerate(answers):
+            descriptor = descriptors[index] if index < len(descriptors) else {}
+            unknown = not descriptor or descriptor.get("attribution_unknown", False)
+            decode_descriptor = {"ascii": "", "report_kind": None, "units": None} if unknown else descriptor
+            reports.append({"command_index": None if unknown else descriptor["command_index"],
+                "answer_index": index, "response": answer, "attribution_unknown": unknown,
+                **decode_report(decode_descriptor, answer.get("data", []))})
+        result["reports"] = reports
+
+    def _snapshot_cavro_answers(self, rows):
+        for row in rows:
+            result = row["result"]
+            if result.get("response_descriptors"):
+                driver = self._transports[row["channel"]]._get_driver()
+                router = getattr(driver.bus, "router", None)
+                if router is not None:
+                    answers = router.snapshot_pipette_answers(row["channel"],
+                        owner_token=row.get("completion_owner_token"))
+                    self._decode_cavro_answers(result, answers)
+
+    @staticmethod
+    def _cavro_buffer_envelope(transport, compiled):
+        """Observation-only authored context, never an instruction to the pump.
+
+        30053815-C p32 appends across calls; p40 READY at H is not the
+        completion of a following stroke. ACK does not prove the program cursor.
+        Unknown/preloaded contents are not fabricated and never block sends.
+        """
+        from .cavro_commands import command_effects
+        from copy import deepcopy
+        driver = transport._get_driver()
+        router = getattr(driver.bus, "router", None)
+        generation = (id(router), getattr(router, "reader_generation", None))
+        state = getattr(transport, "_cavro_authored_buffer", None)
+        if state is None or state["generation"] != generation:
+            state = {"generation": generation, "effects": [], "responses": [],
+                     "phase": "unknown_preloaded", "hazard": False}
+        revision = getattr(driver, "_pipette_buffer_revision", 0)
+        if state.get("send_revision", revision) != revision:
+            state = {**state, "phase": "intervening_command_unknown", "hazard": True,
+                     "responses": [], "original_responses": []}
+        current = deepcopy(dict(compiled))
+        name = (compiled.get("requested") or {}).get("command")
+        effects = compiled.get("command_effects")
+        if effects is None and name:
+            effects = [command_effects(compiled["requested"])]
+        effects = effects or []
+        responses = deepcopy(compiled.get("response_descriptors") or [])
+        if not responses and str(compiled.get("report_kind") or "").startswith("diagnostic_"):
+            responses = [{"command_index": 0, "ascii": compiled["ascii"], "report_kind": compiled["report_kind"],
+                          "units": compiled.get("units"), "requested": compiled["requested"],
+                          "terminal_answer": True}]
+        is_report = compiled["wait_mode"] == "report"
+        control = name in {"buffer_clear", "buffer_execute", "buffer_replay", "terminate", "reset"}
+        prior = deepcopy(state)
+        if not is_report and not control:
+            prior_effects = state["effects"] if state["phase"] == "appended" else []
+            prior_responses = state["responses"] if state["phase"] == "appended" else []
+            for descriptor in prior_responses:
+                descriptor["terminal_answer"] = False
+            for descriptor in responses:
+                descriptor["command_index"] += len(prior_effects)
+            responses = prior_responses + responses
+            combined = prior_effects + effects
+            hazard = state["hazard"] or any(e.get("kind") in {"halt", "control_transfer"}
+                       or e.get("command") in {"loop_start", "loop_end"} for e in combined)
+            if hazard:
+                for descriptor in responses:
+                    descriptor["terminal_answer"] = False
+                    if any(e.get("command") in {"loop_start", "loop_end"} for e in combined):
+                        descriptor["attribution_unknown"] = True
+            current["response_descriptors"] = responses
+            current["completion_attribution_unknown"] = hazard
+            state = {"generation": generation, "effects": combined[:256],
+                     "responses": responses[:256], "original_responses": deepcopy(responses[:256]), "hazard": hazard or len(combined) > 256,
+                     "phase": "appended" if compiled.get("effects_deferred") or
+                         compiled["wait_mode"] == "ack" else "execution_requested"}
+        elif control:
+            # R/X/T are ACK-only controls: no cursor or completed effects are
+            # inferred. Only explicitly authored C discards the known buffer.
+            if name == "buffer_clear":
+                state = {"generation": generation, "effects": [], "responses": [],
+                         "phase": "clear_requested", "hazard": False}
+            else:
+                if name in {"buffer_execute", "buffer_replay"}:
+                    current["response_descriptors"] = deepcopy(state.get("original_responses", state["responses"]) if name == "buffer_replay" else state["responses"])
+                    for descriptor in current["response_descriptors"]:
+                        descriptor["terminal_answer"] = False
+                state = {**state, "phase": "control_cursor_unknown", "hazard": True}
+            current["completion_attribution_unknown"] = True
+        current["buffer_context"] = {"prior_phase": prior["phase"],
+            "known_prior_effects": prior["effects"], "phase": state["phase"],
+            "cursor_verified": False, "preloaded_contents_verified": False,
+            "completion_attribution_unknown": bool(current.get("completion_attribution_unknown"))}
+        # Retain even on send failure as uncertainty; never assume a partial
+        # transmission did not affect the device buffer.
+        transport._cavro_authored_buffer = state
+        return current
+
+    def run_cavro_command(self, compiled: Mapping[str, Any], *, channels: list[int],
+                          timeout_ms: int) -> dict[str, Any]:
+        """Run typed service within the existing finite caller/receipt owner."""
+        selected = self._selected_channels(channels)
+        explicit_termination = (compiled.get("requested") or {}).get("command") in {"terminate", "reset"}
+        def send(channel, transport, deferred):
+            driver = transport._get_driver()
+            if explicit_termination:
+                # Authored selected-channel T/reset is not the all-channel global
+                # Stop. Detach the exact old wait so its completion cannot be
+                # confused with this control's response; global Stop is unchanged.
+                router = getattr(driver.bus, "router", None)
+                if router is not None:
+                    router.interrupt_pipette_completion(channel, owner_token=self._completion_owner_token(transport))
+            envelope = self._cavro_buffer_envelope(transport, compiled)
+            try:
+                result = driver.send_cavro_command(envelope, timeout_ms=timeout_ms)
+            except BaseException:
+                transport._cavro_authored_buffer.update(phase="send_outcome_unknown", hazard=True)
+                raise
+            transport._cavro_authored_buffer["send_revision"] = getattr(driver, "_pipette_buffer_revision", 0)
+            if not result.get("ok"):
+                transport._cavro_authored_buffer.update(phase="send_outcome_unknown", hazard=True)
+            transport._last_transaction = result
+            if compiled["wait_mode"] == "completion":
+                transport._assert_driver_result("cavro_device_command", result)
+            # Report/ACK false is preserved as a channel outcome; actuator send
+            # failures use the same partial-exception path as legacy Cavro.
+            return result
+        control_answers = compiled["wait_mode"] == "control" and (
+            bool(compiled.get("response_descriptors")) or
+            (compiled.get("requested") or {}).get("command") in {"buffer_execute", "buffer_replay"}
+            and any(getattr(self._transports[ch], "_cavro_authored_buffer", {}).get(
+                "original_responses" if (compiled.get("requested") or {}).get("command") == "buffer_replay" else "responses")
+                for ch in selected))
+        result = self._run_group_liquid_operation(
+            "cavro_device_command", selected, send, timeout_ms=timeout_ms,
+            defer_completion=compiled["wait_mode"] == "completion" or control_answers, set_allow_to_stop=False)
+        if compiled["wait_mode"] == "completion" and compiled.get("report_kind"):
+            from .cavro_receiving import decode_report
+            for row in result["channels"]:
+                row["result"]["report"] = decode_report(compiled, (row.get("completion") or {}).get("data", []))
+        for row in result["channels"]:
+            state = getattr(self._transports[row["channel"]], "_cavro_authored_buffer", None)
+            if state and row["result"].get("completion_verified"):
+                state.update(responses=[], phase="completed", hazard=False)
+            elif state and (compiled["wait_mode"] == "completion" or row["result"].get("observation_completion_only")):
+                state.update(phase="completion_attribution_unknown", hazard=True)
+                state["responses"] = (row["result"].get("response_descriptors") or [])[len(row["result"].get("reports") or []):]
+        result["semantic_query_response_verified"] = bool(
+            compiled["wait_mode"] == "report" and all(
+                row["result"].get("semantic_query_response_verified") is True for row in result["channels"]))
+        if compiled["wait_mode"] != "completion":
+            for row in result["channels"]:
+                if not row["result"].get("observation_completion_only"):
+                    row["completion_owner_token"] = None
+        result.update({key: compiled.get(key) for key in
+                       ("wait_mode", "report_kind", "units", "persistent", "warnings", "requested",
+                        "command_effects", "program", "buffer_action", "effects_deferred", "response_descriptors")})
+        return result
+
     def _run_group_liquid_operation(
         self,
         operation: str,
@@ -1868,6 +2073,8 @@ class FourPipetteTransport:
                     if post_send_delay_s:
                         self._sleep(float(post_send_delay_s))
         except Exception as exc:
+            if operation == "cavro_device_command":
+                self._snapshot_cavro_answers(rows)
             self._last_error = {"operation": operation, "error": repr(exc), "channels": rows}
             # Retain channels already sent when a later channel throws. This
             # changes evidence only: no retry, new query, stop or success rule.
@@ -1892,6 +2099,9 @@ class FourPipetteTransport:
             for row in rows:
                 channel = int(row["channel"])
                 remaining = max(0.0, deadline - time.monotonic())
+                if operation == "cavro_device_command" and row["result"].get("wait_mode") == "control" and not row["result"].get("observation_completion_only"):
+                    row["completion"] = {"ok": False, "outcome": "ack_only_control"}
+                    continue
                 try:
                     completion = self._wait_channel_completion(
                         self._transports[channel],
@@ -1908,7 +2118,10 @@ class FourPipetteTransport:
                 with self._transaction_lock:
                     interrupted = self._interrupt_epoch != operation_interrupt_epoch
                     row["interrupted_by_terminate"] = interrupted
-                    if isinstance(completion, Mapping) and completion.get("ok") is True and not interrupted:
+                    if operation == "cavro_device_command":
+                        self._decode_cavro_answers(row["result"], (completion or {}).get("active_answers") or [])
+                    if (isinstance(completion, Mapping) and completion.get("ok") is True and not interrupted
+                            and not row["result"].get("completion_attribution_unknown")):
                         state = self._transports[channel].apply_completed_effect(operation, row["result"])
                         row["result"].update(state)
                         row["result"]["completion_verified"] = True
@@ -1934,7 +2147,8 @@ class FourPipetteTransport:
 
         ok = not interrupted_by_terminate and all(
             row["result"].get("ok") is True
-            and (not defer_completion or row.get("completion", {}).get("ok") is True)
+            and (not defer_completion or row.get("completion", {}).get("ok") is True
+                 or row["result"].get("wait_mode") == "control")
             for row in rows
         )
         self._last_group_transaction = {
@@ -1949,7 +2163,7 @@ class FourPipetteTransport:
             "completion_verified": bool(
                 defer_completion
                 and not interrupted_by_terminate
-                and all(row.get("completion", {}).get("ok") is True for row in rows)
+                and all(row["result"].get("completion_verified") is True for row in rows)
             ),
             "state_reconciled": all(row["result"].get("state_reconciled") is True for row in rows),
             "interrupted_by_terminate": interrupted_by_terminate,
