@@ -86,7 +86,7 @@ def test_order_limit_historical_merge_and_full_detail(tmp_path):
             pytest.fail("full canonical page must not read historical bundle files")
     assert list_protocol_jobs(limit=2, summary=True, store=NoHistoryRead(), command_store=store) == compact[:2]
     selected = get_protocol_job(compact[0]["job_id"], store=historical, command_store=store)
-    assert selected == full[0]
+    assert {**selected, "row_kind": "canonical_workflow"} == full[0]
     assert len(selected["protocol"]["document"]["large"]) == 10000
     assert get_protocol_job("old-job", store=historical, command_store=store)["execution"]["dry_run"] is True
     store.connection.close()
@@ -113,8 +113,9 @@ def test_real_schema_admission_and_api_summary(tmp_path, monkeypatch):
         client = TestClient(app)
         response = client.get("/protocol/jobs?summary=true")
         assert response.status_code == 200
-        assert response.json() == {"rows": [project(full)]}
-        assert client.get("/protocol/jobs").json() == {"rows": [full]}
+        listed = {**full, "row_kind": "canonical_workflow"}
+        assert response.json() == {"rows": [project(listed)]}
+        assert client.get("/protocol/jobs").json() == {"rows": [listed]}
         assert client.get("/protocol/jobs?limit=0").status_code == 422
     finally:
         store.stop()

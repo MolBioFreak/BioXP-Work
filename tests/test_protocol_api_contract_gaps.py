@@ -44,7 +44,8 @@ def test_dry_run_reports_admission_preview_without_enforcing(monkeypatch, tmp_pa
     create = protocol_service.create_protocol_job
     monkeypatch.setattr(api, "create_protocol_job", lambda payload, **kw: create(payload, store=store, **kw))
     monkeypatch.setattr(api, "_get_tester", lambda: pytest.fail("dry run touched hardware"))
-    response = TestClient(api.app).post("/liquid/manual/execute", json=program())
+    response = TestClient(api.app).post("/liquid/manual/execute", json=program(),
+                                        headers={"Idempotency-Key": "manual-preview-test"})
     assert response.status_code == 200, response.text
     preview = response.json()["artifacts"]["admission_preview"]
     assert preview["enforced"] is False
