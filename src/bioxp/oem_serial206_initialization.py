@@ -11168,6 +11168,29 @@ class Serial206OemInitializationProvider:
             )
         return {"ok": True, "psudo_z_home_steps": pseudo_home, "source_anchor": "DefaultParameters.GantryLoad:61-79"}
 
+    def record_movable_object_locations(
+        self, *, locations: Mapping[str, str], source_command_id: str,
+    ) -> dict[str, Any]:
+        """Operator record correction: ClassMachineStatus.updatePlateLocation setter only.
+
+        No motion and no controller I/O. Merges the supplied objects into both
+        the canonical SQLite record and the provider machine_status copy.
+        """
+        reader = getattr(self, "_deck_semantic_state_reader", None)
+        retained = dict(((reader() if callable(reader) else {}) or {}).get("movable_plate_locations") or {})
+        retained.update(dict(locations))
+        published = self._publish_deck_owner_state(
+            source_operation="updatePlateLocation", source_command_id=source_command_id,
+            updates={"movable_plate_locations": retained},
+        )
+        with self._lock:
+            state = self._load_state()
+            machine = state["machine_status"]
+            machine["movable_plate_locations"] = {
+                **dict(machine.get("movable_plate_locations") or {}), **dict(locations)}
+            self._save_state(state)
+        return published
+
     def load_gantry(self, *, tip_loaded: bool | None = None, plate_on_gantry: Any = None) -> dict[str, Any]:
         return self.gantry_load(
             tip_loaded=tip_loaded, plate_on_gantry=plate_on_gantry,

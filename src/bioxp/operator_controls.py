@@ -3075,7 +3075,7 @@ class _OperatorPollCache:
                 # A different cold view must not queue behind a held provider.
                 # Retrying this metadata GET is safe; no action is submitted.
                 if pending is None or self._pending_key != key:
-                    raise HTTPException(503, detail="operator_poll_warming")
+                    raise HTTPException(503, detail="operator_poll_warming", headers={"Retry-After": "1"})
             try:
                 # Host metadata response bound only; never cancels provider or
                 # transport work and never starts a replacement on timeout.
@@ -3086,7 +3086,7 @@ class _OperatorPollCache:
                 wrapped.add_done_callback(lambda done: None if done.cancelled() else done.exception())
                 result = await asyncio.wait_for(asyncio.shield(wrapped), timeout=0.5)
             except asyncio.TimeoutError:
-                raise HTTPException(503, detail="operator_poll_warming") from None
+                raise HTTPException(503, detail="operator_poll_warming", headers={"Retry-After": "1"}) from None
             if self._generation() != generation:
                 raise HTTPException(503, detail="operator_poll_ownership_changed")
             return copy.deepcopy(result)

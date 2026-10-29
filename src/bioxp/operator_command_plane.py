@@ -19,7 +19,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
@@ -50,6 +50,7 @@ from .oem_deck_movement import (
     MovExecutionPlan,
     DeckExecutionFailure,
     FINITE_PLATE_OPERATIONS,
+    OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS,
     WP8_OPERATION_INTENT_KEYS,
     canonical_movable_object_locations,
     canonical_plate_name,
@@ -814,6 +815,23 @@ class RecoveryResolveRequest(BaseModel):
     expected_safety_epoch: StrictInt = Field(ge=0)
     acknowledge_command_ids: list[str] = Field(max_length=10000)
     operation: str = Field(pattern=r"^(resume_undispatched|cancel_pending)$")
+
+
+class DeckRecordTipTray(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    # OEM tray numbers as used by load_tip: 1-4 TECANRACK1-4, 5 tip hotel.
+    tray: StrictInt = Field(ge=1, le=5)
+    tips: Literal["full", "empty"] | list[str]
+
+
+class DeckRecordRequest(BaseModel):
+    """Record-only correction of what the robot believes is on the deck. No motion."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    schema_version: str = Field(pattern=r"^bioxp\.operator_deck_record_request\.v1$")
+    record_id: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+    reason: str = Field(min_length=1, max_length=500)
+    movable_objects: dict[str, str] | None = None
+    tip_trays: list[DeckRecordTipTray] | None = None
 
 
 class DeckReconciliationRequest(BaseModel):
@@ -6993,6 +7011,118 @@ class OperatorCommandPlane:
         @router.post("/recovery/{recovery_epoch}/resolve")
         async def resolve_recovery(recovery_epoch: int, request: RecoveryResolveRequest) -> dict[str, Any]:
             return await asyncio.to_thread(self.store.resolve_recovery, recovery_epoch, request.model_dump())
+
+        @router.get("/deck/state")
+        async def deck_state() -> dict[str, Any]:
+            """Canonical SQLite deck record plus the provider fallback it is merged with."""
+            semantic = await asyncio.to_thread(self.store.deck_semantic_state)
+            provider = self._current_deck_provider()
+            loader = getattr(provider, "_load_state", None)
+            machine: dict[str, Any] = {}
+            if callable(loader):
+                try:
+                    machine = dict((await asyncio.to_thread(loader)).get("machine_status") or {})
+                except Exception as exc:  # observation loss is reported, never raised
+                    machine = {"unavailable": type(exc).__name__}
+            recorded = dict(semantic.get("movable_plate_locations") or {})
+            fallback = dict(machine.get("movable_plate_locations") or {})
+            effective = {**fallback, **recorded}
+            return {"schema_version": "bioxp.operator_deck_state.v1", "semantic": semantic,
+                    "movable_objects": {name: {"location": location,
+                        "source": "sqlite_record" if name in recorded else "provider_machine_status"}
+                        for name, location in sorted(effective.items())},
+                    "physical_observation": False}
+
+        @router.get("/tip-trays")
+        async def tip_trays() -> dict[str, Any]:
+            def read() -> list[dict[str, Any]]:
+                rows = []
+                for tray_id in range(5):
+                    try:
+                        row = self.store.tip_tray_state(tray_id)
+                    except (RuntimeError, ValueError) as exc:
+                        rows.append({"tray": tray_id + 1, "tray_id": tray_id, "unavailable": str(exc)})
+                        continue
+                    occupancy = row.get("occupancy")
+                    rows.append({"tray": tray_id + 1, **row,
+                                 "tips_present": sum(1 for tip in occupancy if tip) if isinstance(occupancy, list) else None,
+                                 "four_channel_groups_available": row.get("available_count")})
+                return rows
+            return {"schema_version": "bioxp.operator_tip_trays.v1", "trays": await asyncio.to_thread(read),
+                    "tray_numbering": "tray = OEM/load_tip tray 1-5 (5 = tip hotel); tray_id = internal 0-4",
+                    "physical_observation": False}
+
+        @router.post("/deck/record")
+        async def record_deck(request: DeckRecordRequest) -> dict[str, Any]:
+            """Correct the robot's record of plates/covers/tip trays. Records only; moves nothing.
+
+            Same effect as OEM ClassMachineStatus.updatePlateLocation and
+            ClassTipTray.loadAllTips/removeAllTips/removeTip setters.
+            """
+            payload = request.model_dump()
+            if not payload["movable_objects"] and not payload["tip_trays"]:
+                raise HTTPException(status_code=422, detail={"error": "deck_record_empty"})
+            provider = self._current_deck_provider()
+            recorder = getattr(provider, "record_movable_object_locations", None)
+            tray_publisher = getattr(provider, "publish_tip_tray_transition", None)
+            if not callable(recorder) or not callable(tray_publisher):
+                raise HTTPException(status_code=503, detail={"error": "deck_record_owner_unavailable"})
+            objects = payload["movable_objects"] or {}
+            if objects:
+                try:
+                    canonical_movable_object_locations(objects, require_complete=False)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail={"error": "deck_record_invalid_objects",
+                        "reason": str(exc), "valid_objects": sorted(OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS)}) from exc
+            trays = []
+            for row in payload["tip_trays"] or []:
+                tips = row["tips"]
+                if isinstance(tips, list):
+                    present = set()
+                    for well in tips:
+                        text = str(well).strip().upper()
+                        if (len(text) < 2 or text[0] not in "ABCDEFGH" or not text[1:].isdigit()
+                                or not 1 <= int(text[1:]) <= 12):
+                            raise HTTPException(status_code=422, detail={"error": "deck_record_invalid_well", "well": well})
+                        present.add((ord(text[0]) - 65) * 12 + int(text[1:]) - 1)
+                    missing = [index for index in range(96) if index not in present]
+                    trays.append((row["tray"], missing))
+                else:
+                    trays.append((row["tray"], tips))
+
+            def apply() -> dict[str, Any]:
+                result: dict[str, Any] = {"tip_trays": []}
+                # Record writes serialize in the canonical SQLite transaction; never wait on motion.
+                if objects:
+                    result["deck"] = recorder(locations=objects,
+                                              source_command_id=f"operator-record:{payload['record_id']}")
+                for tray, tips in trays:
+                    provenance = {"source_operation": "operator_deck_record", "record_id": payload["record_id"],
+                                  "reason": payload["reason"], "physical_observation": False}
+                    base = f"operator-record:{payload['record_id']}:tray{tray}"
+                    if tips == "empty":
+                        published = tray_publisher(tray_id=tray - 1, transition="remove_all",
+                            operation_id=base + ":remove_all", command_id=base, provenance=provenance)
+                    else:
+                        published = tray_publisher(tray_id=tray - 1, transition="load_all",
+                            operation_id=base + ":load_all", command_id=base, provenance=provenance)
+                        if isinstance(tips, list) and tips:
+                            published = tray_publisher(tray_id=tray - 1, transition="camera_missing",
+                                operation_id=base + ":missing", command_id=base, provenance=provenance,
+                                well_ids=tips)
+                    result["tip_trays"].append({"tray": tray, **dict(published)})
+                return result
+
+            try:
+                applied = await asyncio.to_thread(apply)
+            except sqlite3.IntegrityError as exc:
+                raise HTTPException(status_code=409, detail={"error": "deck_record_id_already_used",
+                    "record_id": payload["record_id"]}) from exc
+            except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+                raise HTTPException(status_code=409, detail={"error": "deck_record_rejected",
+                    "reason": f"{type(exc).__name__}: {exc}"[:500]}) from exc
+            return {"schema_version": "bioxp.operator_deck_record_result.v1", "record_id": payload["record_id"],
+                    "motion_commanded": False, "physical_observation": False, **applied}
 
         @router.post("/recovery/deck/{command_id}/reconcile")
         async def reconcile_deck_recovery(command_id: str, request: DeckReconciliationRequest) -> dict[str, Any]:

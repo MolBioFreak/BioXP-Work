@@ -2945,7 +2945,9 @@ class ProtocolExecuteRequest(ProtocolCompileRequest):
     live_execution_ack: bool = Field(False, description="Explicit operator acknowledgement for dry_run=false live protocol execution.")
     operator_id: Optional[str] = Field(None, max_length=120)
     physical_console_verified: bool = Field(False)
-    deck_manifest: Optional[dict[str, Any]] = None
+    deck_manifest: Optional[dict[str, Any]] = Field(None, description=(
+        "Record-only caller annotation saved with the live contract and preflight. It does not seed tip trays, "
+        "well contents or plate/cover locations; use POST /operator/deck/record to correct the deck record."))
     preflight: Optional[dict[str, Any]] = None
     artifact_refs: list[str] = Field(default_factory=list)
     snapshot_refs: list[str] = Field(default_factory=list)
@@ -10231,8 +10233,13 @@ def _protocol_deck_action_result(command_id: str) -> dict[str, Any]:
     except (OSError, RuntimeError, ValueError, KeyError, TypeError, HTTPException) as exc:
         # Observation loss is evidence, never a new execution predicate.
         children, evidence_error = [], type(exc).__name__
+    terminal = command.get("terminal_evidence") if isinstance(command.get("terminal_evidence"), Mapping) else {}
+    # Surface the recorded failure cause on the job's action result (report only).
+    failure = {key: terminal[key] for key in ("error", "detail", "outcome_unknown", "delivery_attempted")
+               if key in terminal} if command.get("status") != "completed" else {}
     return {"ok": command.get("status") == "completed", "command_id": command_id,
             "command": command, "child_outcomes": children,
+            **({"status": command.get("status"), "failure": failure} if failure else {}),
             **({"child_outcomes_error": evidence_error} if evidence_error else {})}
 
 
@@ -10996,6 +11003,12 @@ async def protocol_execute(req: ProtocolExecuteRequest):
         raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (RuntimeError, KeyError, OSError) as exc:
+        # Same outcome as before (no job created by this request path), but the
+        # cause is reported instead of an opaque 500.
+        raise HTTPException(status_code=500, detail={
+            "error": "protocol_execute_internal_error", "type": type(exc).__name__,
+            "reason": str(exc)[:500]}) from exc
 
 
 from .calibration_analysis import AnalysisRequest, AnalysisResult, analyze as analyze_calibration
@@ -11132,6 +11145,9 @@ async def protocol_job_detail(job_id: str, observation: bool = Query(False)):
         return await run_in_threadpool(get_protocol_job, job_id, observation=observation, command_store=_protocol_command_store())
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail={"error": "protocol_job_bundle_unreadable",
+                                                     "job_id": job_id, "reason": str(exc)[:300]}) from exc
 
 
 @app.post("/protocol/jobs/{job_id}/control")
