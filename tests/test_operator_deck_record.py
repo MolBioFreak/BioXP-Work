@@ -77,3 +77,23 @@ def test_tip_tray_records_full_empty_and_partial(client):
     assert trays[3]['tips_present'] == 5 and trays[3]['four_channel_groups_available'] == 1
     assert store.tip_tray_state(2)['occupancy'][0] is True  # A1 on tray 3
     assert frames == []
+
+
+def test_gantry_record_clears_stuck_cover_without_motion(client):
+    http, provider, store, frames = client
+    provider.gantry_load(tip_loaded=False, plate_on_gantry='OUTPUT_COVER')
+    assert store.deck_semantic_state()['plate_on_gantry'] == 4
+    frames.clear()
+    response = http.post('/operator/deck/record', json={'gantry': 'empty',
+        'movable_objects': {'OUTPUT_COVER': 'LOC_OC_COVER'}})
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result['motion_commanded'] is False and result['gantry']['plate_on_gantry'] is None
+    after = store.deck_semantic_state()
+    assert after['plate_on_gantry'] is None and after['pseudo_z_home'] == 65000
+    assert provider._load_state()['machine_status']['plate_on_gantry'] is None
+    assert frames == []
+    # Setting a held object is the same setter; unknown names are 422.
+    held = http.post('/operator/deck/record', json={'gantry': 'REAGENT_COVER'})
+    assert held.status_code == 200 and store.deck_semantic_state()['plate_on_gantry'] == 5
+    assert http.post('/operator/deck/record', json={'gantry': 'NOPE'}).status_code == 422

@@ -833,6 +833,9 @@ class DeckRecordRequest(BaseModel):
     reason: str = Field("operator deck record", min_length=1, max_length=500)
     movable_objects: dict[str, str] | None = None
     tip_trays: list[DeckRecordTipTray] | None = None
+    # What the gripper holds: "empty" or a ClassMachineStatus object name.
+    # Same plain setter as OEM DefaultParameters.GantryLoad / LoadGantryNull.
+    gantry: str | None = None
 
 
 class DeckReconciliationRequest(BaseModel):
@@ -7061,8 +7064,16 @@ class OperatorCommandPlane:
             ClassTipTray.loadAllTips/removeAllTips/removeTip setters.
             """
             payload = request.model_dump()
-            if not payload["movable_objects"] and not payload["tip_trays"]:
+            if not payload["movable_objects"] and not payload["tip_trays"] and payload["gantry"] is None:
                 raise HTTPException(status_code=422, detail={"error": "deck_record_empty"})
+            gantry_plate: Any = None
+            if payload["gantry"] is not None:
+                if payload["gantry"].strip().lower() != "empty":
+                    try:
+                        gantry_plate = canonical_plate_name(payload["gantry"])
+                    except ValueError as exc:
+                        raise HTTPException(status_code=422, detail={"error": "deck_record_invalid_gantry",
+                            "reason": str(exc), "valid": ["empty", *sorted(OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS)]}) from exc
             provider = self._current_deck_provider()
             recorder = getattr(provider, "record_movable_object_locations", None)
             tray_publisher = getattr(provider, "publish_tip_tray_transition", None)
@@ -7091,12 +7102,29 @@ class OperatorCommandPlane:
                 else:
                     trays.append((row["tray"], tips))
 
+            loader = getattr(provider, "gantry_load", None)
+            if payload["gantry"] is not None and not callable(loader):
+                raise HTTPException(status_code=503, detail={"error": "deck_record_owner_unavailable"})
+
             def apply() -> dict[str, Any]:
-                result: dict[str, Any] = {"tip_trays": []}
+                result: dict[str, Any] = {"tip_trays": [], "warnings": []}
                 # Record writes serialize in the canonical SQLite transaction; never wait on motion.
                 if objects:
                     result["deck"] = recorder(locations=objects,
                                               source_command_id=f"operator-record:{payload['record_id']}")
+                if payload["gantry"] is not None:
+                    current = self.store.deck_semantic_state()
+                    tip_loaded = current.get("tip_loaded")
+                    # Keep the recorded tip state; GantryLoad derives pseudo-Z home from both.
+                    result["gantry"] = loader(tip_loaded=tip_loaded if type(tip_loaded) is bool else None,
+                                              plate_on_gantry=gantry_plate, source_operation="GantryLoad")
+                    after = self.store.deck_semantic_state()
+                    result["gantry"]["plate_on_gantry"] = after.get("plate_on_gantry")
+                    held = [name for name, location in dict(after.get("movable_plate_locations") or {}).items()
+                            if location == "LOC_GANTRY" and canonical_plate_name(name) != gantry_plate]
+                    if held:
+                        result["warnings"].append({"code": "object_recorded_on_gantry", "objects": held,
+                            "message": "These objects are still recorded at LOC_GANTRY; set their deck location too."})
                 for tray, tips in trays:
                     provenance = {"source_operation": "operator_deck_record", "record_id": payload["record_id"],
                                   "reason": payload["reason"], "physical_observation": False}
