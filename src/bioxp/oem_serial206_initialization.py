@@ -2042,6 +2042,10 @@ class Serial206ProductionPrimitiveAdapter:
         source_completed = isinstance(move, Mapping) and move.get("ok") is True
         timeout_position = move.get("timeout_position") if isinstance(move, Mapping) else None
         consumed = source_wait.get("event") if isinstance(source_wait, Mapping) else None
+        # The consumed OEM target event (128) is the controller's own terminal
+        # report for moveToAbs; a completed source call that consumed it is a
+        # verified controller terminal state, not an unverified one.
+        controller_terminal = bool(source_completed and move.get("completion_class") == "event_128")
         return {
             "ok": source_completed,
             "failure": None if source_completed else "z_move_source_call_failed",
@@ -2052,7 +2056,7 @@ class Serial206ProductionPrimitiveAdapter:
                 self._z_tmcl_success(move.get("ack"))
                 or self._z_tmcl_success(move.get("retry_ack"))
             ),
-            "controller_terminal_state_verified": False,
+            "controller_terminal_state_verified": controller_terminal,
             "completion_class": move.get("completion_class"),
             "physical_effect_verified": False,
             "command_issued": move.get("command_sent") is True,

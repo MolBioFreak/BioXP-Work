@@ -92,7 +92,8 @@ def test_source_target_survives_route_store_and_reopen(tmp_path, monkeypatch, mi
             assert evidence['before_position_steps'] == start
             assert evidence['after_position_steps'] == (None if arrives else start)
             assert evidence['controller_command_acknowledged'] is True
-            assert evidence['controller_terminal_state_verified'] is False
+            # A consumed OEM target event is the controller's terminal report.
+            assert evidence['controller_terminal_state_verified'] is arrives
             assert evidence['physical_effect_verified'] is False
             assert evidence['coordinate_mode'] == 'absolute'
             assert evidence['target_clamped'] is (requested < minimum)
