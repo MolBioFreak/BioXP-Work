@@ -9029,6 +9029,12 @@ async def chiller_baseline():
     return await _run_blocking("Chiller baseline", lambda: tester.chiller_apply_vendor_baseline(verify=True), timeout_s=30.0)
 
 
+@app.get("/thermal/fan-services")
+async def thermal_fan_services():
+    tester = _get_tester()
+    return tester.oem_fan_service_status()
+
+
 @app.get("/chiller/snapshot")
 async def chiller_snapshot():
     projection = hardware_state.project("chiller")
@@ -9042,10 +9048,7 @@ async def set_chiller_temp(req: ChillerRequest):
     bank = _CHILLER_BANK_MAP[req.bank]
     return await _run_blocking(
         "Chiller setpoint",
-        lambda: (
-            tester.chiller_activate(),
-            tester.chiller_set_target_temp(bank, req.target_temp_c, verify=True),
-        )[1],
+        lambda: dict(tester.oem_chiller_set_temperature(bank, float(req.target_temp_c))),
         timeout_s=25.0,
     )
 

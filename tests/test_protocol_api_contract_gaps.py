@@ -104,3 +104,9 @@ def test_motion_off_toggle_blocks_until_activation(monkeypatch):
         assert any(a["action_id"] == "meta.deactivate_motion" and a["enabled"] for a in actions)
     finally:
         api._maintenance_state.clear(); api._maintenance_state.update(saved)
+
+
+def test_motion_off_has_no_hardware_dependencies():
+    from bioxp import operator_controls as oc
+    assert oc._safety("POST", "/motion/oem/deactivate") == "service"
+    assert oc._motor_motion_action({"informational_method": "POST", "informational_path": "/motion/oem/deactivate", "safety_class": "service"}) is False

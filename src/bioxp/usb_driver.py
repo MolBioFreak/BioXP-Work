@@ -1117,6 +1117,9 @@ class BioXpTester:
             out[bid] = ack
             if expect_reply:
                 self._record_oem_board_activation(bid, active=active, ack=ack)
+                if active and self._oem_board_activation_ack_success(bid, ack):
+                    # ClassControlInterface.activateBoard: activateBoard(); startFanService();
+                    self._oem_ensure_fan_service(bid)
                 observer = getattr(self, "_board_activation_observer", None)
                 if callable(observer):
                     try:
@@ -1222,6 +1225,29 @@ class BioXpTester:
             return {"board": bid, "service": [self._oem_fan_service_start(bid, 0), self._oem_fan_service_start(bid, 1)], "started": True}
         return {"board": bid, "service": "base_noop", "started": True}
 
+    def _oem_ensure_fan_service(self, board_id):
+        """Start the OEM 5 s fan/pedestal service for a thermal or chiller board if it is not running.
+
+        The tick drives fan speed from pedestal temperature and cuts PWM when the
+        pedestal average passes 50 C (ClassThermalFanControl).  Without it the
+        Peltier pedestals have no fan control or overheat cutoff.
+        """
+        bid = int(board_id)
+        if bid not in (self.BOARD_THERMAL, self.BOARD_CHILLER):
+            return {"board": bid, "service": "base_noop"}
+        try:
+            return self._oem_start_fan_service(bid)
+        except Exception as exc:  # report, never block the caller
+            return {"board": bid, "started": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def oem_fan_service_status(self):
+        rows = []
+        for (board, axis), service in sorted(self._oem_fan_services().items()):
+            rows.append({k: service.get(k) for k in (
+                "running", "tc_on", "target_c", "current_c", "pedestal_c", "fan_speed", "error", "last_error", "last_tick_at")}
+                | {"board": board, "axis": axis})
+        return {"services": rows}
+
     def _oem_fan_services(self):
         services = getattr(self, "_oem_fan_service_state", None)
         if not isinstance(services, dict):
@@ -1307,6 +1333,7 @@ class BioXpTester:
             else:
                 speed = self._oem_fan_speed(current, service["target_c"], averaged, False)
             service["fan_speed"] = speed
+            service["last_tick_at"] = time.time()
             self.send_tmcl_retry(board, 141, 0, axis, speed, attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
             if not service["error"] and averaged > 50.0:
                 if board == self.BOARD_THERMAL:
@@ -1315,6 +1342,9 @@ class BioXpTester:
                 else:
                     self.send_tmcl_retry(board, 144, 0, axis, 0, attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
                 service.update({"tc_on": False, "target_c": 30.0, "error": True})
+            service["last_error"] = None
+        except Exception as exc:
+            service["last_error"] = f"{type(exc).__name__}: {exc}"
         finally:
             service["ticking"] = False
             self._oem_fan_schedule(key)
@@ -8462,6 +8492,8 @@ class BioXpTester:
             time.sleep(self.CHILLER_VERIFY_SETTLE_S)
             rb = self.chiller_gp_read(23, bank)
             verified = bool(rb.get("ok") and int(rb.get("value")) == pwm)
+        if self._tmcl_success(ack) and pwm == 0:
+            self._oem_fan_turn_off(self.BOARD_CHILLER, bank)
         return {
             "bank": bank,
             "axis": axis,
@@ -9153,6 +9185,7 @@ class BioXpTester:
             state['needed'] = 10.0 if needed < 10 else needed
             state['target'] = float(temp_c)
             self._oem_thermal_fan(self.BOARD_CHILLER, bank)
+            self._oem_ensure_fan_service(self.BOARD_CHILLER)
             self._oem_fan_set_target(self.BOARD_CHILLER, bank, temp_c)
             state['reached'] = False
             ack = self._oem_thermal_tx(result, self.BOARD_CHILLER, 140, 0, bank, int(temp_c * 1000))
@@ -9197,6 +9230,7 @@ class BioXpTester:
         return result
 
     def thermal_set_target_temp(self, bank, temp_c, verify=False):
+        self._oem_ensure_fan_service(self.BOARD_THERMAL)
         bank = int(bank)
         if bank not in (self.THERMAL_BANK_NEST, self.THERMAL_BANK_LID):
             return {"ok": False, "error": f"invalid bank {bank} (expected 0=NEST or 1=LID)"}

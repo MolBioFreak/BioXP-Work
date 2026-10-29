@@ -39,6 +39,7 @@ def test_thermal_prompt_real_handlers_same_job_and_store_reopen(installed_retain
         CHILLER_BANK_RC=0, CHILLER_BANK_OC=1,
         chiller_activate=lambda: calls.append("activate"),
         chiller_set_target_temp=set_temp, thermal_set_target_temp=set_temp,
+        oem_chiller_set_temperature=lambda selected, target: set_temp(selected, target),
         thermal_set_ped_temp=lambda target, **kw: set_temp("pedestal", target, **kw),
         thermal_read_temp_gp=lambda selected: {"ok": True, "temp_c":last_target[0] - .1, "fixture_only":True})
     monkeypatch.setattr(api, "_get_tester", lambda: tester)

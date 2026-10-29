@@ -466,3 +466,43 @@ def test_exceptional_live_timer_retains_custody_and_origin_until_actual_abort(mo
 def test_factory_absence_not_advertised():
     h = object.__new__(Provider).build_oem_native_handlers(settings={}, execute_plan=None)
     assert not set(h).intersection({'sp', 'splid', 'cc'})
+
+
+def test_board_activation_starts_fan_service_and_chiller_set_runs_it(rig, monkeypatch):
+    t = rig.t
+    t._oem_board_presence = {6: True, 7: True}
+    t._invalidate_oem_no_motion_profiles = lambda **kw: None
+    t._record_oem_board_activation = lambda *a, **k: None
+    t.BOARDS = [6, 7]
+    started = []
+    monkeypatch.setattr(t, '_oem_fan_schedule', lambda key: started.append(key))
+    t._set_boards_active(True)
+    assert sorted(started) == [(6, 0), (7, 0), (7, 1)]
+    assert all(t._oem_fan_services()[k]['running'] for k in started)
+    # chiller setpoint assigns the running service's target (fan follows the setpoint)
+    t.oem_chiller_set_temperature(0, 8)
+    svc = t._oem_fan_services()[(7, 0)]
+    assert svc['running'] and svc['tc_on'] and svc['target_c'] == 8.0
+
+
+def test_fan_tick_survives_transport_error(rig, monkeypatch):
+    t = rig.t
+    rescheduled = []
+    monkeypatch.setattr(t, '_oem_fan_schedule', lambda key: rescheduled.append(key))
+    t._oem_fan_service_start(7, 1)
+    def boom(*a, **k):
+        raise OSError('bus busy')
+    t.send_tmcl_retry = boom
+    t._oem_fan_tick((7, 1))
+    svc = t._oem_fan_services()[(7, 1)]
+    assert 'bus busy' in svc['last_error'] and svc['ticking'] is False
+    assert rescheduled[-1] == (7, 1)
+
+
+def test_raw_chiller_pwm_zero_clears_fan_target(rig):
+    t = rig.t
+    t.CHILLER_WRITE_SETTLE_S = 0
+    t._send_chiller = lambda *a, **k: {'status': 100, 'value': 0}
+    t._oem_fan_set_target(7, 1, 10)
+    t.chiller_set_pwm(1, 0)
+    assert t._oem_fan_services()[(7, 1)]['tc_on'] is False
