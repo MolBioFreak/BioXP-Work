@@ -2385,6 +2385,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         None,
     )
     prepare_bound = prepare_provider is not None and prepare_provider.get("provider_available") is True
+    deactivate_bound = any(row["method"] == "POST" and row["path"] == "/motion/oem/deactivate" for row in dispatch.values())
     recovery_bound = recovery_provider is not None and recovery_provider.get("provider_available") is True
 
     home_xy_bound = home_xy_provider is not None and home_xy_provider.get("provider_available") is True
@@ -2413,6 +2414,29 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "timeout_seconds": 120.0,
             "inputs": list(prepare_provider.get("inputs", [])) if prepare_provider else [],
             "stages": ["serial-206 authority", "24 V/door/latch query", "activate uninitialized boards", "bind current board lifecycle", "initializeMotorsWithoutMotion", "exact parameter readback"],
+        },
+        {
+            "action_id": "meta.deactivate_motion",
+            "label": "Motion Off",
+            "subsystem": "meta",
+            "category": "activation",
+            "kind": "meta",
+            "safety_class": "service",
+            "description": "Turn motion off: new moves are refused until Activate Motion runs again. Sends nothing to the controller and does not stop a move in progress.",
+            "source_anchor": "host motion switch (not OEM)",
+            "informational_method": "POST",
+            "informational_path": "/motion/oem/deactivate",
+            "provider_available": deactivate_bound,
+            "provider_unavailable_reason": None if deactivate_bound else "Motion-off route is not bound.",
+            "available": deactivate_bound,
+            "unavailable_reason": None if deactivate_bound else "Motion-off route is not bound.",
+            "enabled": deactivate_bound,
+            "disabled_reason": None if deactivate_bound else "Motion-off route is not bound.",
+            "dependencies": [],
+            "requires_confirmation": False,
+            "timeout_seconds": 10.0,
+            "inputs": [],
+            "stages": ["set motion off"],
         },
         {
             "action_id": "meta.recover_motion_non_homing",
@@ -2521,6 +2545,9 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         dispatch["meta.home_xy"] = home_route
     if prepare_route:
         dispatch["meta.activate_motion"] = prepare_route
+    deactivate_route = next((row for row in dispatch.values() if row["method"] == "POST" and row["path"] == "/motion/oem/deactivate"), None)
+    if deactivate_route:
+        dispatch["meta.deactivate_motion"] = deactivate_route
     if recovery_route:
         dispatch["meta.recover_motion_non_homing"] = {
             **dict(recovery_route),

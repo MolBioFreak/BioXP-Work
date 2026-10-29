@@ -6741,6 +6741,24 @@ def _prepare_operator_motion_state(tester, authority, *, before_publication=None
     }
 
 
+@app.post("/motion/oem/deactivate")
+async def motion_oem_deactivate():
+    """Operator motion-off switch. Sends nothing to the controller.
+
+    Blocks new motion admissions until meta.activate_motion runs again (which
+    clears this latch). Does not stop a move already in progress; use Stop.
+    """
+    global _maintenance_latch_generation
+    with _maintenance_state_lock:
+        _maintenance_latch_generation += 1
+        state = _set_maintenance_state(
+            transition="operator_motion_off", motion_blocked=True, recovery_required=True,
+            block_reason="operator_motion_off", recovery_hint="Activate motion to turn it back on.",
+            blocked_by="operator")
+    return {"ok": True, "motion_enabled": False, "hardware_motion_commanded": False,
+            "maintenance_state": state}
+
+
 @app.post("/motion/oem/prepare_without_motion")
 async def motion_oem_prepare_without_motion():
     try:

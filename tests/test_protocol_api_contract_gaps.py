@@ -87,3 +87,20 @@ def test_deck_record_defaults_identity_and_reason():
     assert first.schema_version == "bioxp.operator_deck_record_request.v1"
     assert first.record_id.startswith("auto-") and first.record_id != second.record_id
     assert first.reason == "operator deck record"
+
+
+def test_motion_off_toggle_blocks_until_activation(monkeypatch):
+    import copy
+    saved = copy.deepcopy(api._maintenance_state)
+    try:
+        result = asyncio.run(api.motion_oem_deactivate())
+        assert result["motion_enabled"] is False and result["hardware_motion_commanded"] is False
+        state = api._maintenance_state_payload()
+        assert state["motion_blocked"] is True and state["block_reason"] == "operator_motion_off"
+        actions, dispatch = api._build_operator_catalog(api.app) if hasattr(api, "_build_operator_catalog") else (None, None)
+        from bioxp.operator_controls import _build_catalog
+        actions, dispatch = _build_catalog(api.app)
+        assert "meta.deactivate_motion" in dispatch
+        assert any(a["action_id"] == "meta.deactivate_motion" and a["enabled"] for a in actions)
+    finally:
+        api._maintenance_state.clear(); api._maintenance_state.update(saved)
