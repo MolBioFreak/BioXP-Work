@@ -7100,12 +7100,14 @@ class OperatorCommandPlane:
                     provenance = {"source_operation": "operator_deck_record", "record_id": payload["record_id"],
                                   "reason": payload["reason"], "physical_observation": False}
                     base = f"operator-record:{payload['record_id']}:tray{tray}"
+                    # load_all first: remove_all/camera_missing read the prior
+                    # occupancy, which an unconstructed (revision 0) tray lacks.
+                    published = tray_publisher(tray_id=tray - 1, transition="load_all",
+                        operation_id=base + ":load_all", command_id=base, provenance=provenance)
                     if tips == "empty":
                         published = tray_publisher(tray_id=tray - 1, transition="remove_all",
                             operation_id=base + ":remove_all", command_id=base, provenance=provenance)
                     else:
-                        published = tray_publisher(tray_id=tray - 1, transition="load_all",
-                            operation_id=base + ":load_all", command_id=base, provenance=provenance)
                         if isinstance(tips, list) and tips:
                             published = tray_publisher(tray_id=tray - 1, transition="camera_missing",
                                 operation_id=base + ":missing", command_id=base, provenance=provenance,
