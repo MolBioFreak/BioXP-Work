@@ -16,9 +16,9 @@ def client(named, monkeypatch):
     run, provider, store, counts, frames, fault = named
     app = FastAPI()
     app.state.oem_deck_provider = provider
+    # Bind the plane to the fixture's real store instead of a fresh default root.
+    monkeypatch.setattr('bioxp.operator_command_plane.OperatorCommandStore', lambda *a, **k: store)
     plane = OperatorCommandPlane(app, machine_state_provider=lambda: {}, actions=[], dispatch={})
-    plane.store.stop()
-    plane.store = store
     app.include_router(plane.router)
     return TestClient(app), provider, store, frames
 
