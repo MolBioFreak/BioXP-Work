@@ -9185,7 +9185,6 @@ class BioXpTester:
             state['needed'] = 10.0 if needed < 10 else needed
             state['target'] = float(temp_c)
             self._oem_thermal_fan(self.BOARD_CHILLER, bank)
-            self._oem_ensure_fan_service(self.BOARD_CHILLER)
             self._oem_fan_set_target(self.BOARD_CHILLER, bank, temp_c)
             state['reached'] = False
             ack = self._oem_thermal_tx(result, self.BOARD_CHILLER, 140, 0, bank, int(temp_c * 1000))
@@ -9230,7 +9229,6 @@ class BioXpTester:
         return result
 
     def thermal_set_target_temp(self, bank, temp_c, verify=False):
-        self._oem_ensure_fan_service(self.BOARD_THERMAL)
         bank = int(bank)
         if bank not in (self.THERMAL_BANK_NEST, self.THERMAL_BANK_LID):
             return {"ok": False, "error": f"invalid bank {bank} (expected 0=NEST or 1=LID)"}

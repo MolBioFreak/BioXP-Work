@@ -34,6 +34,8 @@ def thermal_leaf(monkeypatch):
         return {"status": 100, "value": values.get((kind, bank), 25000)}
     tester._send_thermal = lambda *a, **k: send("thermal", *a, **k)
     tester._send_chiller = lambda *a, **k: send("chiller", *a, **k)
+    # OEM chiller setter talks to board 7 through send_tmcl_retry.
+    tester.send_tmcl_retry = lambda board, *a, **k: send("chiller" if int(board) == 7 else "thermal", *a, **k)
     tester.THERMAL_VERIFY_SETTLE_S = 0
     tester.CHILLER_VERIFY_SETTLE_S = 0
     monkeypatch.setattr(api, "_get_tester", lambda: tester)

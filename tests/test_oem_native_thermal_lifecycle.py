@@ -474,12 +474,14 @@ def test_board_activation_starts_fan_service_and_chiller_set_runs_it(rig, monkey
     t._invalidate_oem_no_motion_profiles = lambda **kw: None
     t._record_oem_board_activation = lambda *a, **k: None
     t.BOARDS = [6, 7]
+    t.send_tmcl_retry = lambda board, command, typ, bank, value, **kw: (rig.trace.append((board, command, typ, bank, value)), {'status': 100, 'value': 25000})[1]
     started = []
     monkeypatch.setattr(t, '_oem_fan_schedule', lambda key: started.append(key))
     t._set_boards_active(True)
     assert sorted(started) == [(6, 0), (7, 0), (7, 1)]
     assert all(t._oem_fan_services()[k]['running'] for k in started)
     # chiller setpoint assigns the running service's target (fan follows the setpoint)
+    rig.t.send_tmcl_retry = lambda board, command, typ, bank, value, **kw: {'status': 100, 'value': 25000}
     t.oem_chiller_set_temperature(0, 8)
     svc = t._oem_fan_services()[(7, 0)]
     assert svc['running'] and svc['tc_on'] and svc['target_c'] == 8.0
