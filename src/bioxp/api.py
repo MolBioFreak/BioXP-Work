@@ -2960,6 +2960,9 @@ class ManualPipettingExecuteRequest(ManualPipettingRequest):
     idempotency_key: StrictStr | None = Field(default=None, min_length=1, max_length=256)
     live_execution: dict[str, Any] | None = None
     live_execution_ack: bool = False
+    operator_id: Optional[str] = Field(None, max_length=120)
+    deck_manifest: Optional[dict[str, Any]] = Field(None, description="Record-only annotation; same meaning as /protocol/execute.")
+    preflight: Optional[dict[str, Any]] = None
 
 
 class ProtocolControlTarget(BaseModel):
@@ -11002,7 +11005,9 @@ async def protocol_execute(req: ProtocolExecuteRequest):
     except ProtocolLiveContractError as exc:
         raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        from .protocols.input_errors import ProtocolInputError
+        payload = exc.to_payload() if isinstance(exc, ProtocolInputError) else ProtocolInputError(str(exc)).to_payload()
+        raise HTTPException(status_code=400, detail={"error": "protocol_input_invalid", **payload}) from exc
     except (RuntimeError, KeyError, OSError) as exc:
         # Same outcome as before (no job created by this request path), but the
         # cause is reported instead of an opaque 500.
@@ -11128,7 +11133,8 @@ async def liquid_manual_execute(req: ManualPipettingExecuteRequest):
     return await protocol_execute(ProtocolExecuteRequest(
         source_type="native", document=document.to_payload(), dry_run=req.dry_run,
         idempotency_key=req.idempotency_key, live_execution=req.live_execution,
-        live_execution_ack=req.live_execution_ack,
+        live_execution_ack=req.live_execution_ack, operator_id=req.operator_id,
+        deck_manifest=req.deck_manifest, preflight=req.preflight,
     ))
 
 
@@ -11144,7 +11150,7 @@ async def protocol_job_detail(job_id: str, observation: bool = Query(False)):
     try:
         return await run_in_threadpool(get_protocol_job, job_id, observation=observation, command_store=_protocol_command_store())
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail={"error": "protocol_job_not_found", "message": str(exc)}) from exc
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=500, detail={"error": "protocol_job_bundle_unreadable",
                                                      "job_id": job_id, "reason": str(exc)[:300]}) from exc
@@ -11175,6 +11181,6 @@ async def protocol_job_review(job_id: str, req: ProtocolReviewRequest):
     except ProtocolLiveContractError as exc:
         raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail={"error": "protocol_job_not_found", "message": str(exc)}) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=409, detail={"error": "protocol_review_refused", "message": str(exc)}) from exc

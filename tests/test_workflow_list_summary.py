@@ -44,7 +44,8 @@ def project(full):
     return dict(job_id=full["job_id"], status=full["status"],
         dry_run=full["execution"]["dry_run"], protocol_id=full["protocol"]["document"]["protocol_id"],
         source_type=full["protocol"]["source_type"], created_at=full["created_at"],
-        updated_at=full["updated_at"], pending_review=full["operator"]["pending_review"], command=full["command"])
+        updated_at=full["updated_at"], pending_review=full["operator"]["pending_review"], command=full["command"],
+        **({"row_kind": full["row_kind"]} if "row_kind" in full else {}))
 
 
 @pytest.mark.parametrize("receipt", [None, "{}", " { } ", "null", "broken", ""])

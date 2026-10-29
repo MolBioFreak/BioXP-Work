@@ -827,9 +827,10 @@ class DeckRecordTipTray(BaseModel):
 class DeckRecordRequest(BaseModel):
     """Record-only correction of what the robot believes is on the deck. No motion."""
     model_config = ConfigDict(extra="forbid", strict=True)
-    schema_version: str = Field(pattern=r"^bioxp\.operator_deck_record_request\.v1$")
-    record_id: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
-    reason: str = Field(min_length=1, max_length=500)
+    schema_version: str = Field("bioxp.operator_deck_record_request.v1", pattern=r"^bioxp\.operator_deck_record_request\.v1$")
+    record_id: str = Field(default_factory=lambda: "auto-" + uuid.uuid4().hex,
+                           min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+    reason: str = Field("operator deck record", min_length=1, max_length=500)
     movable_objects: dict[str, str] | None = None
     tip_trays: list[DeckRecordTipTray] | None = None
 

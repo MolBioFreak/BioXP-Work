@@ -526,9 +526,36 @@ def _build_operator_bundle(
     }
 
 
+def _admission_preview(compiled) -> dict[str, Any]:
+    """Report what the pure live admission checks would say. Never enforced here.
+
+    Binding/support checks need live handlers and are not evaluated in a dry run.
+    """
+    from ..protocols.executor import ProtocolExecutor
+    from ..protocols.runtime_state import ProtocolSourceModel
+    from ..protocols.validators import validate_prepared_tip_inventory
+    document = compiled.document
+    lifecycle = list(ProtocolExecutor.required_lifecycle(document))
+    preview: dict[str, Any] = {"enforced": False, "required_lifecycle": lifecycle,
+                               "binding_support": "not_evaluated_in_dry_run"}
+    if "epilogue_sweep" in lifecycle and document.metadata.get("oem_prepare") is not True:
+        try:
+            model = ProtocolSourceModel.from_payload(document.to_payload()["metadata"].get("source_model", {}))
+            validate_prepared_tip_inventory(document, model)
+            preview["prepared_tip_inventory"] = {"ok": True}
+        except (ValueError, TypeError, KeyError) as exc:
+            preview["prepared_tip_inventory"] = {"ok": False, "message": str(exc)}
+    else:
+        preview["prepared_tip_inventory"] = {"ok": None, "reason": "not_required"}
+    return preview
+
+
 def _request_fingerprint(protocol: Mapping[str, Any], live_contract: Mapping[str, Any]) -> str:
     fingerprint_contract = dict(live_contract)
     fingerprint_contract.pop("created_at", None)
+    # deck_manifest is a record-only annotation that may legitimately change
+    # while an interactive method is running; it is not execution intent.
+    fingerprint_contract.pop("deck_manifest", None)
     return hashlib.sha256(
         json.dumps(
             {"protocol": dict(protocol), "live_contract": fingerprint_contract},
@@ -740,6 +767,8 @@ def create_protocol_job(
             dry_run=True,
             created_at=created_at,
         )
+        bundle["artifacts"] = {**dict(bundle.get("artifacts") or {}),
+                               "admission_preview": _admission_preview(compiled)}
         return active_store.save(bundle)
 
     raw_idempotency_key = payload.get("idempotency_key")
@@ -834,6 +863,7 @@ def get_protocol_job(job_id: str, *, observation: bool = False, store: ProtocolO
 def list_protocol_jobs(*, limit: int = 20, summary: bool = False, store: ProtocolOperatorBundleStore | None = None, command_store=None) -> list[dict[str, Any]]:
     canonical = ((command_store.list_workflow_summaries(limit=limit) if summary else
                   command_store.list_workflows(limit=limit)) if command_store is not None else [])
+    canonical = [{**row, "row_kind": "canonical_workflow"} for row in canonical]
     if len(canonical) >= limit:
         return canonical
     seen = {row["job_id"] for row in canonical}
@@ -843,7 +873,8 @@ def list_protocol_jobs(*, limit: int = 20, summary: bool = False, store: Protoco
         if not canonical:
             raise
         historical = []
-    return (canonical + [row for row in historical if row["job_id"] not in seen])[:limit]
+    historical = [{**row, "row_kind": "historical_bundle"} for row in historical if row["job_id"] not in seen]
+    return (canonical + historical)[:limit]
 
 
 def _review_protocol_job_locked(
