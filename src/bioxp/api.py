@@ -1175,6 +1175,18 @@ async def lifespan(app: FastAPI):
             detail = getattr(exc, "detail", None) or str(exc)
             _startup_error = f"OEM automatic USB startup failed: {detail}"
             print(f"[WARN] {_startup_error}")
+        else:
+            # OEM program start runs activateBoard(); startFanService() for every
+            # board.  Boards may already be active here, so start the thermal and
+            # chiller fan/pedestal services directly.  Reads and fan writes only.
+            tester_now = _tester
+            if tester_now is not None and hasattr(tester_now, "_oem_ensure_fan_service"):
+                for board in (tester_now.BOARD_THERMAL, tester_now.BOARD_CHILLER):
+                    try:
+                        started = await asyncio.to_thread(tester_now._oem_ensure_fan_service, board)
+                        print(f"[INFO] fan service board {board}: {started}")
+                    except Exception as exc:
+                        print(f"[WARN] fan service board {board} failed to start: {exc}")
     def start_operator_control_plane() -> None:
         global _operator_control_plane_installed
         command_plane_to_start = None
