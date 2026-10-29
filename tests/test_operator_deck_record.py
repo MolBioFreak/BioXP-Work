@@ -97,3 +97,13 @@ def test_gantry_record_clears_stuck_cover_without_motion(client):
     held = http.post('/operator/deck/record', json={'gantry': 'REAGENT_COVER'})
     assert held.status_code == 200 and store.deck_semantic_state()['plate_on_gantry'] == 5
     assert http.post('/operator/deck/record', json={'gantry': 'NOPE'}).status_code == 422
+
+
+def test_record_stamps_do_not_refuse_unknown_board_epochs():
+    import threading
+    from types import SimpleNamespace
+    from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider as P
+    fake = SimpleNamespace(generation_provider=lambda: 3, state_store=None, preparation_provider=None,
+                           _lock=threading.RLock(), _load_state=lambda: {})
+    assert P._deck_owner_authority_stamps_locked(fake) == {
+        'ownership_generation': 3, 'board_epoch_4': 0, 'board_epoch_5': 0}

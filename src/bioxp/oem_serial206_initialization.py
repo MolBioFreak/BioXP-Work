@@ -4769,8 +4769,13 @@ class Serial206OemInitializationProvider:
             with self._lock:
                 state = self._load_state()
                 board_epoch_5 = (state.get("x_lifecycle") or {}).get("board_lifecycle_generation")
-        if type(board_epoch_4) is not int or type(board_epoch_5) is not int:
-            raise RuntimeError("deck_board_epochs_not_authoritative")
+        # Not OEM: board epochs are host bookkeeping. Unknown epochs (e.g. right
+        # after a restart, before motion is activated) are recorded as 0 instead
+        # of refusing record writes. Motion stays gated by motion activation.
+        if type(board_epoch_4) is not int:
+            board_epoch_4 = 0
+        if type(board_epoch_5) is not int:
+            board_epoch_5 = 0
         return {
             "ownership_generation": ownership_generation,
             "board_epoch_4": board_epoch_4,
