@@ -47,3 +47,9 @@ def test_offset_applies_to_calibrated_heights_only_with_a_tip():
     assert _z(0, loaded=True, offset=5000) == 65000   # clearance (pseudo home) untouched
     assert _z(2, loaded=False, offset=5000) == 80000  # no tip, no correction
     assert _z(2, loaded=True, offset=0) == 80000
+
+
+def test_shipped_offsets_match_datasheet_lengths_at_oem_z_scale():
+    for tip, steps in ((10, 45757), (50, 0), (200, -1008), (201, -1008)):
+        info = tip_z_offset(tip)
+        assert info["measured"] is True and info["offset_steps"] == steps == info["datasheet_delta_steps"]

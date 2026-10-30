@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Any
 
 REFERENCE_TIP_TYPE = 50
-TIP_LENGTH_MM = {10: 35.3, 50: 58.0, 200: 58.5}
+TIP_LENGTH_MM = {10: 35.3, 50: 58.0, 200: 58.5, 201: 58.5}
+Z_STEPS_PER_MM = 2015.748  # OEM ControlLib.cs:7848 (51200 / 25.4)
 DATASHEET = "Tecan LiHa DiTi data sheet 399504 V2.0 (2020-10)"
 OFFSETS_ENV = "BIOXP_TIP_Z_OFFSETS"
 DEFAULT_PATH = Path(__file__).resolve().parents[3] / "config" / "oem" / "tip_z_offsets.json"
@@ -48,6 +49,7 @@ def tip_z_offset(tip_type: int | None, *, path: Path | None = None) -> dict[str,
         "reference_tip_type": REFERENCE_TIP_TYPE,
         "datasheet_length_mm": length,
         "datasheet_delta_mm": None if length is None else round(TIP_LENGTH_MM[REFERENCE_TIP_TYPE] - length, 3),
+        "datasheet_delta_steps": None if length is None else round((TIP_LENGTH_MM[REFERENCE_TIP_TYPE] - length) * Z_STEPS_PER_MM),
         "source": data.get("source") if measured else "not measured; OEM behaviour (no correction)",
         "datasheet": DATASHEET,
     }

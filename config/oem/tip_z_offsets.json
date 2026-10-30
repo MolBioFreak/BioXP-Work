@@ -1,8 +1,19 @@
 {
   "schema_version": "bioxp.tip_z_offsets.v1",
   "reference_tip_type": 50,
-  "note": "Signed Z steps added to calibrated low/high targets when this tip type is loaded (Z steps increase downward). Fill only from on-robot measurement; absent means 0 (OEM behaviour).",
-  "offsets_steps": {},
-  "source": null,
-  "planned_measurement": "pLLD on one flat-bottom water reservoir with each tip type at the same XY; offset = detected_z(type) - detected_z(50)."
+  "z_steps_per_mm": 2015.748,
+  "note": "Signed Z steps added to calibrated low/high targets when this tip type is loaded (Z steps increase downward). OEM 2 mm overpress (4030 steps) still applies on top.",
+  "offsets_steps": {
+    "10": 45757,
+    "50": 0,
+    "200": -1008,
+    "201": -1008
+  },
+  "source": "Tecan LiHa DiTi data sheet 399504 V2.0 lengths (T10 35.3, T50 58.0, T200 58.5 mm) x OEM Z scale 2015.748 steps/mm (ControlLib.cs:7848, = 51200/25.4). Assumes equal collar seating; confirm with one move per tip type.",
+  "lengths_mm": {
+    "10": 35.3,
+    "50": 58.0,
+    "200": 58.5,
+    "201": 58.5
+  }
 }
