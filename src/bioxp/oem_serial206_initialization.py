@@ -4072,7 +4072,7 @@ class Serial206ProductionPrimitiveAdapter:
 
     def _loaded_tip_z_offset(self) -> dict[str, Any]:
         from .pipette.tip_length import tip_z_offset
-        tip_type = getattr(self.pipette_transport, "_tip_type", None)
+        tip_type = getattr(getattr(self, "pipette_transport", None), "_tip_type", None)
         return tip_z_offset(int(tip_type) if isinstance(tip_type, int) else None)
 
     def z_pipette_position(
