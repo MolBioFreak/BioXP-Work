@@ -4072,8 +4072,11 @@ class Serial206ProductionPrimitiveAdapter:
 
     def _loaded_tip_z_offset(self) -> dict[str, Any]:
         from .pipette.tip_length import tip_z_offset
-        tip_type = getattr(getattr(self, "pipette_transport", None), "_tip_type", None)
-        return tip_z_offset(int(tip_type) if isinstance(tip_type, int) else None)
+        transport = getattr(self, "pipette_transport", None)
+        tip_type = getattr(transport, "_tip_type", None)
+        # No tip on the gun means no tip length to correct.
+        loaded = getattr(transport, "_tip_loaded", False) is True
+        return tip_z_offset(int(tip_type) if loaded and isinstance(tip_type, int) else None)
 
     def z_pipette_position(
         self,
@@ -12846,8 +12849,10 @@ class Serial206OemInitializationProvider:
             if type(target) is not int:
                 raise RuntimeError("source_pipette_z_calibration_missing")
             from .pipette.tip_length import tip_z_offset
-            loaded_type = getattr(getattr(self.primitives, "pipette_transport", None), "_tip_type", None)
-            tip_offset = tip_z_offset(loaded_type if isinstance(loaded_type, int) else None)
+            transport = getattr(self.primitives, "pipette_transport", None)
+            loaded_type = getattr(transport, "_tip_type", None)
+            loaded = getattr(transport, "_tip_loaded", False) is True
+            tip_offset = tip_z_offset(loaded_type if loaded and isinstance(loaded_type, int) else None)
             target += int(tip_offset["offset_steps"])
             return {**self.moveZ(target), "source_return": target if operation == "sourceLowerTo" else 0,
                     "tip_z_offset": tip_offset}
