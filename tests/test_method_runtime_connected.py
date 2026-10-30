@@ -12,8 +12,8 @@ from bioxp import api
 from bioxp.protocols import compile_native_protocol, ProtocolExecutor
 from bioxp.protocols.runtime_state import ProtocolRuntimeState, ProtocolWorkflowState
 from bioxp.services.protocol_service import _job_status_from_state
-from tests.test_deck_scoped_authority import retained_rig
-from tests.test_deck_scoped_integration import installed_retained
+from tests.deck_scoped_rig import retained_rig
+from tests.deck_scoped_installed import installed_retained
 from tests.test_protocol_workflow_connected import mount_protocol_routes, await_job, request_payload
 from tests.test_camera_oem_led_binding import led_rig
 

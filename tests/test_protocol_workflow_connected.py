@@ -13,8 +13,8 @@ import time
 
 import pytest
 from fastapi.testclient import TestClient
-from tests.test_deck_scoped_authority import retained_rig
-from tests.test_deck_scoped_integration import installed_retained
+from tests.deck_scoped_rig import retained_rig
+from tests.deck_scoped_installed import installed_retained
 
 
 def request_payload(key, actions=None):

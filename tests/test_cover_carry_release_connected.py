@@ -11,7 +11,7 @@ import bioxp.oem_serial206_initialization as mod
 from bioxp.oem_deck_movement import compile_finite_plate_operation, DeckExecutionFailure
 from tests.test_cover_inspection_movement import OfflineNative
 from tests.test_cover_inspection_flow import _SETTINGS, _jpeg, _GRAY_WITH_COVER
-from tests.test_deck_scoped_authority import retained_rig, qualify_test_references
+from tests.deck_scoped_rig import retained_rig, qualify_test_references
 
 
 class TransferNative(OfflineNative):

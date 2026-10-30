@@ -3,8 +3,8 @@ from dataclasses import replace
 
 import pytest
 from fastapi.testclient import TestClient
-from tests.test_deck_scoped_authority import retained_rig
-from tests.test_deck_scoped_integration import installed_retained
+from tests.deck_scoped_rig import retained_rig
+from tests.deck_scoped_installed import installed_retained
 from tests.test_protocol_workflow_connected import request_payload, mount_protocol_routes, await_job
 from tests.test_calibration_measurements import prompt, reference
 from tests.test_calibration_workflow_connected import export
