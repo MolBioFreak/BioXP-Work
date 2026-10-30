@@ -53,4 +53,4 @@ def test_tip_type_is_typed_catalog_service_action():
     assert not _motor_motion_action(matching[0])
     assert _safety("POST", PATH) == "service"
     field = api.PipetteTipTypeRequest.model_json_schema()["properties"]["tip_type"]
-    assert field["enum"] == [50, 200, 201]
+    assert field["enum"] == [10, 50, 200, 201]

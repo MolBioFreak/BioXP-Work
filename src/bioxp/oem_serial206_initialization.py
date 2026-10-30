@@ -4070,6 +4070,11 @@ class Serial206ProductionPrimitiveAdapter:
             "failure": None if ok else "home_gz_controller_evidence_unverified",
         }
 
+    def _loaded_tip_z_offset(self) -> dict[str, Any]:
+        from .pipette.tip_length import tip_z_offset
+        tip_type = getattr(self.pipette_transport, "_tip_type", None)
+        return tip_z_offset(int(tip_type) if isinstance(tip_type, int) else None)
+
     def z_pipette_position(
         self,
         *,
@@ -4083,12 +4088,14 @@ class Serial206ProductionPrimitiveAdapter:
         if operation == "lower_pipette":
             if target_row.z_low is None:
                 return {"ok": False, "failure": "position_table_z_low_missing"}
-            target = int(target_row.z_low) + (4030 if bool(overpress) else 0)
+            tip_offset = self._loaded_tip_z_offset()
+            target = int(target_row.z_low) + (4030 if bool(overpress) else 0) + int(tip_offset["offset_steps"])
             source_anchor = "ClassControlInterface.cs:4401-4421"
         elif operation == "lift_pipette":
             if target_row.z_high is None:
                 return {"ok": False, "failure": "position_table_z_high_missing"}
-            target = int(target_row.z_high)
+            tip_offset = self._loaded_tip_z_offset()
+            target = int(target_row.z_high) + int(tip_offset["offset_steps"])
             source_anchor = "ClassControlInterface.cs:4423-4431"
         else:
             raise ValueError(f"unsupported pipette Z operation: {operation}")
@@ -4108,6 +4115,7 @@ class Serial206ProductionPrimitiveAdapter:
             "location_id": str(location_id),
             "overpress": bool(overpress) if operation == "lower_pipette" else False,
             "target_position_steps": target,
+            "tip_z_offset": tip_offset,
             "position_table_source": table.source,
             "move": _json_safe(move),
             "controller_command_acknowledged": ok,
@@ -4326,6 +4334,7 @@ class Serial206ProductionPrimitiveAdapter:
             tip_loaded=bool(tip_loaded),
             tip_dirty=bool(tip_dirty),
             tip_location=int(tip_location),
+            tip_z_offset_steps=self._loaded_tip_z_offset()["offset_steps"] if bool(tip_loaded) else 0,
             clean_path=bool(clean_path),
             device_type="BIOXP",
             gripper_confirmed=gripper_confirmed,
@@ -12836,7 +12845,10 @@ class Serial206OemInitializationProvider:
             target = row.z_low if operation == "sourceLowerTo" else row.z_high if height is None else row.z_low - height
             if type(target) is not int:
                 raise RuntimeError("source_pipette_z_calibration_missing")
-            return {**self.moveZ(target), "source_return": target if operation == "sourceLowerTo" else 0}
+            tip_offset = self.primitives._loaded_tip_z_offset()
+            target += int(tip_offset["offset_steps"])
+            return {**self.moveZ(target), "source_return": target if operation == "sourceLowerTo" else 0,
+                    "tip_z_offset": tip_offset}
         if operation == "sourceMoveXY":
             # This finite source leaf is invoked by the OEM protocol motion
             # worker, not the manual STA button. Seal its MTA wait schedule.

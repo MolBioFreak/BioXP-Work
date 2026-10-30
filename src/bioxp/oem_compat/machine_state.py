@@ -65,6 +65,7 @@ class OemMachineState:
     tip_loaded: bool = False
     tip_dirty: bool = False
     tip_location: int = -1
+    tip_z_offset_steps: int = 0
     plate_on_gantry: int | str | None = None
     location19_y: int | None = None
     clean_path: bool = False
@@ -92,6 +93,7 @@ class OemMachineState:
             tip_loaded=self.tip_loaded,
             tip_dirty=self.tip_dirty,
             tip_location=self.tip_location,
+            tip_z_offset_steps=self.tip_z_offset_steps,
             plate_on_gantry=self.plate_on_gantry,
             location19_y=self.location19_y,
             clean_path=self.clean_path,
@@ -119,6 +121,7 @@ class OemMachineState:
             "tip_loaded": self.tip_loaded,
             "tip_dirty": self.tip_dirty,
             "tip_location": self.tip_location,
+            "tip_z_offset_steps": self.tip_z_offset_steps,
             "plate_on_gantry": self.plate_on_gantry,
             "location19_y": self.location19_y,
             "clean_path": self.clean_path,

@@ -32,7 +32,7 @@ def run_manual_source_inline(provider: Any, request: Mapping[str, Any], *,
                 if retained.get("occupancy") is not None:
                     metadata = provider._read_constructed_tip_tray(index)
                     if metadata is not None:
-                        tray.tip_type = {"T50": 50, "T200": 200, "T201": 201}[metadata["tip_type"]]
+                        tray.tip_type = {"T10": 10, "T50": 50, "T200": 200, "T201": 201}[metadata["tip_type"]]
                         tray.location = metadata["location"]
                     for well, occupied in zip(tray.wells, retained["occupancy"]):
                         well.empty = not occupied

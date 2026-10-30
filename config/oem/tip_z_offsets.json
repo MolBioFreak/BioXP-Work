@@ -1,0 +1,8 @@
+{
+  "schema_version": "bioxp.tip_z_offsets.v1",
+  "reference_tip_type": 50,
+  "note": "Signed Z steps added to calibrated low/high targets when this tip type is loaded (Z steps increase downward). Fill only from on-robot measurement; absent means 0 (OEM behaviour).",
+  "offsets_steps": {},
+  "source": null,
+  "planned_measurement": "pLLD on one flat-bottom water reservoir with each tip type at the same XY; offset = detected_z(type) - detected_z(50)."
+}

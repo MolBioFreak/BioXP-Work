@@ -2700,7 +2700,7 @@ class PipetteTipRequest(BaseModel):
 class PipetteTipTypeRequest(BaseModel):
     """OEM combo selection: software type only, never physical pickup."""
     model_config = ConfigDict(extra="forbid")
-    tip_type: Literal[50, 200, 201]
+    tip_type: Literal[10, 50, 200, 201]
 
 
 class PipetteEjectAllRequest(BaseModel):

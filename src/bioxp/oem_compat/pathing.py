@@ -71,6 +71,9 @@ class OemPathPlanner:
             z = target.z_low
         if z is None:
             z = state.default_parameters.pseudo_z_home
+        elif int(positionflag) in (1, 2) and state.tip_loaded:
+            # Loaded-tip length correction (0 unless measured); clearance height is untouched.
+            z = int(z) + int(state.tip_z_offset_steps)
         return {
             "x": int(target.base_coordinates.get("x", 0)) + int(target.inc_factor) * OEM_X_INCREMENT * int(column),
             "y": int(target.base_coordinates.get("y", 0)) + int(target.inc_factor) * OEM_Y_INCREMENT * effective_row,
