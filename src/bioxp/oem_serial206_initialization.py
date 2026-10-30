@@ -12845,7 +12845,9 @@ class Serial206OemInitializationProvider:
             target = row.z_low if operation == "sourceLowerTo" else row.z_high if height is None else row.z_low - height
             if type(target) is not int:
                 raise RuntimeError("source_pipette_z_calibration_missing")
-            tip_offset = self.primitives._loaded_tip_z_offset()
+            from .pipette.tip_length import tip_z_offset
+            loaded_type = getattr(getattr(self.primitives, "pipette_transport", None), "_tip_type", None)
+            tip_offset = tip_z_offset(loaded_type if isinstance(loaded_type, int) else None)
             target += int(tip_offset["offset_steps"])
             return {**self.moveZ(target), "source_return": target if operation == "sourceLowerTo" else 0,
                     "tip_z_offset": tip_offset}
