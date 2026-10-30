@@ -504,6 +504,20 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                 body["observation_error"] = str(exc)
         return body
 
+    def tip_offset() -> dict:
+        # Loaded-tip length correction for authored absolute Z (0 with no tip or unmeasured type).
+        reader = getattr(provider.primitives, "_loaded_tip_z_offset", None)
+        info = reader() if callable(reader) else {"offset_steps": 0}
+        result.setdefault("tip_z_offsets", []).append(info)
+        return info
+
+    def authored(geometry):
+        # Detected references come from this tip's own contact, so they need no length correction.
+        if geometry.get("authored", {}).get("reference", {}).get("kind") == "detected":
+            return geometry
+        steps = int(tip_offset()["offset_steps"])
+        return {**geometry, "target_steps": geometry["target_steps"] + steps, "tip_z_offset_steps": steps}
+
     def z_move(target, speed):
         record("z_speed", lambda: provider.primitives.z_set_max_speed(speed), inputs={"speed_native": speed})
         head_targets.pop("z", None)
@@ -564,7 +578,7 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                 if (op.get("resolved_rack") or {}).get("geometry_used") and positioned.get("ok") is True:
                     last_rack = op["calibration"]["rack_transform"]
                     head_targets.update({a: op["resolved_rack"]["target_steps"][a] for a in ("x", "y")})
-                geometry = resolve_surface_move(op["calibration"]["pickup"], detections)
+                geometry = authored(resolve_surface_move(op["calibration"]["pickup"], detections))
                 footprints(geometry, op["calibration"]["pickup"])
                 record("profile_pickup_geometry", lambda: {"ok": True, **geometry,
                     "profile": op["profile"], "calibration": op["calibration"],
@@ -572,17 +586,19 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                 z_move(geometry["target_steps"], geometry["speed_native"])
                 record("query_tip_status_all", lambda t: t.query_tip_status_all(), inputs=op, pipette=True)
                 if op["calibration"]["retract"] is not None:
-                    geometry = resolve_surface_move(op["calibration"]["retract"], detections)
+                    geometry = authored(resolve_surface_move(op["calibration"]["retract"], detections))
                     z_move(geometry["target_steps"], geometry["speed_native"])
             elif kind == "z_move":
-                z_move(op["target_steps"], op["speed_native"])
+                z_move(op["target_steps"] + int(tip_offset()["offset_steps"]), op["speed_native"])
             elif kind == "surface_move":
-                geometry = resolve_surface_move(op, detections)
+                geometry = authored(resolve_surface_move(op, detections))
                 footprints(geometry, op)
                 record("surface_reference", lambda: {"ok": True, **geometry}, inputs=geometry)
                 z_move(geometry["target_steps"], geometry["speed_native"])
             elif kind == "plld":
-                z_move(op["start_steps"], op["search_speed_native"])
+                # Start and search floor are authored heights: correct both for the loaded tip length.
+                plld_offset = int(tip_offset()["offset_steps"])
+                z_move(op["start_steps"] + plld_offset, op["search_speed_native"])
                 search = {"z_search_attempted": False, "z_stop_attempted": False,
                           "final_position_steps": None, "z_settled": None}
                 result["plld"] = search
@@ -592,7 +608,7 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                     def dispatch():
                         search["z_search_attempted"] = True
                         head_targets.pop("z", None)
-                        return provider.primitives.oem_move_z(op["search_target_steps"],
+                        return provider.primitives.oem_move_z(op["search_target_steps"] + plld_offset,
                             pseudo_home_steps=state["pseudo_z_home"],
                             motor_current=op["z_motor_current"], wait_for_stop=False)
                     search["start_result"] = record("plld_z_start", dispatch, inputs=op)
@@ -629,13 +645,14 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                               final_position_steps=position["position_steps"], fluid_timestamps=timestamps)
                 search["shared_head"] = shared_head_evidence(request.get("shared_head"), op["channels"])
                 search["start_mode"] = op.get("start_mode", 0)
+                search["tip_z_offset_steps"] = plld_offset
                 detections[op.get("detection_id", "last_detection")] = deepcopy(search)
                 if op.get("after_detection_steps") is not None:
-                    z_move(op["after_detection_steps"], op["after_detection_speed_native"])
+                    z_move(op["after_detection_steps"] + plld_offset, op["after_detection_speed_native"])
             else:
                 tracking: dict[str, Any] = {}
                 if kind == "tracked_aspirate":
-                    tracking = resolve_surface_move(op["trajectory"], detections)
+                    tracking = authored(resolve_surface_move(op["trajectory"], detections))
                     footprints(tracking, op["trajectory"], op["channels"])
                     tracking["shared_head"] = shared_head_evidence(request.get("shared_head"), op["channels"])
                     record("tracking_reference", lambda: {"ok": True, **tracking}, inputs=op)
