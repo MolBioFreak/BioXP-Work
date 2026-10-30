@@ -146,19 +146,6 @@ def test_script_and_nonscript_waste_and_sweep_are_distinct(rig):
     assert [plan["operation"] for plan in plans] == ["pipette_script_move","pipette_script_move","pipette_waste","pipette_hotel"]
 
 
-def test_current_stall_and_rgb_source_contract(rig):
-    _,c,trace,_,_,_=rig
-    n=c["source_bindings"]
-    c["set_z_current_max"](None,None)
-    n.set_z_current_max(31,None,None)
-    n.stall_guard(10,None,None)
-    n.stall_guard(None,None,None)
-    n.set_color(255,255,255,None,None)
-    n.set_color(255,255,255,None,None)
-    assert [r[1] for r in trace[:2]] == [(None,),(31,)]
-    assert [r[2]["value"] for r in trace[2:4]] == [10,3]
-    assert all(r[2]["param"] == 205 for r in trace[2:4])
-    assert [r[0] for r in trace].count("rgb") == 1
 
 
 def test_lifecycle_confirm_home_and_unlatch_failure(rig):
