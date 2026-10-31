@@ -27,7 +27,7 @@ OFFSETS_ENV = "BIOXP_TIP_Z_OFFSETS"
 DEFAULT_PATH = Path(__file__).resolve().parents[3] / "config" / "oem" / "tip_z_offsets.json"
 # Operator-confirmed values live in writable runtime state and override the release defaults.
 CONFIRMED_ENV = "BIOXP_TIP_Z_OFFSETS_CONFIRMED"
-CONFIRMED_PATH = Path("/var/lib/bioxp-oem-runtime/tip_z_offsets_confirmed.json")
+CONFIRMED_NAME = "tip_z_offsets_confirmed.json"
 
 
 def _read(target: Path) -> dict[str, Any]:
@@ -39,7 +39,9 @@ def _read(target: Path) -> dict[str, Any]:
 
 
 def _confirmed_path() -> Path:
-    return Path(os.environ.get(CONFIRMED_ENV) or CONFIRMED_PATH)
+    # Same writable root as the rest of the OEM runtime state (service sets it; tests isolate it).
+    root = os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT", "/var/lib/bioxp-oem-runtime")
+    return Path(os.environ.get(CONFIRMED_ENV) or Path(root) / CONFIRMED_NAME)
 
 
 def _load(path: Path | None = None) -> dict[str, Any]:
