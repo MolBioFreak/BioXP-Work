@@ -53,3 +53,16 @@ def test_shipped_offsets_match_datasheet_lengths_at_oem_z_scale():
     for tip, steps in ((10, 45757), (50, 0), (200, -1008), (201, -1008)):
         info = tip_z_offset(tip)
         assert info["measured"] is True and info["offset_steps"] == steps == info["datasheet_delta_steps"]
+
+
+def test_confirmed_offset_overrides_default_and_is_listed(tmp_path, monkeypatch):
+    from bioxp.pipette import tip_length
+    monkeypatch.setenv(tip_length.CONFIRMED_ENV, str(tmp_path / "confirmed.json"))
+    before = {r["tip_type"]: r["offset_steps"] for r in tip_length.offsets_table()["tips"]}
+    table = tip_length.save_confirmed(10, 45000, "check move 2026-10-31", at="2026-10-31T00:00:00Z")
+    row = next(r for r in table["tips"] if r["tip_type"] == 10)
+    assert row["offset_steps"] == 45000 and row["confirmed"]["source"] == "check move 2026-10-31"
+    assert next(r for r in table["tips"] if r["tip_type"] == 50)["offset_steps"] == before[50]
+    import pytest
+    with pytest.raises(ValueError):
+        tip_length.save_confirmed(10, 999999, "x", at="t")

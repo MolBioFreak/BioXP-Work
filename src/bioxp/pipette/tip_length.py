@@ -25,15 +25,32 @@ Z_STEPS_PER_MM = 2015.748  # OEM ControlLib.cs:7848 (51200 / 25.4)
 DATASHEET = "Tecan LiHa DiTi data sheet 399504 V2.0 (2020-10)"
 OFFSETS_ENV = "BIOXP_TIP_Z_OFFSETS"
 DEFAULT_PATH = Path(__file__).resolve().parents[3] / "config" / "oem" / "tip_z_offsets.json"
+# Operator-confirmed values live in writable runtime state and override the release defaults.
+CONFIRMED_ENV = "BIOXP_TIP_Z_OFFSETS_CONFIRMED"
+CONFIRMED_PATH = Path("/var/lib/bioxp-oem-runtime/tip_z_offsets_confirmed.json")
 
 
-def _load(path: Path | None = None) -> dict[str, Any]:
-    target = Path(os.environ.get(OFFSETS_ENV) or path or DEFAULT_PATH)
+def _read(target: Path) -> dict[str, Any]:
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {"offsets_steps": {}, "source": None}
-    return data if isinstance(data, dict) else {"offsets_steps": {}, "source": None}
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _confirmed_path() -> Path:
+    return Path(os.environ.get(CONFIRMED_ENV) or CONFIRMED_PATH)
+
+
+def _load(path: Path | None = None) -> dict[str, Any]:
+    data = _read(Path(os.environ.get(OFFSETS_ENV) or path or DEFAULT_PATH)) or {"offsets_steps": {}, "source": None}
+    if path is None:
+        confirmed = _read(_confirmed_path()).get("offsets") or {}
+        if confirmed:
+            data = {**data, "offsets_steps": {**(data.get("offsets_steps") or {}),
+                    **{k: v["offset_steps"] for k, v in confirmed.items() if type(v.get("offset_steps")) is int}},
+                    "confirmed": confirmed}
+    return data
 
 
 def tip_z_offset(tip_type: int | None, *, path: Path | None = None) -> dict[str, Any]:
@@ -50,6 +67,32 @@ def tip_z_offset(tip_type: int | None, *, path: Path | None = None) -> dict[str,
         "datasheet_length_mm": length,
         "datasheet_delta_mm": None if length is None else round(TIP_LENGTH_MM[REFERENCE_TIP_TYPE] - length, 3),
         "datasheet_delta_steps": None if length is None else round((TIP_LENGTH_MM[REFERENCE_TIP_TYPE] - length) * Z_STEPS_PER_MM),
-        "source": data.get("source") if measured else "not measured; OEM behaviour (no correction)",
+        "source": ((data.get("confirmed") or {}).get(str(tip_type), {}).get("source") or data.get("source"))
+                  if measured else "not measured; OEM behaviour (no correction)",
+        "confirmed": (data.get("confirmed") or {}).get(str(tip_type)),
         "datasheet": DATASHEET,
     }
+
+
+def offsets_table() -> dict[str, Any]:
+    """Every tip type's offset in force, datasheet value and any operator confirmation."""
+    return {"z_steps_per_mm": Z_STEPS_PER_MM, "reference_tip_type": REFERENCE_TIP_TYPE,
+            "tips": [tip_z_offset(t) for t in sorted(TIP_LENGTH_MM)]}
+
+
+def save_confirmed(tip_type: int, offset_steps: int, source: str, *, at: str) -> dict[str, Any]:
+    """Record an operator-confirmed offset. A record only: nothing moves."""
+    if tip_type not in TIP_LENGTH_MM:
+        raise ValueError(f"unknown tip type {tip_type}")
+    if abs(int(offset_steps)) > 80000:
+        raise ValueError("offset is more than 40 mm; check the value")
+    target = _confirmed_path()
+    data = _read(target)
+    offsets = dict(data.get("offsets") or {})
+    offsets[str(tip_type)] = {"offset_steps": int(offset_steps), "source": source, "confirmed_at": at}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"schema_version": "bioxp.tip_z_offsets_confirmed.v1", "offsets": offsets}, indent=2))
+    os.replace(tmp, target)
+    return offsets_table()
+

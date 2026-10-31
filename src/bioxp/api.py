@@ -11132,6 +11132,31 @@ async def pipette_tip_tray_set(req: ManualTipTraySet):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+class TipOffsetConfirm(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    tip_type: Literal[10, 50, 200, 201]
+    offset_steps: int
+    source: str = Field(min_length=1, max_length=300)
+
+
+@app.get("/liquid/pipette/tip-offsets")
+async def pipette_tip_offsets_read():
+    from .pipette.tip_length import offsets_table
+    return offsets_table()
+
+
+@app.put("/liquid/pipette/tip-offsets")
+async def pipette_tip_offsets_save(req: TipOffsetConfirm):
+    """Record-only: stores a confirmed offset for later lowering. No motion."""
+    from datetime import datetime, timezone
+    from .pipette.tip_length import save_confirmed
+    try:
+        return await run_in_threadpool(save_confirmed, req.tip_type, req.offset_steps, req.source,
+                                       at=datetime.now(timezone.utc).isoformat())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/liquid/pipette/settings")
 async def pipette_operation_settings_read():
     return await run_in_threadpool(read_pipette_operation_settings, get_active_oem_runtime_state_store())
