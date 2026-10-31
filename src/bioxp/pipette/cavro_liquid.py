@@ -90,8 +90,10 @@ class LiquidDetection(_Input):
     expected: bool = True                      # listed as holding liquid: a miss holds the run
     # Channels whose source well holds liquid per the plan; overrides `expected` when set.
     expected_channels: list[Annotated[int, Field(ge=0, le=3)]] | None = None
-    mode: Literal["by_level", "together", "one_at_a_time"] = "by_level"
+    mode: Literal["by_level", "together", "one_at_a_time", "on_contact"] = "by_level"
     start_mode: Literal[0, 1] = 0
+    on_contact_delay_ms: int = Field(default=0, ge=0, le=5000)
+    volume_check: dict | None = None   # VolumeCheck fields; reports, and pauses only per its response
     submerge_steps: int = Field(default=2016, ge=0)
     follow_steps: int = Field(default=0, ge=0)
     floor_clearance_steps: int = Field(default=2016, ge=0)
@@ -223,16 +225,22 @@ def compile_liquid_recipe(request: dict[str, Any]) -> dict[str, Any]:
             if r.aspiration_tracking is not None:
                 raise ValueError("choose liquid detection or authored aspiration tracking, not both")
             d = r.liquid_detection
+            on_contact = {"volume_ul": commanded, "speed_ul_s": r.aspiration_speed_ul_s, "delay_ms": d.on_contact_delay_ms,
+                          "target_liquid_ul": r.target_liquid_ul,
+                          **({"accounting_intent": r.aspiration_intent.model_dump()} if r.aspiration_intent else {})}
             operations.append({"operation": "liquid_search", "channels": r.channels, "timeout_ms": d.search_timeout_ms,
+                **({"on_contact": on_contact} if d.mode == "on_contact" else {}),
+                **({"volume_check": d.volume_check} if d.volume_check else {}),
                 "location_id": d.location_id, "detection_id": d.detection_id, "start_mode": d.start_mode, "sensing": d.sensing,
                 "floor_clearance_steps": d.floor_clearance_steps, "search_speed_native": d.search_speed_native,
                 **({"expected_channels": [c for c in r.channels if c in d.expected_channels]}
                    if d.expected_channels is not None else {"expected_channels": r.channels} if d.expected else {})})
-            operations.append({"operation": "surface_aspirate", **base, "detection_id": d.detection_id,
-                "mode": d.mode, "level_tolerance_steps": d.level_tolerance_steps, "submerge_steps": d.submerge_steps,
-                "follow_steps": d.follow_steps, "volume_ul": commanded, "speed_ul_s": r.aspiration_speed_ul_s,
-                "target_liquid_ul": r.target_liquid_ul,
-                **({"accounting_intent": r.aspiration_intent.model_dump()} if r.aspiration_intent else {})})
+            if d.mode != "on_contact":
+                operations.append({"operation": "surface_aspirate", **base, "detection_id": d.detection_id,
+                    "mode": d.mode, "level_tolerance_steps": d.level_tolerance_steps, "submerge_steps": d.submerge_steps,
+                    "follow_steps": d.follow_steps, "volume_ul": commanded, "speed_ul_s": r.aspiration_speed_ul_s,
+                    "target_liquid_ul": r.target_liquid_ul,
+                    **({"accounting_intent": r.aspiration_intent.model_dump()} if r.aspiration_intent else {})})
         else:
             stroke("tracked_aspirate" if r.aspiration_tracking else "aspirate", commanded,
                    r.aspiration_speed_ul_s, target_liquid_ul=r.target_liquid_ul,

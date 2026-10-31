@@ -50,7 +50,7 @@ def test_recipe_emits_search_then_surface_aspirate():
 class _Rig:
     """Shared Z head with four pumps; channels touch at the given descent fractions (None = no contact)."""
     def __init__(self, monkeypatch, touch):
-        self.z, self.moves, self.aspirated = 0, [], []
+        self.z, self.moves, self.aspirated, self.aspirate_times, self.z_stops = 0, [], [], [], []
         row = SimpleNamespace(z_high=60000, z_low=80000)
         monkeypatch.setattr("bioxp.oem_compat.position_table.load_bound_oem_position_table",
                             lambda: SimpleNamespace(resolve=lambda **_: row))
@@ -59,13 +59,23 @@ class _Rig:
         class Group:
             _interrupt_epoch = 0
             _fluid_detection_timestamps = {}
-            _transports = [SimpleNamespace() for _ in range(4)]
+            _transports = [SimpleNamespace(channel=i) for i in range(4)]
             def _forceabort(self):
                 return False
-            def _run_group_liquid_operation(self, effect, channels, send, *, timeout_ms, after_sends=None, set_allow_to_stop=True):
+            def _wait_channel_completion(self, transport, timeout_s, *, owner_token=None):
+                f = touch.get(transport.channel)
+                if f is None:
+                    time.sleep(0.03)
+                    return {"ok": False, "outcome": "timeout"}
+                time.sleep(0.02 * f)
+                return {"ok": True, "pipette_message_state": {"fluid_timestamp": time.monotonic()}}
+            def _run_group_liquid_operation(self, effect, channels, send, *, timeout_ms, after_sends=None,
+                                            set_allow_to_stop=True, defer_completion=True):
                 if after_sends:
                     after_sends()
                 rows = []
+                if effect == "fluid detection" and not defer_completion:
+                    return {"ok": True, "channels": [{"channel": c, "result": {"ok": True}} for c in channels]}
                 if effect == "fluid detection":
                     t0 = time.monotonic()
                     for c in channels:
@@ -78,13 +88,15 @@ class _Rig:
                     return {"ok": all(r["completion"]["ok"] for r in rows), "channels": rows, "interrupted_by_terminate": False}
                 if effect == "aspirate":
                     rig.aspirated.append((list(channels), rig.z))
+                    rig.aspirate_times.append((list(channels), time.monotonic()))
                 return {"ok": True, "interrupted_by_terminate": False,
                         "channels": [{"channel": c, "completion": {"ok": True}} for c in channels]}
 
         def move(target, **_):
             rig.z = target; rig.moves.append(target); return {"ok": True}
         primitives = SimpleNamespace(pipette_transport=Group(), z_set_max_speed=lambda v: {"ok": True},
-            oem_move_z=lambda target, **kw: {"ok": True, "target": target}, z_stop=lambda: {"ok": True},
+            oem_move_z=lambda target, **kw: {"ok": True, "target": target},
+            z_stop=lambda: (rig.z_stops.append(time.monotonic()), {"ok": True})[1],
             _read_axis_position=lambda axis: rig.z, _loaded_tip_z_offset=lambda: {"offset_steps": 0})
         self.provider = SimpleNamespace(primitives=primitives, moveZ=lambda t: move(t),
             _wp8_execution_fence_checker=lambda *a, **k: None,
@@ -144,3 +156,51 @@ def test_plan_expected_channels_hold_only_listed_wells(monkeypatch):
 def test_search_sets_hybrid_sensing_by_default():
     ops = compile_liquid_recipe(_recipe())["application"]["operations"]
     assert next(o for o in ops if o["operation"] == "liquid_search")["sensing"] == "hybrid"
+
+
+def test_on_contact_aspirates_each_channel_as_it_touches(monkeypatch):
+    rig = _Rig(monkeypatch, {0: 0.5, 1: 3.0, 2: 1.5})
+    result = rig.run(_recipe(mode="on_contact"))
+    assert result["ok"] is True, result.get("error")
+    ops = [e["operation"] for e in result["events"]]
+    assert "surface_aspirate" not in ops
+    order = [ch[0] for ch, _ in rig.aspirate_times]
+    assert order == [0, 2, 1]                       # in contact order, one channel at a time
+    assert result["liquid_levels"][0]["aspirated_on_contact"].keys() == {"0", "1", "2"}
+    assert rig.z_stops and rig.z_stops[0] >= rig.aspirate_times[-1][1] - 0.05
+
+
+def test_on_contact_missing_liquid_still_holds(monkeypatch):
+    rig = _Rig(monkeypatch, {0: 0.5, 1: None, 2: 1.0})
+    result = rig.run(_recipe(mode="on_contact"))
+    assert result["ok"] is False and result["missing_liquid_channels"] == [1]
+    assert result["requested_control"] == "pause_for_operator"
+    assert sorted(ch[0] for ch, _ in rig.aspirated) == [0, 2]   # touched channels already drew
+
+
+TABLE = [[0.0, 0.0], [2.27, 20.0], [6.57, 70.0], [9.17, 120.0]]
+
+
+def test_volume_check_reports_and_pauses_on_large_mismatch():
+    from bioxp.pipette.liquid_detection import volume_check
+    low = 80000
+    # contact 4.0 mm above calibrated low, gap 0.5 mm -> 4.5 mm above bottom
+    near = volume_check(contact_steps=low - round(4.0 * 2015.748), low_steps=low,
+                        check={"expected_ul": {"0": 46}, "table": TABLE, "gap_mm": 0.5}, channel=0)
+    assert near["checked"] and near["within_tolerance"] and 44 < near["found_ul"] < 48
+    far = volume_check(contact_steps=low - round(8.0 * 2015.748), low_steps=low,
+                       check={"expected_ul": {"0": 46}, "table": TABLE, "gap_mm": 0.5}, channel=0)
+    assert far["within_tolerance"] is False
+    unmeasured = volume_check(contact_steps=low - 100, low_steps=low, check={"expected_ul": {"0": 46}}, channel=0)
+    assert unmeasured["checked"] is False
+
+
+@pytest.mark.parametrize("response,ok,control", [("pause", False, "pause_for_operator"), ("fail", False, "stop"), ("proceed", True, None)])
+def test_volume_mismatch_response(monkeypatch, response, ok, control):
+    rig = _Rig(monkeypatch, {0: 0.25, 1: 0.25, 2: 0.25})
+    check = {"expected_ul": {"0": 5, "1": 5, "2": 5}, "table": TABLE, "gap_mm": 0.5, "response": response}
+    result = rig.run(_recipe(volume_check=check))
+    assert result["ok"] is ok and result["liquid_volume_mismatch_channels"] == [0, 1, 2]
+    if control:
+        assert result["requested_control"] == control
+        assert rig.aspirated == []

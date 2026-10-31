@@ -135,6 +135,30 @@ class LiquidSearch(_Selected):
     sensing: Literal["pressure", "capacitive", "hybrid"] = "hybrid"
     # Channels whose wells are listed as holding liquid. A miss here holds the run.
     expected_channels: list[Annotated[int, Field(ge=0, le=3)]] | None = None
+    # Optional: aspirate on each channel as it touches while Z keeps descending.
+    on_contact: "OnContact | None" = None
+    # Optional: compare found surfaces with expected volumes (plate table + well-bottom gap).
+    volume_check: "VolumeCheck | None" = None
+
+
+class OnContact(_Input):
+    volume_ul: NonnegativeNumber
+    speed_ul_s: PositiveNumber
+    delay_ms: int = Field(default=0, ge=0, le=5000)   # wait after contact so Z submerges the tip
+    target_liquid_ul: NonnegativeNumber | None = None
+    accounting_intent: StrokeIntent | None = None
+
+
+class VolumeCheck(_Input):
+    expected_ul: dict[str, float] = Field(default_factory=dict)   # channel -> expected well volume
+    table: list[Annotated[list[float], Field(min_length=2, max_length=2)]] | None = None  # [height_mm, volume_ul]
+    gap_mm: float | None = None             # calibrated low above the well bottom, for the loaded tip
+    tolerance_mm: float = Field(default=1.0, ge=0)
+    tolerance_fraction: float = Field(default=0.15, ge=0)
+    response: Literal["proceed", "pause", "fail"] = "pause"
+
+
+LiquidSearch.model_rebuild()
 
 
 class SurfaceAspirate(_Selected):
@@ -479,6 +503,71 @@ def _send_wire(group, channels, wire, timeout_ms, *, after_sends=None, effect="c
     return outcome
 
 
+def _detect_and_aspirate_on_contact(group, op, contact, start_z, stop_z):
+    """Shared-Z search where each channel aspirates as soon as it reports liquid.
+
+    Detection commands go to every active channel, Z starts, then one waiter per
+    channel takes that channel's own completion; a touched channel aspirates at
+    once (after the optional delay) while Z keeps descending for the others.
+    """
+    import threading
+    sent = group._run_group_liquid_operation("fluid detection", op["channels"],
+        lambda channel, transport, defer: _send_one(transport, op["wire_commands"][0]["ascii"], "start_fluid_detection"),
+        timeout_ms=op["timeout_ms"], defer_completion=False, after_sends=start_z, set_allow_to_stop=False)
+    epoch = group._interrupt_epoch
+    deadline = time.monotonic() + op["timeout_ms"] / 1000.0
+    rows, aspirated, lock = [], {}, threading.Lock()
+    stopped = {}
+    def watch(row):
+        channel = int(row["channel"])
+        completion = group._wait_channel_completion(group._transports[channel], max(0.0, deadline - time.monotonic()),
+                                                    owner_token=row.get("completion_owner_token"))
+        with lock:
+            rows.append({"channel": channel, "result": row["result"], "completion": completion})
+            last = len(rows) == len(sent["channels"])
+        if last:
+            # Every channel has reported (contact or none): stop Z now, before the remaining draws finish.
+            stopped.update(monotonic=time.monotonic(), wall=time.time())
+            stop_z()
+        if completion.get("ok") is True and group._interrupt_epoch == epoch and not group._forceabort():
+            if contact.get("delay_ms"):
+                time.sleep(contact["delay_ms"] / 1000.0)
+            inputs = {"volume_ul": contact["volume_ul"], "front_air": False, "liquid_phase": "aspirate",
+                      "target_liquid_ul": contact.get("target_liquid_ul"), "commanded_displacement_ul": contact["volume_ul"],
+                      **({"accounting_intent": contact["accounting_intent"]} if contact.get("accounting_intent") else {})}
+            try:
+                outcome = _send_wire(group, [channel], f"P{_number(contact['volume_ul'])},1R", op["timeout_ms"],
+                                     effect="aspirate", inputs=inputs)
+            except Exception as exc:
+                outcome = {"ok": False, "error": str(exc), "exception_type": type(exc).__name__}
+            with lock:
+                aspirated[str(channel)] = {"ok": outcome.get("ok") is True, "error": outcome.get("error")}
+    threads = [threading.Thread(target=watch, args=(row,), daemon=True) for row in sent["channels"]]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()) + op["timeout_ms"] / 1000.0)
+    interrupted = group._interrupt_epoch != epoch
+    rows.sort(key=lambda r: r["channel"])
+    if not stopped:
+        stopped.update(monotonic=time.monotonic(), wall=time.time())
+        stop_z()
+    return {"z_stopped_at": stopped, "ok": not interrupted and all(a["ok"] for a in aspirated.values()), "search_complete":
+            all(r["completion"].get("ok") is True for r in rows), "interrupted_by_terminate": interrupted,
+            "detection": {"channels": rows}, "aspirated_on_contact": aspirated}
+
+
+def _send_one(transport, wire, command_name):
+    transport._require_initialized()
+    driver = transport._get_driver()
+    raw = driver._send_pipette_command(wire, command_name=command_name, wait_for_completion=False)
+    token = (raw.get("provenance") or {}).get("completion_owner_token")
+    if isinstance(token, str) and token:
+        driver._pipette_completion_owner_token = token
+    transport._assert_driver_result("fluid detection", raw)
+    return {"ok": raw.get("ok") is True, "driver_result": raw, **transport._driver_evidence(raw)}
+
+
 def run_application_inline(provider, request: Mapping[str, Any], *, command_id: str,
                            owner_identity: Mapping[str, Any]) -> dict[str, Any]:
     from .effect_accounting import accounting_occurrence
@@ -593,7 +682,15 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
             head_targets.pop("z", None)
             return provider.primitives.oem_move_z(floor, pseudo_home_steps=state["pseudo_z_home"],
                 motor_current=op["z_motor_current"], wait_for_stop=False)
+        contact = op.get("on_contact")
+        if contact is not None:
+            # Top speed first, on every active channel, so each aspirate starts the moment it touches.
+            record("set_top_speed", lambda t: _send_wire(t, op["channels"], f"V{_number(contact['speed_ul_s'])},1R",
+                   op["timeout_ms"], effect="set_top_speed"), inputs={"speed_ul_s": contact["speed_ul_s"]}, pipette=True)
         def detect(t):
+            if contact is not None:
+                return _detect_and_aspirate_on_contact(t, op, contact, start_z,
+                    lambda: provider.primitives.z_stop())
             body = _send_wire(t, op["channels"], op["wire_commands"][0]["ascii"], op["timeout_ms"],
                               after_sends=start_z, effect="fluid detection")
             if body.get("ok") is False and not body.get("interrupted_by_terminate"):
@@ -605,7 +702,7 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
             # A channel without contact is a per-channel result, not a failed search.
             return {"ok": True, "search_complete": body.get("ok") is True, "detection": body}
         detected = record("liquid_search", detect, inputs=op, pipette=True)
-        stopped = {"monotonic": time.monotonic(), "wall": time.time()}
+        stopped = detected.get("z_stopped_at") or {"monotonic": time.monotonic(), "wall": time.time()}
         record("liquid_search_z_stop", lambda: provider.primitives.z_stop(), inputs={})
         final = provider.primitives._read_axis_position("z")
         head_targets["z"] = final
@@ -631,6 +728,17 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
         search = {"location_id": op["location_id"], "start_steps": start, "floor_steps": floor,
                   "final_position_steps": final, "tip_z_offset_steps": offset, "channels": channels,
                   "estimate": "contact heights interpolated over a constant-speed descent"}
+        if contact is not None:
+            search["aspirated_on_contact"] = detected.get("aspirated_on_contact", {})
+        mismatched = []
+        if op.get("volume_check"):
+            from .liquid_detection import volume_check
+            low = int(row.z_low) + offset
+            for key, value in channels.items():
+                value["volume_check"] = volume_check(contact_steps=value["contact_steps"], low_steps=low,
+                                                     check=op["volume_check"], channel=int(key))
+                if value["volume_check"].get("within_tolerance") is False:
+                    mismatched.append(int(key))
         detections[op["detection_id"]] = search
         result.setdefault("liquid_levels", []).append({"detection_id": op["detection_id"], **search})
         from .liquid_detection import missing_channels
@@ -639,6 +747,13 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
             result["missing_liquid_channels"] = missing
             raise PipetteCommandError(f"No liquid found by channel(s) {missing} at location {op['location_id']}; "
                                       "nothing was aspirated there", details={"liquid_search": search})
+        response = (op.get("volume_check") or {}).get("response", "pause")
+        if mismatched:
+            result["liquid_volume_mismatch_channels"] = mismatched
+            if response != "proceed":
+                result["liquid_mismatch_response"] = response
+                raise PipetteCommandError(f"Liquid volume differs from expected on channel(s) {mismatched} "
+                                          f"at location {op['location_id']}", details={"liquid_search": search})
 
     def surface_aspirate(op):
         from .liquid_detection import aspirate_target, level_groups
@@ -845,7 +960,9 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                       has_unknown_outcomes=any(e["status"] == "unknown" for e in events))
     except Exception as exc:
         # No liquid where liquid was listed: nothing aspirated; hold for the operator.
-        control = "pause_for_operator" if result.get("missing_liquid_channels") else request.get("event_policy", "stop")
+        control = ("pause_for_operator" if result.get("missing_liquid_channels")
+                   or result.get("liquid_mismatch_response") == "pause"
+                   else "stop" if result.get("liquid_mismatch_response") == "fail" else request.get("event_policy", "stop"))
         result.update(error=str(exc), exception_type=type(exc).__name__,
                       interrupted=epoch != group._interrupt_epoch,
                       event_policy=request.get("event_policy", "stop"),
