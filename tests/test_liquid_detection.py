@@ -220,3 +220,19 @@ def test_tip_tray_location_with_and_without_persisted_constructor():
     assert [tip_tray_location(legacy, i) for i in range(5)] == [7, 8, 9, 10, 15]
     built = {"constructed_tip_trays": [{"location": 20 + i} for i in range(5)]}
     assert tip_tray_location(built, 3) == 23
+
+
+def test_failed_detection_after_descent_started_still_stops_z(monkeypatch):
+    rig = _Rig(monkeypatch, {0: 0.25})
+    group = rig.provider.primitives.pipette_transport
+    def reject(effect, channels, send, *, timeout_ms, after_sends=None, **_):
+        if effect != "fluid detection":
+            return {"ok": True, "interrupted_by_terminate": False, "channels": [{"channel": c, "completion": {"ok": True}} for c in channels]}
+        after_sends()                                  # Z descent starts, then every pump rejects (error 38)
+        group._interrupt_epoch += 1
+        return {"ok": False, "interrupted_by_terminate": False, "channels": []}
+    monkeypatch.setattr(group, "_run_group_liquid_operation", reject)
+    group.terminate = lambda: {"ok": True}
+    result = rig.run(_recipe())
+    assert result["ok"] is False
+    assert rig.z_stops, "Z must be stopped when the search fails after the descent started"

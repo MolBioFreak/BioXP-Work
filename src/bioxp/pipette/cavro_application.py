@@ -701,7 +701,17 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                     body["source_timeout_termination"] = {"error": str(exc), "exception_type": type(exc).__name__}
             # A channel without contact is a per-channel result, not a failed search.
             return {"ok": True, "search_complete": body.get("ok") is True, "detection": body}
-        detected = record("liquid_search", detect, inputs=op, pipette=True)
+        try:
+            detected = record("liquid_search", detect, inputs=op, pipette=True)
+        except BaseException:
+            # Z was started by the search; a failed or interrupted search must never leave it descending.
+            if clocks:
+                try:
+                    events.append({"operation": "liquid_search_z_stop_after_failure", "status": "completed",
+                                   "result": provider.primitives.z_stop()})
+                except Exception as exc:
+                    events.append({"operation": "liquid_search_z_stop_after_failure", "status": "failed", "error": str(exc)})
+            raise
         stopped = detected.get("z_stopped_at") or {"monotonic": time.monotonic(), "wall": time.time()}
         record("liquid_search_z_stop", lambda: provider.primitives.z_stop(), inputs={})
         final = provider.primitives._read_axis_position("z")
