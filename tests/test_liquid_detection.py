@@ -212,3 +212,11 @@ def test_firmware_text_frame_is_not_a_pipette_error():
     assert text["event_error_code"] == 0
     real = process_pipette_message(2, [38, 0], arbitration_id=0x0506, command_name="query_status")
     assert real["event_error_code"] == 38
+
+
+def test_tip_tray_location_with_and_without_persisted_constructor():
+    from bioxp.oem_serial206_initialization import tip_tray_location
+    legacy = {"tip_loaded": False}  # migrated state: no constructed trays
+    assert [tip_tray_location(legacy, i) for i in range(5)] == [7, 8, 9, 10, 15]
+    built = {"constructed_tip_trays": [{"location": 20 + i} for i in range(5)]}
+    assert tip_tray_location(built, 3) == 23

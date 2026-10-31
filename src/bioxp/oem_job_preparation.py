@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
 from .protocols.runtime_state import ProtocolSourceModel, SourceTray, SourceWell
+from .oem_compat.pathing import TIP_TRAY_LOCATIONS
 
 SOURCE = "BioXPMainWindow.PrepareToRunJob:1588-1808"
 INSPECTION_ITEMS = {0: "StripInspection", 6: "CoverInspection", 7: "TroughInspection",
@@ -56,7 +57,7 @@ def construct_new_machine_source_model() -> ProtocolSourceModel:
                 for i, name in enumerate(("STRIP_ONE", "STRIP_TWO", "STRIP_THREE", "STRIP_FOUR"))],
         tip_trays=[SourceTray(str(i), location, wells(96, 200.0, i == 4),
                               200 if i == 3 else 50, False)
-                   for i, location in enumerate((7, 8, 9, 10, 15))],
+                   for i, location in enumerate(TIP_TRAY_LOCATIONS)],
     )
 
 

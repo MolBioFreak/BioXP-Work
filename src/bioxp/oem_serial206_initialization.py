@@ -23,7 +23,7 @@ from typing import Any, Callable, Mapping
 
 from .motion_safety import Serial206MotionAuthority, prepare_motion_without_motion
 from .oem_compat.machine_state import OemMachineState
-from .oem_compat.pathing import OemPathPlanner
+from .oem_compat.pathing import OemPathPlanner, TIP_TRAY_LOCATIONS
 from .oem_compat.position_table import load_bound_oem_position_table
 from .oem_homing_routes import _execute_oem_steps_live
 from .oem_deck_movement import (
@@ -4397,6 +4397,18 @@ class Serial206ProductionPrimitiveAdapter:
         }
 
 
+
+def tip_tray_location(machine_status: Mapping[str, Any], index: int) -> int:
+    """Deck station of tip tray ``index`` (0-4).
+
+    Uses the persisted constructor when present. State migrated from older
+    releases has no constructor; tray stations are fixed OEM deck facts.
+    """
+    trays = machine_status.get("constructed_tip_trays")
+    if isinstance(trays, list) and len(trays) == len(TIP_TRAY_LOCATIONS):
+        return int(trays[index]["location"])
+    return TIP_TRAY_LOCATIONS[index]
+
 class Serial206OemInitializationProvider:
     """One durable expected-next stage per generation-bound approval."""
 
@@ -5231,7 +5243,7 @@ class Serial206OemInitializationProvider:
                 "construction_id": str(uuid.uuid4()),
                 "constructed_tip_trays": [
                     {"tray_id": tray_id, "tip_type": "T200" if tray_id == 3 else "T50",
-                     "location": (7, 8, 9, 10, 15)[tray_id],
+                     "location": TIP_TRAY_LOCATIONS[tray_id],
                      "plate_name": "TIP_HOTEL" if tray_id == 4 else "TIP_TRAY",
                      "occupancy": [tray_id != 4] * 96, "tip_available": True}
                     for tray_id in range(5)
@@ -12714,10 +12726,9 @@ class Serial206OemInitializationProvider:
             return runner(name, call, command_id, child_identity, arguments)
 
         def tray_location(index):
-            # Read only location from the actual persisted source machine object.
-            # Occupancy/history is neither synthesized nor an admission condition.
             with self._lock:
-                return self._load_state()["machine_status"]["constructed_tip_trays"][index]["location"]
+                machine = self._load_state().get("machine_status") or {}
+            return tip_tray_location(machine, index)
 
         # Pickup does not consume motor-current settings. Detection does.
         current = (get_active_oem_machine_snapshot().config_sections["offsets"]["m_Z_MOTOR_MAX_CURRENT_DOWN"]
