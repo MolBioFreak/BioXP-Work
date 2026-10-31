@@ -118,6 +118,39 @@ class Plld(_Selected):
         return value
 
 
+class LiquidSearch(_Selected):
+    """Find each active channel's liquid surface in one shared descent.
+
+    Start and floor come from the station's calibrated high/low with the loaded
+    tip offset; Z stops once every channel reports or the floor is reached.
+    """
+    operation: Literal["liquid_search"]
+    location_id: int = Field(ge=0)
+    detection_id: str = Field(default="last_detection", min_length=1)
+    start_mode: Literal[0, 1] = 0
+    floor_clearance_steps: int = Field(default=2016, ge=0)  # 1 mm above calibrated low
+    search_speed_native: int = Field(default=300, gt=0)      # OEM btnDetectFluid speed
+    z_motor_current: int = 25                                 # OEM Z_MOTOR_MAX_CURRENT_DOWN
+    # Channels whose wells are listed as holding liquid. A miss here holds the run.
+    expected_channels: list[Annotated[int, Field(ge=0, le=3)]] | None = None
+
+
+class SurfaceAspirate(_Selected):
+    """Aspirate below each channel's detected surface, grouped by liquid level."""
+    operation: Literal["surface_aspirate"]
+    detection_id: str = Field(default="last_detection", min_length=1)
+    mode: Literal["by_level", "together", "one_at_a_time"] = "by_level"
+    level_tolerance_steps: int = Field(default=1008, ge=0)    # 0.5 mm counts as one level
+    submerge_steps: int = Field(default=2016, ge=0)          # 1 mm below the surface
+    follow_steps: int = Field(default=0, ge=0)               # extra descent while aspirating
+    z_speed_native: int = Field(default=1791, gt=0)
+    follow_speed_native: int = Field(default=300, gt=0)
+    volume_ul: NonnegativeNumber
+    speed_ul_s: PositiveNumber
+    target_liquid_ul: NonnegativeNumber | None = None
+    accounting_intent: StrokeIntent | None = None
+
+
 class TrackedAspirate(_Selected):
     operation: Literal["tracked_aspirate"]
     volume_ul: NonnegativeNumber
@@ -144,7 +177,7 @@ class PressureCapture(_Input):
     capture: PressureCaptureRequest
 
 
-Instruction = Annotated[Union[Stroke, Empty, Settings, Delay, Position, ZMove, Plld,
+Instruction = Annotated[Union[Stroke, Empty, Settings, Delay, Position, ZMove, Plld, LiquidSearch, SurfaceAspirate,
                               SurfaceMove, TrackedAspirate, DeviceCommandInstruction, DeviceProgramInstruction,
                               ProfilePickup, PressureCapture],
                         Field(discriminator="operation")]
@@ -310,6 +343,13 @@ def compile_application(request: Mapping[str, Any]) -> dict[str, Any]:
                 if (instruction.after_detection_steps is None) != (instruction.after_detection_speed_native is None):
                     raise ValueError("after_detection_steps and after_detection_speed_native must be specified together")
                 op["wire_commands"] = [{"field": "plld", "ascii": "B1R" if instruction.start_mode == 1 else "BR"}]
+            elif isinstance(instruction, LiquidSearch):
+                op.update(instruction.model_dump())  # defaults are part of the executed search
+                op["wire_commands"] = [{"field": "plld", "ascii": "B1R" if instruction.start_mode == 1 else "BR"}]
+            elif isinstance(instruction, SurfaceAspirate):
+                op.update(instruction.model_dump(exclude_none=True))
+                op["wire_commands"] = [{"field": "speed_ul_s", "ascii": f"V{_number(instruction.speed_ul_s)},1R"},
+                                       {"field": "volume_ul", "ascii": f"P{_number(instruction.volume_ul)},1R"}]
             elif isinstance(instruction, SurfaceMove):
                 resolve_displacement(op["displacement"])
                 if instruction.reference.kind in {"authored", "vessel", "rack"}:
@@ -531,6 +571,111 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
         transform = move["reference"].get("transform") if move["reference"]["kind"] == "rack" else last_rack
         return trajectory_evidence(geometry, {**head_targets, "z": geometry["target_steps"]}, transform, channels)
 
+    def liquid_search(op):
+        from ..oem_compat.pathing import LOCATION_ID_TO_NAME
+        from ..oem_compat.position_table import load_bound_oem_position_table
+        from .liquid_detection import contact_from_timestamps, height_above_floor_mm, search_window
+        row = load_bound_oem_position_table().resolve(location_id=LOCATION_ID_TO_NAME[op["location_id"]])
+        if type(row.z_low) is not int or type(row.z_high) is not int:
+            raise PipetteCommandError("liquid search needs calibrated high and low heights for this station")
+        offset = int(tip_offset()["offset_steps"])
+        start, floor = search_window(row.z_high, row.z_low, offset, op["floor_clearance_steps"])
+        z_move(start, op["search_speed_native"])
+        clocks = {}
+        def start_z():
+            state = provider._offset_deck_semantic_state(gripper_confirmed=False, pseudo_home_only=True)
+            clocks["monotonic"], clocks["wall"] = time.monotonic(), time.time()
+            head_targets.pop("z", None)
+            return provider.primitives.oem_move_z(floor, pseudo_home_steps=state["pseudo_z_home"],
+                motor_current=op["z_motor_current"], wait_for_stop=False)
+        def detect(t):
+            body = _send_wire(t, op["channels"], op["wire_commands"][0]["ascii"], op["timeout_ms"],
+                              after_sends=start_z, effect="fluid detection")
+            if body.get("ok") is False and not body.get("interrupted_by_terminate"):
+                try:
+                    fence(f"{owner_identity['source_identity']}:liquid_search:terminate")
+                    body["source_timeout_termination"] = t.terminate()
+                except Exception as exc:
+                    body["source_timeout_termination"] = {"error": str(exc), "exception_type": type(exc).__name__}
+            # A channel without contact is a per-channel result, not a failed search.
+            return {"ok": True, "search_complete": body.get("ok") is True, "detection": body}
+        detected = record("liquid_search", detect, inputs=op, pipette=True)
+        stopped = {"monotonic": time.monotonic(), "wall": time.time()}
+        record("liquid_search_z_stop", lambda: provider.primitives.z_stop(), inputs={})
+        final = provider.primitives._read_axis_position("z")
+        head_targets["z"] = final
+        channels = {}
+        for row_ in detected.get("detection", {}).get("channels", []):
+            completion = row_.get("completion") or {}
+            stamp = (completion.get("pipette_message_state") or {}).get("fluid_timestamp")
+            found = completion.get("ok") is True and stamp is not None
+            contact, method = None, "no_contact"
+            if found:
+                for basis in ("monotonic", "wall"):
+                    contact, method = contact_from_timestamps(start_steps=start, stop_steps=final,
+                        started_at=clocks.get(basis, 0.0), stopped_at=stopped[basis], stamp=stamp)
+                    if contact is not None:
+                        method = f"{method}:{basis}"
+                        break
+                if contact is None:
+                    contact, method = final, "z_at_stop"  # contact time not on the descent clock
+            channels[str(row_["channel"])] = {"found": found, "contact_steps": contact, "method": method,
+                "fluid_timestamp": stamp, "height_above_floor_mm": height_above_floor_mm(contact, floor)}
+        for channel in op["channels"]:
+            channels.setdefault(str(channel), {"found": False, "contact_steps": None, "method": "no_report"})
+        search = {"location_id": op["location_id"], "start_steps": start, "floor_steps": floor,
+                  "final_position_steps": final, "tip_z_offset_steps": offset, "channels": channels,
+                  "estimate": "contact heights interpolated over a constant-speed descent"}
+        detections[op["detection_id"]] = search
+        result.setdefault("liquid_levels", []).append({"detection_id": op["detection_id"], **search})
+        from .liquid_detection import missing_channels
+        missing = missing_channels(search, op.get("expected_channels") or [])
+        if missing:
+            result["missing_liquid_channels"] = missing
+            raise PipetteCommandError(f"No liquid found by channel(s) {missing} at location {op['location_id']}; "
+                                      "nothing was aspirated there", details={"liquid_search": search})
+
+    def surface_aspirate(op):
+        from .liquid_detection import aspirate_target, level_groups
+        search = detections.get(op["detection_id"])
+        if search is None:
+            raise PipetteCommandError(f"surface aspirate has no liquid search {op['detection_id']!r}")
+        contacts = {c: search["channels"][str(c)]["contact_steps"] for c in op["channels"]
+                    if search["channels"].get(str(c), {}).get("found")}
+        tolerance = -1 if op["mode"] == "one_at_a_time" else op["level_tolerance_steps"]
+        groups = level_groups(contacts, "together" if op["mode"] == "together" else "by_level", tolerance)
+        plan_rows = []
+        for channels, surface in groups:
+            target = aspirate_target(surface, op["submerge_steps"], search["floor_steps"])
+            z_move(target, op["z_speed_native"])
+            follow_to = min(target + op["follow_steps"], search["floor_steps"])
+            def follow():
+                if follow_to == target:
+                    return None
+                head_targets.pop("z", None)
+                record("z_speed", lambda: provider.primitives.z_set_max_speed(op["follow_speed_native"]),
+                       inputs={"speed_native": op["follow_speed_native"]})
+                state = provider._offset_deck_semantic_state(gripper_confirmed=False, pseudo_home_only=True)
+                return provider.primitives.oem_move_z(follow_to, pseudo_home_steps=state["pseudo_z_home"],
+                    motor_current=25, wait_for_stop=False)
+            inputs = {"volume_ul": op["volume_ul"], "front_air": False, "target_liquid_ul": op.get("target_liquid_ul"),
+                      "commanded_displacement_ul": op["volume_ul"], "liquid_phase": "aspirate"}
+            if op.get("accounting_intent") is not None:
+                inputs["accounting_intent"] = op["accounting_intent"]
+            for command in op["wire_commands"]:
+                effect = "set_top_speed" if command["field"] == "speed_ul_s" else "aspirate"
+                record(effect, lambda t, w=command["ascii"], e=effect, ch=channels, values=inputs:
+                    _send_wire(t, ch, w, op["timeout_ms"], effect=e, inputs=values,
+                               after_sends=follow if e == "aspirate" else None),
+                    inputs={"field": command["field"], "ascii": command["ascii"], "channels": channels, **inputs}, pipette=True)
+            if follow_to != target:
+                record("follow_z_wait", lambda: provider.wp8_wait_z("waitZ", {"timeout_ms": op["timeout_ms"]}),
+                       inputs={"timeout_ms": op["timeout_ms"]})
+                head_targets["z"] = follow_to
+            plan_rows.append({"channels": channels, "surface_steps": surface, "aspirate_steps": target, "follow_to_steps": follow_to})
+        result.setdefault("surface_aspirations", []).append({"detection_id": op["detection_id"], "mode": op["mode"],
+            "groups": plan_rows, "skipped_channels": [c for c in op["channels"] if c not in contacts]})
+
     try:
         for index, op in enumerate(plan["operations"]):
             result["operation_index"] = index
@@ -649,6 +794,10 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                 detections[op.get("detection_id", "last_detection")] = deepcopy(search)
                 if op.get("after_detection_steps") is not None:
                     z_move(op["after_detection_steps"] + plld_offset, op["after_detection_speed_native"])
+            elif kind == "liquid_search":
+                liquid_search(op)
+            elif kind == "surface_aspirate":
+                surface_aspirate(op)
             else:
                 tracking: dict[str, Any] = {}
                 if kind == "tracked_aspirate":
@@ -690,10 +839,12 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
         result.update(ok=True, completed=True, source_return_completed=True,
                       has_unknown_outcomes=any(e["status"] == "unknown" for e in events))
     except Exception as exc:
+        # No liquid where liquid was listed: nothing aspirated; hold for the operator.
+        control = "pause_for_operator" if result.get("missing_liquid_channels") else request.get("event_policy", "stop")
         result.update(error=str(exc), exception_type=type(exc).__name__,
                       interrupted=epoch != group._interrupt_epoch,
                       event_policy=request.get("event_policy", "stop"),
-                      requested_control=request.get("event_policy", "stop"),
+                      requested_control=control,
                       partial_effects=True)
     if request.get("accounting_context") is not None:
         from .effect_accounting import application_accounting

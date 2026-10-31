@@ -84,6 +84,21 @@ class Multi(_Input):
     aliquots: list[Aliquot]
 
 
+class LiquidDetection(_Input):
+    """Find the source surface, then aspirate below it (replaces the calibrated source lower)."""
+    location_id: int = Field(ge=0)
+    expected: bool = True                      # listed as holding liquid: a miss holds the run
+    mode: Literal["by_level", "together", "one_at_a_time"] = "by_level"
+    start_mode: Literal[0, 1] = 0
+    submerge_steps: int = Field(default=2016, ge=0)
+    follow_steps: int = Field(default=0, ge=0)
+    floor_clearance_steps: int = Field(default=2016, ge=0)
+    level_tolerance_steps: int = Field(default=1008, ge=0)
+    search_speed_native: int = Field(default=300, gt=0)
+    search_timeout_ms: int = Field(default=15000, gt=0)   # OEM detectFluidLevel wait
+    detection_id: str = Field(default="source", min_length=1)
+
+
 class Recipe(_Input):
     mode: Literal["single", "multi"]
     channels: list[int]
@@ -94,6 +109,7 @@ class Recipe(_Input):
     commanded_aspiration_ul: NonnegativeNumber | None = None
     selected_correction: SelectedCorrection | None = None
     aspiration_tracking: AspirationTracking | None = None
+    liquid_detection: LiquidDetection | None = None
     shared_head: SharedHead | None = None
     accounting_context: AccountingContext | None = None
     aspiration_intent: StrokeIntent | None = None
@@ -200,10 +216,24 @@ def compile_liquid_recipe(request: dict[str, Any]) -> dict[str, Any]:
             stroke("leading_air", r.leading_air.volume_ul, r.leading_air.speed_ul_s)
         append_motion(r.before_liquid)
         settings("aspirate")
-        stroke("tracked_aspirate" if r.aspiration_tracking else "aspirate", commanded,
-               r.aspiration_speed_ul_s, target_liquid_ul=r.target_liquid_ul,
-               **({"accounting_intent": r.aspiration_intent.model_dump()} if r.aspiration_intent else {}),
-               **(r.aspiration_tracking.model_dump() if r.aspiration_tracking else {}))
+        if r.liquid_detection is not None:
+            if r.aspiration_tracking is not None:
+                raise ValueError("choose liquid detection or authored aspiration tracking, not both")
+            d = r.liquid_detection
+            operations.append({"operation": "liquid_search", "channels": r.channels, "timeout_ms": d.search_timeout_ms,
+                "location_id": d.location_id, "detection_id": d.detection_id, "start_mode": d.start_mode,
+                "floor_clearance_steps": d.floor_clearance_steps, "search_speed_native": d.search_speed_native,
+                **({"expected_channels": r.channels} if d.expected else {})})
+            operations.append({"operation": "surface_aspirate", **base, "detection_id": d.detection_id,
+                "mode": d.mode, "level_tolerance_steps": d.level_tolerance_steps, "submerge_steps": d.submerge_steps,
+                "follow_steps": d.follow_steps, "volume_ul": commanded, "speed_ul_s": r.aspiration_speed_ul_s,
+                "target_liquid_ul": r.target_liquid_ul,
+                **({"accounting_intent": r.aspiration_intent.model_dump()} if r.aspiration_intent else {})})
+        else:
+            stroke("tracked_aspirate" if r.aspiration_tracking else "aspirate", commanded,
+                   r.aspiration_speed_ul_s, target_liquid_ul=r.target_liquid_ul,
+                   **({"accounting_intent": r.aspiration_intent.model_dump()} if r.aspiration_intent else {}),
+                   **(r.aspiration_tracking.model_dump() if r.aspiration_tracking else {}))
         operations.append({"operation": "delay", "duration_ms": r.aspiration_delay_ms})
         append_motion(r.after_liquid)
         if r.trailing_air is not None:
