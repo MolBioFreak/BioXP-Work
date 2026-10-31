@@ -88,6 +88,8 @@ class LiquidDetection(_Input):
     """Find the source surface, then aspirate below it (replaces the calibrated source lower)."""
     location_id: int = Field(ge=0)
     expected: bool = True                      # listed as holding liquid: a miss holds the run
+    # Channels whose source well holds liquid per the plan; overrides `expected` when set.
+    expected_channels: list[Annotated[int, Field(ge=0, le=3)]] | None = None
     mode: Literal["by_level", "together", "one_at_a_time"] = "by_level"
     start_mode: Literal[0, 1] = 0
     submerge_steps: int = Field(default=2016, ge=0)
@@ -223,7 +225,8 @@ def compile_liquid_recipe(request: dict[str, Any]) -> dict[str, Any]:
             operations.append({"operation": "liquid_search", "channels": r.channels, "timeout_ms": d.search_timeout_ms,
                 "location_id": d.location_id, "detection_id": d.detection_id, "start_mode": d.start_mode,
                 "floor_clearance_steps": d.floor_clearance_steps, "search_speed_native": d.search_speed_native,
-                **({"expected_channels": r.channels} if d.expected else {})})
+                **({"expected_channels": [c for c in r.channels if c in d.expected_channels]}
+                   if d.expected_channels is not None else {"expected_channels": r.channels} if d.expected else {})})
             operations.append({"operation": "surface_aspirate", **base, "detection_id": d.detection_id,
                 "mode": d.mode, "level_tolerance_steps": d.level_tolerance_steps, "submerge_steps": d.submerge_steps,
                 "follow_steps": d.follow_steps, "volume_ul": commanded, "speed_ul_s": r.aspiration_speed_ul_s,

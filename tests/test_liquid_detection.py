@@ -131,3 +131,11 @@ def test_liquid_levels_survive_the_operational_record(monkeypatch):
     kept = application_outcome(rig.run(_recipe()))
     assert kept["missing_liquid_channels"] == [1]
     assert kept["liquid_levels"][0]["channels"]["0"]["found"] is True
+
+
+def test_plan_expected_channels_hold_only_listed_wells(monkeypatch):
+    rig = _Rig(monkeypatch, {0: 0.25, 1: None, 2: None})
+    result = rig.run(_recipe(expected_channels=[0, 2]))
+    assert result["ok"] is False and result["missing_liquid_channels"] == [2]
+    rig = _Rig(monkeypatch, {0: 0.25, 1: None, 2: 0.5})
+    assert rig.run(_recipe(expected_channels=[0, 2]))["ok"] is True
