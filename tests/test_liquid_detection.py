@@ -123,3 +123,11 @@ def test_unlisted_well_without_liquid_is_skipped_not_held(monkeypatch):
     result = rig.run(_recipe(expected=False))
     assert result["ok"] is True and result["surface_aspirations"][0]["skipped_channels"] == [1]
     assert sorted(c for ch, _ in rig.aspirated for c in ch) == [0, 2]
+
+
+def test_liquid_levels_survive_the_operational_record(monkeypatch):
+    from bioxp.protocols.operational_results import application_outcome
+    rig = _Rig(monkeypatch, {0: 0.25, 1: None, 2: 0.5})
+    kept = application_outcome(rig.run(_recipe()))
+    assert kept["missing_liquid_channels"] == [1]
+    assert kept["liquid_levels"][0]["channels"]["0"]["found"] is True
