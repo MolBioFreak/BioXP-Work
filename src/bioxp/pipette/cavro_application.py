@@ -131,6 +131,8 @@ class LiquidSearch(_Selected):
     floor_clearance_steps: int = Field(default=2016, ge=0)  # 1 mm above calibrated low
     search_speed_native: int = Field(default=300, gt=0)      # OEM btnDetectFluid speed
     z_motor_current: int = 25                                 # OEM Z_MOTOR_MAX_CURRENT_DOWN
+    # ADP LLD mode (M 30053815-C U70/U71/U72). Conductive DiTis support both: hybrid.
+    sensing: Literal["pressure", "capacitive", "hybrid"] = "hybrid"
     # Channels whose wells are listed as holding liquid. A miss here holds the run.
     expected_channels: list[Annotated[int, Field(ge=0, le=3)]] | None = None
 
@@ -345,7 +347,8 @@ def compile_application(request: Mapping[str, Any]) -> dict[str, Any]:
                 op["wire_commands"] = [{"field": "plld", "ascii": "B1R" if instruction.start_mode == 1 else "BR"}]
             elif isinstance(instruction, LiquidSearch):
                 op.update(instruction.model_dump())  # defaults are part of the executed search
-                op["wire_commands"] = [{"field": "plld", "ascii": "B1R" if instruction.start_mode == 1 else "BR"}]
+                op["wire_commands"] = [{"field": "plld", "ascii": "B1R" if instruction.start_mode == 1 else "BR"},
+                    {"field": "sensing", "ascii": {"pressure": "U70R", "capacitive": "U71R", "hybrid": "U72R"}[instruction.sensing]}]
             elif isinstance(instruction, SurfaceAspirate):
                 op.update(instruction.model_dump(exclude_none=True))
                 op["wire_commands"] = [{"field": "speed_ul_s", "ascii": f"V{_number(instruction.speed_ul_s)},1R"},
@@ -581,6 +584,8 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
         offset = int(tip_offset()["offset_steps"])
         start, floor = search_window(row.z_high, row.z_low, offset, op["floor_clearance_steps"])
         z_move(start, op["search_speed_native"])
+        record("lld_sensing_mode", lambda t: _send_wire(t, op["channels"], op["wire_commands"][1]["ascii"], op["timeout_ms"]),
+               inputs={"sensing": op.get("sensing"), "ascii": op["wire_commands"][1]["ascii"]}, pipette=True)
         clocks = {}
         def start_z():
             state = provider._offset_deck_semantic_state(gripper_confirmed=False, pseudo_home_only=True)

@@ -99,6 +99,7 @@ class LiquidDetection(_Input):
     search_speed_native: int = Field(default=300, gt=0)
     search_timeout_ms: int = Field(default=15000, gt=0)   # OEM detectFluidLevel wait
     detection_id: str = Field(default="source", min_length=1)
+    sensing: Literal["pressure", "capacitive", "hybrid"] = "hybrid"
 
 
 class Recipe(_Input):
@@ -223,7 +224,7 @@ def compile_liquid_recipe(request: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("choose liquid detection or authored aspiration tracking, not both")
             d = r.liquid_detection
             operations.append({"operation": "liquid_search", "channels": r.channels, "timeout_ms": d.search_timeout_ms,
-                "location_id": d.location_id, "detection_id": d.detection_id, "start_mode": d.start_mode,
+                "location_id": d.location_id, "detection_id": d.detection_id, "start_mode": d.start_mode, "sensing": d.sensing,
                 "floor_clearance_steps": d.floor_clearance_steps, "search_speed_native": d.search_speed_native,
                 **({"expected_channels": [c for c in r.channels if c in d.expected_channels]}
                    if d.expected_channels is not None else {"expected_channels": r.channels} if d.expected else {})})

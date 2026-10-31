@@ -139,3 +139,8 @@ def test_plan_expected_channels_hold_only_listed_wells(monkeypatch):
     assert result["ok"] is False and result["missing_liquid_channels"] == [2]
     rig = _Rig(monkeypatch, {0: 0.25, 1: None, 2: 0.5})
     assert rig.run(_recipe(expected_channels=[0, 2]))["ok"] is True
+
+
+def test_search_sets_hybrid_sensing_by_default():
+    ops = compile_liquid_recipe(_recipe())["application"]["operations"]
+    assert next(o for o in ops if o["operation"] == "liquid_search")["sensing"] == "hybrid"
