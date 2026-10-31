@@ -66,3 +66,15 @@ def test_confirmed_offset_overrides_default_and_is_listed(tmp_path, monkeypatch)
     import pytest
     with pytest.raises(ValueError):
         tip_length.save_confirmed(10, 999999, "x", at="t")
+
+
+def test_missing_confirmed_file_is_never_opened(tmp_path, monkeypatch):
+    import builtins, io
+    from bioxp.pipette import tip_length
+    target = tmp_path / "absent.json"
+    monkeypatch.setenv(tip_length.CONFIRMED_ENV, str(target))
+    opened = []
+    real = io.open
+    monkeypatch.setattr(io, "open", lambda f, *a, **k: (opened.append(str(f)), real(f, *a, **k))[1])
+    tip_length.tip_z_offset(10)
+    assert str(target) not in opened

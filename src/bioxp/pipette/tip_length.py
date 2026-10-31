@@ -46,8 +46,9 @@ def _confirmed_path() -> Path:
 
 def _load(path: Path | None = None) -> dict[str, Any]:
     data = _read(Path(os.environ.get(OFFSETS_ENV) or path or DEFAULT_PATH)) or {"offsets_steps": {}, "source": None}
-    if path is None:
-        confirmed = _read(_confirmed_path()).get("offsets") or {}
+    confirmed_file = _confirmed_path() if path is None else None
+    if confirmed_file is not None and confirmed_file.is_file():   # stat only; absent until an operator saves
+        confirmed = _read(confirmed_file).get("offsets") or {}
         if confirmed:
             data = {**data, "offsets_steps": {**(data.get("offsets_steps") or {}),
                     **{k: v["offset_steps"] for k, v in confirmed.items() if type(v.get("offset_steps")) is int}},
