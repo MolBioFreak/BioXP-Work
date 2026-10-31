@@ -145,6 +145,10 @@ def process_pipette_message(
     event_error_code = error_code
     if error_code == 42 and command_name == "pipette_eject_tip":
         event_error_code = 0
+    # Firmware text continuation frames carry ASCII in byte 2 (e.g. "2013" -> 50).
+    # That is reply data, not one of the ADP error codes 33..47.
+    if command_name == "query_firmware" and not 33 <= error_code <= 47:
+        event_error_code = 0
 
     completion_signal = selected_dlc == 2 and command_name in _PIPETTE_COMPLETION_CATEGORIES
     if selected_dlc == 2 and command_name == "start_fluid_detection":

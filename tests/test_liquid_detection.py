@@ -204,3 +204,11 @@ def test_volume_mismatch_response(monkeypatch, response, ok, control):
     if control:
         assert result["requested_control"] == control
         assert rig.aspirated == []
+
+
+def test_firmware_text_frame_is_not_a_pipette_error():
+    from bioxp.can_driver import process_pipette_message
+    text = process_pipette_message(4, [50, 48, 49, 51], arbitration_id=0x0506, command_name="query_firmware")
+    assert text["event_error_code"] == 0
+    real = process_pipette_message(2, [38, 0], arbitration_id=0x0506, command_name="query_status")
+    assert real["event_error_code"] == 38
