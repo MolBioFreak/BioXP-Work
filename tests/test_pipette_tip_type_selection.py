@@ -54,3 +54,37 @@ def test_tip_type_is_typed_catalog_service_action():
     assert _safety("POST", PATH) == "service"
     field = api.PipetteTipTypeRequest.model_json_schema()["properties"]["tip_type"]
     assert field["enum"] == [10, 50, 200, 201]
+
+
+def test_tip_type_receipt_is_completed_not_failed(tmp_path, monkeypatch):
+    from bioxp.oem_runtime_store import OEMRuntimeStore
+    from bioxp.pipette.receipts import PipetteReceiptStore
+    import bioxp.pipette.receipts as receipts
+    monkeypatch.setattr(receipts, "current_release_identity", lambda: {"verified": True, "release_id": "offline",
+        "source": {"manifest_sha256": "1" * 64, "aggregate_sha256": "2" * 64}})
+    monkeypatch.setattr(receipts, "current_authority_identity", lambda: {"evidence_lock_identity_verified": True,
+        "evidence_lock_sha256": "3" * 64})
+    monkeypatch.setattr(receipts, "current_registry_sha256", lambda: "4" * 64)
+    OEMRuntimeStore(tmp_path).close()
+    store = PipetteReceiptStore(root=tmp_path)
+    driver = SimpleNamespace(_pipette_message_state=None, bus=None)
+    transport = FourPipetteTransport([
+        SimpleNamespace(_driver=driver, _get_driver=lambda: driver) for _ in range(4)
+    ])
+    monkeypatch.setattr(api, "_get_pipette_transport", lambda: transport)
+    monkeypatch.setattr(api, "_pipette_receipts", store)
+
+    async def inline(label, call, *, timeout_s):
+        return call()
+
+    monkeypatch.setattr(api, "_run_blocking", inline)
+    client = TestClient(api.app, raise_server_exceptions=True)
+    try:
+        response = client.post(PATH, json={"tip_type": 50}, headers={"Idempotency-Key": "tip-type-receipt"})
+        assert response.status_code == 200, response.text
+        assert response.json()["hardware_commanded"] is False
+        row = store.connection.execute(
+            "SELECT status FROM pipette_operations ORDER BY rowid DESC LIMIT 1").fetchone()
+        assert row["status"] == "completed"
+    finally:
+        client.close()

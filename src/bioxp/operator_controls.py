@@ -5005,8 +5005,11 @@ def install_operator_control_plane(
                 )
                 linked_status = None
                 if isinstance(pipette_truth, Mapping):
+                    from .pipette.receipts import _host_state_success
                     linked_status = (
-                        "observed"
+                        "completed"
+                        if isinstance(response, Mapping) and _host_state_success(response)
+                        else "observed"
                         if pipette_truth.get("semantic_query_response_verified") is True
                         else "completed"
                         if pipette_truth.get("completion_verified") is True

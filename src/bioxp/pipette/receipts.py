@@ -30,6 +30,12 @@ from .audit import PipetteAuditIntegrityError, normalize_pipette_result, normali
 _LINKED_FINALIZATION_KEY = "_bioxp_linked_pipette_finalization"
 
 
+
+def _host_state_success(result: Mapping[str, Any]) -> bool:
+    """A host-only setting (e.g. OEM tip type) that succeeded; no hardware was commanded."""
+    return (result.get("ok") is True and result.get("outcome") == "host_state_only"
+            and result.get("hardware_commanded") is False)
+
 class PipetteReceiptError(RuntimeError):
     """A pipette operation cannot be durably represented."""
 
@@ -553,7 +559,7 @@ class PipetteReceiptStore:
                     or receipt["truth"]["hardware_postcondition_verified"]
                 )
                 else "completed"
-                if receipt["truth"]["completion_verified"] or empty_pressure_return or (
+                if receipt["truth"]["completion_verified"] or empty_pressure_return or _host_state_success(result) or (
                     result.get("kind") == "scientific_pressure_capture" and
                     result.get("ok") is True and result.get("source_return_completed") is True)
                 else "acknowledged"
