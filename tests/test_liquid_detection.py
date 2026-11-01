@@ -209,12 +209,21 @@ def test_volume_mismatch_response(monkeypatch, response, ok, control):
         assert rig.aspirated == []
 
 
-def test_firmware_text_frame_is_not_a_pipette_error():
-    from bioxp.can_driver import process_pipette_message
-    text = process_pipette_message(4, [50, 48, 49, 51], arbitration_id=0x0506, command_name="query_firmware")
-    assert text["event_error_code"] == 0
-    real = process_pipette_message(2, [38, 0], arbitration_id=0x0506, command_name="query_status")
-    assert real["event_error_code"] == 38
+def test_firmware_reply_text_is_not_a_pipette_error():
+    from bioxp.can_driver import BioXpCanDriver
+    driver = BioXpCanDriver.__new__(BioXpCanDriver)
+    driver.pipette_id, driver._pipette_message_state, driver._pipette_last_command = 3, {}, None
+    errors = []
+    driver._pipette_error_callback = lambda channel, code: errors.append((channel, code))
+    # Recorded reply to &1 on channel 3: "ADP-V2" / ".030-12/" / "2013".
+    frames = [{"arbitration_id": 0x51b, "dlc": 8, "data": [32, 96, 65, 68, 80, 45, 86, 50]},
+              {"arbitration_id": 0x51c, "dlc": 8, "data": [46, 48, 51, 48, 45, 49, 50, 47]},
+              {"arbitration_id": 0x51e, "dlc": 4, "data": [50, 48, 49, 51]}]
+    state = driver._apply_pipette_provenance({"frames": frames}, "query_firmware")
+    assert errors == [] and state["error_code"] == 32
+    # A real error reply still reports.
+    driver._apply_pipette_provenance({"frames": [{"arbitration_id": 0x519, "dlc": 2, "data": [46, 96]}]}, "query_status")
+    assert errors == [(3, 46)]
 
 
 def test_tip_tray_location_with_and_without_persisted_constructor():

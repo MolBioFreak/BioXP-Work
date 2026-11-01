@@ -145,10 +145,6 @@ def process_pipette_message(
     event_error_code = error_code
     if error_code == 42 and command_name == "pipette_eject_tip":
         event_error_code = 0
-    # Firmware text continuation frames carry ASCII in byte 2 (e.g. "2013" -> 50).
-    # That is reply data, not one of the ADP error codes 33..47.
-    if command_name == "query_firmware" and not 33 <= error_code <= 47:
-        event_error_code = 0
 
     completion_signal = selected_dlc == 2 and command_name in _PIPETTE_COMPLETION_CATEGORIES
     if selected_dlc == 2 and command_name == "start_fluid_detection":
@@ -813,9 +809,16 @@ class BioXpCanDriver:
 
     def _apply_pipette_provenance(self, provenance: Any, command_name: str | None) -> dict[str, Any]:
         state = dict(getattr(self, "_pipette_message_state", {}))
+        multipart = False
         for frame in provenance.get("frames", []) if isinstance(provenance, dict) else []:
             if not isinstance(frame, dict):
                 continue
+            # Multipart reports: only the first part (function 3) carries the status byte. Later
+            # parts (function 4, and the closing report frame) are reply text such as ".030-12/".
+            function = frame.get("arbitration_id") & 0x7 if type(frame.get("arbitration_id")) is int else None
+            if function == 4 or (function == 6 and multipart):
+                continue
+            multipart = multipart or function == 3
             state = self.process_pipette_message(
                 int(frame.get("dlc", len(frame.get("data", [])))),
                 list(frame.get("data", [])),
