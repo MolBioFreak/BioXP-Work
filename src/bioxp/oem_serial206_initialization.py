@@ -11204,13 +11204,25 @@ class Serial206OemInitializationProvider:
             raise ValueError("tip tray type record needs tray 0-4 and tip type 10, 50 or 200")
         with self._lock:
             state = self._load_state()
-            trays = (state.get("machine_status") or {}).get("constructed_tip_trays")
-            if not isinstance(trays, list) or len(trays) != 5:
-                raise RuntimeError("tip tray constructor is unavailable")
-            before = trays[tray_id].get("tip_type")
-            trays[tray_id]["tip_type"] = names[tip_type]
+            machine = state["machine_status"]
+            before = self.tip_tray_type(tray_id)
+            # Records predating the persisted constructor keep the size beside it.
+            machine["tip_tray_types"] = {**dict(machine.get("tip_tray_types") or {}), str(tray_id): names[tip_type]}
+            trays = machine.get("constructed_tip_trays")
+            if isinstance(trays, list) and len(trays) == 5:
+                trays[tray_id]["tip_type"] = names[tip_type]
             self._save_state(state)
         return {"tray": tray_id + 1, "tip_type": names[tip_type], "before": before}
+
+    def tip_tray_type(self, tray_id: int) -> str | None:
+        """Recorded tip size of tray ``tray_id`` (T10/T50/T200), or None if never recorded."""
+        with self._lock:
+            machine = self._load_state().get("machine_status") or {}
+        recorded = dict(machine.get("tip_tray_types") or {}).get(str(tray_id))
+        if recorded:
+            return recorded
+        trays = machine.get("constructed_tip_trays")
+        return trays[tray_id].get("tip_type") if isinstance(trays, list) and len(trays) == 5 else None
 
     def record_movable_object_locations(
         self, *, locations: Mapping[str, str], source_command_id: str,

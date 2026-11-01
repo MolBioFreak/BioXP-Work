@@ -90,6 +90,15 @@ def test_tip_tray_type_record_is_read_back_and_used_by_pickup(client):
     assert trays[1]['tip_type'] == 'T10' and trays[2]['tip_type'] == 'T10' and trays[3]['tip_type'] == 'T50'
     assert provider._read_constructed_tip_tray(0)['tip_type'] == 'T10'
     assert frames == []
+    # Live records that predate the persisted tray constructor still accept a size.
+    state = provider._load_state()
+    state['machine_status'].pop('constructed_tip_trays')
+    state['machine_status'].pop('construction_id')
+    provider._save_state(state)
+    legacy = http.post('/operator/deck/record', json=body('rec-type-0004', tip_trays=[{'tray': 3, 'tip_type': 10}]))
+    assert legacy.status_code == 200, legacy.text
+    trays = {row['tray']: row for row in http.get('/operator/tip-trays').json()['trays']}
+    assert trays[1]['tip_type'] == 'T10' and trays[3]['tip_type'] == 'T10' and trays[4]['tip_type'] is None
     assert http.post('/operator/deck/record', json=body('rec-type-0002',
         tip_trays=[{'tray': 1, 'tip_type': 20}])).status_code == 422
     assert http.post('/operator/deck/record', json=body('rec-type-0003',

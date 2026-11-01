@@ -7050,9 +7050,8 @@ class OperatorCommandPlane:
                         rows.append({"tray": tray_id + 1, "tray_id": tray_id, "unavailable": str(exc)})
                         continue
                     occupancy = row.get("occupancy")
-                    reader = getattr(self.store, "_tip_tray_constructor_reader", None)
-                    constructor = reader(tray_id) if callable(reader) else None
-                    tip_type = constructor.get("tip_type") if isinstance(constructor, Mapping) else None
+                    reader = getattr(self._current_deck_provider(), "tip_tray_type", None)
+                    tip_type = reader(tray_id) if callable(reader) else None
                     rows.append({"tray": tray_id + 1, **row, "tip_type": tip_type,
                                  "tips_present": sum(1 for tip in occupancy if tip) if isinstance(occupancy, list) else None,
                                  "four_channel_groups_available": row.get("available_count")})

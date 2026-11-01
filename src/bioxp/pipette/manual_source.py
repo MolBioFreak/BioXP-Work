@@ -34,6 +34,9 @@ def run_manual_source_inline(provider: Any, request: Mapping[str, Any], *,
                     if metadata is not None:
                         tray.tip_type = {"T10": 10, "T50": 50, "T200": 200, "T201": 201}[metadata["tip_type"]]
                         tray.location = metadata["location"]
+                    recorded = provider.tip_tray_type(index) if callable(getattr(provider, "tip_tray_type", None)) else None
+                    if recorded is not None:
+                        tray.tip_type = {"T10": 10, "T50": 50, "T200": 200, "T201": 201}[recorded]
                     for well, occupied in zip(tray.wells, retained["occupancy"]):
                         well.empty = not occupied
     base = owner_identity["source_identity"]
