@@ -827,6 +827,19 @@ def _mov_terminal_truth(result: Any) -> bool:
     )
 
 
+def _known_cavro_failure(result: Any) -> bool:
+    """A Cavro application that failed with every step's outcome recorded.
+
+    Its effects are known (each event completed or failed), so the stage is a
+    failure, not an unknown outcome. Interrupted or unrecorded steps stay ambiguous.
+    """
+    if not isinstance(result, Mapping) or result.get("kind") != "cavro_application" or result.get("ok") is not False:
+        return False
+    events = result.get("events")
+    return (result.get("interrupted") is not True and isinstance(events, list) and bool(events)
+            and all(isinstance(e, Mapping) and e.get("status") in {"completed", "failed"} for e in events))
+
+
 def execute_mov_execution(command_id: str, plan: MovExecutionPlan, *, provider: Any, command_store: Any) -> dict[str, Any]:
     """Execute one precompiled movExecution plan without replaying ambiguous I/O."""
     persist = getattr(command_store, "persist_mov_execution_plan", None)
@@ -974,7 +987,8 @@ def execute_mov_execution(command_id: str, plan: MovExecutionPlan, *, provider: 
                 or any(row.get("delivery_attempted") is True for row in provider_results)
             )
             if not _mov_terminal_truth(result):
-                terminal_state = "ambiguous" if delivery_attempted else "failed"
+                terminal_state = ("ambiguous" if delivery_attempted and not _known_cavro_failure(result)
+                                  else "failed")
                 if callable(terminalize):
                     if callable(assert_current):
                         assert_current(command_id, boundary=f"before_terminalize:{step.order}:{step.operation}")
@@ -989,7 +1003,7 @@ def execute_mov_execution(command_id: str, plan: MovExecutionPlan, *, provider: 
                     "controller_command_acknowledged": bool(result_map.get("controller_command_acknowledged")),
                     "controller_completion_verified": False,
                     "semantic_state_committed": False,
-                    "ambiguity_state": "ambiguous" if delivery_attempted else "failed",
+                    "ambiguity_state": terminal_state,
                     "source_return_disposition": "ignored",
                     "provider_results": [*provider_results, result_map],
                 }

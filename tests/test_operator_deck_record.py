@@ -133,3 +133,13 @@ def test_record_stamps_do_not_refuse_unknown_board_epochs():
                            _lock=threading.RLock(), _load_state=lambda: {})
     assert P._deck_owner_authority_stamps_locked(fake) == {
         'ownership_generation': 3, 'board_epoch_4': 0, 'board_epoch_5': 0}
+
+
+def test_cavro_failure_with_every_step_recorded_is_failed_not_ambiguous():
+    from bioxp.oem_deck_movement import _known_cavro_failure
+    done = [{'status': 'completed'}, {'status': 'failed'}]
+    assert _known_cavro_failure({'kind': 'cavro_application', 'ok': False, 'events': done})
+    assert not _known_cavro_failure({'kind': 'cavro_application', 'ok': False, 'events': done, 'interrupted': True})
+    assert not _known_cavro_failure({'kind': 'cavro_application', 'ok': False, 'events': [{'status': 'in_flight'}]})
+    assert not _known_cavro_failure({'kind': 'cavro_application', 'ok': False, 'events': []})
+    assert not _known_cavro_failure({'kind': 'other', 'ok': False, 'events': done})
