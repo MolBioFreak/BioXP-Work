@@ -988,6 +988,7 @@ _NO_MOTION_PREPARATION_PATHS = {
     "/liquid/pipette/settings",
     "/liquid/pipette/tip-type",
     "/liquid/pipette/tip-offsets",
+    "/liquid/pipette/lld-profiles",
     "/motion/oem/prepare_without_motion",
     "/motion/arm/strict_startup",
     # ClassMotor.setHome is a controller-coordinate write (SAP1=0), not a

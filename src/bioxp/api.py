@@ -11163,6 +11163,36 @@ async def pipette_tip_offsets_save(req: TipOffsetConfirm):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+class LldProfileSave(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    filtered_tips: bool | None = None
+    tip_type: Literal[10, 50, 200] | None = None
+    kind: Literal["filtered", "unfiltered"] | None = None
+    threshold_adc: int | None = None
+    threshold_duration_ms: int | None = None
+    speed_increments_per_second: int | None = None
+    source: str | None = Field(default=None, max_length=300)
+
+
+@app.get("/liquid/pipette/lld-profiles")
+async def pipette_lld_profiles_read():
+    from .pipette.lld_profiles import profiles
+    return profiles()
+
+
+@app.put("/liquid/pipette/lld-profiles")
+async def pipette_lld_profiles_save(req: LldProfileSave):
+    """Record-only: saved settings are applied at the next liquid search. No motion."""
+    from .pipette.lld_profiles import save
+    values = {k: v for k, v in req.model_dump().items()
+              if k in ("threshold_adc", "threshold_duration_ms", "speed_increments_per_second") and v is not None}
+    try:
+        return await run_in_threadpool(lambda: save(filtered_tips=req.filtered_tips, tip_type=req.tip_type,
+                                                    kind=req.kind, values=values, source=req.source))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/liquid/pipette/settings")
 async def pipette_operation_settings_read():
     return await run_in_threadpool(read_pipette_operation_settings, get_active_oem_runtime_state_store())

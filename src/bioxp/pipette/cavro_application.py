@@ -649,6 +649,17 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                 body["observation_error"] = str(exc)
         return body
 
+    def apply_lld_profile(op) -> None:
+        # pLLD threshold/duration/speed follow the loaded tip type (filtered or unfiltered).
+        from .lld_profiles import profile_for, wires
+        profile = profile_for(getattr(group, "_tip_type", None))
+        result.setdefault("lld_profiles", []).append(profile)
+        if profile is None:
+            return  # unknown tip type: leave the pumps' current settings unchanged
+        for wire in wires(profile):
+            record("lld_profile", lambda t, w=wire: _send_wire(t, op["channels"], w, op["timeout_ms"]),
+                   inputs={"ascii": wire, "profile": profile}, pipette=True)
+
     def tip_offset() -> dict:
         # Loaded-tip length correction for authored absolute Z (0 with no tip or unmeasured type).
         reader = getattr(provider.primitives, "_loaded_tip_z_offset", None)
@@ -684,6 +695,7 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
         row = load_bound_oem_position_table().resolve(location_id=LOCATION_ID_TO_NAME[op["location_id"]])
         if type(row.z_low) is not int or type(row.z_high) is not int:
             raise PipetteCommandError("liquid search needs calibrated high and low heights for this station")
+        apply_lld_profile(op)
         offset = int(tip_offset()["offset_steps"])
         start, floor = search_window(row.z_high, row.z_low, offset, op["floor_clearance_steps"])
         z_move(start, op["search_speed_native"])
@@ -894,6 +906,7 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                 z_move(geometry["target_steps"], geometry["speed_native"])
             elif kind == "plld":
                 # Start and search floor are authored heights: correct both for the loaded tip length.
+                apply_lld_profile(op)
                 plld_offset = int(tip_offset()["offset_steps"])
                 z_move(op["start_steps"] + plld_offset, op["search_speed_native"])
                 search = {"z_search_attempted": False, "z_stop_attempted": False,
