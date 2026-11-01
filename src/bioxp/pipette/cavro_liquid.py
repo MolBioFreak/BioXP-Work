@@ -101,7 +101,7 @@ class LiquidDetection(_Input):
     search_speed_native: int = Field(default=300, gt=0)
     search_timeout_ms: int = Field(default=15000, gt=0)   # OEM detectFluidLevel wait
     detection_id: str = Field(default="source", min_length=1)
-    sensing: Literal["pressure", "capacitive", "hybrid"] = "hybrid"
+    sensing: Literal["pressure", "capacitive", "hybrid"] = "pressure"  # capacitive/hybrid need an external cLLD board
 
 
 class Recipe(_Input):

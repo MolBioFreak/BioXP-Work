@@ -153,9 +153,12 @@ def test_plan_expected_channels_hold_only_listed_wells(monkeypatch):
     assert rig.run(_recipe(expected_channels=[0, 2]))["ok"] is True
 
 
-def test_search_sets_hybrid_sensing_by_default():
+def test_search_sets_pressure_sensing_by_default():
     ops = compile_liquid_recipe(_recipe())["application"]["operations"]
-    assert next(o for o in ops if o["operation"] == "liquid_search")["sensing"] == "hybrid"
+    search = next(o for o in ops if o["operation"] == "liquid_search")
+    assert search["sensing"] == "pressure"
+    explicit = compile_liquid_recipe(_recipe(sensing="hybrid"))["application"]["operations"]
+    assert next(o for o in explicit if o["operation"] == "liquid_search")["sensing"] == "hybrid"
 
 
 def test_on_contact_aspirates_each_channel_as_it_touches(monkeypatch):

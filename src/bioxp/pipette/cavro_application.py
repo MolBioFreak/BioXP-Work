@@ -131,8 +131,8 @@ class LiquidSearch(_Selected):
     floor_clearance_steps: int = Field(default=2016, ge=0)  # 1 mm above calibrated low
     search_speed_native: int = Field(default=300, gt=0)      # OEM btnDetectFluid speed
     z_motor_current: int = 25                                 # OEM Z_MOTOR_MAX_CURRENT_DOWN
-    # ADP LLD mode (M 30053815-C U70/U71/U72). Conductive DiTis support both: hybrid.
-    sensing: Literal["pressure", "capacitive", "hybrid"] = "hybrid"
+    # ADP LLD mode (M 30053815-C U70/U71/U72). pLLD is onboard; cLLD/hybrid need an external cLLD board.
+    sensing: Literal["pressure", "capacitive", "hybrid"] = "pressure"
     # Channels whose wells are listed as holding liquid. A miss here holds the run.
     expected_channels: list[Annotated[int, Field(ge=0, le=3)]] | None = None
     # Optional: aspirate on each channel as it touches while Z keeps descending.
