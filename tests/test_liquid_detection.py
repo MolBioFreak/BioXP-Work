@@ -236,3 +236,55 @@ def test_failed_detection_after_descent_started_still_stops_z(monkeypatch):
     result = rig.run(_recipe())
     assert result["ok"] is False
     assert rig.z_stops, "Z must be stopped when the search fails after the descent started"
+
+
+def test_failed_search_keeps_device_error_stops_z_and_restores_speed(monkeypatch):
+    rig = _Rig(monkeypatch, {0: 0.25})
+    group = rig.provider.primitives.pipette_transport
+    speeds = []
+    rig.provider.primitives.z_set_max_speed = lambda v: (speeds.append(v), {"ok": True})[1]
+    def reject(effect, channels, send, *, timeout_ms, after_sends=None, **_):
+        if effect != "fluid detection":
+            return {"ok": True, "interrupted_by_terminate": False, "channels": [{"channel": c, "completion": {"ok": True}} for c in channels]}
+        after_sends()
+        rows = [{"channel": c, "completion": {"ok": False, "outcome": "oem_error", "event_error_code": 38}} for c in channels]
+        return {"ok": False, "interrupted_by_terminate": False, "channels": rows}
+    def terminate():                                   # the search's own pump cleanup bumps the epoch
+        group._interrupt_epoch += 1
+        return {"ok": True, "interrupt_epoch": group._interrupt_epoch}
+    monkeypatch.setattr(group, "_run_group_liquid_operation", reject)
+    group.terminate = terminate
+    result = rig.run(_recipe())
+    assert result["ok"] is False and result["interrupted"] is False
+    assert "device error 38" in result["error"] and "interrupted" not in result["error"]
+    assert rig.z_stops and speeds[-1] == 0             # Z stopped, then back to the default max speed
+
+
+def test_operator_stop_during_search_is_still_an_interruption(monkeypatch):
+    rig = _Rig(monkeypatch, {0: 0.25})
+    group = rig.provider.primitives.pipette_transport
+    def stopped(effect, channels, send, *, timeout_ms, after_sends=None, **_):
+        if effect != "fluid detection":
+            return {"ok": True, "interrupted_by_terminate": False, "channels": [{"channel": c, "completion": {"ok": True}} for c in channels]}
+        after_sends()
+        group._interrupt_epoch += 1                    # external Stop
+        return {"ok": False, "interrupted_by_terminate": True, "channels": []}
+    monkeypatch.setattr(group, "_run_group_liquid_operation", stopped)
+    result = rig.run(_recipe())
+    assert result["ok"] is False and result["interrupted"] is True and rig.z_stops
+
+
+def test_failed_z_stop_is_reported_failed(monkeypatch):
+    rig = _Rig(monkeypatch, {0: 0.25})
+    group = rig.provider.primitives.pipette_transport
+    rig.provider.primitives.z_stop = lambda: {"ok": False}
+    def stopped(effect, channels, send, *, timeout_ms, after_sends=None, **_):
+        if effect != "fluid detection":
+            return {"ok": True, "interrupted_by_terminate": False, "channels": [{"channel": c, "completion": {"ok": True}} for c in channels]}
+        after_sends()
+        group._interrupt_epoch += 1
+        return {"ok": False, "interrupted_by_terminate": True, "channels": []}
+    monkeypatch.setattr(group, "_run_group_liquid_operation", stopped)
+    result = rig.run(_recipe())
+    stops = [e for e in result["events"] if e["operation"].startswith("liquid_search_z_stop")]
+    assert stops and all(e["status"] == "failed" for e in stops)

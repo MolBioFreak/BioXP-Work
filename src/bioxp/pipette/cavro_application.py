@@ -587,6 +587,10 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
         return {**result, "issues": plan["issues"]}
     group = provider.primitives.pipette_transport
     epoch = group._interrupt_epoch
+    # Pump cleanup after a failed detection bumps the same epoch an operator Stop does.
+    # Only that cleanup's own bump is accepted; any other bump is still an interruption.
+    accepted = {"epoch": epoch}
+    z_speed_changed = []
     events = result["events"]
     detections = {}
     last_rack = None
@@ -595,7 +599,7 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
 
     def fence(identity):
         provider._wp8_execution_fence_checker(command_id, boundary=identity)
-        if epoch != group._interrupt_epoch or group._forceabort():
+        if accepted["epoch"] != group._interrupt_epoch or group._forceabort():
             raise PipetteCommandError("Cavro application interrupted; no replay")
 
     def record(name, call, *, inputs, pipette=False):
@@ -628,6 +632,15 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                 getattr(exc, "detail", getattr(exc, "pipette_partial_result", None))))
             raise
 
+    def cleanup_terminate(t, label):
+        fence(f"{owner_identity['source_identity']}:{label}:terminate")
+        before = group._interrupt_epoch
+        termination = t.terminate()
+        own = termination.get("interrupt_epoch") if isinstance(termination, dict) else None
+        if own == before + 1 == group._interrupt_epoch:
+            accepted["epoch"] = own
+        return termination
+
     def trajectory_evidence(body, targets, transform=None, channels=()):
         if request.get("shared_head") is not None:
             try:
@@ -651,6 +664,7 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
         return {**geometry, "target_steps": geometry["target_steps"] + steps, "tip_z_offset_steps": steps}
 
     def z_move(target, speed):
+        z_speed_changed.append(speed)
         record("z_speed", lambda: provider.primitives.z_set_max_speed(speed), inputs={"speed_native": speed})
         head_targets.pop("z", None)
         body = record("z_move", lambda: trajectory_evidence(provider.moveZ(target),
@@ -695,25 +709,27 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                               after_sends=start_z, effect="fluid detection")
             if body.get("ok") is False and not body.get("interrupted_by_terminate"):
                 try:
-                    fence(f"{owner_identity['source_identity']}:liquid_search:terminate")
-                    body["source_timeout_termination"] = t.terminate()
+                    body["source_timeout_termination"] = cleanup_terminate(t, "liquid_search")
                 except Exception as exc:
                     body["source_timeout_termination"] = {"error": str(exc), "exception_type": type(exc).__name__}
             # A channel without contact is a per-channel result, not a failed search.
             return {"ok": True, "search_complete": body.get("ok") is True, "detection": body}
         try:
             detected = record("liquid_search", detect, inputs=op, pipette=True)
+            stopped = detected.get("z_stopped_at") or {"monotonic": time.monotonic(), "wall": time.time()}
+            record("liquid_search_z_stop", lambda: provider.primitives.z_stop(), inputs={})
         except BaseException:
-            # Z was started by the search; a failed or interrupted search must never leave it descending.
-            if clocks:
+            # Once Z has started, any failure before the normal stop completes still stops Z.
+            # The original error is re-raised; the stop is reported as it actually returned.
+            if clocks and not any(e.get("operation") == "liquid_search_z_stop" and e.get("status") == "completed"
+                                  for e in events):
                 try:
-                    events.append({"operation": "liquid_search_z_stop_after_failure", "status": "completed",
-                                   "result": provider.primitives.z_stop()})
+                    body = provider.primitives.z_stop()
+                    events.append({"operation": "liquid_search_z_stop_after_failure", "result": body,
+                                   "status": "completed" if isinstance(body, dict) and body.get("ok") is True else "failed"})
                 except Exception as exc:
                     events.append({"operation": "liquid_search_z_stop_after_failure", "status": "failed", "error": str(exc)})
             raise
-        stopped = detected.get("z_stopped_at") or {"monotonic": time.monotonic(), "wall": time.time()}
-        record("liquid_search_z_stop", lambda: provider.primitives.z_stop(), inputs={})
         final = provider.primitives._read_axis_position("z")
         head_targets["z"] = final
         channels = {}
@@ -732,7 +748,9 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                 if contact is None:
                     contact, method = final, "z_at_stop"  # contact time not on the descent clock
             channels[str(row_["channel"])] = {"found": found, "contact_steps": contact, "method": method,
-                "fluid_timestamp": stamp, "height_above_floor_mm": height_above_floor_mm(contact, floor)}
+                "fluid_timestamp": stamp, "height_above_floor_mm": height_above_floor_mm(contact, floor),
+                "outcome": completion.get("outcome"), "device_error": completion.get("event_error_code")
+                if completion.get("event_error_code") not in (None, 0, 0x20) else None}
         for channel in op["channels"]:
             channels.setdefault(str(channel), {"found": False, "contact_steps": None, "method": "no_report"})
         search = {"location_id": op["location_id"], "start_steps": start, "floor_steps": floor,
@@ -755,7 +773,10 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
         missing = missing_channels(search, op.get("expected_channels") or [])
         if missing:
             result["missing_liquid_channels"] = missing
-            raise PipetteCommandError(f"No liquid found by channel(s) {missing} at location {op['location_id']}; "
+            reasons = {c: (f"device error {channels[str(c)]['device_error']}" if channels[str(c)].get("device_error")
+                           else channels[str(c)].get("outcome") or "no contact") for c in missing}
+            raise PipetteCommandError(f"No liquid found by channel(s) {missing} at location {op['location_id']} "
+                                      f"({', '.join(f'{c}: {r}' for c, r in reasons.items())}); "
                                       "nothing was aspirated there", details={"liquid_search": search})
         response = (op.get("volume_check") or {}).get("response", "pause")
         if mismatched:
@@ -783,6 +804,7 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                 if follow_to == target:
                     return None
                 head_targets.pop("z", None)
+                z_speed_changed.append(op["follow_speed_native"])
                 record("z_speed", lambda: provider.primitives.z_set_max_speed(op["follow_speed_native"]),
                        inputs={"speed_native": op["follow_speed_native"]})
                 state = provider._offset_deck_semantic_state(gripper_confirmed=False, pseudo_home_only=True)
@@ -895,8 +917,7 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                         # pumps, not Z. No finally lift/home/Stop is in source.
                         # Existing Stop/owner fences remain authoritative.
                         try:
-                            fence(f"{owner_identity['source_identity']}:plld:terminate")
-                            body["source_timeout_termination"] = t.terminate()
+                            body["source_timeout_termination"] = cleanup_terminate(t, "plld")
                         except Exception as exc:
                             body["source_timeout_termination"] = {"error": str(exc),
                                 "exception_type": type(exc).__name__}
@@ -935,6 +956,7 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                     footprints(tracking, op["trajectory"], op["channels"])
                     tracking["shared_head"] = shared_head_evidence(request.get("shared_head"), op["channels"])
                     record("tracking_reference", lambda: {"ok": True, **tracking}, inputs=op)
+                    z_speed_changed.append(tracking["speed_native"])
                     record("z_speed", lambda: provider.primitives.z_set_max_speed(tracking["speed_native"]),
                            inputs={"speed_native": tracking["speed_native"]})
                 def start_tracking():
@@ -974,10 +996,20 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                    or result.get("liquid_mismatch_response") == "pause"
                    else "stop" if result.get("liquid_mismatch_response") == "fail" else request.get("event_policy", "stop"))
         result.update(error=str(exc), exception_type=type(exc).__name__,
-                      interrupted=epoch != group._interrupt_epoch,
+                      interrupted=accepted["epoch"] != group._interrupt_epoch or group._forceabort(),
                       event_policy=request.get("event_policy", "stop"),
                       requested_control=control,
                       partial_effects=True)
+    if z_speed_changed:
+        # OEM scripts return Z to its default max speed (1791) after slow moves; a later
+        # home or move otherwise runs at the last search/follow speed.
+        try:
+            body = provider.primitives.z_set_max_speed(0)
+            events.append({"operation": "z_speed_restore", "origin": "robot_orchestration", "result": body,
+                           "status": "completed" if isinstance(body, dict) and body.get("ok") is True else "failed"})
+        except Exception as exc:
+            events.append({"operation": "z_speed_restore", "origin": "robot_orchestration", "status": "failed",
+                           "error": str(exc)})
     if request.get("accounting_context") is not None:
         from .effect_accounting import application_accounting
         try:
