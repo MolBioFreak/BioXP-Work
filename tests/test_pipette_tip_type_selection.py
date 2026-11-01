@@ -92,3 +92,17 @@ def test_tip_type_receipt_is_completed_not_failed(tmp_path, monkeypatch):
         assert row["status"] == "completed"
     finally:
         client.close()
+    # A finished completion-wait pump command is terminal even when completion
+    # attribution stayed unverified (it used to be left 'acknowledged' forever).
+    acked = {"controller_acknowledged": True, "delivery_verified": True, "completion_verified": False}
+    for ok, status in ((True, "completed"), (False, "failed")):
+        store.record(operation="device_command", requested_inputs={"command": "lld_parameter"},
+                     result={**acked, "ok": ok, "wait_mode": "completion",
+                             "channels": [{"channel": c, "completion": {"ok": ok}} for c in range(4)]})
+        row = store.connection.execute(
+            "SELECT status FROM pipette_operations ORDER BY rowid DESC LIMIT 1").fetchone()
+        assert row["status"] == status
+    store.record(operation="device_command", requested_inputs={"command": "lld_parameter"},
+                 result={**acked, "ok": True, "wait_mode": "ack", "channels": [{"channel": 0}]})
+    assert store.connection.execute(
+        "SELECT status FROM pipette_operations ORDER BY rowid DESC LIMIT 1").fetchone()["status"] == "acknowledged"

@@ -36,6 +36,19 @@ def _host_state_success(result: Mapping[str, Any]) -> bool:
     return (result.get("ok") is True and result.get("outcome") == "host_state_only"
             and result.get("hardware_commanded") is False)
 
+def _completion_wait_returned(result: Mapping[str, Any]) -> bool:
+    """A completion-wait command whose every channel reported back: the call is over.
+
+    Completion attribution can stay unverified (shared device buffer), but the
+    record must still be terminal; 'acknowledged' would leave it open forever.
+    """
+    channels = result.get("channels")
+    return (result.get("wait_mode") == "completion" and isinstance(channels, list) and bool(channels)
+            and result.get("interrupted_by_terminate") is not True
+            and all(isinstance(row, Mapping) and isinstance((row.get("completion") or {}).get("ok"), bool)
+                    for row in channels))
+
+
 class PipetteReceiptError(RuntimeError):
     """A pipette operation cannot be durably represented."""
 
@@ -552,6 +565,7 @@ class PipetteReceiptStore:
                 and not any(value for key, value in receipt["truth"].items()
                             if key != "physical_effect_claim_suppressed")
             )
+            returned = _completion_wait_returned(result)
             target_status = (
                 "observed"
                 if (
@@ -562,6 +576,9 @@ class PipetteReceiptStore:
                 if receipt["truth"]["completion_verified"] or empty_pressure_return or _host_state_success(result) or (
                     result.get("kind") == "scientific_pressure_capture" and
                     result.get("ok") is True and result.get("source_return_completed") is True)
+                or (returned and result.get("ok") is True)
+                else "failed"
+                if returned
                 else "acknowledged"
                 if receipt["truth"]["controller_acknowledged"]
                 else "dispatched"
