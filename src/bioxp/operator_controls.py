@@ -1628,6 +1628,16 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
     z_authority_value = provider_state.get("z_authority") if isinstance(provider_state, Mapping) else None
     z_authority: Mapping[str, Any] = z_authority_value if isinstance(z_authority_value, Mapping) else {}
     terminal_state = z_authority.get("terminal_state") if isinstance(z_authority.get("terminal_state"), Mapping) else {}
+    axes_observed = (domains.get("axes") or {}).get("observed_unix") if isinstance(domains.get("axes"), Mapping) else None
+    terminal_observed = terminal_state.get("observed_at")
+    if (z_axis is not None and type(terminal_state.get("position_steps")) is int
+            and type(terminal_observed) in (int, float)
+            and (type(axes_observed) not in (int, float) or terminal_observed > axes_observed)):
+        # The provider's terminal read is newer than the cached snapshot row: show the newer one.
+        axes.remove(z_axis)
+        z_axis = None
+    if z_axis is not None:
+        z_axis["observed_at"] = axes_observed if type(axes_observed) in (int, float) else None
     if z_axis is None and (
         type(terminal_state.get("position_steps")) is int
         or type(terminal_state.get("speed_steps_s")) is int
@@ -1653,6 +1663,7 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
             "motor_temperature_c": None,
             "motor_temperature_available": False,
             "telemetry_authority": terminal_state.get("authority"),
+            "observed_at": terminal_observed if type(terminal_observed) in (int, float) else None,
         }
         axes.append(z_axis)
     provider_z_available = bool(

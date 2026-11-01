@@ -300,3 +300,16 @@ def test_failed_z_stop_is_reported_failed(monkeypatch):
     result = rig.run(_recipe())
     stops = [e for e in result["events"] if e["operation"].startswith("liquid_search_z_stop")]
     assert stops and all(e["status"] == "failed" for e in stops)
+
+
+def test_dashboard_z_shows_the_newest_reading():
+    from bioxp.operator_controls import _dashboard_payload
+    def state(axes_at, terminal_at):
+        return {"domains": {"axes": {"observed_unix": axes_at, "observation": {"rows": {"z": {
+                    "status": {"position": {"value": 0}}}}}}},
+                "serial206_initialization_provider": {"bound": True, "z_authority": {"state": "referenced_ready",
+                    "terminal_state": {"position_steps": 3083, "speed_steps_s": 0, "observed_at": terminal_at}}}}
+    newer_terminal = _dashboard_payload(state(100.0, 200.0))["z_axis"]["status"]
+    assert newer_terminal["position_steps"] == 3083 and newer_terminal["observed_at"] == 200.0
+    newer_snapshot = _dashboard_payload(state(300.0, 200.0))["z_axis"]["status"]
+    assert newer_snapshot["position_steps"] == 0 and newer_snapshot["observed_at"] == 300.0
