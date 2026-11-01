@@ -6618,15 +6618,16 @@ class OperatorCommandPlane:
                         hardware_postcondition_verified=bool(response.get("hardware_postcondition_verified")),
                         provider_results=failure.provider_results if failure is not None else None,
                     )
+                unknown = delivery_attempted and not getattr(failure, "known_failure", False)
                 self.store.finish(
                     command_id,
-                    status="ambiguous" if delivery_attempted else "failed",
+                    status="ambiguous" if unknown else "failed",
                     payload={
                         "error": f"wp8_operation_exception:{type(exc).__name__}",
                         "detail": str(exc)[:500],
                         "delivery_attempted": delivery_attempted,
                         "response": _bounded_json(response, 131072),
-                        **({"outcome_unknown": True} if delivery_attempted else {}),
+                        **({"outcome_unknown": True} if unknown else {}),
                     },
                     controller_acknowledged=bool(response.get("controller_command_acknowledged")),
                     claimed=claimed,
@@ -6788,14 +6789,15 @@ class OperatorCommandPlane:
                             hardware_postcondition_verified=bool(exc.hardware_postcondition_verified),
                             provider_results=exc.provider_results,
                         )
+                unknown = delivery_attempted and not exc.known_failure
                 self.store.finish(
                     command_id,
-                    status="ambiguous" if delivery_attempted else "failed",
+                    status="ambiguous" if unknown else "failed",
                     payload={
                         "error": f"deck_executor_exception:{type(exc).__name__}",
                         "detail": str(exc)[:500],
                         "delivery_attempted": delivery_attempted,
-                        **({"outcome_unknown": True} if delivery_attempted else {}),
+                        **({"outcome_unknown": True} if unknown else {}),
                     },
                     controller_acknowledged=controller_acknowledged,
                     claimed=claimed,

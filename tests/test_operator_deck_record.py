@@ -143,3 +143,9 @@ def test_cavro_failure_with_every_step_recorded_is_failed_not_ambiguous():
     assert not _known_cavro_failure({'kind': 'cavro_application', 'ok': False, 'events': [{'status': 'in_flight'}]})
     assert not _known_cavro_failure({'kind': 'cavro_application', 'ok': False, 'events': []})
     assert not _known_cavro_failure({'kind': 'other', 'ok': False, 'events': done})
+
+
+def test_known_failure_travels_on_the_deck_exception():
+    from bioxp.oem_deck_movement import DeckExecutionFailure
+    assert DeckExecutionFailure('x', delivery_attempted=True, known_failure=True).known_failure is True
+    assert DeckExecutionFailure('x', delivery_attempted=True).known_failure is False

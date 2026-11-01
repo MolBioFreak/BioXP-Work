@@ -448,9 +448,12 @@ class DeckExecutionFailure(RuntimeError):
         controller_completion_verified: bool = False,
         hardware_postcondition_verified: bool = False,
         provider_results: list[Mapping[str, Any]] | None = None,
+        known_failure: bool = False,
     ) -> None:
         super().__init__(message)
         self.delivery_attempted = bool(delivery_attempted)
+        # Every step's outcome is recorded: a failure, not an unknown outcome.
+        self.known_failure = bool(known_failure)
         self.controller_command_acknowledged = bool(controller_command_acknowledged)
         self.controller_completion_verified = bool(controller_completion_verified)
         self.hardware_postcondition_verified = bool(hardware_postcondition_verified)
@@ -969,7 +972,8 @@ def execute_mov_execution(command_id: str, plan: MovExecutionPlan, *, provider: 
                     if callable(assert_current):
                         assert_current(command_id, boundary=f"before_terminalize:{step.order}:{step.operation}")
                     terminalize(
-                        command_id, step, state="ambiguous" if delivery_attempted else "failed",
+                        command_id, step,
+                        state="ambiguous" if delivery_attempted and not getattr(exc, "known_failure", False) else "failed",
                         reason=f"provider_stage_exception:{type(exc).__name__}",
                         result={"ok": False, "exception_type": type(exc).__name__, "exception": str(exc),
                                 "provider_results": getattr(exc, "provider_results", None)},
@@ -1932,9 +1936,10 @@ def make_wp8_operation_executor(
                     command_store.assert_deck_execution_current(
                         command_id, boundary=f"before_terminalize_wp8_child_{order}",
                     )
+                    known = _known_cavro_failure(result)
                     command_store.terminalize_wp8_child(
                         command_id, order,
-                        state="ambiguous" if child_delivery_attempted else "failed",
+                        state="ambiguous" if child_delivery_attempted and not known else "failed",
                         result=result,
                         dispatch_attempt_id=child_dispatch_attempt_id,
                     )
@@ -1942,6 +1947,7 @@ def make_wp8_operation_executor(
                         f"wp8 child failed: {child['operation']}",
                         delivery_attempted=child_delivery_attempted,
                         provider_results=[dict(result)],
+                        known_failure=known,
                     )
                 if not bool(child.get("awaited", True)):
                     if (
@@ -2032,7 +2038,7 @@ def make_wp8_operation_executor(
                     "ok": False, "exception_suppressed": False,
                     "exception_type": type(exc).__name__, "exception": str(exc),
                     "delivery_attempted": delivery_attempted,
-                    "outcome_unknown": delivery_attempted,
+                    "outcome_unknown": delivery_attempted and not getattr(exc, "known_failure", False),
                     "background_pending": any(not bool(row.get("awaited", True)) for row in plan.get("children", [])),
                 }
                 finalize = getattr(command_store, "finalize_wp8_operation", None)
