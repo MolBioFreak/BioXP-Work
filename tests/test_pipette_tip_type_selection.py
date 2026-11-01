@@ -18,6 +18,8 @@ def test_typed_tip_selection_uses_existing_software_owner(monkeypatch):
     monkeypatch.setattr(api, "_get_pipette_transport", lambda: transport)
     monkeypatch.setattr(api, "_pipette_receipts", None)
     monkeypatch.setattr(api, "_get_tester", lambda: pytest.fail("hardware must not be acquired"))
+    # Fake channels have no status payload; project only the software tip type.
+    monkeypatch.setattr(transport, "get_status", lambda: {"tip_type": transport._tip_type, "live_query_performed": False})
 
     async def inline(label, call, *, timeout_s):
         return call()
@@ -30,7 +32,7 @@ def test_typed_tip_selection_uses_existing_software_owner(monkeypatch):
             assert client.post(PATH, json=invalid,
                 headers={"Idempotency-Key": f"invalid-tip-type-{index}"}).status_code == 422
         assert transport._tip_type == 201
-        for kind in (50, 200, 201):
+        for kind in (10, 50, 200, 201):
             response = client.post(PATH, json={"tip_type": kind},
                                    headers={"Idempotency-Key": f"tip-type-{kind}"})
             assert response.status_code == 200, response.text
@@ -41,6 +43,8 @@ def test_typed_tip_selection_uses_existing_software_owner(monkeypatch):
             assert body["hardware_commanded"] is False
             assert body["physical_effect_verified"] is False
             assert transport._tip_type == kind
+            # Status projection follows the selection without a separate collect.
+            assert api.hardware_state.project("pipette")["domains"]["pipette"]["observation"]["tip_type"] == kind
     finally:
         client.close()
 

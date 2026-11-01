@@ -1432,7 +1432,7 @@ class _OemPipetteBody:
         args = self.action.params["arguments"]
         self.model.allow_to_stop = False
         self.pressure_base()
-        tip_types = {"T50": 50, "T200": 200, "UNKNOWN": 201}
+        tip_types = {"T10": 10, "T50": 50, "T200": 200, "UNKNOWN": 201}
         tip_type = tip_types[args[0]] if args[0] in tip_types else int(args[0])
         force = len(args) > 1 and args[1] in ("T", "True")
         pipette = int(args[2]) if len(args) > 2 else -1

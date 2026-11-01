@@ -9527,7 +9527,7 @@ async def liquid_tip(req: PipetteTipRequest):
 
 @app.post("/liquid/pipette/tip-type")
 async def liquid_pipette_tip_type(req: PipetteTipTypeRequest):
-    return await run_pipette_operation(
+    result = await run_pipette_operation(
         "select_tip_type",
         lambda transport: transport.loadTip(req.tip_type),
         get_transport=_get_pipette_transport,
@@ -9536,6 +9536,12 @@ async def liquid_pipette_tip_type(req: PipetteTipTypeRequest):
         receipt_store=_pipette_receipts,
         requested_inputs={"tip_type": req.tip_type},
     )
+    # Republish the cache-only pipette projection so status shows the new type.
+    try:
+        hardware_state.collect(["pipette"], {"pipette": lambda _: _get_pipette_transport().get_status()})
+    except Exception as exc:  # status refresh only; the selection already applied
+        result = {**result, "status_refresh_error": str(exc)[:300]}
+    return result
 
 @app.post("/liquid/eject-all")
 async def liquid_eject_all(req: PipetteEjectAllRequest):

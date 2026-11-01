@@ -11197,6 +11197,21 @@ class Serial206OemInitializationProvider:
             )
         return {"ok": True, "psudo_z_home_steps": pseudo_home, "source_anchor": "DefaultParameters.GantryLoad:61-79"}
 
+    def record_tip_tray_type(self, *, tray_id: int, tip_type: int) -> dict[str, Any]:
+        """Operator record: ClassTipTray.tipType setter only. No motion, no I/O."""
+        names = {10: "T10", 50: "T50", 200: "T200"}
+        if type(tray_id) is not int or tray_id not in range(5) or tip_type not in names:
+            raise ValueError("tip tray type record needs tray 0-4 and tip type 10, 50 or 200")
+        with self._lock:
+            state = self._load_state()
+            trays = (state.get("machine_status") or {}).get("constructed_tip_trays")
+            if not isinstance(trays, list) or len(trays) != 5:
+                raise RuntimeError("tip tray constructor is unavailable")
+            before = trays[tray_id].get("tip_type")
+            trays[tray_id]["tip_type"] = names[tip_type]
+            self._save_state(state)
+        return {"tray": tray_id + 1, "tip_type": names[tip_type], "before": before}
+
     def record_movable_object_locations(
         self, *, locations: Mapping[str, str], source_command_id: str,
     ) -> dict[str, Any]:
@@ -12481,7 +12496,7 @@ class Serial206OemInitializationProvider:
                 raise RuntimeError("source_authority_missing:loadTips:tip_tray")
             state = reader(index)
             occupancy = state["occupancy"]
-            tip_type = {"T50": 50, "T200": 200, "T201": 201}[constructed["tip_type"]]
+            tip_type = {"T10": 10, "T50": 50, "T200": 200, "T201": 201}[constructed["tip_type"]]
             return {"tip_type": tip_type,
                     "tip_available": state["tip_available"], "location": constructed["location"],
                     "next_group": next((group for group in range(24)

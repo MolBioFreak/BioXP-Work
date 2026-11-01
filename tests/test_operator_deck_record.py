@@ -79,6 +79,23 @@ def test_tip_tray_records_full_empty_and_partial(client):
     assert frames == []
 
 
+def test_tip_tray_type_record_is_read_back_and_used_by_pickup(client):
+    http, provider, store, frames = client
+    frames.clear()
+    response = http.post('/operator/deck/record', json=body('rec-type-0001', tip_trays=[
+        {'tray': 1, 'tip_type': 10}, {'tray': 2, 'tip_type': 10, 'tips': 'full'}]))
+    assert response.status_code == 200, response.text
+    assert [row['tip_type'] for row in response.json()['tip_types']] == ['T10', 'T10']
+    trays = {row['tray']: row for row in http.get('/operator/tip-trays').json()['trays']}
+    assert trays[1]['tip_type'] == 'T10' and trays[2]['tip_type'] == 'T10' and trays[3]['tip_type'] == 'T50'
+    assert provider._read_constructed_tip_tray(0)['tip_type'] == 'T10'
+    assert frames == []
+    assert http.post('/operator/deck/record', json=body('rec-type-0002',
+        tip_trays=[{'tray': 1, 'tip_type': 20}])).status_code == 422
+    assert http.post('/operator/deck/record', json=body('rec-type-0003',
+        tip_trays=[{'tray': 1}])).status_code == 422
+
+
 def test_gantry_record_clears_stuck_cover_without_motion(client):
     http, provider, store, frames = client
     provider.gantry_load(tip_loaded=False, plate_on_gantry='OUTPUT_COVER')

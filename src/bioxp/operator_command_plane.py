@@ -821,7 +821,9 @@ class DeckRecordTipTray(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     # OEM tray numbers as used by load_tip: 1-4 TECANRACK1-4, 5 tip hotel.
     tray: StrictInt = Field(ge=1, le=5)
-    tips: Literal["full", "empty"] | list[str]
+    tips: Literal["full", "empty"] | list[str] | None = None
+    # ClassTipTray.tipType: which tips the rack holds (10, 50 or 200 uL).
+    tip_type: Literal[10, 50, 200] | None = None
 
 
 class DeckRecordRequest(BaseModel):
@@ -7048,7 +7050,10 @@ class OperatorCommandPlane:
                         rows.append({"tray": tray_id + 1, "tray_id": tray_id, "unavailable": str(exc)})
                         continue
                     occupancy = row.get("occupancy")
-                    rows.append({"tray": tray_id + 1, **row,
+                    reader = getattr(self.store, "_tip_tray_constructor_reader", None)
+                    constructor = reader(tray_id) if callable(reader) else None
+                    tip_type = constructor.get("tip_type") if isinstance(constructor, Mapping) else None
+                    rows.append({"tray": tray_id + 1, **row, "tip_type": tip_type,
                                  "tips_present": sum(1 for tip in occupancy if tip) if isinstance(occupancy, list) else None,
                                  "four_channel_groups_available": row.get("available_count")})
                 return rows
@@ -7077,7 +7082,8 @@ class OperatorCommandPlane:
             provider = self._current_deck_provider()
             recorder = getattr(provider, "record_movable_object_locations", None)
             tray_publisher = getattr(provider, "publish_tip_tray_transition", None)
-            if not callable(recorder) or not callable(tray_publisher):
+            type_recorder = getattr(provider, "record_tip_tray_type", None)
+            if not callable(recorder) or not callable(tray_publisher) or not callable(type_recorder):
                 raise HTTPException(status_code=503, detail={"error": "deck_record_owner_unavailable"})
             objects = payload["movable_objects"] or {}
             if objects:
@@ -7087,8 +7093,15 @@ class OperatorCommandPlane:
                     raise HTTPException(status_code=422, detail={"error": "deck_record_invalid_objects",
                         "reason": str(exc), "valid_objects": sorted(OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS)}) from exc
             trays = []
+            tray_types = []
             for row in payload["tip_trays"] or []:
                 tips = row["tips"]
+                if tips is None and row["tip_type"] is None:
+                    raise HTTPException(status_code=422, detail={"error": "deck_record_tray_empty", "tray": row["tray"]})
+                if row["tip_type"] is not None:
+                    tray_types.append((row["tray"], row["tip_type"]))
+                if tips is None:
+                    continue
                 if isinstance(tips, list):
                     present = set()
                     for well in tips:
@@ -7142,6 +7155,8 @@ class OperatorCommandPlane:
                                 operation_id=base + ":missing", command_id=base, provenance=provenance,
                                 well_ids=tips)
                     result["tip_trays"].append({"tray": tray, **dict(published)})
+                result["tip_types"] = [type_recorder(tray_id=tray - 1, tip_type=tip_type)
+                                       for tray, tip_type in tray_types]
                 return result
 
             try:
