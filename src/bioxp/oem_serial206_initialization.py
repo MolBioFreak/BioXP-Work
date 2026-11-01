@@ -12718,6 +12718,22 @@ class Serial206OemInitializationProvider:
         return run_diagnostic_inline(self, arguments["diagnostic"], command_id=command_id,
                                      owner_identity=owner_identity)
 
+    def _manual_pickup_bookkeeping(self, arguments, finite, pipette) -> dict[str, Any]:
+        """After a completed manual pickup: take those four tips off the rack record
+        and set the software tip type to the rack's recorded size."""
+        from .oem_compat.position_table import tip_group_well_ids
+        tray_id = int(arguments["tray"]) - 1
+        well = str(arguments["well"]).upper()
+        group = (int(well[1:]) - 1) * 2 + (well[0] == "B")
+        removed = finite("pipette_tip_transition", {"tray_id": tray_id,
+            "well_ids": list(tip_group_well_ids(group)), "transition": "remove"})
+        out: dict[str, Any] = {"rack_tips_removed": list(tip_group_well_ids(group)), "rack_record": removed}
+        size = self.tip_tray_type(tray_id)
+        if size in {"T10", "T50", "T200"}:
+            value = {"T10": 10, "T50": 50, "T200": 200}[size]
+            out["tip_type_set"] = pipette("load_tip_metadata", lambda transport: transport.loadTip(value, -1))
+        return out
+
     def wp8_manual_pipette_physical(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
         child_order: int, plan_digest: str, owner_identity: Mapping[str, Any], **_: Any,
@@ -12766,6 +12782,8 @@ class Serial206OemInitializationProvider:
             result = (manual_load_tip(ManualTipLoadRequest(**arguments), bindings)
                       if operation == "sourceManualLoadTip" else
                       measure_fluid_height(FluidHeightRequest(**arguments), bindings))
+            if operation == "sourceManualLoadTip":
+                result = {**result, **self._manual_pickup_bookkeeping(arguments, finite, pipette)}
         except CalibrationExecutionError as exc:
             # Return partial source receipts for canonical terminalization, not
             # an exception string that loses already-completed physical children.

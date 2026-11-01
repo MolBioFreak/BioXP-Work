@@ -149,3 +149,21 @@ def test_known_failure_travels_on_the_deck_exception():
     from bioxp.oem_deck_movement import DeckExecutionFailure
     assert DeckExecutionFailure('x', delivery_attempted=True, known_failure=True).known_failure is True
     assert DeckExecutionFailure('x', delivery_attempted=True).known_failure is False
+
+
+def test_manual_pickup_removes_rack_tips_and_sets_tip_type_from_rack_size():
+    from types import SimpleNamespace
+    from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider as P
+    calls = []
+    fake = SimpleNamespace(tip_tray_type=lambda tray: 'T10')
+    transport = SimpleNamespace(loadTip=lambda value, location: calls.append(('type', value, location)) or {'ok': True})
+    out = P._manual_pickup_bookkeeping(fake, {'tray': 1, 'well': 'A2'},
+        lambda name, inputs: calls.append((name, inputs)) or {'ok': True},
+        lambda name, call: call(transport))
+    assert calls[0] == ('pipette_tip_transition', {'tray_id': 0, 'well_ids': [1, 25, 49, 73], 'transition': 'remove'})
+    assert calls[1] == ('type', 10, -1)
+    assert out['rack_tips_removed'] == [1, 25, 49, 73]
+    calls.clear()
+    P._manual_pickup_bookkeeping(SimpleNamespace(tip_tray_type=lambda tray: None), {'tray': 3, 'well': 'B1'},
+        lambda name, inputs: calls.append((name, inputs)) or {'ok': True}, lambda name, call: call(transport))
+    assert calls == [('pipette_tip_transition', {'tray_id': 2, 'well_ids': [12, 36, 60, 84], 'transition': 'remove'})]
