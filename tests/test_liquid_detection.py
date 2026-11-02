@@ -348,3 +348,13 @@ def test_contact_uses_search_speed_when_z_waited_at_the_floor():
     assert method == "search_speed_estimate" and contact == round(5.0 * 300 * Z_STEPS_PER_S_PER_NATIVE)
     assert contact_from_timestamps(start_steps=0, stop_steps=58000, started_at=0, stopped_at=16,
                                    stamp=15.0, floor_steps=58000, speed_native=300)[0] == 58000
+
+
+def test_recipe_passes_plate_type_to_the_search():
+    recipe = _recipe(mode="by_level")
+    recipe["liquid_detection"]["plate_type"] = "ONT barcode 96"
+    ops = compile_liquid_recipe(recipe)["application"]["operations"]
+    search = next(o for o in ops if o["operation"] == "liquid_search")
+    assert search["plate_type"] == "ONT barcode 96"
+    assert "plate_type" not in next(o for o in compile_liquid_recipe(_recipe(mode="by_level"))["application"]["operations"]
+                                    if o["operation"] == "liquid_search")

@@ -102,6 +102,8 @@ class LiquidDetection(_Input):
     search_timeout_ms: int = Field(default=15000, gt=0)   # OEM detectFluidLevel wait
     detection_id: str = Field(default="source", min_length=1)
     sensing: Literal["pressure", "capacitive", "hybrid"] = "pressure"  # capacitive/hybrid need an external cLLD board
+    # Source plate type (BMS labware profile name), so a saved plate-type depth offset applies.
+    plate_type: str | None = Field(default=None, max_length=80)
 
 
 class Recipe(_Input):
@@ -232,6 +234,7 @@ def compile_liquid_recipe(request: dict[str, Any]) -> dict[str, Any]:
                 **({"on_contact": on_contact} if d.mode == "on_contact" else {}),
                 **({"volume_check": d.volume_check} if d.volume_check else {}),
                 "location_id": d.location_id, "detection_id": d.detection_id, "start_mode": d.start_mode, "sensing": d.sensing,
+                **({"plate_type": d.plate_type} if d.plate_type else {}),
                 "floor_clearance_steps": d.floor_clearance_steps, "search_speed_native": d.search_speed_native,
                 **({"expected_channels": [c for c in r.channels if c in d.expected_channels]}
                    if d.expected_channels is not None else {"expected_channels": r.channels} if d.expected else {})})
