@@ -184,8 +184,8 @@ def test_partial_pickup_releases_unneeded_tips_after_short_lift_and_books_only_k
         lower_pipette=lambda loc, op: {'ok': True, 'target_position_steps': 150000},
         z_low=lambda loc: None, set_z_speed=None, detection_move=None, stop_z=None)
     out = manual_load_tip(ManualTipLoadRequest(tray=1, well='A2', keep_channels=(2, 0)), b)
-    assert ('pipette_move_z', {'value': 150000 - round(3.0 * 2015.748)}) in calls
-    assert ('eject', [1, 3]) in calls and calls.index(('pipette_move_z', {'value': 150000 - round(3.0 * 2015.748)})) < calls.index(('eject', [1, 3]))
+    assert ('pipette_move_z', {'value': 150000 - round(5.0 * 2015.748)}) in calls
+    assert ('eject', [1, 3]) in calls and calls.index(('pipette_move_z', {'value': 150000 - round(5.0 * 2015.748)})) < calls.index(('eject', [1, 3]))
     assert [c._tip_loaded for c in chans] == [True, False, True, False]
     assert out['kept_channels'] == [0, 2] and out['released_channels'] == [1, 3]
     books = []
