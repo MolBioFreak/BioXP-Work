@@ -11174,6 +11174,47 @@ class LldProfileSave(BaseModel):
     source: str | None = Field(default=None, max_length=300)
 
 
+class DepthOffsetSave(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    tip_type: Literal[10, 50, 200] | None = None
+    location: str | None = Field(default=None, max_length=40)
+    plate_type: str | None = Field(default=None, max_length=80)
+    offset_mm: float
+    source: str | None = Field(default=None, max_length=300)
+
+
+class DepthOffsetRemove(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    tip_type: Literal[10, 50, 200] | None = None
+    location: str | None = Field(default=None, max_length=40)
+    plate_type: str | None = Field(default=None, max_length=80)
+
+
+@app.get("/liquid/pipette/depth-offsets")
+async def pipette_depth_offsets_read():
+    from .pipette.depth_offsets import table
+    return table()
+
+
+@app.put("/liquid/pipette/depth-offsets")
+async def pipette_depth_offsets_save(req: DepthOffsetSave):
+    """Record-only: the next lowering move or liquid search at a matching station uses it. No motion."""
+    from .pipette.depth_offsets import save
+    try:
+        return await run_in_threadpool(lambda: save(**req.model_dump()))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/liquid/pipette/depth-offsets/remove")
+async def pipette_depth_offsets_remove(req: DepthOffsetRemove):
+    from .pipette.depth_offsets import remove
+    try:
+        return await run_in_threadpool(lambda: remove(**req.model_dump()))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
+
+
 @app.get("/liquid/pipette/lld-profiles")
 async def pipette_lld_profiles_read():
     from .pipette.lld_profiles import profiles

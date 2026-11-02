@@ -325,3 +325,13 @@ def test_search_lifts_then_dispenses_all_before_any_aspirate(monkeypatch):
     assert ops.index("liquid_search_z_stop") < empty
     assert 60000 in rig.moves  # lifted back to the search start before emptying
     assert all(o != "aspirate" for o in ops[:empty])
+
+
+def test_search_floor_follows_a_saved_depth_offset(monkeypatch):
+    rig = _Rig(monkeypatch, {0: 0.25, 1: 0.25, 2: 0.75})
+    rig.provider.primitives._depth_offset = lambda name, plate=None: {"offset_steps": 4000, "offset_mm": 1.98}
+    result = rig.run(_recipe(mode="by_level"))
+    assert result["ok"] is True, result.get("error")
+    level = result["liquid_levels"][0]
+    assert level["start_steps"] == 60000 and level["floor_steps"] == 80000 - 2016 + 4000
+    assert level["depth_offset"]["offset_steps"] == 4000

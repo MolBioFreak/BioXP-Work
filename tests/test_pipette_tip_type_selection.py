@@ -131,6 +131,7 @@ def test_tip_rack_pickup_lowers_without_tip_length_offset(monkeypatch):
     fake = SimpleNamespace(pipette_transport=group, _z_profile=lambda: None,
         oem_move_axis_absolute=lambda axis, target, wait_for_stop: moves.append(target) or {"ok": True})
     fake._loaded_tip_z_offset = lambda: P._loaded_tip_z_offset(fake)
+    fake._depth_offset = lambda name, plate=None: {"offset_steps": 0}
     P.z_pipette_position(fake, location_id="TECANRACK1", operation="lower_pipette")
     P.z_pipette_position(fake, location_id="LOC_STRIP1", operation="lower_pipette")
     assert moves == [141531, 56000 + 45757]

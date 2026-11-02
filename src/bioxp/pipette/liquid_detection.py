@@ -11,7 +11,10 @@ from .tip_length import Z_STEPS_PER_MM
 
 
 def search_window(z_high: int, z_low: int, tip_offset_steps: int, floor_clearance_steps: int) -> tuple[int, int]:
-    """Start at the station's calibrated high; never search below its calibrated low."""
+    """Start at the station's calibrated high; the floor is its calibrated low less the clearance.
+
+    A negative clearance (a saved depth offset larger than the clearance) lets the floor go deeper.
+    """
     start = int(z_high) + int(tip_offset_steps)
     floor = int(z_low) + int(tip_offset_steps) - int(floor_clearance_steps)
     if floor <= start:

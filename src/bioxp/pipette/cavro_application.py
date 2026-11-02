@@ -129,6 +129,8 @@ class LiquidSearch(_Selected):
     detection_id: str = Field(default="last_detection", min_length=1)
     start_mode: Literal[0, 1] = 0
     floor_clearance_steps: int = Field(default=2016, ge=0)  # 1 mm above calibrated low
+    # Optional plate type, so a saved plate-type depth offset can apply (see depth_offsets).
+    plate_type: str | None = Field(default=None, max_length=80)
     search_speed_native: int = Field(default=300, gt=0)      # OEM btnDetectFluid speed
     z_motor_current: int = 25                                 # OEM Z_MOTOR_MAX_CURRENT_DOWN
     # ADP LLD mode (M 30053815-C U70/U71/U72). pLLD is onboard; cLLD/hybrid need an external cLLD board.
@@ -697,7 +699,11 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
             raise PipetteCommandError("liquid search needs calibrated high and low heights for this station")
         apply_lld_profile(op)
         offset = int(tip_offset()["offset_steps"])
-        start, floor = search_window(row.z_high, row.z_low, offset, op["floor_clearance_steps"])
+        reader = getattr(provider.primitives, "_depth_offset", None)
+        depth = reader(LOCATION_ID_TO_NAME[op["location_id"]], op.get("plate_type")) if callable(reader) else {"offset_steps": 0}
+        result.setdefault("depth_offsets", []).append(depth)
+        # The search may reach the saved extra depth; its start height stays the calibrated high.
+        start, floor = search_window(row.z_high, row.z_low, offset, op["floor_clearance_steps"] - int(depth["offset_steps"]))
         z_move(start, op["search_speed_native"])
         record("lld_sensing_mode", lambda t: _send_wire(t, op["channels"], op["wire_commands"][1]["ascii"], op["timeout_ms"]),
                inputs={"sensing": op.get("sensing"), "ascii": op["wire_commands"][1]["ascii"]}, pipette=True)
@@ -773,14 +779,14 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
         for channel in op["channels"]:
             channels.setdefault(str(channel), {"found": False, "contact_steps": None, "method": "no_report"})
         search = {"location_id": op["location_id"], "start_steps": start, "floor_steps": floor,
-                  "final_position_steps": final, "tip_z_offset_steps": offset, "channels": channels,
+                  "final_position_steps": final, "tip_z_offset_steps": offset, "depth_offset": depth, "channels": channels,
                   "estimate": "contact heights interpolated over a constant-speed descent"}
         if contact is not None:
             search["aspirated_on_contact"] = detected.get("aspirated_on_contact", {})
         mismatched = []
         if op.get("volume_check"):
             from .liquid_detection import volume_check
-            low = int(row.z_low) + offset
+            low = int(row.z_low) + offset + int(depth["offset_steps"])
             for key, value in channels.items():
                 value["volume_check"] = volume_check(contact_steps=value["contact_steps"], low_steps=low,
                                                      check=op["volume_check"], channel=int(key))

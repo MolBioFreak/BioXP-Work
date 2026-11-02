@@ -4070,6 +4070,13 @@ class Serial206ProductionPrimitiveAdapter:
             "failure": None if ok else "home_gz_controller_evidence_unverified",
         }
 
+    def _depth_offset(self, location_name: str, plate_type: str | None = None) -> dict[str, Any]:
+        """Saved extra depth for the loaded tip at this station (and plate type, when known)."""
+        from .pipette.depth_offsets import resolve
+        transport = getattr(self, "pipette_transport", None)
+        tip_type = getattr(transport, "_tip_type", None) if _transport_tip_loaded(transport) else None
+        return resolve(tip_type=tip_type, location=location_name, plate_type=plate_type)
+
     def _loaded_tip_z_offset(self) -> dict[str, Any]:
         from .pipette.tip_length import tip_z_offset
         transport = getattr(self, "pipette_transport", None)
@@ -4095,7 +4102,9 @@ class Serial206ProductionPrimitiveAdapter:
             if target_row.z_low is None:
                 return {"ok": False, "failure": "position_table_z_low_missing"}
             tip_offset = {"offset_steps": 0, "reason": "tip_rack"} if at_tip_rack else self._loaded_tip_z_offset()
-            target = int(target_row.z_low) + (4030 if bool(overpress) else 0) + int(tip_offset["offset_steps"])
+            depth = {"offset_steps": 0, "reason": "tip_rack"} if at_tip_rack else self._depth_offset(str(location_id))
+            target = (int(target_row.z_low) + (4030 if bool(overpress) else 0) + int(tip_offset["offset_steps"])
+                      + int(depth["offset_steps"]))
             source_anchor = "ClassControlInterface.cs:4401-4421"
         elif operation == "lift_pipette":
             if target_row.z_high is None:
@@ -4122,6 +4131,7 @@ class Serial206ProductionPrimitiveAdapter:
             "overpress": bool(overpress) if operation == "lower_pipette" else False,
             "target_position_steps": target,
             "tip_z_offset": tip_offset,
+            **({"depth_offset": depth} if operation == "lower_pipette" else {}),
             "position_table_source": table.source,
             "move": _json_safe(move),
             "controller_command_acknowledged": ok,
@@ -12921,8 +12931,13 @@ class Serial206OemInitializationProvider:
             loaded = _transport_tip_loaded(transport)
             tip_offset = tip_z_offset(loaded_type if loaded and isinstance(loaded_type, int) else None)
             target += int(tip_offset["offset_steps"])
+            depth = {"offset_steps": 0}
+            if operation == "sourceLowerTo":
+                from .pipette.depth_offsets import resolve
+                depth = resolve(tip_type=loaded_type if loaded else None, location=LOCATION_ID_TO_NAME[arguments["location"]])
+                target += int(depth["offset_steps"])
             return {**self.moveZ(target), "source_return": target if operation == "sourceLowerTo" else 0,
-                    "tip_z_offset": tip_offset}
+                    "tip_z_offset": tip_offset, "depth_offset": depth}
         if operation == "sourceMoveXY":
             # This finite source leaf is invoked by the OEM protocol motion
             # worker, not the manual STA button. Seal its MTA wait schedule.
