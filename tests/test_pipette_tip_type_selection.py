@@ -106,3 +106,14 @@ def test_tip_type_receipt_is_completed_not_failed(tmp_path, monkeypatch):
                  result={**acked, "ok": True, "wait_mode": "ack", "channels": [{"channel": 0}]})
     assert store.connection.execute(
         "SELECT status FROM pipette_operations ORDER BY rowid DESC LIMIT 1").fetchone()["status"] == "acknowledged"
+
+
+def test_tip_length_correction_sees_tips_on_the_four_channel_group():
+    from types import SimpleNamespace
+    from bioxp.oem_serial206_initialization import Serial206ProductionPrimitiveAdapter as P, _transport_tip_loaded
+    group = SimpleNamespace(_tip_type=10, _transports=[SimpleNamespace(_tip_loaded=True) for _ in range(4)])
+    assert _transport_tip_loaded(group) is True
+    fake = SimpleNamespace(pipette_transport=group)
+    assert P._loaded_tip_z_offset(fake)["offset_steps"] == 45757
+    group._transports = [SimpleNamespace(_tip_loaded=False) for _ in range(4)]
+    assert P._loaded_tip_z_offset(fake)["offset_steps"] == 0

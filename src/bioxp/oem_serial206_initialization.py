@@ -4075,7 +4075,7 @@ class Serial206ProductionPrimitiveAdapter:
         transport = getattr(self, "pipette_transport", None)
         tip_type = getattr(transport, "_tip_type", None)
         # No tip on the gun means no tip length to correct.
-        loaded = getattr(transport, "_tip_loaded", False) is True
+        loaded = _transport_tip_loaded(transport)
         return tip_z_offset(int(tip_type) if loaded and isinstance(tip_type, int) else None)
 
     def z_pipette_position(
@@ -4408,6 +4408,14 @@ def tip_tray_location(machine_status: Mapping[str, Any], index: int) -> int:
     if isinstance(trays, list) and len(trays) == len(TIP_TRAY_LOCATIONS):
         return int(trays[index]["location"])
     return TIP_TRAY_LOCATIONS[index]
+
+def _transport_tip_loaded(transport: Any) -> bool:
+    """Tips on: the four-channel group carries the flag on its channel transports."""
+    channels = getattr(transport, "_transports", None)
+    if isinstance(channels, (list, tuple)):
+        return any(getattr(t, "_tip_loaded", False) is True for t in channels)
+    return getattr(transport, "_tip_loaded", False) is True
+
 
 class Serial206OemInitializationProvider:
     """One durable expected-next stage per generation-bound approval."""
@@ -12907,7 +12915,7 @@ class Serial206OemInitializationProvider:
             from .pipette.tip_length import tip_z_offset
             transport = getattr(self.primitives, "pipette_transport", None)
             loaded_type = getattr(transport, "_tip_type", None)
-            loaded = getattr(transport, "_tip_loaded", False) is True
+            loaded = _transport_tip_loaded(transport)
             tip_offset = tip_z_offset(loaded_type if loaded and isinstance(loaded_type, int) else None)
             target += int(tip_offset["offset_steps"])
             return {**self.moveZ(target), "source_return": target if operation == "sourceLowerTo" else 0,
