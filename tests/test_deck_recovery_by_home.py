@@ -1,6 +1,6 @@
 import sqlite3
 
-from bioxp.operator_command_plane import OperatorCommandPlane
+from bioxp.operator_command_plane import OperatorCommandStore
 
 
 def _db(hold=1):
@@ -22,13 +22,13 @@ def _db(hold=1):
 
 def test_unknown_move_holds_until_x_y_and_z_home_after_it():
     c = _db()
-    assert OperatorCommandPlane._deck_recovery_blocker(c) == "deck_recovery_hold"
+    assert OperatorCommandStore._deck_recovery_blocker(c) == "deck_recovery_hold"
     c.execute("INSERT INTO operator_commands VALUES('z0','oem.z.manual_home','completed',50)")
     c.execute("INSERT INTO operator_commands VALUES('z1','oem.z.manual_home','completed',150)")
     c.execute("INSERT INTO operator_commands VALUES('xy0','oem.xy.home','failed',160)")
-    assert OperatorCommandPlane._deck_recovery_blocker(c) == "deck_recovery_hold"
+    assert OperatorCommandStore._deck_recovery_blocker(c) == "deck_recovery_hold"
     c.execute("INSERT INTO operator_commands VALUES('xy1','oem.xy.home','completed',170)")
     # Resolved by the homes; the stale hold flag is what settle_deck_recovery_by_home lifts.
-    assert OperatorCommandPlane._deck_recovery_blocker(c) == "deck_recovery_state_inconsistent"
+    assert OperatorCommandStore._deck_recovery_blocker(c) == "deck_recovery_state_inconsistent"
     c.execute("UPDATE operator_plane_safety SET recovery_hold=0")
-    assert OperatorCommandPlane._deck_recovery_blocker(c) is None
+    assert OperatorCommandStore._deck_recovery_blocker(c) is None
