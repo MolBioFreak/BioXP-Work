@@ -4088,16 +4088,19 @@ class Serial206ProductionPrimitiveAdapter:
         self._z_profile()
         table = load_bound_oem_position_table()
         target_row = table.resolve(location_id=str(location_id))
+        # Tip racks are approached by the collar, never by a tip's length.
+        from .oem_compat.pathing import LOCATION_NAME_TO_ID, TIP_TRAY_LOCATIONS
+        at_tip_rack = LOCATION_NAME_TO_ID.get(str(location_id)) in TIP_TRAY_LOCATIONS
         if operation == "lower_pipette":
             if target_row.z_low is None:
                 return {"ok": False, "failure": "position_table_z_low_missing"}
-            tip_offset = self._loaded_tip_z_offset()
+            tip_offset = {"offset_steps": 0, "reason": "tip_rack"} if at_tip_rack else self._loaded_tip_z_offset()
             target = int(target_row.z_low) + (4030 if bool(overpress) else 0) + int(tip_offset["offset_steps"])
             source_anchor = "ClassControlInterface.cs:4401-4421"
         elif operation == "lift_pipette":
             if target_row.z_high is None:
                 return {"ok": False, "failure": "position_table_z_high_missing"}
-            tip_offset = self._loaded_tip_z_offset()
+            tip_offset = {"offset_steps": 0, "reason": "tip_rack"} if at_tip_rack else self._loaded_tip_z_offset()
             target = int(target_row.z_high) + int(tip_offset["offset_steps"])
             source_anchor = "ClassControlInterface.cs:4423-4431"
         else:

@@ -117,3 +117,20 @@ def test_tip_length_correction_sees_tips_on_the_four_channel_group():
     assert P._loaded_tip_z_offset(fake)["offset_steps"] == 45757
     group._transports = [SimpleNamespace(_tip_loaded=False) for _ in range(4)]
     assert P._loaded_tip_z_offset(fake)["offset_steps"] == 0
+
+
+def test_tip_rack_pickup_lowers_without_tip_length_offset(monkeypatch):
+    from types import SimpleNamespace
+    from bioxp.oem_serial206_initialization import Serial206ProductionPrimitiveAdapter as P
+    import bioxp.oem_serial206_initialization as m
+    rows = {"TECANRACK1": SimpleNamespace(z_low=141531, z_high=10000), "LOC_STRIP1": SimpleNamespace(z_low=56000, z_high=10000)}
+    monkeypatch.setattr(m, "load_bound_oem_position_table", lambda: SimpleNamespace(source="fake", resolve=lambda location_id: rows[location_id]))
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    moves = []
+    group = SimpleNamespace(_tip_type=10, _transports=[SimpleNamespace(_tip_loaded=True) for _ in range(4)])
+    fake = SimpleNamespace(pipette_transport=group, _z_profile=lambda: None,
+        oem_move_axis_absolute=lambda axis, target, wait_for_stop: moves.append(target) or {"ok": True})
+    fake._loaded_tip_z_offset = lambda: P._loaded_tip_z_offset(fake)
+    P.z_pipette_position(fake, location_id="TECANRACK1", operation="lower_pipette")
+    P.z_pipette_position(fake, location_id="LOC_STRIP1", operation="lower_pipette")
+    assert moves == [141531, 56000 + 45757]

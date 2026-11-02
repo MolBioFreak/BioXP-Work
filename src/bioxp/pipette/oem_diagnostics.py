@@ -165,6 +165,9 @@ def run_collection_diagnostic(group, request, record, result=None):
                 record("eject_tip", lambda t, ch=channel: {"ok": True, "channels":
                     t._eject_tip_channels_once([ch], wait_for_completion=False)})
                 result["ejected_channels"].append(channel)
+        # Software tip state follows the eject, so no later move applies a tip-length offset.
+        for ch in result["ejected_channels"]:
+            group._transports[ch]._tip_loaded = False
     elif action == "get_data":
         result["channels"] = []
         for channel in range(4):
