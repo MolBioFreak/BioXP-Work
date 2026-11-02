@@ -43,7 +43,9 @@ def _completion_wait_returned(result: Mapping[str, Any]) -> bool:
     record must still be terminal; 'acknowledged' would leave it open forever.
     """
     channels = result.get("channels")
-    return (result.get("wait_mode") == "completion" and isinstance(channels, list) and bool(channels)
+    # Group sends report the wait as wait_mode="completion" or as a shared-deadline wait_policy.
+    waited = result.get("wait_mode") == "completion" or str(result.get("wait_policy") or "").startswith("shared_deadline")
+    return (waited and isinstance(channels, list) and bool(channels)
             and result.get("interrupted_by_terminate") is not True
             and all(isinstance(row, Mapping) and isinstance((row.get("completion") or {}).get("ok"), bool)
                     for row in channels))

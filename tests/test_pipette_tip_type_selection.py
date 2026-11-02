@@ -135,3 +135,14 @@ def test_tip_rack_pickup_lowers_without_tip_length_offset(monkeypatch):
     P.z_pipette_position(fake, location_id="TECANRACK1", operation="lower_pipette")
     P.z_pipette_position(fake, location_id="LOC_STRIP1", operation="lower_pipette")
     assert moves == [141531, 56000 + 45757]
+
+
+def test_rejected_group_setting_with_shared_deadline_wait_is_terminal():
+    # A pump-rejected setting (error 35) on all channels, reported with wait_policy, must not stay 'acknowledged'.
+    from bioxp.pipette.receipts import _completion_wait_returned
+    rows = [{"channel": c, "completion": {"ok": False, "event_error_code": 35}} for c in range(4)]
+    assert _completion_wait_returned({"wait_policy": "shared_deadline_after_all_selected_channel_sends",
+                                      "channels": rows, "interrupted_by_terminate": False, "ok": False})
+    assert not _completion_wait_returned({"wait_policy": "shared_deadline_after_all_selected_channel_sends",
+                                          "channels": rows, "interrupted_by_terminate": True})
+    assert not _completion_wait_returned({"channels": rows})
