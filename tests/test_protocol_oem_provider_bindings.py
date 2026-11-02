@@ -239,6 +239,7 @@ def test_repeated_ms_real_wp8_claims_and_canonical_location(rig,tmp_path):
         requested_inputs={"bundle":{"execution":{"runtime_state":{}}}},ownership_generation=1,
         resources=("axis:x","axis:y","axis:z","gripper"),board_epochs={})
     assert store.claim_next()["command_id"] == "parent"
+    assert store._renew_owner(lease_seconds=600.0)  # no dispatcher here renews the 5 s lane lease
     execute_wp8=make_wp8_operation_executor(provider_getter=lambda:p,command_store=store)
     admission_state={"ownership_generation":1,"serial206_initialization_provider":{
         "x_authority":{"current_board_lifecycle_generation":1},"board4_authority":{"active_board_epoch":1}}}

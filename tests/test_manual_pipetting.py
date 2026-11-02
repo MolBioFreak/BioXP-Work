@@ -102,6 +102,8 @@ def test_connected_calibrated_move_and_lower_lift(rig, monkeypatch, tmp_path, ti
         requested_inputs={"bundle": {}}, ownership_generation=1,
         resources=("axis:x", "axis:y", "axis:z"), board_epochs={})
     assert store.claim_next()["command_id"] == "parent"
+    # No dispatcher runs here to renew the 5 s lane lease (production renews every 1 s).
+    assert store._renew_owner(lease_seconds=600.0)
     execute_wp8 = make_wp8_operation_executor(provider_getter=lambda: p, command_store=store)
     admission = {"ownership_generation": 1, "serial206_initialization_provider": {
         "x_authority": {"current_board_lifecycle_generation": 1}, "board4_authority": {"active_board_epoch": 1}}}
