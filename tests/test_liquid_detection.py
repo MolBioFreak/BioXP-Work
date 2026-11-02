@@ -313,3 +313,15 @@ def test_dashboard_z_shows_the_newest_reading():
     assert newer_terminal["position_steps"] == 3083 and newer_terminal["observed_at"] == 200.0
     newer_snapshot = _dashboard_payload(state(300.0, 200.0))["z_axis"]["status"]
     assert newer_snapshot["position_steps"] == 0 and newer_snapshot["observed_at"] == 300.0
+
+
+def test_search_lifts_then_dispenses_all_before_any_aspirate(monkeypatch):
+    # OEM scrFluidDetection: liftTo then DispenseAll, so search air never stays in the tip.
+    rig = _Rig(monkeypatch, {0: 0.25, 1: 0.25, 2: 0.75})
+    result = rig.run(_recipe(mode="by_level"))
+    assert result["ok"] is True, result.get("error")
+    ops = [e["operation"] for e in result["events"]]
+    empty = ops.index("liquid_search_dispense_all")
+    assert ops.index("liquid_search_z_stop") < empty
+    assert 60000 in rig.moves  # lifted back to the search start before emptying
+    assert all(o != "aspirate" for o in ops[:empty])

@@ -744,6 +744,13 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
             raise
         final = provider.primitives._read_axis_position("z")
         head_targets["z"] = final
+        if contact is None:
+            # OEM scrFluidDetection: liftTo, then DispenseAll, so the air drawn while
+            # searching never stays in the tip and later pipetting starts from zero.
+            z_move(start, 1791)
+            record("liquid_search_dispense_all", lambda t: _send_wire(t, op["channels"], "A0,0R", op["timeout_ms"],
+                   effect="dispense_all"), inputs={"ascii": "A0,0R", "source": "ControlLib.scrFluidDetection DispenseAll"},
+                   pipette=True)
         channels = {}
         for row_ in detected.get("detection", {}).get("channels", []):
             completion = row_.get("completion") or {}
