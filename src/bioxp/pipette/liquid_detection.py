@@ -22,17 +22,33 @@ def search_window(z_high: int, z_low: int, tip_offset_steps: int, floor_clearanc
     return start, floor
 
 
+# Z steps/s per native Z max-speed unit: TMCL 16 MHz / (2^3 * 2048 * 32). Measured on this robot at
+# native 300 as 8877-9219 steps/s over 17 searches that stopped before the floor (2026-11-01).
+Z_STEPS_PER_S_PER_NATIVE = 16e6 / (2 ** 3 * 2048 * 32)
+
+
 def contact_from_timestamps(*, start_steps: int, stop_steps: int, started_at: float, stopped_at: float,
-                            stamp: float | None) -> tuple[int | None, str]:
+                            stamp: float | None, floor_steps: int | None = None,
+                            speed_native: int | None = None) -> tuple[int | None, str]:
     """Estimate where one channel touched during a shared constant-speed descent.
 
     The pump reports only when it sensed liquid; Z is read once after it stops.
-    Linear interpolation over the descent is an estimate, reported as such.
+    If Z stopped before the floor, the descent ran the whole time and is interpolated.
+    If Z reached the floor and waited there for a slower channel, the descent time is
+    unknown, so the contact is placed from the search speed instead. Both are estimates.
     """
     if stamp is None:
         return None, "no_contact_time"
     if not (stopped_at > started_at) or not (started_at <= stamp <= stopped_at):
         return None, "contact_time_outside_descent"
+    if floor_steps is not None and speed_native and int(stop_steps) == int(floor_steps):
+        rate = float(speed_native) * Z_STEPS_PER_S_PER_NATIVE
+        descent_s = abs(int(floor_steps) - int(start_steps)) / rate
+        # Z waited at the floor only if the search ran clearly longer than the descent itself.
+        if stopped_at - started_at > descent_s * 1.1:
+            travelled = (stamp - started_at) * rate * (1 if floor_steps >= start_steps else -1)
+            bounded = min(start_steps + travelled, floor_steps) if floor_steps >= start_steps else max(start_steps + travelled, floor_steps)
+            return int(round(bounded)), "search_speed_estimate"
     fraction = (stamp - started_at) / (stopped_at - started_at)
     return int(round(start_steps + (stop_steps - start_steps) * fraction)), "interpolated_descent"
 

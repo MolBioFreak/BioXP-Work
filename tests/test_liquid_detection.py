@@ -335,3 +335,16 @@ def test_search_floor_follows_a_saved_depth_offset(monkeypatch):
     level = result["liquid_levels"][0]
     assert level["start_steps"] == 60000 and level["floor_steps"] == 80000 - 2016 + 4000
     assert level["depth_offset"]["offset_steps"] == 4000
+
+
+def test_contact_uses_search_speed_when_z_waited_at_the_floor():
+    from bioxp.pipette.liquid_detection import contact_from_timestamps, Z_STEPS_PER_S_PER_NATIVE
+    # Stopped before the floor: whole-descent interpolation.
+    assert contact_from_timestamps(start_steps=0, stop_steps=50000, started_at=0, stopped_at=5,
+                                   stamp=2.5, floor_steps=58000, speed_native=300) == (25000, "interpolated_descent")
+    # Reached the floor at ~6.3 s, then waited to 16 s for a missing channel: use the search speed.
+    contact, method = contact_from_timestamps(start_steps=0, stop_steps=58000, started_at=0, stopped_at=16,
+                                              stamp=5.0, floor_steps=58000, speed_native=300)
+    assert method == "search_speed_estimate" and contact == round(5.0 * 300 * Z_STEPS_PER_S_PER_NATIVE)
+    assert contact_from_timestamps(start_steps=0, stop_steps=58000, started_at=0, stopped_at=16,
+                                   stamp=15.0, floor_steps=58000, speed_native=300)[0] == 58000

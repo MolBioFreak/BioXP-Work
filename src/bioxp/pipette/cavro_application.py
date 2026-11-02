@@ -766,7 +766,8 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
             if found:
                 for basis in ("monotonic", "wall"):
                     contact, method = contact_from_timestamps(start_steps=start, stop_steps=final,
-                        started_at=clocks.get(basis, 0.0), stopped_at=stopped[basis], stamp=stamp)
+                        started_at=clocks.get(basis, 0.0), stopped_at=stopped[basis], stamp=stamp,
+                        floor_steps=floor, speed_native=op["search_speed_native"])
                     if contact is not None:
                         method = f"{method}:{basis}"
                         break
