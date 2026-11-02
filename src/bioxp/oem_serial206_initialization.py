@@ -12746,9 +12746,12 @@ class Serial206OemInitializationProvider:
         tray_id = int(arguments["tray"]) - 1
         well = str(arguments["well"]).upper()
         group = (int(well[1:]) - 1) * 2 + (well[0] == "B")
+        keep = arguments.get("keep_channels")
+        # Wells are in channel order; released tips went back into their wells.
+        wells = [w for ch, w in enumerate(tip_group_well_ids(group)) if keep is None or ch in keep]
         removed = finite("pipette_tip_transition", {"tray_id": tray_id,
-            "well_ids": list(tip_group_well_ids(group)), "transition": "remove"})
-        out: dict[str, Any] = {"rack_tips_removed": list(tip_group_well_ids(group)), "rack_record": removed}
+            "well_ids": wells, "transition": "remove"})
+        out: dict[str, Any] = {"rack_tips_removed": wells, "rack_record": removed}
         size = self.tip_tray_type(tray_id)
         if size in {"T10", "T50", "T200"}:
             value = {"T10": 10, "T50": 50, "T200": 200}[size]

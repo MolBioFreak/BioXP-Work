@@ -1242,7 +1242,12 @@ def _compile_finite_plate_operation_unchecked(
         return _wp8_plan(operation, children, source_caller="ControlLib.DefaultParameters.ForceToHighHome")
     if operation in OEM_PIPETTE_LEAVES:
         leaf, keys = OEM_PIPETTE_LEAVES[operation]
-        _wp8_child(children, leaf, arguments={key: inputs[key] for key in keys})
+        arguments = {key: inputs[key] for key in keys}
+        if operation == "manual_load_tip" and inputs.get("keep_channels") is not None:
+            # Partial pickup: keep these channels, release the rest back into the rack.
+            arguments.update(keep_channels=[int(c) for c in inputs["keep_channels"]],
+                             release_lift_mm=float(inputs.get("release_lift_mm", 3.0)))
+        _wp8_child(children, leaf, arguments=arguments)
         return _wp8_plan(operation, children)
     if operation == "pipette_shift_camera":
         _wp8_child(children, "sourceHomeZ", arguments={"rehome": False})

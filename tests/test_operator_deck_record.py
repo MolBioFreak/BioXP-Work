@@ -167,3 +167,32 @@ def test_manual_pickup_removes_rack_tips_and_sets_tip_type_from_rack_size():
     P._manual_pickup_bookkeeping(SimpleNamespace(tip_tray_type=lambda tray: None), {'tray': 3, 'well': 'B1'},
         lambda name, inputs: calls.append((name, inputs)) or {'ok': True}, lambda name, call: call(transport))
     assert calls == [('pipette_tip_transition', {'tray_id': 2, 'well_ids': [12, 36, 60, 84], 'transition': 'remove'})]
+
+
+def test_partial_pickup_releases_unneeded_tips_after_short_lift_and_books_only_kept_wells():
+    from types import SimpleNamespace
+    from bioxp.pipette.oem_calibration import CalibrationBindings, ManualTipLoadRequest, manual_load_tip
+    from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider as P
+    calls = []
+    chans = [SimpleNamespace(_tip_loaded=True) for _ in range(4)]
+    group = SimpleNamespace(_transports=chans, query_tip_status_all=lambda: {'ok': True},
+                            _eject_tip_channels_once=lambda ch, wait_for_completion: calls.append(('eject', ch)) or [])
+    b = CalibrationBindings(
+        finite=lambda name, inputs: calls.append((name, dict(inputs))) or {'ok': True},
+        native=lambda name, call, inputs: call(), pipette=lambda name, call: call(group),
+        facts=dict, tray_location=lambda i: 7,
+        lower_pipette=lambda loc, op: {'ok': True, 'target_position_steps': 150000},
+        z_low=lambda loc: None, set_z_speed=None, detection_move=None, stop_z=None)
+    out = manual_load_tip(ManualTipLoadRequest(tray=1, well='A2', keep_channels=(2, 0)), b)
+    assert ('pipette_move_z', {'value': 150000 - round(3.0 * 2015.748)}) in calls
+    assert ('eject', [1, 3]) in calls and calls.index(('pipette_move_z', {'value': 150000 - round(3.0 * 2015.748)})) < calls.index(('eject', [1, 3]))
+    assert [c._tip_loaded for c in chans] == [True, False, True, False]
+    assert out['kept_channels'] == [0, 2] and out['released_channels'] == [1, 3]
+    books = []
+    P._manual_pickup_bookkeeping(SimpleNamespace(tip_tray_type=lambda tray: None),
+        {'tray': 1, 'well': 'A2', 'keep_channels': [0, 2]},
+        lambda name, inputs: books.append(inputs) or {'ok': True}, lambda name, call: None)
+    assert books[0]['well_ids'] == [1, 49]
+    calls.clear()
+    manual_load_tip(ManualTipLoadRequest(tray=1, well='A2'), b)
+    assert not any(c[0] in ('eject', 'pipette_move_z') for c in calls)

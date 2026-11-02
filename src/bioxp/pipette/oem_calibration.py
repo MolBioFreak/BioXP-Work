@@ -19,14 +19,29 @@ from ..oem_compat.position_table import well_id_from_label
 Result = dict[str, Any]
 
 
+RELEASE_LIFT_MM = 3.0  # lift before ejecting unneeded tips back into the rack
+Z_STEPS_PER_MM = 2015.748
+
+
 @dataclass(frozen=True)
 class ManualTipLoadRequest:
     tray: int  # OEM UI is one-based, including hotel = 5
     well: str  # tipLocation: A1,B1,...,A12,B12 (four-channel pickup)
     overpress: bool = False
     lift_z: bool = False
+    # Channels (0-3) that keep their tips. The others are ejected back into
+    # their rack wells right after pickup, after a short lift. None keeps all four.
+    keep_channels: tuple[int, ...] | None = None
+    release_lift_mm: float = RELEASE_LIFT_MM
 
     def __post_init__(self) -> None:
+        if self.keep_channels is not None:
+            keep = tuple(self.keep_channels)
+            if not keep or len(set(keep)) != len(keep) or any(type(c) is not int or c not in range(4) for c in keep):
+                raise ValueError("keep_channels must be distinct channels 0..3")
+            object.__setattr__(self, "keep_channels", tuple(sorted(keep)))
+        if not 0 <= float(self.release_lift_mm) <= 10:
+            raise ValueError("release_lift_mm must be 0..10")
         if type(self.tray) is not int or not 1 <= self.tray <= 5:
             raise ValueError("tray must be an OEM tray number 1..5")
         if not isinstance(self.well, str) or not re.fullmatch(r"[ABab](?:[1-9]|1[0-2])", self.well):
@@ -96,6 +111,23 @@ class _Sequence:
         return result
 
 
+def _find_target(value: Any) -> int | None:
+    """The lowerPipette Z target, wherever the step receipt nests it."""
+    if isinstance(value, Mapping):
+        if type(value.get("target_position_steps")) is int:
+            return value["target_position_steps"]
+        for v in value.values():
+            found = _find_target(v)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for v in value:
+            found = _find_target(v)
+            if found is not None:
+                return found
+    return None
+
+
 def manual_load_tip(request: ManualTipLoadRequest, bindings: CalibrationBindings) -> Result:
     """Physical btnLoadTip_Click body. No loadTip(host-only) substitution.
 
@@ -113,7 +145,24 @@ def manual_load_tip(request: ManualTipLoadRequest, bindings: CalibrationBindings
     seq.step("updateLocation", lambda: b.finite("pipette_location", dict(destination=location, well=well)))
     seq.step("lowerPipette", lambda: b.native("lowerPipette", lambda: b.lower_pipette(location, request.overpress),
                                                {"location": location, "overpress": request.overpress}))
+    lowered = seq.result["steps"][-1] if seq.result.get("steps") else {}
     seq.step("queryTipStatus", lambda: b.pipette("query_tip_status_all", lambda t: t.query_tip_status_all()))
+    drop = [c for c in range(4) if request.keep_channels is not None and c not in request.keep_channels]
+    if drop:
+        target = _find_target(lowered)
+        if target is None:
+            raise CalibrationExecutionError("pickup depth unknown; cannot release unneeded tips", seq.result)
+        lift = int(round(float(request.release_lift_mm) * Z_STEPS_PER_MM))
+        seq.step("releaseLift", lambda: b.finite("pipette_move_z", {"value": int(target) - lift}))
+
+        def release(t):
+            sends = t._eject_tip_channels_once(drop, wait_for_completion=True)
+            for ch in drop:
+                t._transports[ch]._tip_loaded = False
+            return {"ok": True, "channels": drop, "sends": sends}
+        seq.step("releaseUnneededTips", lambda: b.pipette("release_unneeded_tips", release))
+        seq.result.update(kept_channels=list(request.keep_channels), released_channels=drop,
+                          release_lift_steps=lift)
     if request.lift_z:
         home = seq.step("MoveZHome", lambda: b.finite("pipette_home", {"rehome": False}))
         lost = home.get("source_return")
