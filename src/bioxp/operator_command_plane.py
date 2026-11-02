@@ -90,6 +90,17 @@ COMMAND_STATES = frozenset({
 COMMAND_NONTERMINAL = frozenset({"queued", "dispatched", "issued_pending", "stop_requested", "abort_requested"})
 COMMAND_TERMINAL = COMMAND_STATES - COMMAND_NONTERMINAL
 
+# Successful homes that re-reference each axis. An unknown deck move (alias c)
+# is resolved once X, Y and Z have each completed a home after it finished.
+_X_HOMES = ("oem.xy.home", "oem.x.manual_panel_home", "oem.x.startup_home", "oem.x.move_to_origin_home", "meta.initialize_motion")
+_Y_HOMES = ("oem.xy.home", "oem.y.manual_panel_home", "meta.initialize_motion")
+_Z_HOMES = ("oem.z.manual_home", "oem.z.move_z_home", "oem.z.diagnostic_home_axis", "meta.initialize_motion")
+HOME_ACTIONS = tuple(sorted(set(_X_HOMES + _Y_HOMES + _Z_HOMES)))
+HOMED_AFTER_SQL = " AND ".join(
+    "EXISTS(SELECT 1 FROM operator_commands h WHERE h.status='completed' AND h.action_id IN ("
+    + ",".join(f"'{a}'" for a in group) + ") AND h.updated_at>COALESCE(c.finished_at,c.updated_at))"
+    for group in (_X_HOMES, _Y_HOMES, _Z_HOMES))
+
 ALLOWED_ACTIONS = frozenset({
     "oem.x.prepare",
     "oem.x.diagnostic_home_axis",
@@ -2830,7 +2841,8 @@ class OperatorCommandStore(CommandReceiptReader):
             "SELECT 1 FROM operator_plane_commands c LEFT JOIN operator_plane_deck_commands d USING(command_id) "
             "WHERE c.action_id IN ('oem.deck.move_to_location','oem.deck.move_to_well','oem.deck._mov_execution','oem.deck._finite_operation') "
             "AND (c.status IN ('ambiguous','interrupted') OR d.ambiguity_state='recovery_required') "
-            "AND NOT EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions r WHERE r.command_id=c.command_id) LIMIT 1"
+            "AND NOT EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions r WHERE r.command_id=c.command_id) "
+            "AND NOT (" + HOMED_AFTER_SQL + ") LIMIT 1"
         ).fetchone()
         semantic = conn.execute(
             "SELECT ambiguity_state FROM operator_plane_deck_semantic_state WHERE singleton=1"
@@ -2846,6 +2858,31 @@ class OperatorCommandStore(CommandReceiptReader):
     def deck_recovery_blocker(self) -> str | None:
         with self._lock:
             return self._deck_recovery_blocker(self.connection)
+
+    def settle_deck_recovery_by_home(self) -> bool:
+        """Lift the deck recovery hold once every unknown deck move has had
+        successful X, Y and Z homes after it. A completed home re-references
+        the axes, so the position is known again; the home commands are the
+        evidence. The unknown records themselves keep their history."""
+        with self._lock:
+            hold = self.connection.execute("SELECT recovery_hold FROM operator_plane_safety WHERE singleton=1").fetchone()
+        if hold is None or not hold[0]:
+            return False
+        with self._transaction() as conn:
+            if self._deck_recovery_blocker(conn) != "deck_recovery_state_inconsistent":
+                return False
+            semantic = conn.execute("SELECT ambiguity_state FROM operator_plane_deck_semantic_state WHERE singleton=1").fetchone()
+            if semantic is not None and str(semantic[0]) in {"ambiguous", "recovery_required"}:
+                return False
+            homes = [dict(r) for r in conn.execute(
+                "SELECT action_id, MAX(updated_at) AS at, command_id FROM operator_commands "
+                "WHERE status='completed' AND action_id IN (" + ",".join("?" for _ in HOME_ACTIONS) + ") GROUP BY action_id",
+                tuple(HOME_ACTIONS))]
+            conn.execute("UPDATE operator_plane_safety SET recovery_hold=0,recovery_version=recovery_version+1,updated_at=? WHERE singleton=1", (_now(),))
+            self._insert_transition(conn, event_kind="recovery_resolved", state="recovery_resolved",
+                                    payload={"resolution": "axes_homed_after_unknown_moves", "home_evidence": homes})
+        self._wake.set()
+        return True
 
     def bind_tip_tray_constructor_reader(self, reader: Callable[[int], Mapping[str, Any] | None]) -> None:
         if not callable(reader):
@@ -6272,6 +6309,10 @@ class OperatorCommandStore(CommandReceiptReader):
                     self._stop.set()
                     break
                 next_renewal = time.monotonic() + 1.0
+                try:
+                    self.settle_deck_recovery_by_home()
+                except sqlite3.OperationalError:
+                    pass
 
             self._settle_workflow_child_waiters()
             self._notify_workflow_interrupt()
