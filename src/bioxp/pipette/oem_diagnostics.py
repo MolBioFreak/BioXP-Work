@@ -162,8 +162,12 @@ def run_collection_diagnostic(group, request, record, result=None):
             query = record("query_all_pipette_tip_states", lambda t, ch=channel:
                 t.query_tip_status_for_oem_script(ch))
             if query["source_return"] == 1 and channel in request.channels:
+                # Wait for the eject to finish. A fire-and-forget eject left its
+                # completion registered on the channel, so the next command on that
+                # channel within the timeout was refused ("completion is already
+                # registered") without being sent.
                 record("eject_tip", lambda t, ch=channel: {"ok": True, "channels":
-                    t._eject_tip_channels_once([ch], wait_for_completion=False)})
+                    t._eject_tip_channels_once([ch], wait_for_completion=True)})
                 result["ejected_channels"].append(channel)
         # Software tip state follows the eject, so no later move applies a tip-length offset.
         for ch in result["ejected_channels"]:
