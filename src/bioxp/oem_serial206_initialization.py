@@ -12819,8 +12819,23 @@ class Serial206OemInitializationProvider:
                     operation_id=child_identity["source_identity"], command_id=command_id,
                     provenance={"source_operation": "sourceManualLoadTip",
                                 "source_child": child_identity["source_identity"]})
-            return self._manual_pickup_bookkeeping(arguments, record, pipette,
-                channels=channels, transition=transition)
+            out = {}
+            if transition == "remove":
+                # Host-only dependent state follows observed pickup, even if a
+                # later release/home fails. Already inside the query receipt's
+                # active claim: do not recursively admit another pipette call.
+                try:
+                    out.update(self._manual_pickup_bookkeeping(arguments, record,
+                        lambda name, call: call(self.primitives.pipette_transport),
+                        metadata_only=True))
+                except Exception as exc:
+                    out["bookkeeping_error"] = repr(exc)
+            try:
+                out.update(self._manual_pickup_bookkeeping(arguments, record, pipette,
+                    channels=channels, transition=transition))
+            except Exception as exc:
+                out.update(error=repr(exc), published=False)
+            return out
 
         bindings = bind_calibration_provider(self, finite=finite, native=native, pipette=pipette,
             tray_location=tray_location, z_current_down=current, sleep=self.sleep,
@@ -12829,12 +12844,6 @@ class Serial206OemInitializationProvider:
             result = (manual_load_tip(ManualTipLoadRequest(**arguments), bindings)
                       if operation == "sourceManualLoadTip" else
                       measure_fluid_height(FluidHeightRequest(**arguments), bindings))
-            if operation == "sourceManualLoadTip":
-                try:
-                    result.update(self._manual_pickup_bookkeeping(arguments, finite, pipette,
-                                                                 metadata_only=True))
-                except Exception as exc:
-                    result.update(ok=False, error=str(exc), bookkeeping_error=repr(exc))
         except CalibrationExecutionError as exc:
             # Return partial source receipts for canonical terminalization, not
             # an exception string that loses already-completed physical children.
