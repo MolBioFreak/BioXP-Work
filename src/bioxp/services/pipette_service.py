@@ -617,6 +617,10 @@ async def _run_transport_call(
             result["delivery_verified"] = False
             result["controller_acknowledged"] = False
             result["completion_verified"] = False
+    if isinstance(result, dict):
+        from ..pipette.audit import normalize_eject_result_flags
+
+        result = normalize_eject_result_flags(str(operation_name or label), result)
     if receipt_store is not None and isinstance(result, dict):
         try:
             effective_candidate = result.get("effective")
