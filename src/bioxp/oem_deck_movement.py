@@ -1004,7 +1004,7 @@ def execute_mov_execution(command_id: str, plan: MovExecutionPlan, *, provider: 
                         assert_current(command_id, boundary=f"before_terminalize:{step.order}:{step.operation}")
                     terminalize(
                         command_id, step,
-                        state="ambiguous" if delivery_attempted and not getattr(exc, "known_failure", False) else "failed",
+                        state="ambiguous" if current_stage_delivery and not getattr(exc, "known_failure", False) else "failed",
                         reason=f"provider_stage_exception:{type(exc).__name__}",
                         result={"ok": False, "exception_type": type(exc).__name__, "exception": str(exc),
                                 "provider_results": getattr(exc, "provider_results", None)},
@@ -1012,7 +1012,10 @@ def execute_mov_execution(command_id: str, plan: MovExecutionPlan, *, provider: 
                     )
                 return {
                     "ok": False, "delivery_attempted": delivery_attempted,
-                    "ambiguity_state": "ambiguous" if delivery_attempted else "failed",
+                    "ambiguity_state": "ambiguous" if current_stage_delivery and not getattr(exc, "known_failure", False) else "failed",
+                    "failed_child_delivery_attempted": current_stage_delivery,
+                    "known_failure": getattr(exc, "known_failure", False),
+                    "provider_results": [*provider_results, *getattr(exc, "provider_results", [])],
                     "semantic_state_committed": False,
                 }
             result_map = dict(result) if isinstance(result, Mapping) else {"source_return": result}
@@ -1022,8 +1025,11 @@ def execute_mov_execution(command_id: str, plan: MovExecutionPlan, *, provider: 
                 or any(row.get("delivery_attempted") is True for row in provider_results)
             )
             if not _mov_terminal_truth(result):
-                terminal_state = ("ambiguous" if delivery_attempted and not _known_cavro_failure(result)
-                                  else "failed")
+                failed_delivery = _failed_child_delivery(result_map)
+                if failed_delivery is None:
+                    failed_delivery = delivery_attempted
+                known_failure = _known_cavro_failure(result) or result_map.get("known_failure") is True
+                terminal_state = "ambiguous" if failed_delivery and not known_failure else "failed"
                 if callable(terminalize):
                     if callable(assert_current):
                         assert_current(command_id, boundary=f"before_terminalize:{step.order}:{step.operation}")
@@ -1039,6 +1045,8 @@ def execute_mov_execution(command_id: str, plan: MovExecutionPlan, *, provider: 
                     "controller_completion_verified": False,
                     "semantic_state_committed": False,
                     "ambiguity_state": terminal_state,
+                    "failed_child_delivery_attempted": failed_delivery,
+                    "known_failure": known_failure,
                     "source_return_disposition": "ignored",
                     "provider_results": [*provider_results, result_map],
                 }
@@ -1957,6 +1965,7 @@ def make_wp8_operation_executor(
                         result={
                             "exception_type": type(exc).__name__, "exception": str(exc),
                             "delivery_attempted": child_delivery_attempted,
+                            "known_failure": getattr(exc, "known_failure", False),
                             **({"provider_results": exc.provider_results}
                                if isinstance(exc, DeckExecutionFailure) else {}),
                         },

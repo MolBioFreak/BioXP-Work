@@ -82,6 +82,43 @@ def test_failure_classification_and_recovery_agree(rig, failure, expected):
         assert saved["steps"][:2] == failure["steps"][:2]
 
 
+@pytest.mark.parametrize("failure,expected", [
+    ({"ok": False, "delivery_attempted": False}, "failed"),
+    ({"ok": False, "delivery_attempted": True, "kind": "cavro_application",
+      "events": [{"status": "completed"}, {"status": "failed"}]}, "failed"),
+    (DeckExecutionFailure("pre-send refusal", delivery_attempted=False), "failed"),
+    (DeckExecutionFailure("known failure", delivery_attempted=True, known_failure=True), "failed"),
+    (DeckExecutionFailure("unknown return", delivery_attempted=True), "ambiguous"),
+])
+def test_mov_failure_does_not_borrow_prior_stage_sends(failure, expected):
+    from bioxp.oem_deck_movement import execute_mov_execution, MovExecutionPlan, MovExecutionStep
+    terminals = []
+    # Unit seam records native-stage classification; the tests above exercise
+    # real SQLite ownership, terminalization, receipt and recovery receiving.
+    ledger = SimpleNamespace(
+        persist_mov_execution_plan=lambda *a: None,
+        record_delivery_attempt=lambda *a, **kw: {"dispatch_attempt_id": "offline"},
+        terminalize_mov_execution_stage=lambda *a, **kw: terminals.append(kw))
+    prior = {"ok": True, "delivery_attempted": True,
+             "controller_command_acknowledged": True, "controller_completion_verified": True}
+    def fail():
+        if isinstance(failure, Exception):
+            raise failure
+        return failure
+    provider = SimpleNamespace(first=lambda: prior, second=fail)
+    plan = MovExecutionPlan(script_line=1, source_branch="offline-fault", authority_digest="offline",
+        destination=6, plate_name=0, well_id=0, well_source="offline", source_hazards=(),
+        machine_state_updates={}, destination_translation={}, steps=(
+            MovExecutionStep(0, "first", "offline", {}),
+            MovExecutionStep(1, "second", "offline", {})))
+    result = execute_mov_execution("offline", plan, provider=provider, command_store=ledger)
+    assert result["ok"] is False
+    assert result["delivery_attempted"] is True  # Actual preceding completed effect.
+    assert result["ambiguity_state"] == expected
+    assert terminals[-1]["state"] == expected
+    assert result["provider_results"][0]["ok"] is True
+
+
 def home(rig, action, status="completed"):
     store, _, _, state = rig
     admitted = store.admit_command({"action_id": action, "inputs": {},
@@ -113,7 +150,18 @@ def test_home_resolution_is_per_command_additive_and_received(rig):
     assert not store.settle_deck_recovery_by_home()
     y = home(rig, "oem.y.manual_panel_home")
     second = run_failure(rig, pickup({"ok": False, "delivery_attempted": True}))
+    # Settlement is bookkeeping even while an unrelated live owner exists.
+    state = rig[3]
+    admitted = store.admit_command({"action_id": "oem.z.manual_home", "inputs": {},
+        "idempotency_key": "live-home", "expected_ownership_generation": 1}, state=state)
+    live = store.claim_next()
+    assert live["command_id"] == admitted["command_id"]
+    resources = list(store.connection.execute("SELECT * FROM serial206_command_resources"))
+    assert resources
     assert store.settle_deck_recovery_by_home()
+    assert list(store.connection.execute("SELECT * FROM serial206_command_resources")) == resources
+    assert store.get_command(live["command_id"])["status"] == "dispatched"
+    store.finish(live["command_id"], status="failed", payload={"ok": False}, claimed=live)
     assert immutable_rows(store, first) == before
     assert store.recovery()["outcome_unknown_command_ids"] == [second]
     assert store.recovery()["hold"] is True

@@ -2874,6 +2874,8 @@ class OperatorCommandStore(CommandReceiptReader):
                 "WHERE c.action_id IN ('oem.deck.move_to_location','oem.deck.move_to_well','oem.deck._mov_execution','oem.deck._finite_operation') "
                 "AND (c.status IN ('ambiguous','interrupted') OR d.ambiguity_state='recovery_required') "
                 "AND NOT EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions r WHERE r.command_id=c.command_id) "
+                "AND NOT EXISTS (SELECT 1 FROM operator_plane_transitions t WHERE t.command_id=c.command_id "
+                "AND t.event_kind='recovery_resolved' AND json_extract(t.payload_json,'$.resolution')='axes_homed_after_unknown_moves') "
                 "AND (" + HOMED_AFTER_SQL + ")"
             ).fetchall()
             for candidate in candidates:
@@ -6711,7 +6713,8 @@ class OperatorCommandPlane:
             except (OSError, RuntimeError, ValueError, KeyError) as exc:
                 wp8_response["child_outcomes_error"] = type(exc).__name__
             ok = wp8_response.get("ok") is True
-            terminal_status = "completed" if ok else ("ambiguous" if delivery_attempted else "failed")
+            unknown = delivery_attempted and wp8_response.get("failed_child_delivery_attempted") is not False and wp8_response.get("known_failure") is not True
+            terminal_status = "completed" if ok else ("ambiguous" if unknown else "failed")
             terminal_payload = {
                 "response": _bounded_json(wp8_response, 131072),
                 "delivery_attempted": delivery_attempted,
@@ -6782,22 +6785,24 @@ class OperatorCommandPlane:
                     (command_id,),
                 ).fetchall()
                 delivery_attempted = (
+                    exc.delivery_attempted if isinstance(exc, DeckExecutionFailure) else
                     any(str(row["terminal_state"]) in {"completed", "ambiguous"} for row in stage_rows)
                     or self.store.has_delivery_attempt(command_id)
                 )
-                if delivery_attempted:
+                unknown = delivery_attempted and not getattr(exc, "known_failure", False)
+                if unknown:
                     self.store.mark_deck_recovery_required(
                         command_id, reason=str(exc)[:500], controller_command_acknowledged=False,
                         controller_completion_verified=False, hardware_postcondition_verified=False,
                         provider_results=None,
                     )
                 self.store.finish(
-                    command_id, status="ambiguous" if delivery_attempted else "failed",
+                    command_id, status="ambiguous" if unknown else "failed",
                     payload={
                         "error": f"mov_execution_exception:{type(exc).__name__}",
                         "detail": str(exc)[:500],
                         "delivery_attempted": delivery_attempted,
-                        **({"outcome_unknown": True} if delivery_attempted else {}),
+                        **({"outcome_unknown": True} if unknown else {}),
                     },
                     claimed=claimed,
                 )
@@ -6808,7 +6813,8 @@ class OperatorCommandPlane:
             response = dict(mov_response)
             ok = isinstance(response, Mapping) and response.get("ok") is True
             delivery_attempted = bool(isinstance(response, Mapping) and response.get("delivery_attempted") is True)
-            terminal_status = "completed" if ok else ("ambiguous" if delivery_attempted else "failed")
+            unknown = delivery_attempted and response.get("failed_child_delivery_attempted") is not False and response.get("known_failure") is not True
+            terminal_status = "completed" if ok else ("ambiguous" if unknown else "failed")
             if terminal_status == "ambiguous":
                 self.store.mark_deck_recovery_required(
                     command_id, reason=str(response.get("reason") or "mov_execution_outcome_unknown")[:500],
