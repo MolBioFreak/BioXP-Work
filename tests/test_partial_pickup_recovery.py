@@ -144,11 +144,6 @@ def test_home_resolution_is_per_command_additive_and_received(rig):
     before = immutable_rows(store, first)
     assert not store.settle_deck_recovery_by_home()
     z = home(rig, "oem.z.manual_home")
-    home(rig, "oem.x.manual_panel_home", "failed")
-    assert not store.settle_deck_recovery_by_home()
-    x = home(rig, "oem.x.manual_panel_home")
-    assert not store.settle_deck_recovery_by_home()
-    y = home(rig, "oem.y.manual_panel_home")
     second = run_failure(rig, pickup({"ok": False, "delivery_attempted": True}))
     # Settlement is bookkeeping even while an unrelated live owner exists.
     state = rig[3]
@@ -170,7 +165,7 @@ def test_home_resolution_is_per_command_additive_and_received(rig):
         assert receipt["status"] == "ambiguous"
         resolution = receipt["deck_movement"]["recovery_resolution"]
         assert resolution["command_id"] == first
-        assert {r["axis"]: r["command_id"] for r in resolution["home_evidence"]} == {"x": x, "y": y, "z": z}
+        assert {r["axis"]: r["command_id"] for r in resolution["home_evidence"]} == {"z": z}
     assert not store.settle_deck_recovery_by_home()
     for action in ("oem.z.manual_home", "oem.x.manual_panel_home", "oem.y.manual_panel_home"):
         home(rig, action)
@@ -180,3 +175,78 @@ def test_home_resolution_is_per_command_additive_and_received(rig):
     assert immutable_rows(store, first) == before
     assert store.get_command(second)["status"] == "ambiguous"
     assert not store.settle_deck_recovery_by_home()
+
+def test_unknown_scope_is_not_invented_and_mixed_axes(rig):
+    store, *_ = rig
+    unknown = run_failure(rig, DeckExecutionFailure("unrecorded step", delivery_attempted=True))
+    xyz = run_failure(rig, {"ok": False, "steps": [
+        {"operation": "moveTo", "result": {"ok": False, "delivery_attempted": True}}]})
+    z = run_failure(rig, pickup({"ok": False, "delivery_attempted": True}))
+    assert store.get_command(unknown)["affected_axes"] is None
+    assert store.get_command(xyz)["affected_axes"] == ["x", "y", "z"]
+    home(rig, "oem.z.manual_home", "failed")
+    assert not store.settle_deck_recovery_by_home()
+    home(rig, "oem.z.manual_home")
+    assert store.settle_deck_recovery_by_home()
+    assert store._home_recovery_resolution(z)
+    assert store._home_recovery_resolution(xyz) is None
+    home(rig, "oem.xy.home")
+    assert store.settle_deck_recovery_by_home()
+    assert store._home_recovery_resolution(xyz)
+    assert store._home_recovery_resolution(unknown) is None
+    assert store.recovery()["outcome_unknown_command_ids"] == [unknown]
+
+
+def test_no_repeat_writer_or_history_scan(rig, monkeypatch):
+    store, *_ = rig
+    run_failure(rig, pickup({"ok": False, "delivery_attempted": True}))
+    assert not store.settle_deck_recovery_by_home()
+    statements = []
+    store.connection.set_trace_callback(statements.append)
+    monkeypatch.setattr(store, "_transaction", lambda: pytest.fail("repeat writer opened"))
+    for _ in range(3):
+        assert not store.settle_deck_recovery_by_home()
+    store.connection.set_trace_callback(None)
+    assert len(statements) == 3
+    assert all("MAX(transition_sequence)" in sql for sql in statements)
+
+
+def test_home_order_uses_terminal_time_not_mutable_update(rig):
+    store, *_ = rig
+    earlier = home(rig, "oem.z.manual_home")
+    cid = run_failure(rig, pickup({"ok": False, "delivery_attempted": True}))
+    with store._transaction() as conn:
+        conn.execute("UPDATE operator_commands SET updated_at=updated_at+1000 WHERE command_id=?", (earlier,))
+    assert not store.settle_deck_recovery_by_home()
+    assert store._home_recovery_resolution(cid) is None
+    home(rig, "oem.z.manual_home")
+    assert store.settle_deck_recovery_by_home()
+
+
+@pytest.mark.parametrize("independent,unknown_child", [(False, False), (True, False), (False, True)])
+def test_workflow_resolution_requires_only_resolved_children(rig, independent, unknown_child):
+    store, *_ = rig
+    store.admit_workflow(command_id="parent", idempotency_key="parent", plan_fingerprint="fixture",
+        requested_inputs={"bundle": {}}, ownership_generation=1,
+        resources=("axis:x", "axis:y", "axis:z"), board_epochs={})
+    assert store.claim_next()["command_id"] == "parent"
+    assert store._renew_owner(lease_seconds=600)
+    with store.workflow_context("parent", source_occurrence_id="pickup"):
+        child = run_failure(rig, pickup({"ok": False, "delivery_attempted": True}))
+    if unknown_child:
+        with store.workflow_context("parent", source_occurrence_id="unknown"):
+            other = run_failure(rig, DeckExecutionFailure("unknown step", delivery_attempted=True))
+    store.finish_workflow("parent", status="failed", payload={}, lifecycle_settled=not independent)
+    before = [tuple(store.connection.execute("SELECT * FROM " + table + " WHERE command_id='parent'").fetchone())
+              for table in ("operator_commands", "operator_plane_commands")]
+    home(rig, "oem.z.manual_home")
+    assert store.settle_deck_recovery_by_home()
+    assert store._home_recovery_resolution(child)
+    resolution = store.get_command("parent")["recovery_resolution"]
+    assert bool(resolution) is (not independent and not unknown_child)
+    assert ("parent" in store.recovery()["outcome_unknown_command_ids"]) is (independent or unknown_child)
+    assert before == [tuple(store.connection.execute("SELECT * FROM " + table + " WHERE command_id='parent'").fetchone())
+                      for table in ("operator_commands", "operator_plane_commands")]
+    if resolution:
+        assert resolution["child_evidence"][0]["command_id"] == child
+

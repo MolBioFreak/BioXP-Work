@@ -32,11 +32,43 @@ class CommandReceiptReader:
         self.connection = connection
         self._lock = lock
 
+    def _unknown_affected_axes(self, command_id: str) -> list[str] | None:
+        """None means retained evidence cannot identify the uncertain axes.
+
+        Completed earlier steps do not enlarge the failed step's scope. This
+        recognises native source operations, not arbitrary nested axis labels.
+        """
+        scopes = {"MoveZHome": {"z"}, "moveTo": {"x", "y", "z"}}
+        rows = self.connection.execute(
+            "SELECT terminal_evidence_json FROM operator_plane_wp8_children "
+            "WHERE command_id=? AND terminal_state IN ('ambiguous','interrupted')",
+            (command_id,),
+        ).fetchall()
+        axes = set()
+        if not rows:
+            return None
+        for row in rows:
+            result = _json_load(row[0], {}).get("result", {})
+            steps = result.get("steps") if isinstance(result, dict) else None
+            if not isinstance(steps, list) or not steps:
+                return None
+            uncertain = [step for step in steps if isinstance(step, dict)
+                         and isinstance(step.get("result"), dict)
+                         and step["result"].get("ok") is not True]
+            if not uncertain:
+                return None
+            for step in uncertain:
+                scope = scopes.get(str(step.get("operation")))
+                if scope is None:
+                    return None
+                axes.update(scope)
+        return sorted(axes) or None
+
     def _home_recovery_resolution(self, command_id: str) -> dict[str, Any] | None:
         row = self.connection.execute(
             "SELECT transition_sequence,payload_json FROM operator_plane_transitions "
             "WHERE command_id=? AND event_kind='recovery_resolved' "
-            "AND json_extract(payload_json,'$.resolution')='axes_homed_after_unknown_moves' "
+            "AND json_extract(payload_json,'$.resolution') IN ('axes_homed_after_unknown_moves','children_recovery_resolved') "
             "ORDER BY transition_sequence DESC LIMIT 1", (str(command_id),),
         ).fetchone()
         if row is None:
@@ -245,6 +277,9 @@ class CommandReceiptReader:
                     and response["finished_at"] is not None
                     and deck_detail.get("ambiguity_state") == "recovery_required"):
                 response["completion_class"] = "recovery_required"
+        response["recovery_resolution"] = self._home_recovery_resolution(str(row["command_id"]))
+        if response["status"] in {"ambiguous", "interrupted"}:
+            response["affected_axes"] = self._unknown_affected_axes(str(row["command_id"]))
         return response
 
     def get_command(self, command_id: str) -> dict[str, Any] | None:

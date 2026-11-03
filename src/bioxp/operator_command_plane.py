@@ -96,10 +96,8 @@ _X_HOMES = ("oem.xy.home", "oem.x.manual_panel_home", "oem.x.startup_home", "oem
 _Y_HOMES = ("oem.xy.home", "oem.y.manual_panel_home", "meta.initialize_motion")
 _Z_HOMES = ("oem.z.manual_home", "oem.z.move_z_home", "oem.z.diagnostic_home_axis", "meta.initialize_motion")
 HOME_ACTIONS = tuple(sorted(set(_X_HOMES + _Y_HOMES + _Z_HOMES)))
-HOMED_AFTER_SQL = " AND ".join(
-    "EXISTS(SELECT 1 FROM operator_commands h WHERE h.status='completed' AND h.action_id IN ("
-    + ",".join(f"'{a}'" for a in group) + ") AND h.updated_at>COALESCE(c.finished_at,c.updated_at))"
-    for group in (_X_HOMES, _Y_HOMES, _Z_HOMES))
+# Home resolution is derived from retained failed-step scope, never a blanket XYZ policy.
+_HOME_ACTIONS_BY_AXIS = {"x": _X_HOMES, "y": _Y_HOMES, "z": _Z_HOMES}
 
 ALLOWED_ACTIONS = frozenset({
     "oem.x.prepare",
@@ -2601,12 +2599,19 @@ class OperatorCommandStore(CommandReceiptReader):
                 "SELECT 1 FROM operator_commands c LEFT JOIN serial206_movement_commands m USING(command_id) "
                 "WHERE c.parent_command_id=? AND COALESCE(m.state,c.status) NOT IN ("
                 + ",".join("?" for _ in settled) + ") LIMIT 1", (command_id, *settled)).fetchone()
+            independent_unknown = status == "ambiguous"
             if pending or not lifecycle_settled:
                 status = "ambiguous"
             if status == "ambiguous":
                 payload = json.loads(_canonical(payload))
                 workflow = payload.setdefault("execution", {}).setdefault("runtime_state", {}).setdefault("workflow", {"command_id": command_id})
-                workflow.update(phase="reconciling", held_reason="workflow_settlement_unknown")
+                causes = (["children"] if pending else [])
+                if not lifecycle_settled:
+                    causes.append("lifecycle")
+                if independent_unknown:
+                    causes.append("parent")
+                workflow.update(phase="reconciling", held_reason="workflow_settlement_unknown",
+                                settlement_unknown_causes=causes)
             if status == "completed":
                 try:
                     self._workflow_current(conn, command_id)
@@ -2843,7 +2848,8 @@ class OperatorCommandStore(CommandReceiptReader):
             "WHERE c.action_id IN ('oem.deck.move_to_location','oem.deck.move_to_well','oem.deck._mov_execution','oem.deck._finite_operation') "
             "AND (c.status IN ('ambiguous','interrupted') OR d.ambiguity_state='recovery_required') "
             "AND NOT EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions r WHERE r.command_id=c.command_id) "
-            "AND NOT (" + HOMED_AFTER_SQL + ") LIMIT 1"
+            "AND NOT EXISTS (SELECT 1 FROM operator_plane_transitions t WHERE t.command_id=c.command_id "
+            "AND t.event_kind='recovery_resolved') LIMIT 1"
         ).fetchone()
         semantic = conn.execute(
             "SELECT ambiguity_state FROM operator_plane_deck_semantic_state WHERE singleton=1"
@@ -2861,42 +2867,65 @@ class OperatorCommandStore(CommandReceiptReader):
             return self._deck_recovery_blocker(self.connection)
 
     def settle_deck_recovery_by_home(self) -> bool:
-        """Link subsequent XYZ homes to each unknown deck command, additively.
+        """Link subsequent affected-axis homes to each unknown deck command, additively.
 
         Partial settlement is visible even while another command remains
         unresolved. Neither terminal history nor live resource owners change.
         """
+        # The transition sequence is indexed and belongs to this existing owner.
+        # Lease renewals/telemetry are not relevant terminal evidence.
+        with self._lock:
+            high = self.connection.execute("SELECT COALESCE(MAX(transition_sequence),0) FROM operator_plane_transitions").fetchone()[0]
+            previous = getattr(self, "_home_settlement_sequence", None)
+            if previous == high:
+                return False
+            if previous is not None:
+                relevant = self.connection.execute(
+                    "SELECT 1 FROM operator_plane_transitions WHERE transition_sequence>? "
+                    "AND event_kind IN ('command_terminal','workflow_terminal','interrupt_terminal','recovery_resolved') LIMIT 1",
+                    (previous,)).fetchone()
+                if relevant is None:
+                    self._home_settlement_sequence = high
+                    return False
         changed = False
         with self._transaction() as conn:
             candidates = conn.execute(
-                "SELECT c.command_id,COALESCE(c.finished_at,c.updated_at) AS failed_at "
+                "SELECT c.command_id,c.finished_at AS failed_at "
                 "FROM operator_plane_commands c LEFT JOIN operator_plane_deck_commands d USING(command_id) "
                 "WHERE c.action_id IN ('oem.deck.move_to_location','oem.deck.move_to_well','oem.deck._mov_execution','oem.deck._finite_operation') "
                 "AND (c.status IN ('ambiguous','interrupted') OR d.ambiguity_state='recovery_required') "
                 "AND NOT EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions r WHERE r.command_id=c.command_id) "
                 "AND NOT EXISTS (SELECT 1 FROM operator_plane_transitions t WHERE t.command_id=c.command_id "
                 "AND t.event_kind='recovery_resolved' AND json_extract(t.payload_json,'$.resolution')='axes_homed_after_unknown_moves') "
-                "AND (" + HOMED_AFTER_SQL + ")"
             ).fetchall()
             for candidate in candidates:
                 command_id = str(candidate["command_id"])
                 if self._home_recovery_resolution(command_id) is not None:
                     continue
+                axes = self._unknown_affected_axes(command_id)
+                if axes is None or candidate["failed_at"] is None:
+                    continue
                 homes = []
-                for axis, actions in (("x", _X_HOMES), ("y", _Y_HOMES), ("z", _Z_HOMES)):
+                for axis in axes:
+                    actions = _HOME_ACTIONS_BY_AXIS[axis]
                     home = conn.execute(
-                        "SELECT command_id,action_id,updated_at AS at FROM operator_commands "
-                        "WHERE status='completed' AND updated_at>? AND action_id IN ("
-                        + ",".join("?" for _ in actions) + ") ORDER BY updated_at,command_id LIMIT 1",
+                        "SELECT command_id,action_id,CAST(finished_at AS REAL) AS at FROM operator_commands "
+                        "WHERE status='completed' AND CAST(finished_at AS REAL)>? AND action_id IN ("
+                        + ",".join("?" for _ in actions) + ") ORDER BY CAST(finished_at AS REAL),command_id LIMIT 1",
                         (candidate["failed_at"], *actions),
                     ).fetchone()
+                    if home is None:
+                        break
                     homes.append({"axis": axis, **dict(home)})
+                if len(homes) != len(axes):
+                    continue
                 self._insert_transition(
                     conn, command_id=command_id, event_kind="recovery_resolved", state="recovery_resolved",
                     payload={"command_id": command_id, "resolution": "axes_homed_after_unknown_moves",
-                             "home_evidence": homes},
+                             "affected_axes": axes, "home_evidence": homes},
                 )
                 changed = True
+            changed = self._settle_workflow_child_recovery(conn) or changed
             hold = conn.execute("SELECT recovery_hold FROM operator_plane_safety WHERE singleton=1").fetchone()
             semantic = conn.execute("SELECT ambiguity_state FROM operator_plane_deck_semantic_state WHERE singleton=1").fetchone()
             if (hold is not None and hold[0]
@@ -2906,8 +2935,41 @@ class OperatorCommandStore(CommandReceiptReader):
                 changed = True
             elif changed:
                 conn.execute("UPDATE operator_plane_safety SET recovery_version=recovery_version+1,updated_at=? WHERE singleton=1", (_now(),))
+            self._home_settlement_sequence = conn.execute(
+                "SELECT COALESCE(MAX(transition_sequence),0) FROM operator_plane_transitions").fetchone()[0]
         if changed:
             self._wake.set()
+        return changed
+
+    def _settle_workflow_child_recovery(self, conn: sqlite3.Connection) -> bool:
+        from .runtime_audit_store import TERMINAL_COMMAND_STATES
+        settled = (TERMINAL_COMMAND_STATES | COMMAND_TERMINAL) - {
+            "ambiguous", "outcome_unknown", "reconciliation_required", "interrupted"}
+        changed = False
+        for parent in conn.execute(
+                "SELECT command_id,receipt_json FROM operator_commands "
+                "WHERE command_kind='protocol_workflow' AND status='ambiguous'").fetchall():
+            pid = parent["command_id"]
+            if self._home_recovery_resolution(pid) is not None:
+                continue
+            workflow = _json_load(parent["receipt_json"], {}).get("execution", {}).get("runtime_state", {}).get("workflow", {})
+            # Older generic reasons do not distinguish child from independent
+            # lifecycle uncertainty. Do not invent that missing evidence.
+            if (workflow.get("held_reason") != "workflow_settlement_unknown"
+                    or workflow.get("settlement_unknown_causes") != ["children"]):
+                continue
+            children = conn.execute(
+                "SELECT c.command_id,COALESCE(m.state,c.status) AS state FROM operator_commands c "
+                "LEFT JOIN serial206_movement_commands m USING(command_id) WHERE c.parent_command_id=?",
+                (pid,)).fetchall()
+            uncertain = [c for c in children if c["state"] not in settled]
+            resolutions = [self._home_recovery_resolution(c["command_id"]) for c in uncertain]
+            if not uncertain or not all(resolutions):
+                continue
+            self._insert_transition(conn, command_id=pid, event_kind="recovery_resolved", state="recovery_resolved",
+                payload={"command_id": pid, "resolution": "children_recovery_resolved",
+                         "child_evidence": resolutions})
+            changed = True
         return changed
 
     def bind_tip_tray_constructor_reader(self, reader: Callable[[int], Mapping[str, Any] | None]) -> None:
