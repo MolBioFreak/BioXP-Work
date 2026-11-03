@@ -38,7 +38,27 @@ class CommandReceiptReader:
         Completed earlier steps do not enlarge the failed step's scope. This
         recognises native source operations, not arbitrary nested axis labels.
         """
-        scopes = {"MoveZHome": {"z"}, "moveTo": {"x", "y", "z"}}
+        scopes = {"MoveZHome": {"z"}, "moveTo": {"x", "y", "z"},
+                  "sourceHomeZ": {"z"}, "sourceMoveZ": {"z"},
+                  "sourceMoveX": {"x"}, "sourceMoveXY": {"x", "y"}}
+
+        def failed_scope(operation, evidence):
+            if "failure_evidence" not in evidence:
+                return scopes.get(str(operation))
+            failures = evidence.get("failure_evidence")
+            completed = evidence.get("completed_children")
+            if (not isinstance(failures, list) or not failures
+                    or not isinstance(completed, list)
+                    or not all(isinstance(child, dict) and isinstance(child.get("result"), dict)
+                               and child["result"].get("ok") is True for child in completed)):
+                return None
+            scope = set()
+            for failure in failures:
+                if not isinstance(failure, dict) or str(failure.get("operation")) not in scopes:
+                    return None
+                scope.update(scopes[str(failure["operation"])])
+            return scope
+
         rows = self.connection.execute(
             "SELECT terminal_evidence_json FROM operator_plane_wp8_children "
             "WHERE command_id=? AND terminal_state IN ('ambiguous','interrupted')",
@@ -60,7 +80,7 @@ class CommandReceiptReader:
             if not uncertain:
                 return None
             for step in uncertain:
-                scope = scopes.get(str(step.get("operation")))
+                scope = failed_scope(step.get("operation"), step.get("result", step.get("evidence", {})))
                 if scope is None:
                     return None
                 axes.update(scope)

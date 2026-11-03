@@ -2258,6 +2258,7 @@ class OperatorCommandStore(CommandReceiptReader):
             payload = _json_load(row["receipt_json"], {}) or inputs.get("bundle", {})
             return {**payload, "job_id": command_id, "status": row["status"], "command": {
                 "command_id": command_id, "idempotency_key": row["idempotency_key"],
+                "recovery_resolution": self._home_recovery_resolution(command_id),
                 "ownership_generation": int(row["ownership_generation"]), "state_version": int(row["version"]),
                 "status": row["status"], "terminal": row["status"] in {"completed","failed","interrupted","ambiguous","cleared","rejected"},
                 "status_path": f"/protocol/jobs/{command_id}"}}
@@ -2302,6 +2303,7 @@ class OperatorCommandStore(CommandReceiptReader):
                 "execution": {**({"dry_run": dry_run} if row["dry_run_type"] is not None else {}),
                               "runtime_state": runtime}, "operator": operator,
                 "command": {"command_id": command_id,
+                    "recovery_resolution": self._home_recovery_resolution(command_id),
                     "ownership_generation": int(row["ownership_generation"]), "state_version": int(row["version"]),
                     "status": row["status"], "terminal": row["status"] in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"}}}
 
@@ -2608,7 +2610,7 @@ class OperatorCommandStore(CommandReceiptReader):
                 causes = (["children"] if pending else [])
                 if not lifecycle_settled:
                     causes.append("lifecycle")
-                if independent_unknown:
+                if independent_unknown or workflow.get("held_reason") not in {None, "workflow_settlement_unknown"}:
                     causes.append("parent")
                 workflow.update(phase="reconciling", held_reason="workflow_settlement_unknown",
                                 settlement_unknown_causes=causes)

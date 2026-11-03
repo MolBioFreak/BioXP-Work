@@ -220,17 +220,23 @@ def test_unknown_scope_is_not_invented_and_mixed_axes(rig):
     assert store.settle_deck_recovery_by_home()
     assert store._home_recovery_resolution(z)
     assert store._home_recovery_resolution(xyz) is None
-    home(rig, "oem.xy.home")
+    home(rig, "oem.x.manual_panel_home")
+    home(rig, "oem.y.manual_panel_home")
     assert store.settle_deck_recovery_by_home()
     assert store._home_recovery_resolution(xyz)
     assert store._home_recovery_resolution(unknown) is None
     assert store.recovery()["outcome_unknown_command_ids"] == [unknown]
 
 
-def test_no_repeat_writer_or_history_scan(rig, monkeypatch):
+@pytest.mark.parametrize("resolved", [False, True])
+def test_no_repeat_writer_or_history_scan(rig, monkeypatch, resolved):
     store, *_ = rig
     run_failure(rig, pickup({"ok": False, "delivery_attempted": True}))
     assert not store.settle_deck_recovery_by_home()
+    if resolved:
+        home(rig, "oem.z.manual_home")
+        assert store.settle_deck_recovery_by_home()
+    assert store._renew_owner(lease_seconds=600)
     statements = []
     store.connection.set_trace_callback(statements.append)
     with monkeypatch.context() as m:
@@ -254,7 +260,7 @@ def test_home_order_uses_terminal_time_not_mutable_update(rig):
     assert store.settle_deck_recovery_by_home()
 
 
-@pytest.mark.parametrize("independent,unknown_child", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("independent,unknown_child", [(False, False), (True, False), (False, True), ("parent", False)])
 def test_workflow_resolution_requires_only_resolved_children(rig, independent, unknown_child):
     store, *_ = rig
     store.bind_workflow_dispatcher(lambda _: None)
@@ -268,15 +274,18 @@ def test_workflow_resolution_requires_only_resolved_children(rig, independent, u
     if unknown_child:
         with store.workflow_context("parent", source_occurrence_id="unknown"):
             other = run_failure(rig, DeckExecutionFailure("unknown step", delivery_attempted=True))
-    store.finish_workflow("parent", status="failed", payload={}, lifecycle_settled=not independent)
+    store.finish_workflow("parent", status="ambiguous" if independent == "parent" else "failed",
+        payload={}, lifecycle_settled=independent is not True)
     before = [tuple(store.connection.execute("SELECT * FROM " + table + " WHERE command_id='parent'").fetchone())
               for table in ("operator_commands", "operator_plane_commands")]
     home(rig, "oem.z.manual_home")
     assert store.settle_deck_recovery_by_home()
     assert store._home_recovery_resolution(child)
     resolution = store.get_command("parent")["recovery_resolution"]
+    assert store.get_workflow("parent")["command"]["recovery_resolution"] == resolution
+    assert store.get_workflow_observation("parent")["command"]["recovery_resolution"] == resolution
     assert bool(resolution) is (not independent and not unknown_child)
-    assert ("parent" in store.recovery()["outcome_unknown_command_ids"]) is (independent or unknown_child)
+    assert ("parent" in store.recovery()["outcome_unknown_command_ids"]) is bool(independent or unknown_child)
     assert before == [tuple(store.connection.execute("SELECT * FROM " + table + " WHERE command_id='parent'").fetchone())
                       for table in ("operator_commands", "operator_plane_commands")]
     if resolution:
