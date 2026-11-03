@@ -11,6 +11,7 @@ def _db(hold=1):
     CREATE TABLE operator_plane_commands(command_id TEXT, action_id TEXT, status TEXT, finished_at REAL, updated_at REAL);
     CREATE TABLE operator_plane_deck_commands(command_id TEXT, ambiguity_state TEXT);
     CREATE TABLE operator_plane_deck_recovery_decisions(command_id TEXT);
+    CREATE TABLE operator_plane_transitions(command_id TEXT, event_kind TEXT);
     CREATE TABLE operator_plane_deck_semantic_state(singleton INTEGER, ambiguity_state TEXT);
     CREATE TABLE operator_commands(command_id TEXT, action_id TEXT, status TEXT, updated_at REAL);
     INSERT INTO operator_plane_deck_semantic_state VALUES(1,'none');
@@ -20,7 +21,7 @@ def _db(hold=1):
     return c
 
 
-def test_unknown_move_holds_until_x_y_and_z_home_after_it():
+def test_recovery_reader_uses_the_published_resolution_without_rewriting_history():
     c = _db()
     assert OperatorCommandStore._deck_recovery_blocker(c) == "deck_recovery_hold"
     c.execute("INSERT INTO operator_commands VALUES('z0','oem.z.manual_home','completed',50)")
@@ -28,7 +29,9 @@ def test_unknown_move_holds_until_x_y_and_z_home_after_it():
     c.execute("INSERT INTO operator_commands VALUES('xy0','oem.xy.home','failed',160)")
     assert OperatorCommandStore._deck_recovery_blocker(c) == "deck_recovery_hold"
     c.execute("INSERT INTO operator_commands VALUES('xy1','oem.xy.home','completed',170)")
-    # Resolved by the homes; the stale hold flag is what settle_deck_recovery_by_home lifts.
+    # The writer publishes command-linked resolution; this reader does not infer it from homes.
+    assert OperatorCommandStore._deck_recovery_blocker(c) == "deck_recovery_hold"
+    c.execute("INSERT INTO operator_plane_transitions VALUES('m','recovery_resolved')")
     assert OperatorCommandStore._deck_recovery_blocker(c) == "deck_recovery_state_inconsistent"
     c.execute("UPDATE operator_plane_safety SET recovery_hold=0")
     assert OperatorCommandStore._deck_recovery_blocker(c) is None
