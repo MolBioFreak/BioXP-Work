@@ -1252,7 +1252,7 @@ def _compile_finite_plate_operation_unchecked(
         if operation == "manual_load_tip" and inputs.get("keep_channels") is not None:
             # Partial pickup: keep these channels, release the rest back into the rack.
             arguments.update(keep_channels=[int(c) for c in inputs["keep_channels"]],
-                             release_lift_mm=float(inputs.get("release_lift_mm", 5.0)))
+                             release_lift_mm=float(inputs.get("release_lift_mm", 10.0)))
         _wp8_child(children, leaf, arguments=arguments)
         return _wp8_plan(operation, children)
     if operation == "pipette_shift_camera":

@@ -89,7 +89,7 @@ class ManualLoadTip(_Request):
     overpress: bool = False
     lift_z: bool = False
     keep_channels: list[int] | None = Field(default=None, min_length=1, max_length=4)
-    release_lift_mm: float = Field(default=5.0, ge=0, le=10)
+    release_lift_mm: float = Field(default=10.0, ge=0, le=10)
 
     @field_validator("keep_channels", mode="before")
     @classmethod

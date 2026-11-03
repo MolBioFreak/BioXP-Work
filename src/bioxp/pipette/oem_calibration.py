@@ -19,7 +19,7 @@ from ..oem_compat.position_table import well_id_from_label
 Result = dict[str, Any]
 
 
-RELEASE_LIFT_MM = 5.0  # lift before ejecting unneeded tips back into the rack
+RELEASE_LIFT_MM = 10.0  # lift before ejecting unneeded tips back into the rack
 Z_STEPS_PER_MM = 2015.748
 
 
