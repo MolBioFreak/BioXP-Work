@@ -91,6 +91,12 @@ class ManualLoadTip(_Request):
     keep_channels: list[int] | None = Field(default=None, min_length=1, max_length=4)
     release_lift_mm: float = Field(default=5.0, ge=0, le=10)
 
+    @field_validator("keep_channels", mode="before")
+    @classmethod
+    def thaw_keep_channels(cls, value):
+        # Protocol documents freeze lists into tuples.
+        return list(value) if isinstance(value, tuple) else value
+
 
 class SourceLoadTips(_Request):
     """newloadTips, not calibration loadTips or manual tray/well pickup.
