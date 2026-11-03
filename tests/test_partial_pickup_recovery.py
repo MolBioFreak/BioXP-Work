@@ -202,7 +202,10 @@ def test_production_exception_envelopes(rig, envelope, expected):
     store = rig[0]
     assert store.get_command(cid)["status"] == expected
     retained = json.loads(store.wp8_operation_evidence(cid)["children"][0]["terminal_evidence_json"])["result"]
-    assert retained["failed_step"]["evidence"] == envelope
+    # Diagnostic-only nesting is intentionally dropped by the integrated
+    # operational projection; it must not supply failed-send proof.
+    assert retained["failed_step"]["evidence"] == {k: v for k, v in envelope.items() if k != "diagnostics"}
+    assert "diagnostics" not in retained["failed_step"]["evidence"]
     assert retained["steps"][:2] == result["steps"][:2]
 
 
