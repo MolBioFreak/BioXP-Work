@@ -14,6 +14,7 @@ OUTCOME_FIELDS = frozenset({
     'command_id', 'receipt_id', 'operation_index', 'requested_control', 'partial_effects',
     'source_anchor', 'source_return_code', 'reason',
     'failed_channel', 'failure_details', 'completion_wait_started', 'source_timeout_termination',
+    'known_failure', 'failed_child_delivery_attempted', 'outcome_unknown',
 })
 
 
@@ -112,7 +113,12 @@ def compact_manual_pickup(value: Any) -> Any:
         'release_lift_steps', 'rack_tips_removed', 'rack_record', 'tip_type_set',
         'lost_steps', 'lost_steps_warning', 'calibration_persisted', 'tip_type',
         'tip_location', 'tip_loaded', 'tip_dirty', 'hardware_commanded',
-        'known_failure', 'outcome_unknown', 'accounting', 'accounting_error',
+        'known_failure', 'failed_child_delivery_attempted', 'outcome_unknown',
+        'accounting', 'accounting_error', 'bookkeeping_error', 'pickup_accounting',
+        'picked_up_channels', 'release_unverified_channels', 'rack_tips_restored',
+        'transition', 'published', 'details', 'observed_channels', 'semantic_ok',
+        'hardware_truth_level', 'tray_id', 'revision', 'available_count', 'operation_id',
+        'record_id',
     })
     if isinstance(value, Mapping):
         return {key: compact_manual_pickup(item) for key, item in value.items() if key in fields}

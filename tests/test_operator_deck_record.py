@@ -175,8 +175,13 @@ def test_partial_pickup_releases_unneeded_tips_after_short_lift_and_books_only_k
     from bioxp.oem_serial206_initialization import Serial206OemInitializationProvider as P
     calls = []
     chans = [SimpleNamespace(_tip_loaded=True) for _ in range(4)]
-    group = SimpleNamespace(_transports=chans, query_tip_status_all=lambda: {'ok': True},
-                            _eject_tip_channels_once=lambda ch, wait_for_completion: calls.append(('eject', ch)) or [])
+    group = SimpleNamespace(_transports=chans,
+        query_tip_status_all=lambda: {'ok': True, 'channels': [
+            {'channel': ch, 'tip_loaded': True, 'result': {'ok': True, 'semantic_ok': True,
+             'hardware_truth_level': 'hardware_query'}} for ch in range(4)]},
+        _eject_tip_channels_once=lambda ch, wait_for_completion: calls.append(('eject', ch)) or [
+            {'channel': channel, 'result': {'ok': True, 'completion_verified': True}}
+            for channel in ch])
     b = CalibrationBindings(
         finite=lambda name, inputs: calls.append((name, dict(inputs))) or {'ok': True},
         native=lambda name, call, inputs: call(), pipette=lambda name, call: call(group),
@@ -192,7 +197,7 @@ def test_partial_pickup_releases_unneeded_tips_after_short_lift_and_books_only_k
     P._manual_pickup_bookkeeping(SimpleNamespace(tip_tray_type=lambda tray: None),
         {'tray': 1, 'well': 'A2', 'keep_channels': [0, 2]},
         lambda name, inputs: books.append(inputs) or {'ok': True}, lambda name, call: None)
-    assert books[0]['well_ids'] == [1, 49]
+    assert [entry['well_ids'] for entry in books] == [[1], [49]]
     calls.clear()
     manual_load_tip(ManualTipLoadRequest(tray=1, well='A2'), b)
     assert not any(c[0] in ('eject', 'pipette_move_z') for c in calls)
