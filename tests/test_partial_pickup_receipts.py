@@ -14,6 +14,7 @@ import json
 import pytest
 from fastapi import HTTPException
 from bioxp.oem_runtime_store import OEMRuntimeStore
+from bioxp.pipette.models import PipetteCommandError
 from bioxp.pipette.receipts import PipetteReceiptStore
 from bioxp.services.pipette_service import run_pipette_operation
 
@@ -726,13 +727,14 @@ def test_partial_exception_keeps_original_failure_and_channel_evidence(store, fa
 
 
 @pytest.mark.parametrize("phase", ["send", "wait"])
-@pytest.mark.parametrize("error_type", [RuntimeError, TimeoutError, ValueError])
+@pytest.mark.parametrize("error_type", [RuntimeError, TimeoutError, ValueError, PipetteCommandError])
 def test_real_eject_throw_keeps_prefix_through_service(store, phase, error_type):
     from types import SimpleNamespace
     from bioxp.pipette.transport import FourPipetteTransport
 
     failure = error_type("P2 eject failed")
-    failure.details = {"owner_token": "original-owner", "channel": 1}
+    if error_type is not RuntimeError:
+        failure.details = {"owner_token": "original-owner", "channel": 1}
     trace = []
     completed = {"ok": True, **dict.fromkeys(FLAGS, True)}
     deferred = {"ok": True, "outcome": "tx_only", "delivery_verified": True,
@@ -765,8 +767,9 @@ def test_real_eject_throw_keeps_prefix_through_service(store, phase, error_type)
             return transport._eject_tip_channels_once([0, 1, 2, 3], wait_for_completion=True)
         except Exception as exc:
             assert exc is failure  # No replacement type, retry, or owner transfer.
-            assert exc.details["owner_token"] == "original-owner"
-            assert exc.details["channel"] == 1
+            if error_type is not RuntimeError:
+                assert failure.details["owner_token"] == "original-owner"
+                assert failure.details["channel"] == 1
             raise
 
     returned, row, receipt = run(store, "release_unneeded_tips", None,
