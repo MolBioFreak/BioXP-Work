@@ -784,6 +784,9 @@ def _compact_pipette_response(value: Any) -> Any:
     """
     if not isinstance(value, Mapping):
         return value
+    if value.get("kind") == "manual_load_tip" or str(value.get("source_anchor") or "").startswith("ControlLib.btnLoadTip_Click:"):
+        from .protocols.operational_results import compact_manual_pickup
+        return {**compact_manual_pickup(value), "kind": "manual_load_tip"}
     if value.get("kind") == "cavro_application":
         # Versioned application events are operational fields, not diagnostic
         # previews: retain channels, partial settings and control at every child.
@@ -794,7 +797,8 @@ def _compact_pipette_response(value: Any) -> Any:
     if value.get("kind") in _ADDITIONAL_PIPETTE_KINDS:
         return _compact_additional_pipette(value)
     source = str(value.get("source") or value.get("source_anchor") or "")
-    kinds = {"ControlLib.calwithFluid:": "source_calwith_fluid",
+    kinds = {"ControlLib.btnLoadTip_Click:": "manual_load_tip",
+             "ControlLib.calwithFluid:": "source_calwith_fluid",
              "ControlLib.btnDetectFluid_Click:": "diagnostic_detect_fluid",
              "ControlLib.zOffset:": "source_fluid_offset",
              "ControlLib.scrFluidDetection:": "measure_fluid_height"}
@@ -889,7 +893,7 @@ def _bounded_json(value: Any, limit: int) -> Any:
         return json.loads(raw)
     if isinstance(value, Mapping) and isinstance(value.get("kind"), str) and value["kind"] in {
             "source_calwith_fluid", "diagnostic_detect_fluid",
-            "source_fluid_offset", "measure_fluid_height", *_ADDITIONAL_PIPETTE_KINDS}:
+            "source_fluid_offset", "measure_fluid_height", "manual_load_tip", *_ADDITIONAL_PIPETTE_KINDS}:
         return json.loads(raw)
     if isinstance(value, Mapping) and any(key in value for key in ("pipette_result", "barcode_result", "child_outcomes")):
         # Critical source data is not diagnostic preview data. Drop the redundant
