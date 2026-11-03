@@ -72,15 +72,21 @@ class CommandReceiptReader:
             steps = result.get("steps") if isinstance(result, dict) else None
             if not isinstance(steps, list) or not steps:
                 return None
-            if not all(isinstance(step, dict) and isinstance(
-                    step.get("result", step.get("evidence")), dict) for step in steps):
+            if not all(isinstance(step, dict) for step in steps):
+                return None
+            # A retained exception step still names its operation even when
+            # older producers dropped the exception's detailed return evidence.
+            if any((step.get("result", step.get("evidence")) is not None
+                    and not isinstance(step.get("result", step.get("evidence")), dict))
+                   or (step.get("result", step.get("evidence")) is None and "error" not in step)
+                   for step in steps):
                 return None
             uncertain = [step for step in steps
-                         if step.get("result", step.get("evidence", {})).get("ok") is not True]
+                         if (step.get("result", step.get("evidence")) or {}).get("ok") is not True]
             if not uncertain:
                 return None
             for step in uncertain:
-                scope = failed_scope(step.get("operation"), step.get("result", step.get("evidence", {})))
+                scope = failed_scope(step.get("operation"), step.get("result", step.get("evidence")) or {})
                 if scope is None:
                     return None
                 axes.update(scope)

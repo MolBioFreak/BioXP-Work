@@ -206,6 +206,18 @@ def test_production_exception_envelopes(rig, envelope, expected):
     assert retained["steps"][:2] == result["steps"][:2]
 
 
+def test_retained_exception_operation_identifies_axis_without_inventing_return(rig):
+    result = pickup({})
+    result["steps"][-1] = {"operation": "MoveZHome", "error": "unretained native exception"}
+    cid = run_failure(rig, result)
+    store = rig[0]
+    assert store.get_command(cid)["status"] == "ambiguous"
+    assert store.get_command(cid)["affected_axes"] == ["z"]
+    home(rig, "oem.z.manual_home")
+    assert store.settle_deck_recovery_by_home()
+    assert store.get_command(cid)["status"] == "ambiguous"
+
+
 def test_unknown_scope_is_not_invented_and_mixed_axes(rig):
     store, *_ = rig
     unknown = run_failure(rig, DeckExecutionFailure("unrecorded step", delivery_attempted=True))
