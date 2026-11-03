@@ -16,6 +16,37 @@ def _tip_exists(collection: Mapping[str, Any] | None) -> bool | None:
     return None if not isinstance(collection, Mapping) else collection.get("tip_exists")
 
 
+def _failed_child_delivery(result: Mapping[str, Any]) -> bool | None:
+    """Use the failed source step, never successful earlier sends, for ambiguity.
+
+    Missing failure evidence remains unknown. Only the ordered manual-pickup
+    sequence has this shape; do not recursively infer truth from diagnostics.
+    """
+    if str(result.get("source_anchor", "")).startswith("ControlLib.btnLoadTip_Click:"):
+        steps = result.get("steps")
+        if not isinstance(steps, list) or not steps:
+            return None
+        # The source stops at the first failure. Prior effects must be known,
+        # otherwise a last-step pre-send failure cannot settle their uncertainty.
+        if not all(isinstance(s, Mapping) and isinstance(s.get("result"), Mapping)
+                   and s["result"].get("ok") is True for s in steps[:-1]):
+            return None
+        last = steps[-1]
+        if not isinstance(last, Mapping):
+            return None
+        failure = last.get("result") if "result" in last else last.get("evidence")
+        if not isinstance(failure, Mapping):
+            return None
+        return _failed_child_delivery(failure)
+    if result.get("controller_command_acknowledged") is True or result.get("delivery_verified") is True:
+        return True
+    if type(result.get("delivery_attempted")) is bool:
+        return result["delivery_attempted"]
+    if result.get("tx_ok") is False and result.get("delivery_verified") is False:
+        return False
+    return None
+
+
 def _controller_terminal_truth(result: Mapping[str, Any]) -> bool:
     """Require acknowledged source motion and non-contradictory terminal proof."""
     if result.get("source_noop") is True:
@@ -1922,7 +1953,7 @@ def make_wp8_operation_executor(
                     )
                     command_store.terminalize_wp8_child(
                         command_id, order,
-                        state="ambiguous" if child_delivery_attempted else "failed",
+                        state="ambiguous" if child_delivery_attempted and not getattr(exc, "known_failure", False) else "failed",
                         result={
                             "exception_type": type(exc).__name__, "exception": str(exc),
                             "delivery_attempted": child_delivery_attempted,
@@ -1947,7 +1978,10 @@ def make_wp8_operation_executor(
                     command_store.assert_deck_execution_current(
                         command_id, boundary=f"before_terminalize_wp8_child_{order}",
                     )
-                    known = _known_cavro_failure(result)
+                    failed_delivery = _failed_child_delivery(result)
+                    if failed_delivery is not None:
+                        child_delivery_attempted = failed_delivery
+                    known = _known_cavro_failure(result) or result.get("known_failure") is True
                     command_store.terminalize_wp8_child(
                         command_id, order,
                         state="ambiguous" if child_delivery_attempted and not known else "failed",
@@ -2049,7 +2083,9 @@ def make_wp8_operation_executor(
                     "ok": False, "exception_suppressed": False,
                     "exception_type": type(exc).__name__, "exception": str(exc),
                     "delivery_attempted": delivery_attempted,
-                    "outcome_unknown": delivery_attempted and not getattr(exc, "known_failure", False),
+                    "outcome_unknown": (exc.delivery_attempted if isinstance(exc, DeckExecutionFailure) else delivery_attempted) and not getattr(exc, "known_failure", False),
+                    "known_failure": getattr(exc, "known_failure", False),
+                    "failed_child_delivery_attempted": exc.delivery_attempted if isinstance(exc, DeckExecutionFailure) else None,
                     "background_pending": any(not bool(row.get("awaited", True)) for row in plan.get("children", [])),
                 }
                 finalize = getattr(command_store, "finalize_wp8_operation", None)

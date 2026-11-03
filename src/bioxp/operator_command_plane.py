@@ -1774,7 +1774,8 @@ class OperatorCommandStore(CommandReceiptReader):
         ).fetchone()
         assert row is not None
         self._transition_pending = True
-        if command_id:
+        if command_id and event_kind != "recovery_resolved":
+            # Recovery is additive evidence, not a rewrite of terminal history.
             # Keep SQL claim/report lineage current, not a second rendered
             # receipt. Readers use the canonical owner on their own connection.
             command = conn.execute(
@@ -2860,29 +2861,52 @@ class OperatorCommandStore(CommandReceiptReader):
             return self._deck_recovery_blocker(self.connection)
 
     def settle_deck_recovery_by_home(self) -> bool:
-        """Lift the deck recovery hold once every unknown deck move has had
-        successful X, Y and Z homes after it. A completed home re-references
-        the axes, so the position is known again; the home commands are the
-        evidence. The unknown records themselves keep their history."""
-        with self._lock:
-            hold = self.connection.execute("SELECT recovery_hold FROM operator_plane_safety WHERE singleton=1").fetchone()
-        if hold is None or not hold[0]:
-            return False
+        """Link subsequent XYZ homes to each unknown deck command, additively.
+
+        Partial settlement is visible even while another command remains
+        unresolved. Neither terminal history nor live resource owners change.
+        """
+        changed = False
         with self._transaction() as conn:
-            if self._deck_recovery_blocker(conn) != "deck_recovery_state_inconsistent":
-                return False
+            candidates = conn.execute(
+                "SELECT c.command_id,COALESCE(c.finished_at,c.updated_at) AS failed_at "
+                "FROM operator_plane_commands c LEFT JOIN operator_plane_deck_commands d USING(command_id) "
+                "WHERE c.action_id IN ('oem.deck.move_to_location','oem.deck.move_to_well','oem.deck._mov_execution','oem.deck._finite_operation') "
+                "AND (c.status IN ('ambiguous','interrupted') OR d.ambiguity_state='recovery_required') "
+                "AND NOT EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions r WHERE r.command_id=c.command_id) "
+                "AND (" + HOMED_AFTER_SQL + ")"
+            ).fetchall()
+            for candidate in candidates:
+                command_id = str(candidate["command_id"])
+                if self._home_recovery_resolution(command_id) is not None:
+                    continue
+                homes = []
+                for axis, actions in (("x", _X_HOMES), ("y", _Y_HOMES), ("z", _Z_HOMES)):
+                    home = conn.execute(
+                        "SELECT command_id,action_id,updated_at AS at FROM operator_commands "
+                        "WHERE status='completed' AND updated_at>? AND action_id IN ("
+                        + ",".join("?" for _ in actions) + ") ORDER BY updated_at,command_id LIMIT 1",
+                        (candidate["failed_at"], *actions),
+                    ).fetchone()
+                    homes.append({"axis": axis, **dict(home)})
+                self._insert_transition(
+                    conn, command_id=command_id, event_kind="recovery_resolved", state="recovery_resolved",
+                    payload={"command_id": command_id, "resolution": "axes_homed_after_unknown_moves",
+                             "home_evidence": homes},
+                )
+                changed = True
+            hold = conn.execute("SELECT recovery_hold FROM operator_plane_safety WHERE singleton=1").fetchone()
             semantic = conn.execute("SELECT ambiguity_state FROM operator_plane_deck_semantic_state WHERE singleton=1").fetchone()
-            if semantic is not None and str(semantic[0]) in {"ambiguous", "recovery_required"}:
-                return False
-            homes = [dict(r) for r in conn.execute(
-                "SELECT action_id, MAX(updated_at) AS at, command_id FROM operator_commands "
-                "WHERE status='completed' AND action_id IN (" + ",".join("?" for _ in HOME_ACTIONS) + ") GROUP BY action_id",
-                tuple(HOME_ACTIONS))]
-            conn.execute("UPDATE operator_plane_safety SET recovery_hold=0,recovery_version=recovery_version+1,updated_at=? WHERE singleton=1", (_now(),))
-            self._insert_transition(conn, event_kind="recovery_resolved", state="recovery_resolved",
-                                    payload={"resolution": "axes_homed_after_unknown_moves", "home_evidence": homes})
-        self._wake.set()
-        return True
+            if (hold is not None and hold[0]
+                    and self._deck_recovery_blocker(conn) == "deck_recovery_state_inconsistent"
+                    and not (semantic is not None and str(semantic[0]) in {"ambiguous", "recovery_required"})):
+                conn.execute("UPDATE operator_plane_safety SET recovery_hold=0,recovery_version=recovery_version+1,updated_at=? WHERE singleton=1", (_now(),))
+                changed = True
+            elif changed:
+                conn.execute("UPDATE operator_plane_safety SET recovery_version=recovery_version+1,updated_at=? WHERE singleton=1", (_now(),))
+        if changed:
+            self._wake.set()
+        return changed
 
     def bind_tip_tray_constructor_reader(self, reader: Callable[[int], Mapping[str, Any] | None]) -> None:
         if not callable(reader):
@@ -4597,6 +4621,12 @@ class OperatorCommandStore(CommandReceiptReader):
         with self._lock:
             safety = self.connection.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone()
             unknown = self.connection.execute("SELECT command_id,status,stream_sequence FROM operator_plane_commands WHERE status IN ('ambiguous','interrupted') ORDER BY stream_sequence").fetchall()
+            unknown = [row for row in unknown
+                       if self._home_recovery_resolution(str(row["command_id"])) is None
+                       and self.connection.execute(
+                           "SELECT 1 FROM operator_plane_deck_recovery_decisions WHERE command_id=?",
+                           (str(row["command_id"]),),
+                       ).fetchone() is None]
             queued_rows = self.connection.execute("SELECT stream_sequence FROM operator_plane_commands WHERE status='queued' ORDER BY stream_sequence").fetchall()
             queued = len(queued_rows)
             lane = self.connection.execute("SELECT dispatcher_epoch FROM operator_plane_lane WHERE singleton=1").fetchone()
@@ -6641,7 +6671,7 @@ class OperatorCommandPlane:
                 # stringifying it loses the Park pause/error callback boundary.
                 failure = exc if isinstance(exc, DeckExecutionFailure) else None
                 if failure is not None:
-                    delivery_attempted = delivery_attempted or failure.delivery_attempted
+                    delivery_attempted = failure.delivery_attempted
                 response = ({
                     "ok": False,
                     "delivery_attempted": delivery_attempted,
@@ -6651,7 +6681,9 @@ class OperatorCommandPlane:
                     "provider_results": failure.provider_results,
                 } if failure is not None else {})
                 response["child_outcomes"] = finite_child_outcomes(command_id, evidence)
-                if delivery_attempted:
+                unknown = delivery_attempted and not getattr(failure, "known_failure", False)
+                response["known_failure"] = getattr(failure, "known_failure", False)
+                if unknown:
                     self.store.mark_deck_recovery_required(
                         command_id, reason=str(exc)[:500],
                         controller_command_acknowledged=bool(response.get("controller_command_acknowledged")),
@@ -6659,7 +6691,6 @@ class OperatorCommandPlane:
                         hardware_postcondition_verified=bool(response.get("hardware_postcondition_verified")),
                         provider_results=failure.provider_results if failure is not None else None,
                     )
-                unknown = delivery_attempted and not getattr(failure, "known_failure", False)
                 self.store.finish(
                     command_id,
                     status="ambiguous" if unknown else "failed",
@@ -6819,7 +6850,8 @@ class OperatorCommandPlane:
             except DeckExecutionFailure as exc:
                 delivery_attempted = exc.delivery_attempted
                 controller_acknowledged = bool(exc.controller_command_acknowledged)
-                if delivery_attempted:
+                unknown = delivery_attempted and not exc.known_failure
+                if unknown:
                     mark_recovery = getattr(self.store, "mark_deck_recovery_required", None)
                     if callable(mark_recovery):
                         mark_recovery(
@@ -6830,7 +6862,6 @@ class OperatorCommandPlane:
                             hardware_postcondition_verified=bool(exc.hardware_postcondition_verified),
                             provider_results=exc.provider_results,
                         )
-                unknown = delivery_attempted and not exc.known_failure
                 self.store.finish(
                     command_id,
                     status="ambiguous" if unknown else "failed",

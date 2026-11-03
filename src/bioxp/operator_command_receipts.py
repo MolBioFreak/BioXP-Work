@@ -32,6 +32,20 @@ class CommandReceiptReader:
         self.connection = connection
         self._lock = lock
 
+    def _home_recovery_resolution(self, command_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT transition_sequence,payload_json FROM operator_plane_transitions "
+            "WHERE command_id=? AND event_kind='recovery_resolved' "
+            "AND json_extract(payload_json,'$.resolution')='axes_homed_after_unknown_moves' "
+            "ORDER BY transition_sequence DESC LIMIT 1", (str(command_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        payload = _json_load(row["payload_json"], {})
+        if payload.get("command_id") != str(command_id):
+            return None
+        return {**payload, "transition_sequence": int(row["transition_sequence"])}
+
     def _deck_command_detail(self, command_id: str) -> dict[str, Any] | None:
         row = self.connection.execute(
             "SELECT * FROM operator_plane_deck_commands WHERE command_id=?", (str(command_id),)
@@ -217,6 +231,9 @@ class CommandReceiptReader:
             deck_detail = self._deck_command_detail(str(row["command_id"]))
             if deck_detail is None:
                 deck_detail = self._wp8_finite_recovery_detail(str(row["command_id"]))
+        home_resolution = self._home_recovery_resolution(str(row["command_id"]))
+        if home_resolution is not None:
+            deck_detail = {**(deck_detail or {}), "recovery_resolution": home_resolution}
         if deck_detail is not None:
             response["deck_movement"] = deck_detail
             # A retained post-delivery exception can lack the outer class even
