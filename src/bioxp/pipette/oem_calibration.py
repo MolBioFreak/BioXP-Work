@@ -80,6 +80,7 @@ class CalibrationBindings:
     stop_z: Callable[[], Result]
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
+    pickup_effect: Callable[[str, list[int]], Result] | None = None
 
 
 class CalibrationExecutionError(RuntimeError):
@@ -146,7 +147,41 @@ def manual_load_tip(request: ManualTipLoadRequest, bindings: CalibrationBindings
     seq.step("lowerPipette", lambda: b.native("lowerPipette", lambda: b.lower_pipette(location, request.overpress),
                                                {"location": location, "overpress": request.overpress}))
     lowered = seq.result["steps"][-1] if seq.result.get("steps") else {}
-    seq.step("queryTipStatus", lambda: b.pipette("query_tip_status_all", lambda t: t.query_tip_status_all()))
+    seq.result.update(picked_up_channels=[], released_channels=[], pickup_accounting=[])
+
+    def account(transition, channels):
+        key = "picked_up_channels" if transition == "remove" else "released_channels"
+        channels = sorted(set(channels) - set(seq.result[key]))
+        if not channels:
+            return
+        seq.result[key].extend(channels)
+        if b.pickup_effect is not None:
+            # Record failure without adding a new stop to the physical sequence.
+            try:
+                record = b.pickup_effect(transition, channels)
+            except Exception as exc:
+                record = {"error": repr(exc), "published": False}
+            seq.result["pickup_accounting"].append(
+                {"transition": transition, "channels": channels, "result": record})
+
+    def observe_pickup(t):
+        try:
+            result = t.query_tip_status_all()
+        except Exception as exc:
+            rows = getattr(exc, "details", {}).get("observed_channels", [])
+            account("remove", observed_loaded(rows))
+            raise
+        account("remove", observed_loaded(result.get("channels", [])))
+        return result
+
+    def observed_loaded(rows):
+        return [r["channel"] for r in rows
+                if r.get("channel") in range(4) and r.get("tip_loaded") is True
+                and r.get("result", {}).get("ok") is True
+                and r["result"].get("semantic_ok") is True
+                and r["result"].get("hardware_truth_level") == "hardware_query"]
+
+    seq.step("queryTipStatus", lambda: b.pipette("query_tip_status_all", observe_pickup))
     drop = [c for c in range(4) if request.keep_channels is not None and c not in request.keep_channels]
     if drop:
         target = _find_target(lowered)
@@ -156,13 +191,28 @@ def manual_load_tip(request: ManualTipLoadRequest, bindings: CalibrationBindings
         seq.step("releaseLift", lambda: b.finite("pipette_move_z", {"value": int(target) - lift}))
 
         def release(t):
-            sends = t._eject_tip_channels_once(drop, wait_for_completion=True)
+            def completed(sends):
+                channels = []
+                for row in sends:
+                    proof = row.get("completion", row.get("result", {}))
+                    ch = row.get("channel")
+                    if ch in drop and proof.get("ok") is True and proof.get("completion_verified") is True:
+                        t._transports[ch]._tip_loaded = False
+                        channels.append(ch)
+                account("restore", channels)
+
+            try:
+                sends = t._eject_tip_channels_once(drop, wait_for_completion=True)
+            except Exception as exc:
+                completed(getattr(exc, "details", {}).get("sends", []))
+                raise
+            completed(sends)
+            # Preserve the existing source setters on a normal transport return.
             for ch in drop:
                 t._transports[ch]._tip_loaded = False
             return {"ok": True, "channels": drop, "sends": sends}
         seq.step("releaseUnneededTips", lambda: b.pipette("release_unneeded_tips", release))
-        seq.result.update(kept_channels=list(request.keep_channels), released_channels=drop,
-                          release_lift_steps=lift)
+        seq.result.update(kept_channels=list(request.keep_channels), release_lift_steps=lift)
     if request.lift_z:
         home = seq.step("MoveZHome", lambda: b.finite("pipette_home", {"rehome": False}))
         lost = home.get("source_return")
@@ -291,7 +341,8 @@ def measure_fluid_height(request: FluidHeightRequest, bindings: CalibrationBindi
 def bind_calibration_provider(provider: Any, *, finite: Callable, native: Callable,
                               pipette: Callable, tray_location: Callable[[int], int],
                               z_current_down: int | None, sleep: Callable = time.sleep,
-                              clock: Callable = time.monotonic) -> CalibrationBindings:
+                              clock: Callable = time.monotonic,
+                              pickup_effect: Callable | None = None) -> CalibrationBindings:
     """Connect real provider primitives to the existing owner's child runners.
 
     finite takes (compiler-operation, explicit inputs); native takes (name,
@@ -316,7 +367,7 @@ def bind_calibration_provider(provider: Any, *, finite: Callable, native: Callab
         lower_pipette=lower,
         z_low=lambda location: load_bound_oem_position_table().resolve(location_id=LOCATION_ID_TO_NAME[location]).z_low,
         set_z_speed=provider.primitives.z_set_max_speed, detection_move=detection_move,
-        stop_z=provider.primitives.z_stop, sleep=sleep, clock=clock)
+        stop_z=provider.primitives.z_stop, sleep=sleep, clock=clock, pickup_effect=pickup_effect)
 
 
 CALIBRATION_PLATES = {"TC": (2, 0, 12, 25), "MS": (0, 0, 12, 25),

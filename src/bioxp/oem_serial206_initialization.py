@@ -12739,19 +12739,29 @@ class Serial206OemInitializationProvider:
         return run_diagnostic_inline(self, arguments["diagnostic"], command_id=command_id,
                                      owner_identity=owner_identity)
 
-    def _manual_pickup_bookkeeping(self, arguments, finite, pipette) -> dict[str, Any]:
+    def _manual_pickup_bookkeeping(self, arguments, finite, pipette, *,
+                                   channels=None, transition="remove", metadata_only=False) -> dict[str, Any]:
         """After a completed manual pickup: take those four tips off the rack record
         and set the software tip type to the rack's recorded size."""
         from .oem_compat.position_table import tip_group_well_ids
         tray_id = int(arguments["tray"]) - 1
         well = str(arguments["well"]).upper()
         group = (int(well[1:]) - 1) * 2 + (well[0] == "B")
-        keep = arguments.get("keep_channels")
-        # Wells are in channel order; released tips went back into their wells.
+        keep = channels if channels is not None else arguments.get("keep_channels")
         wells = [w for ch, w in enumerate(tip_group_well_ids(group)) if keep is None or ch in keep]
-        removed = finite("pipette_tip_transition", {"tray_id": tray_id,
-            "well_ids": wells, "transition": "remove"})
-        out: dict[str, Any] = {"rack_tips_removed": wells, "rack_record": removed}
+        out: dict[str, Any] = {}
+        if not metadata_only:
+            # The canonical provider accepts one well or a complete OEM group,
+            # not an arbitrary two/three-channel removal.
+            batches = [wells] if len(wells) in (1, 4) else [[w] for w in wells]
+            records = []
+            for batch in batches:
+                records.append(finite("pipette_tip_transition", {"tray_id": tray_id,
+                    "well_ids": batch, "transition": transition}))
+            out = {"rack_tips_removed" if transition == "remove" else "rack_tips_restored": wells,
+                   "rack_record": records}
+        if channels is not None:
+            return out
         size = self.tip_tray_type(tray_id)
         if size in {"T10", "T50", "T200"}:
             value = {"T10": 10, "T50": 50, "T200": 200}[size]
@@ -12800,14 +12810,31 @@ class Serial206OemInitializationProvider:
         # Pickup does not consume motor-current settings. Detection does.
         current = (get_active_oem_machine_snapshot().config_sections["offsets"]["m_Z_MOTOR_MAX_CURRENT_DOWN"]
                    if operation == "sourceMeasureFluidHeight" else None)
+        def pickup_effect(transition, channels):
+            def record(name, inputs):
+                child_identity = identity("pickup_accounting")
+                # Record an already-observed effect, not another physical child.
+                # A later motion fence must not erase completed effects.
+                return self.publish_tip_tray_transition(**inputs,
+                    operation_id=child_identity["source_identity"], command_id=command_id,
+                    provenance={"source_operation": "sourceManualLoadTip",
+                                "source_child": child_identity["source_identity"]})
+            return self._manual_pickup_bookkeeping(arguments, record, pipette,
+                channels=channels, transition=transition)
+
         bindings = bind_calibration_provider(self, finite=finite, native=native, pipette=pipette,
-            tray_location=tray_location, z_current_down=current, sleep=self.sleep)
+            tray_location=tray_location, z_current_down=current, sleep=self.sleep,
+            pickup_effect=pickup_effect)
         try:
             result = (manual_load_tip(ManualTipLoadRequest(**arguments), bindings)
                       if operation == "sourceManualLoadTip" else
                       measure_fluid_height(FluidHeightRequest(**arguments), bindings))
             if operation == "sourceManualLoadTip":
-                result = {**result, **self._manual_pickup_bookkeeping(arguments, finite, pipette)}
+                try:
+                    result.update(self._manual_pickup_bookkeeping(arguments, finite, pipette,
+                                                                 metadata_only=True))
+                except Exception as exc:
+                    result.update(ok=False, error=str(exc), bookkeeping_error=repr(exc))
         except CalibrationExecutionError as exc:
             # Return partial source receipts for canonical terminalization, not
             # an exception string that loses already-completed physical children.
