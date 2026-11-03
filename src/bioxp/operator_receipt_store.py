@@ -1460,6 +1460,13 @@ class OperatorReceiptStore:
             receipt["authority_receipt_id"] = receipt.get("authority_receipt_id") or receipt["command_id"]
             if not isinstance(receipt.get("authority_receipt_status"), str):
                 receipt["authority_receipt_status"] = receipt.get("status")
+        from .operator_command_receipts import CommandReceiptReader, UNKNOWN_OUTCOME_STATES
+        if receipt["status"] in UNKNOWN_OUTCOME_STATES and self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_plane_transitions'").fetchone():
+            if CommandReceiptReader(self.connection, self.lock)._home_recovery_resolution(receipt["command_id"]) is not None:
+                # Later successful homes settled this unknown outcome.
+                receipt["recorded_status"] = receipt["status"]
+                receipt["status"] = "cleared"
         return self._with_assessment(row, receipt)
 
     def _with_assessment(self, row: sqlite3.Row, receipt: dict[str, Any]) -> dict[str, Any]:

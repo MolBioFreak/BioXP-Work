@@ -13,6 +13,8 @@ from collections.abc import Mapping
 from typing import Any
 
 RECEIPT_SCHEMA = "bioxp.operator_command_receipt.v1"
+# Outcomes a later successful home settles; receipts then report "cleared".
+UNKNOWN_OUTCOME_STATES = frozenset({"ambiguous", "interrupted", "outcome_unknown", "reconciliation_required"})
 ROBOT_IDENTITY = os.getenv("BIOXP_ROBOT_IDENTITY", "serial206").strip() or "serial206"
 
 
@@ -292,8 +294,13 @@ class CommandReceiptReader:
             if deck_detail is None:
                 deck_detail = self._wp8_finite_recovery_detail(str(row["command_id"]))
         home_resolution = self._home_recovery_resolution(str(row["command_id"]))
-        if home_resolution is not None:
-            deck_detail = {**(deck_detail or {}), "recovery_resolution": home_resolution}
+        if home_resolution is not None and response["status"] in UNKNOWN_OUTCOME_STATES:
+            # Later successful homes settled this unknown outcome: report it as
+            # cleared, keeping the original terminal status alongside.
+            response["recorded_status"] = response["status"]
+            response["status"] = "cleared"
+            if response["completion_class"] == "recovery_required":
+                response["completion_class"] = None
         if deck_detail is not None:
             response["deck_movement"] = deck_detail
             # A retained post-delivery exception can lack the outer class even
@@ -305,7 +312,7 @@ class CommandReceiptReader:
                     and response["finished_at"] is not None
                     and deck_detail.get("ambiguity_state") == "recovery_required"):
                 response["completion_class"] = "recovery_required"
-        response["recovery_resolution"] = self._home_recovery_resolution(str(row["command_id"]))
+        response["recovery_resolution"] = home_resolution
         if response["status"] in {"ambiguous", "interrupted"}:
             response["affected_axes"] = self._unknown_affected_axes(str(row["command_id"]))
         return response

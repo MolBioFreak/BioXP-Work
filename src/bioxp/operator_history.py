@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from collections.abc import Mapping
 
-from .operator_command_receipts import CommandReceiptReader
+from .operator_command_receipts import CommandReceiptReader, UNKNOWN_OUTCOME_STATES
 
 HistoryKey = tuple[float, int, int, str]
 
@@ -251,10 +251,17 @@ def read_history_page(root: str | Path, limit: int, cursor: str | None = None) -
                     }
                     result[item["command_id"]] = item
             ordered = []
+            settled_reader = CommandReceiptReader(db, nullcontext()) if "operator_plane_transitions" in tables else None
             for key in page:
                 item = result.get(key["command_id"])
                 if item is None:
                     raise RuntimeError("history_receipt_missing_in_snapshot")
+                # Unknown outcomes settled by later successful homes read as cleared.
+                if (settled_reader is not None and item.get("status") in UNKNOWN_OUTCOME_STATES
+                        and settled_reader._home_recovery_resolution(str(item["command_id"])) is not None):
+                    item["status"] = "cleared"
+                    if item.get("completion_class") == "recovery_required":
+                        item["completion_class"] = None
                 item["sequence"] = key["sequence"]
                 item["accepted_at"] = key["accepted_at"]
                 item["__history_key"] = (key["accepted_at"], key["source_rank"], key["sequence"], key["command_id"])

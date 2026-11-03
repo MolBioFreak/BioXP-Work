@@ -162,8 +162,10 @@ def test_home_resolution_is_per_command_additive_and_received(rig):
     assert store.recovery()["hold"] is True
     for reader in (store.get_command, store.get_command_summary, store.command_detail_v2):
         receipt = reader(first)
-        assert receipt["status"] == "ambiguous"
-        resolution = receipt["deck_movement"]["recovery_resolution"]
+        # Settled by the later home: reads as cleared; the recorded row is unchanged.
+        assert receipt["status"] == "cleared"
+        assert receipt["recorded_status"] == "ambiguous"
+        resolution = receipt["recovery_resolution"]
         assert resolution["command_id"] == first
         assert {r["axis"]: r["command_id"] for r in resolution["home_evidence"]} == {"z": z}
     assert not store.settle_deck_recovery_by_home()
@@ -173,7 +175,7 @@ def test_home_resolution_is_per_command_additive_and_received(rig):
     assert store.recovery()["outcome_unknown_command_ids"] == []
     assert store.recovery()["hold"] is False
     assert immutable_rows(store, first) == before
-    assert store.get_command(second)["status"] == "ambiguous"
+    assert store.get_command(second)["status"] == "cleared"
     assert not store.settle_deck_recovery_by_home()
 
 @pytest.mark.parametrize("envelope,expected", [
@@ -218,10 +220,10 @@ def test_retained_exception_operation_identifies_axis_without_inventing_return(r
     assert store.get_command(cid)["affected_axes"] == ["z"]
     home(rig, "oem.z.manual_home")
     assert store.settle_deck_recovery_by_home()
-    assert store.get_command(cid)["status"] == "ambiguous"
+    assert store.get_command(cid)["status"] == "cleared"
 
 
-def test_unknown_scope_is_not_invented_and_mixed_axes(rig):
+def test_unknown_scope_is_settled_by_xyz_homes_and_mixed_axes(rig):
     store, *_ = rig
     unknown = run_failure(rig, DeckExecutionFailure("unrecorded step", delivery_attempted=True))
     xyz = run_failure(rig, {"ok": False, "delivery_attempted": True, "steps": [
@@ -235,12 +237,29 @@ def test_unknown_scope_is_not_invented_and_mixed_axes(rig):
     assert store.settle_deck_recovery_by_home()
     assert store._home_recovery_resolution(z)
     assert store._home_recovery_resolution(xyz) is None
+    assert store._home_recovery_resolution(unknown) is None
+    assert store.recovery()["hold"] is True
     home(rig, "oem.x.manual_panel_home")
     home(rig, "oem.y.manual_panel_home")
     assert store.settle_deck_recovery_by_home()
-    assert store._home_recovery_resolution(xyz)
-    assert store._home_recovery_resolution(unknown) is None
-    assert store.recovery()["outcome_unknown_command_ids"] == [unknown]
+    assert store._home_recovery_resolution(xyz)["axes_scope"] == "retained"
+    # Without retained axis scope, later X, Y and Z homes settle it.
+    resolved = store._home_recovery_resolution(unknown)
+    assert resolved["axes_scope"] == "all_axes" and resolved["affected_axes"] == ["x", "y", "z"]
+    assert store.recovery()["outcome_unknown_command_ids"] == []
+    assert store.recovery()["hold"] is False
+    assert {store.get_command(c)["status"] for c in (unknown, xyz, z)} == {"cleared"}
+
+
+def test_non_deck_unknown_outcome_is_settled_by_homes(rig):
+    store, *_ = rig
+    cid = home(rig, "oem.z.manual_home", "ambiguous")
+    assert store.recovery()["outcome_unknown_command_ids"] == [cid]
+    for action in ("oem.z.manual_home", "oem.x.manual_panel_home", "oem.y.manual_panel_home"):
+        home(rig, action)
+    assert store.settle_deck_recovery_by_home()
+    assert store.recovery()["outcome_unknown_command_ids"] == []
+    assert store.get_command(cid)["status"] == "cleared"
 
 
 @pytest.mark.parametrize("resolved", [False, True])
@@ -305,4 +324,18 @@ def test_workflow_resolution_requires_only_resolved_children(rig, independent, u
                       for table in ("operator_commands", "operator_plane_commands")]
     if resolution:
         assert resolution["child_evidence"][0]["command_id"] == child
+        assert store.get_workflow("parent")["status"] == "cleared"
+    # Parent, lifecycle or unscoped child uncertainty: later X, Y and Z homes settle it.
+    home(rig, "oem.x.manual_panel_home")
+    home(rig, "oem.y.manual_panel_home")
+    store.settle_deck_recovery_by_home()
+    assert store.get_command("parent")["recovery_resolution"]
+    assert store.recovery()["outcome_unknown_command_ids"] == []
+    assert store.recovery()["hold"] is False
+    for view in (store.get_workflow("parent"), store.get_workflow_observation("parent")):
+        assert view["status"] == view["command"]["status"] == "cleared"
+        assert view["recorded_status"] == "ambiguous"
+    assert [s["status"] for s in store.list_workflow_summaries() if s["job_id"] == "parent"] == ["cleared"]
+    assert before == [tuple(store.connection.execute("SELECT * FROM " + table + " WHERE command_id='parent'").fetchone())
+                      for table in ("operator_commands", "operator_plane_commands")]
 

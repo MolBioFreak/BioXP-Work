@@ -35,7 +35,7 @@ from .operator_controls import (
     _MAX_INPUT_BYTES,
 )
 from .operator_receipt_store import runtime_state_root
-from .operator_command_receipts import CommandReceiptReader
+from .operator_command_receipts import CommandReceiptReader, UNKNOWN_OUTCOME_STATES
 from .runtime_audit_store import open_runtime_connection, runtime_write_coordinator
 from .oem_runtime_store import (
     LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256,
@@ -2256,12 +2256,20 @@ class OperatorCommandStore(CommandReceiptReader):
                 return None
             inputs = _json_load(row["requested_inputs_json"], {})
             payload = _json_load(row["receipt_json"], {}) or inputs.get("bundle", {})
-            return {**payload, "job_id": command_id, "status": row["status"], "command": {
+            resolution = self._home_recovery_resolution(command_id)
+            status = self._settled_status(row["status"], resolution)
+            return {**payload, "job_id": command_id, "status": status,
+                **({"recorded_status": row["status"]} if status != row["status"] else {}), "command": {
                 "command_id": command_id, "idempotency_key": row["idempotency_key"],
-                "recovery_resolution": self._home_recovery_resolution(command_id),
+                "recovery_resolution": resolution,
                 "ownership_generation": int(row["ownership_generation"]), "state_version": int(row["version"]),
-                "status": row["status"], "terminal": row["status"] in {"completed","failed","interrupted","ambiguous","cleared","rejected"},
+                "status": status, "terminal": status in {"completed","failed","interrupted","ambiguous","cleared","rejected"},
                 "status_path": f"/protocol/jobs/{command_id}"}}
+
+    @staticmethod
+    def _settled_status(status: str, resolution: Mapping[str, Any] | None) -> str:
+        """An unknown outcome settled by later successful homes reads as cleared."""
+        return "cleared" if resolution is not None and status in UNKNOWN_OUTCOME_STATES else status
 
     def get_workflow_observation(self, command_id: str) -> dict[str, Any] | None:
         """Read current control/review truth, not the retained scientific bundle.
@@ -2298,14 +2306,17 @@ class OperatorCommandStore(CommandReceiptReader):
             dry_run, workflow, review = _json_load(row["observation_json"])
             runtime = {"workflow": workflow} if row["workflow_type"] is not None else {}
             operator = {"pending_review": review} if row["review_type"] is not None else {}
+            resolution = self._home_recovery_resolution(command_id)
+            status = self._settled_status(row["status"], resolution)
             return {"schema_version": "bioxp.protocol_job_observation.v1",
-                "job_id": command_id, "status": row["status"],
+                "job_id": command_id, "status": status,
+                **({"recorded_status": row["status"]} if status != row["status"] else {}),
                 "execution": {**({"dry_run": dry_run} if row["dry_run_type"] is not None else {}),
                               "runtime_state": runtime}, "operator": operator,
                 "command": {"command_id": command_id,
-                    "recovery_resolution": self._home_recovery_resolution(command_id),
+                    "recovery_resolution": resolution,
                     "ownership_generation": int(row["ownership_generation"]), "state_version": int(row["version"]),
-                    "status": row["status"], "terminal": row["status"] in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"}}}
+                    "status": status, "terminal": status in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"}}}
 
     def list_workflow_summaries(self, *, limit: int = 20) -> list[dict[str, Any]]:
         """Project discovery fields in SQLite; never hydrate full job bundles.
@@ -2342,13 +2353,16 @@ class OperatorCommandStore(CommandReceiptReader):
             result = []
             for row in rows:
                 fields = _json_load(row["summary_json"])
+                status = row["status"]
+                if status in UNKNOWN_OUTCOME_STATES:
+                    status = self._settled_status(status, self._home_recovery_resolution(row["command_id"]))
                 result.append(dict(zip(
                     ("dry_run", "protocol_id", "source_type", "created_at", "updated_at", "pending_review"),
-                    fields), job_id=row["command_id"], status=row["status"], command={
+                    fields), job_id=row["command_id"], status=status, command={
                         "command_id": row["command_id"], "idempotency_key": row["idempotency_key"],
                         "ownership_generation": int(row["ownership_generation"]),
-                        "state_version": int(row["version"]), "status": row["status"],
-                        "terminal": row["status"] in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"},
+                        "state_version": int(row["version"]), "status": status,
+                        "terminal": status in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"},
                         "status_path": f"/protocol/jobs/{row['command_id']}",
                     }))
             return result
@@ -2891,10 +2905,12 @@ class OperatorCommandStore(CommandReceiptReader):
                     return False
         changed = False
         with self._transaction() as conn:
+            # Every unknown command outcome (deck or not) is settled by later
+            # successful homes. Workflow parents are settled below.
             candidates = conn.execute(
-                "SELECT c.command_id,c.finished_at AS failed_at "
+                "SELECT c.command_id,COALESCE(c.finished_at,c.updated_at) AS failed_at "
                 "FROM operator_plane_commands c LEFT JOIN operator_plane_deck_commands d USING(command_id) "
-                "WHERE c.action_id IN ('oem.deck.move_to_location','oem.deck.move_to_well','oem.deck._mov_execution','oem.deck._finite_operation') "
+                "WHERE c.action_id<>'protocol.execute' "
                 "AND (c.status IN ('ambiguous','interrupted') OR d.ambiguity_state='recovery_required') "
                 "AND NOT EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions r WHERE r.command_id=c.command_id) "
                 "AND NOT EXISTS (SELECT 1 FROM operator_plane_transitions t WHERE t.command_id=c.command_id "
@@ -2904,9 +2920,12 @@ class OperatorCommandStore(CommandReceiptReader):
                 command_id = str(candidate["command_id"])
                 if self._home_recovery_resolution(command_id) is not None:
                     continue
-                axes = self._unknown_affected_axes(command_id)
-                if axes is None or candidate["failed_at"] is None:
+                if candidate["failed_at"] is None:
                     continue
+                # Retained evidence names the affected axes when it can; when it
+                # cannot, a later successful X, Y and Z home settles the command.
+                scoped = self._unknown_affected_axes(command_id)
+                axes = scoped if scoped is not None else ["x", "y", "z"]
                 homes = []
                 for axis in axes:
                     actions = _HOME_ACTIONS_BY_AXIS[axis]
@@ -2924,7 +2943,8 @@ class OperatorCommandStore(CommandReceiptReader):
                 self._insert_transition(
                     conn, command_id=command_id, event_kind="recovery_resolved", state="recovery_resolved",
                     payload={"command_id": command_id, "resolution": "axes_homed_after_unknown_moves",
-                             "affected_axes": axes, "home_evidence": homes},
+                             "affected_axes": axes, "axes_scope": "retained" if scoped is not None else "all_axes",
+                             "home_evidence": homes},
                 )
                 changed = True
             changed = self._settle_workflow_child_recovery(conn) or changed
@@ -2949,28 +2969,45 @@ class OperatorCommandStore(CommandReceiptReader):
             "ambiguous", "outcome_unknown", "reconciliation_required", "interrupted"}
         changed = False
         for parent in conn.execute(
-                "SELECT command_id,receipt_json FROM operator_commands "
+                "SELECT command_id,receipt_json,COALESCE(finished_at,updated_at) AS failed_at FROM operator_commands "
                 "WHERE command_kind='protocol_workflow' AND status='ambiguous'").fetchall():
             pid = parent["command_id"]
             if self._home_recovery_resolution(pid) is not None:
                 continue
             workflow = _json_load(parent["receipt_json"], {}).get("execution", {}).get("runtime_state", {}).get("workflow", {})
-            # Older generic reasons do not distinguish child from independent
-            # lifecycle uncertainty. Do not invent that missing evidence.
-            if (workflow.get("held_reason") != "workflow_settlement_unknown"
-                    or workflow.get("settlement_unknown_causes") != ["children"]):
-                continue
             children = conn.execute(
                 "SELECT c.command_id,COALESCE(m.state,c.status) AS state FROM operator_commands c "
                 "LEFT JOIN serial206_movement_commands m USING(command_id) WHERE c.parent_command_id=?",
                 (pid,)).fetchall()
             uncertain = [c for c in children if c["state"] not in settled]
             resolutions = [self._home_recovery_resolution(c["command_id"]) for c in uncertain]
-            if not uncertain or not all(resolutions):
+            if not all(resolutions):
                 continue
+            homes = None
+            # Uncertainty only from children is settled by their resolutions.
+            # Parent/lifecycle or unrecorded causes are settled by a later
+            # successful X, Y and Z home, like any other unknown outcome.
+            if not (uncertain and workflow.get("settlement_unknown_causes") == ["children"]):
+                try:
+                    failed_at = float(parent["failed_at"])
+                except (TypeError, ValueError):
+                    continue
+                homes = []
+                for axis in ("x", "y", "z"):
+                    actions = _HOME_ACTIONS_BY_AXIS[axis]
+                    home = conn.execute(
+                        "SELECT command_id,action_id,CAST(finished_at AS REAL) AS at FROM operator_commands "
+                        "WHERE status='completed' AND CAST(finished_at AS REAL)>? AND action_id IN ("
+                        + ",".join("?" for _ in actions) + ") ORDER BY CAST(finished_at AS REAL),command_id LIMIT 1",
+                        (failed_at, *actions)).fetchone()
+                    if home is None:
+                        break
+                    homes.append({"axis": axis, **dict(home)})
+                if len(homes) != 3:
+                    continue
             self._insert_transition(conn, command_id=pid, event_kind="recovery_resolved", state="recovery_resolved",
                 payload={"command_id": pid, "resolution": "children_recovery_resolved",
-                         "child_evidence": resolutions})
+                         "child_evidence": resolutions, **({"home_evidence": homes} if homes is not None else {})})
             changed = True
         return changed
 
