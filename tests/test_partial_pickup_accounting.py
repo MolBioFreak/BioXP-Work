@@ -172,12 +172,9 @@ from tests.test_cover_carry_release_connected import connected  # noqa: F401
 @pytest.mark.parametrize('fail_home', [False, True])
 def test_pickup_publication_inside_active_receipt(connected, monkeypatch, reopen, fail_home):
     import json
-    from bioxp.manual_pipetting import manual_physical_plan
     from bioxp.pipette.transport import CanPipetteTransport, FourPipetteTransport
     from bioxp.pipette.receipts import PipetteReceiptStore
-    from bioxp.services.pipette_service import run_pipette_operation
     p, n, store = connected.provider, connected.native, connected.store
-    fault = 'home_false' if fail_home else None
     def local_socket(family=socket.AF_INET, *args, **kwargs):
         assert family == socket.AF_UNIX
         return _SOCKET(family, *args, **kwargs)
@@ -190,11 +187,7 @@ def test_pickup_publication_inside_active_receipt(connected, monkeypatch, reopen
     def home(**kwargs):
         homes.append(kwargs)
         n.positions[4, 1] = 0
-        if len(homes) == 1 and fault == 'lease_expired':
-            assert store._renew_owner(lease_seconds=-1)
-        if len(homes) == 1 and fault == 'home_throw':
-            raise RuntimeError('synthetic native home exception after Z=0')
-        return {'ok': not (len(homes) == 1 and fault == 'home_false'), 'source_return_code': 173}
+        return {'ok': not fail_home, 'source_return_code': 173}
     n.motor_oem_move_z_home = home
     class Driver:
         def query_tip_status(self):
@@ -210,7 +203,7 @@ def test_pickup_publication_inside_active_receipt(connected, monkeypatch, reopen
     p.primitives.pipette_transport = transport
     assert transport._tip_type == 201
     p.record_tip_tray_type(tray_id=0, tip_type=50)
-    p.bind_pipette_collection_state_reader(lambda: {'tip_exists': transport.TipExist})
+    p.bind_pipette_collection_state_reader(lambda: {'tip_exists': any(ch._tip_loaded for ch in channels)})
     p.bind_tip_tray_state_reader(store.tip_tray_state)
     p.bind_tip_tray_state_publisher(store.publish_tip_tray_transition)
     store.publish_tip_tray_transition(tray_id=0, transition='construct', operation_id='rca-rack',
@@ -277,7 +270,7 @@ def test_pickup_publication_inside_active_receipt(connected, monkeypatch, reopen
         p.bind_deck_semantic_state_publisher(store.publish_deck_owner_state)
         p.bind_tip_tray_state_reader(store.tip_tray_state)
         p.bind_tip_tray_state_publisher(publish)
-        p.bind_pipette_collection_state_reader(lambda: {'tip_exists':transport.TipExist})
+        p.bind_pipette_collection_state_reader(lambda: {'tip_exists':any(ch._tip_loaded for ch in channels)})
         raw = p.wp8_manual_pipette_physical
         monkeypatch.setattr(p, 'wp8_manual_pipette_physical', observe)
     action = SimpleNamespace(action_id='connected-pickup', params={'operation':'load_tip',
@@ -296,7 +289,7 @@ def test_pickup_publication_inside_active_receipt(connected, monkeypatch, reopen
     assert all('error' not in row['result'] and 'bookkeeping_error' not in row['result']
         for row in result['pickup_accounting']), result['pickup_accounting']
     assert transport._tip_type == 50
-    assert transport.TipExist
+    assert any(ch._tip_loaded for ch in channels)
     assert publications and all(publications), publications
     assert publications[0] == [('query_all_pipette_tip_states', 'pending')]
     assert all(rows == [('release_unneeded_tips', 'pending')] for rows in publications[1:])
@@ -309,4 +302,34 @@ def test_pickup_publication_inside_active_receipt(connected, monkeypatch, reopen
     finally:
         cold.stop()
     assert len(homes) == 1
+
+
+@pytest.mark.parametrize('envelope', ['evidence', 'detail', 'details', 'none', 'false_return'])
+def test_sequence_preserves_explicit_failure_envelope(envelope):
+    from fastapi import HTTPException
+    from bioxp.pipette.oem_calibration import _Sequence, CalibrationExecutionError
+    details = {'channel': 1, 'result': {'ok': False, 'delivery_attempted': False}, 'sends': []}
+    payload = {'ok': False, 'error': 'command_failed', 'details': details}
+    exc = (HTTPException(status_code=502, detail=payload) if envelope == 'detail'
+           else PipetteCommandError('failed', details=details) if envelope == 'details'
+           else RuntimeError('unstructured'))
+    if envelope == 'evidence':
+        exc.evidence = payload
+        exc.detail = {'must_not_replace': True}
+    seq = _Sequence('offline')
+    def failed():
+        if envelope == 'false_return':
+            return payload
+        raise exc
+    with pytest.raises(CalibrationExecutionError) as caught:
+        seq.step('releaseUnneededTips', failed)
+    result = caught.value.evidence
+    assert result['ok'] is False
+    assert result['failed_step'] == 'releaseUnneededTips'
+    step = result['steps'][-1]
+    if envelope == 'false_return':
+        assert step['result'] is payload
+    else:
+        expected = details if envelope == 'details' else None if envelope == 'none' else payload
+        assert step['evidence'] is expected
 

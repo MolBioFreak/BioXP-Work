@@ -100,14 +100,19 @@ class _Sequence:
         except Exception as exc:
             if isinstance(exc, CalibrationExecutionError) and exc.evidence is self.result:
                 raise
-            self.result["ok"] = False
+            self.result.update(ok=False, failed_step=name)
+            evidence = getattr(exc, "evidence", None)
+            if evidence is None:
+                evidence = getattr(exc, "detail", None)
+            if evidence is None:
+                evidence = getattr(exc, "details", None)
             self.result["steps"].append({"operation": name, "error": repr(exc),
-                                          "evidence": getattr(exc, "evidence", None)})
+                                          "evidence": evidence})
             raise CalibrationExecutionError(str(exc), self.result) from exc
         self.result["steps"].append({"operation": name, "result": result})
         # Preserve actual native failures. This is not an extra observation gate.
         if result.get("ok") is False and not allow_false:
-            self.result["ok"] = False
+            self.result.update(ok=False, failed_step=name)
             raise CalibrationExecutionError(f"{name} failed", self.result)
         return result
 
