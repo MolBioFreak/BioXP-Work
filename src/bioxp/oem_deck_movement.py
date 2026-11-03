@@ -1072,6 +1072,12 @@ def _wp8_child(
     })
 
 
+def arguments_have_float(children: list[dict[str, Any]]) -> bool:
+    """Plans carrying fractional values (e.g. a 5.0 mm release lift) use the
+    owner's RFC8785 digest, where 5.0 and 5 are the same JSON number."""
+    return any(isinstance(v, float) for c in children for v in (c.get("arguments") or {}).values())
+
+
 def _wp8_plan(operation: str, children: list[dict[str, Any]], **metadata: Any) -> dict[str, Any]:
     plan = {
         "schema_version": "bioxp.oem_wp8_operation.v1",
@@ -1096,7 +1102,7 @@ def _wp8_plan(operation: str, children: list[dict[str, Any]], **metadata: Any) -
             "terminal_source_point" if child["operation"] == "updatePlateLocation"
             else "immediate_after_source_call" if mutation else "none"
         )
-    if operation in {"manual_source_pipette", "diagnostic_pipette", "cavro_application"}:
+    if operation in {"manual_source_pipette", "diagnostic_pipette", "cavro_application"} or arguments_have_float(children):
         # Typed source calls carry fractional values. Match the existing
         # SQLite owner's RFC8785 digest (10.0 and 10 are the same JSON number).
         import rfc8785

@@ -204,6 +204,10 @@ def test_partial_pickup_accepts_frozen_protocol_params():
                                  'lift_z': True, 'keep_channels': (0,), 'release_lift_mm': 5.0})
     child = plan['children'][0] if 'children' in plan else plan['plan']['children'][0]
     assert child['arguments']['keep_channels'] == [0] and child['arguments']['release_lift_mm'] == 5.0
+    from bioxp.operator_command_plane import _digest
+    import json
+    stored = json.loads(json.dumps(plan))
+    assert stored['plan_digest'] == _digest({k: v for k, v in stored.items() if k != 'plan_digest'})
     plain = manual_physical_plan({'operation': 'load_tip', 'tray': 1, 'well': 'A10', 'overpress': False, 'lift_z': True})
     child = plain['children'][0] if 'children' in plain else plain['plan']['children'][0]
     assert 'keep_channels' not in child['arguments']
