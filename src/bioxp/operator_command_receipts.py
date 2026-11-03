@@ -52,9 +52,11 @@ class CommandReceiptReader:
             steps = result.get("steps") if isinstance(result, dict) else None
             if not isinstance(steps, list) or not steps:
                 return None
-            uncertain = [step for step in steps if isinstance(step, dict)
-                         and isinstance(step.get("result"), dict)
-                         and step["result"].get("ok") is not True]
+            if not all(isinstance(step, dict) and isinstance(
+                    step.get("result", step.get("evidence")), dict) for step in steps):
+                return None
+            uncertain = [step for step in steps
+                         if step.get("result", step.get("evidence", {})).get("ok") is not True]
             if not uncertain:
                 return None
             for step in uncertain:

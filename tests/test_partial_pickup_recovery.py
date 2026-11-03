@@ -176,10 +176,40 @@ def test_home_resolution_is_per_command_additive_and_received(rig):
     assert store.get_command(second)["status"] == "ambiguous"
     assert not store.settle_deck_recovery_by_home()
 
+@pytest.mark.parametrize("envelope,expected", [
+    ({"ok": False, "error": "command_failed", "message": "eject refused", "details": {
+        "channel": 0, "result": {"tx_ok": False, "delivery_verified": False,
+        "error": "completion already registered"}, "sends": []}}, "failed"),
+    ({"ok": False, "error": "command_failed", "details": {
+        "channel": 1, "result": {"tx_ok": False, "delivery_verified": False},
+        "sends": [{"channel": 0, "result": {"ok": True, "delivery_verified": True}}]}}, "failed"),
+    ({"ok": False, "error": "command_failed", "details": {
+        "channel": 1, "result": {"tx_ok": False, "delivery_verified": False},
+        "sends": [{"channel": 0, "result": {"ok": False, "delivery_attempted": True}}]}}, "ambiguous"),
+    ({"ok": False, "completed_children": [{"operation": "first", "result": {"ok": True}}],
+      "failure_evidence": [{"operation": "sourceHomeZ", "exception_type": "RuntimeError",
+        "exception_message": "refused", "result": {"tx_ok": False, "delivery_verified": False}}]}, "failed"),
+    ({"ok": False, "completed_children": [], "failure_evidence": [{"operation": "sourceHomeZ",
+      "exception_type": "RuntimeError", "exception_message": "timeout",
+      "result": {"delivery_attempted": True}}]}, "ambiguous"),
+    ({"ok": False, "diagnostics": {"result": {"tx_ok": False, "delivery_verified": False}}}, "ambiguous"),
+])
+def test_production_exception_envelopes(rig, envelope, expected):
+    result = pickup({})
+    result["steps"][-1] = {"operation": "MoveZHome", "evidence": envelope, "error": "raised"}
+    result["failed_step"] = result["steps"][-1]
+    cid = run_failure(rig, result)
+    store = rig[0]
+    assert store.get_command(cid)["status"] == expected
+    retained = json.loads(store.wp8_operation_evidence(cid)["children"][0]["terminal_evidence_json"])["result"]
+    assert retained["failed_step"]["evidence"] == envelope
+    assert retained["steps"][:2] == result["steps"][:2]
+
+
 def test_unknown_scope_is_not_invented_and_mixed_axes(rig):
     store, *_ = rig
     unknown = run_failure(rig, DeckExecutionFailure("unrecorded step", delivery_attempted=True))
-    xyz = run_failure(rig, {"ok": False, "steps": [
+    xyz = run_failure(rig, {"ok": False, "delivery_attempted": True, "steps": [
         {"operation": "moveTo", "result": {"ok": False, "delivery_attempted": True}}]})
     z = run_failure(rig, pickup({"ok": False, "delivery_attempted": True}))
     assert store.get_command(unknown)["affected_axes"] is None
@@ -203,9 +233,10 @@ def test_no_repeat_writer_or_history_scan(rig, monkeypatch):
     assert not store.settle_deck_recovery_by_home()
     statements = []
     store.connection.set_trace_callback(statements.append)
-    monkeypatch.setattr(store, "_transaction", lambda: pytest.fail("repeat writer opened"))
-    for _ in range(3):
-        assert not store.settle_deck_recovery_by_home()
+    with monkeypatch.context() as m:
+        m.setattr(store, "_transaction", lambda: pytest.fail("repeat writer opened"))
+        for _ in range(3):
+            assert not store.settle_deck_recovery_by_home()
     store.connection.set_trace_callback(None)
     assert len(statements) == 3
     assert all("MAX(transition_sequence)" in sql for sql in statements)
@@ -226,6 +257,7 @@ def test_home_order_uses_terminal_time_not_mutable_update(rig):
 @pytest.mark.parametrize("independent,unknown_child", [(False, False), (True, False), (False, True)])
 def test_workflow_resolution_requires_only_resolved_children(rig, independent, unknown_child):
     store, *_ = rig
+    store.bind_workflow_dispatcher(lambda _: None)
     store.admit_workflow(command_id="parent", idempotency_key="parent", plan_fingerprint="fixture",
         requested_inputs={"bundle": {}}, ownership_generation=1,
         resources=("axis:x", "axis:y", "axis:z"), board_epochs={})

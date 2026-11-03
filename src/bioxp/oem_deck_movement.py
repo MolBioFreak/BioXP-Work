@@ -38,6 +38,31 @@ def _failed_child_delivery(result: Mapping[str, Any]) -> bool | None:
         if not isinstance(failure, Mapping):
             return None
         return _failed_child_delivery(failure)
+    # Service exception envelope: only the failed channel result, plus the
+    # explicitly retained earlier sends. Never search arbitrary diagnostics.
+    if result.get("error") == "command_failed" and isinstance(result.get("details"), Mapping):
+        details = result["details"]
+        failure = details.get("result")
+        sends = details.get("sends")
+        if not isinstance(failure, Mapping) or not isinstance(sends, list):
+            return None
+        if not all(isinstance(send, Mapping) and isinstance(send.get("result"), Mapping)
+                   and send["result"].get("ok") is True for send in sends):
+            return None
+        return _failed_child_delivery(failure)
+    if "failure_evidence" in result:
+        failures = result.get("failure_evidence")
+        completed = result.get("completed_children")
+        if (not isinstance(failures, list) or len(failures) != 1
+                or not isinstance(completed, list)):
+            return None
+        if not all(isinstance(child, Mapping) and isinstance(child.get("result"), Mapping)
+                   and child["result"].get("ok") is True for child in completed):
+            return None
+        failure = failures[0]
+        if not isinstance(failure, Mapping) or not isinstance(failure.get("result"), Mapping):
+            return None
+        return _failed_child_delivery(failure["result"])
     if result.get("controller_command_acknowledged") is True or result.get("delivery_verified") is True:
         return True
     if type(result.get("delivery_attempted")) is bool:
