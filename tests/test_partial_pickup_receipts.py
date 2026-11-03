@@ -622,10 +622,12 @@ def store(tmp_path, monkeypatch):
     owner.connection.close()
 
 
-def run(store, operation, result, *, failure=None):
+def run(store, operation, result, *, failure=None, transport_call=None):
     calls = []
     def leaf(_):
         calls.append(operation)
+        if transport_call is not None:
+            return transport_call()
         if failure is not None:
             failure.pipette_partial_result = result
             raise failure
@@ -721,6 +723,67 @@ def test_partial_exception_keeps_original_failure_and_channel_evidence(store, fa
     assert row["completion_verified"] == 0
     assert receipt["sends"] == partial["sends"]
     assert returned.detail["pipette_partial_result"]["sends"] == partial["sends"]
+
+
+@pytest.mark.parametrize("phase", ["send", "wait"])
+@pytest.mark.parametrize("error_type", [RuntimeError, TimeoutError, ValueError])
+def test_real_eject_throw_keeps_prefix_through_service(store, phase, error_type):
+    from types import SimpleNamespace
+    from bioxp.pipette.transport import FourPipetteTransport
+
+    failure = error_type("P2 eject failed")
+    failure.details = {"owner_token": "original-owner", "channel": 1}
+    trace = []
+    completed = {"ok": True, **dict.fromkeys(FLAGS, True)}
+    deferred = {"ok": True, "outcome": "tx_only", "delivery_verified": True,
+                "controller_acknowledged": False, "completion_verified": False}
+
+    class Driver:
+        def __init__(self, channel):
+            self.channel = channel
+
+        def pipette_eject_tip(self, *, initialized, wait_for_completion):
+            assert initialized and wait_for_completion
+            trace.append(("send", self.channel))
+            if phase == "send" and self.channel == 1:
+                raise failure
+            return dict(completed if phase == "send" else deferred)
+
+        def wait_pipette_command_completion(self, timeout):
+            assert 0 <= timeout <= 8
+            trace.append(("wait", self.channel))
+            if self.channel == 1:
+                raise failure
+            return dict(completed)
+
+    transport = object.__new__(FourPipetteTransport)
+    transport._transports = [SimpleNamespace(_initialized=True, _get_driver=lambda d=Driver(ch): d)
+                             for ch in range(4)]
+
+    def invoke():
+        try:
+            return transport._eject_tip_channels_once([0, 1, 2, 3], wait_for_completion=True)
+        except Exception as exc:
+            assert exc is failure  # No replacement type, retry, or owner transfer.
+            assert exc.details["owner_token"] == "original-owner"
+            assert exc.details["channel"] == 1
+            raise
+
+    returned, row, receipt = run(store, "release_unneeded_tips", None,
+                                 failure=failure, transport_call=invoke)
+    assert returned.__cause__ is failure
+    assert trace == ([("send", 0), ("send", 1)] if phase == "send" else
+                     [("send", ch) for ch in range(4)] + [("wait", 0), ("wait", 1)])
+    sends = failure.details["sends"]
+    assert [item["channel"] for item in sends] == ([0] if phase == "send" else [0, 1, 2, 3])
+    assert sends[0]["result" if phase == "send" else "completion"] == completed
+    if phase == "wait":
+        assert all("completion" not in item for item in sends[1:])
+    assert receipt["sends"] == sends
+    assert returned.detail["pipette_partial_result"]["sends"] == sends
+    assert returned.detail["pipette_partial_result"]["ok"] is False
+    assert row["status"] == ("reconciliation_required" if error_type is TimeoutError else "failed")
+    assert row["completion_verified"] == 0
 
 
 def test_unrelated_operation_is_not_recursively_promoted(store):
