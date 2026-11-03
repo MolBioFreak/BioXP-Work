@@ -23,7 +23,7 @@ from typing import Any, Callable, Mapping
 
 from .motion_safety import Serial206MotionAuthority, prepare_motion_without_motion
 from .oem_compat.machine_state import OemMachineState
-from .oem_compat.pathing import OemPathPlanner
+from .oem_compat.pathing import OemPathPlanner, TIP_TRAY_LOCATIONS
 from .oem_compat.position_table import load_bound_oem_position_table
 from .oem_homing_routes import _execute_oem_steps_live
 from .oem_deck_movement import (
@@ -2042,6 +2042,10 @@ class Serial206ProductionPrimitiveAdapter:
         source_completed = isinstance(move, Mapping) and move.get("ok") is True
         timeout_position = move.get("timeout_position") if isinstance(move, Mapping) else None
         consumed = source_wait.get("event") if isinstance(source_wait, Mapping) else None
+        # The consumed OEM target event (128) is the controller's own terminal
+        # report for moveToAbs; a completed source call that consumed it is a
+        # verified controller terminal state, not an unverified one.
+        controller_terminal = bool(source_completed and move.get("completion_class") == "event_128")
         return {
             "ok": source_completed,
             "failure": None if source_completed else "z_move_source_call_failed",
@@ -2052,7 +2056,7 @@ class Serial206ProductionPrimitiveAdapter:
                 self._z_tmcl_success(move.get("ack"))
                 or self._z_tmcl_success(move.get("retry_ack"))
             ),
-            "controller_terminal_state_verified": False,
+            "controller_terminal_state_verified": controller_terminal,
             "completion_class": move.get("completion_class"),
             "physical_effect_verified": False,
             "command_issued": move.get("command_sent") is True,
@@ -4066,6 +4070,21 @@ class Serial206ProductionPrimitiveAdapter:
             "failure": None if ok else "home_gz_controller_evidence_unverified",
         }
 
+    def _depth_offset(self, location_name: str, plate_type: str | None = None) -> dict[str, Any]:
+        """Saved extra depth for the loaded tip at this station (and plate type, when known)."""
+        from .pipette.depth_offsets import resolve
+        transport = getattr(self, "pipette_transport", None)
+        tip_type = getattr(transport, "_tip_type", None) if _transport_tip_loaded(transport) else None
+        return resolve(tip_type=tip_type, location=location_name, plate_type=plate_type)
+
+    def _loaded_tip_z_offset(self) -> dict[str, Any]:
+        from .pipette.tip_length import tip_z_offset
+        transport = getattr(self, "pipette_transport", None)
+        tip_type = getattr(transport, "_tip_type", None)
+        # No tip on the gun means no tip length to correct.
+        loaded = _transport_tip_loaded(transport)
+        return tip_z_offset(int(tip_type) if loaded and isinstance(tip_type, int) else None)
+
     def z_pipette_position(
         self,
         *,
@@ -4076,15 +4095,22 @@ class Serial206ProductionPrimitiveAdapter:
         self._z_profile()
         table = load_bound_oem_position_table()
         target_row = table.resolve(location_id=str(location_id))
+        # Tip racks are approached by the collar, never by a tip's length.
+        from .oem_compat.pathing import LOCATION_NAME_TO_ID, TIP_TRAY_LOCATIONS
+        at_tip_rack = LOCATION_NAME_TO_ID.get(str(location_id)) in TIP_TRAY_LOCATIONS
         if operation == "lower_pipette":
             if target_row.z_low is None:
                 return {"ok": False, "failure": "position_table_z_low_missing"}
-            target = int(target_row.z_low) + (4030 if bool(overpress) else 0)
+            tip_offset = {"offset_steps": 0, "reason": "tip_rack"} if at_tip_rack else self._loaded_tip_z_offset()
+            depth = {"offset_steps": 0, "reason": "tip_rack"} if at_tip_rack else self._depth_offset(str(location_id))
+            target = (int(target_row.z_low) + (4030 if bool(overpress) else 0) + int(tip_offset["offset_steps"])
+                      + int(depth["offset_steps"]))
             source_anchor = "ClassControlInterface.cs:4401-4421"
         elif operation == "lift_pipette":
             if target_row.z_high is None:
                 return {"ok": False, "failure": "position_table_z_high_missing"}
-            target = int(target_row.z_high)
+            tip_offset = {"offset_steps": 0, "reason": "tip_rack"} if at_tip_rack else self._loaded_tip_z_offset()
+            target = int(target_row.z_high) + int(tip_offset["offset_steps"])
             source_anchor = "ClassControlInterface.cs:4423-4431"
         else:
             raise ValueError(f"unsupported pipette Z operation: {operation}")
@@ -4104,6 +4130,8 @@ class Serial206ProductionPrimitiveAdapter:
             "location_id": str(location_id),
             "overpress": bool(overpress) if operation == "lower_pipette" else False,
             "target_position_steps": target,
+            "tip_z_offset": tip_offset,
+            **({"depth_offset": depth} if operation == "lower_pipette" else {}),
             "position_table_source": table.source,
             "move": _json_safe(move),
             "controller_command_acknowledged": ok,
@@ -4322,6 +4350,7 @@ class Serial206ProductionPrimitiveAdapter:
             tip_loaded=bool(tip_loaded),
             tip_dirty=bool(tip_dirty),
             tip_location=int(tip_location),
+            tip_z_offset_steps=self._loaded_tip_z_offset()["offset_steps"] if bool(tip_loaded) else 0,
             clean_path=bool(clean_path),
             device_type="BIOXP",
             gripper_confirmed=gripper_confirmed,
@@ -4379,6 +4408,26 @@ class Serial206ProductionPrimitiveAdapter:
             "execution": _json_safe(execution),
             "source_anchor": "ClassControlInterface.scriptmoveTo:3734-4014",
         }
+
+
+
+def tip_tray_location(machine_status: Mapping[str, Any], index: int) -> int:
+    """Deck station of tip tray ``index`` (0-4).
+
+    Uses the persisted constructor when present. State migrated from older
+    releases has no constructor; tray stations are fixed OEM deck facts.
+    """
+    trays = machine_status.get("constructed_tip_trays")
+    if isinstance(trays, list) and len(trays) == len(TIP_TRAY_LOCATIONS):
+        return int(trays[index]["location"])
+    return TIP_TRAY_LOCATIONS[index]
+
+def _transport_tip_loaded(transport: Any) -> bool:
+    """Tips on: the four-channel group carries the flag on its channel transports."""
+    channels = getattr(transport, "_transports", None)
+    if isinstance(channels, (list, tuple)):
+        return any(getattr(t, "_tip_loaded", False) is True for t in channels)
+    return getattr(transport, "_tip_loaded", False) is True
 
 
 class Serial206OemInitializationProvider:
@@ -4765,8 +4814,13 @@ class Serial206OemInitializationProvider:
             with self._lock:
                 state = self._load_state()
                 board_epoch_5 = (state.get("x_lifecycle") or {}).get("board_lifecycle_generation")
-        if type(board_epoch_4) is not int or type(board_epoch_5) is not int:
-            raise RuntimeError("deck_board_epochs_not_authoritative")
+        # Not OEM: board epochs are host bookkeeping. Unknown epochs (e.g. right
+        # after a restart, before motion is activated) are recorded as 0 instead
+        # of refusing record writes. Motion stays gated by motion activation.
+        if type(board_epoch_4) is not int:
+            board_epoch_4 = 0
+        if type(board_epoch_5) is not int:
+            board_epoch_5 = 0
         return {
             "ownership_generation": ownership_generation,
             "board_epoch_4": board_epoch_4,
@@ -5210,7 +5264,7 @@ class Serial206OemInitializationProvider:
                 "construction_id": str(uuid.uuid4()),
                 "constructed_tip_trays": [
                     {"tray_id": tray_id, "tip_type": "T200" if tray_id == 3 else "T50",
-                     "location": (7, 8, 9, 10, 15)[tray_id],
+                     "location": TIP_TRAY_LOCATIONS[tray_id],
                      "plate_name": "TIP_HOTEL" if tray_id == 4 else "TIP_TRAY",
                      "occupancy": [tray_id != 4] * 96, "tip_available": True}
                     for tray_id in range(5)
@@ -11164,6 +11218,56 @@ class Serial206OemInitializationProvider:
             )
         return {"ok": True, "psudo_z_home_steps": pseudo_home, "source_anchor": "DefaultParameters.GantryLoad:61-79"}
 
+    def record_tip_tray_type(self, *, tray_id: int, tip_type: int) -> dict[str, Any]:
+        """Operator record: ClassTipTray.tipType setter only. No motion, no I/O."""
+        names = {10: "T10", 50: "T50", 200: "T200"}
+        if type(tray_id) is not int or tray_id not in range(5) or tip_type not in names:
+            raise ValueError("tip tray type record needs tray 0-4 and tip type 10, 50 or 200")
+        with self._lock:
+            state = self._load_state()
+            machine = state["machine_status"]
+            before = self.tip_tray_type(tray_id)
+            # Records predating the persisted constructor keep the size beside it.
+            machine["tip_tray_types"] = {**dict(machine.get("tip_tray_types") or {}), str(tray_id): names[tip_type]}
+            trays = machine.get("constructed_tip_trays")
+            if isinstance(trays, list) and len(trays) == 5:
+                trays[tray_id]["tip_type"] = names[tip_type]
+            self._save_state(state)
+        return {"tray": tray_id + 1, "tip_type": names[tip_type], "before": before}
+
+    def tip_tray_type(self, tray_id: int) -> str | None:
+        """Recorded tip size of tray ``tray_id`` (T10/T50/T200), or None if never recorded."""
+        with self._lock:
+            machine = self._load_state().get("machine_status") or {}
+        recorded = dict(machine.get("tip_tray_types") or {}).get(str(tray_id))
+        if recorded:
+            return recorded
+        trays = machine.get("constructed_tip_trays")
+        return trays[tray_id].get("tip_type") if isinstance(trays, list) and len(trays) == 5 else None
+
+    def record_movable_object_locations(
+        self, *, locations: Mapping[str, str], source_command_id: str,
+    ) -> dict[str, Any]:
+        """Operator record correction: ClassMachineStatus.updatePlateLocation setter only.
+
+        No motion and no controller I/O. Merges the supplied objects into both
+        the canonical SQLite record and the provider machine_status copy.
+        """
+        reader = getattr(self, "_deck_semantic_state_reader", None)
+        retained = dict(((reader() if callable(reader) else {}) or {}).get("movable_plate_locations") or {})
+        retained.update(dict(locations))
+        published = self._publish_deck_owner_state(
+            source_operation="updatePlateLocation", source_command_id=source_command_id,
+            updates={"movable_plate_locations": retained},
+        )
+        with self._lock:
+            state = self._load_state()
+            machine = state["machine_status"]
+            machine["movable_plate_locations"] = {
+                **dict(machine.get("movable_plate_locations") or {}), **dict(locations)}
+            self._save_state(state)
+        return published
+
     def load_gantry(self, *, tip_loaded: bool | None = None, plate_on_gantry: Any = None) -> dict[str, Any]:
         return self.gantry_load(
             tip_loaded=tip_loaded, plate_on_gantry=plate_on_gantry,
@@ -12425,7 +12529,7 @@ class Serial206OemInitializationProvider:
                 raise RuntimeError("source_authority_missing:loadTips:tip_tray")
             state = reader(index)
             occupancy = state["occupancy"]
-            tip_type = {"T50": 50, "T200": 200, "T201": 201}[constructed["tip_type"]]
+            tip_type = {"T10": 10, "T50": 50, "T200": 200, "T201": 201}[constructed["tip_type"]]
             return {"tip_type": tip_type,
                     "tip_available": state["tip_available"], "location": constructed["location"],
                     "next_group": next((group for group in range(24)
@@ -12635,6 +12739,35 @@ class Serial206OemInitializationProvider:
         return run_diagnostic_inline(self, arguments["diagnostic"], command_id=command_id,
                                      owner_identity=owner_identity)
 
+    def _manual_pickup_bookkeeping(self, arguments, finite, pipette, *,
+                                   channels=None, transition="remove", metadata_only=False) -> dict[str, Any]:
+        """After a completed manual pickup: take those four tips off the rack record
+        and set the software tip type to the rack's recorded size."""
+        from .oem_compat.position_table import tip_group_well_ids
+        tray_id = int(arguments["tray"]) - 1
+        well = str(arguments["well"]).upper()
+        group = (int(well[1:]) - 1) * 2 + (well[0] == "B")
+        keep = channels if channels is not None else arguments.get("keep_channels")
+        wells = [w for ch, w in enumerate(tip_group_well_ids(group)) if keep is None or ch in keep]
+        out: dict[str, Any] = {}
+        if not metadata_only:
+            # The canonical provider accepts one well or a complete OEM group,
+            # not an arbitrary two/three-channel removal.
+            batches = [wells] if len(wells) in (1, 4) else [[w] for w in wells]
+            records = []
+            for batch in batches:
+                records.append(finite("pipette_tip_transition", {"tray_id": tray_id,
+                    "well_ids": batch, "transition": transition}))
+            out = {"rack_tips_removed" if transition == "remove" else "rack_tips_restored": wells,
+                   "rack_record": records}
+        if channels is not None:
+            return out
+        size = self.tip_tray_type(tray_id)
+        if size in {"T10", "T50", "T200"}:
+            value = {"T10": 10, "T50": 50, "T200": 200}[size]
+            out["tip_type_set"] = pipette("load_tip_metadata", lambda transport: transport.loadTip(value, -1))
+        return out
+
     def wp8_manual_pipette_physical(
         self, operation: str, arguments: Mapping[str, Any], *, command_id: str,
         child_order: int, plan_digest: str, owner_identity: Mapping[str, Any], **_: Any,
@@ -12670,16 +12803,43 @@ class Serial206OemInitializationProvider:
             return runner(name, call, command_id, child_identity, arguments)
 
         def tray_location(index):
-            # Read only location from the actual persisted source machine object.
-            # Occupancy/history is neither synthesized nor an admission condition.
             with self._lock:
-                return self._load_state()["machine_status"]["constructed_tip_trays"][index]["location"]
+                machine = self._load_state().get("machine_status") or {}
+            return tip_tray_location(machine, index)
 
         # Pickup does not consume motor-current settings. Detection does.
         current = (get_active_oem_machine_snapshot().config_sections["offsets"]["m_Z_MOTOR_MAX_CURRENT_DOWN"]
                    if operation == "sourceMeasureFluidHeight" else None)
+        def pickup_effect(transition, channels):
+            def record(name, inputs):
+                child_identity = identity("pickup_accounting")
+                # Record an already-observed effect, not another physical child.
+                # A later motion fence must not erase completed effects.
+                return self.publish_tip_tray_transition(**inputs,
+                    operation_id=child_identity["source_identity"], command_id=command_id,
+                    provenance={"source_operation": "sourceManualLoadTip",
+                                "source_child": child_identity["source_identity"]})
+            out = {}
+            if transition == "remove":
+                # Host-only dependent state follows observed pickup, even if a
+                # later release/home fails. Already inside the query receipt's
+                # active claim: do not recursively admit another pipette call.
+                try:
+                    out.update(self._manual_pickup_bookkeeping(arguments, record,
+                        lambda name, call: call(self.primitives.pipette_transport),
+                        metadata_only=True))
+                except Exception as exc:
+                    out["bookkeeping_error"] = repr(exc)
+            try:
+                out.update(self._manual_pickup_bookkeeping(arguments, record, pipette,
+                    channels=channels, transition=transition))
+            except Exception as exc:
+                out.update(error=repr(exc), published=False)
+            return out
+
         bindings = bind_calibration_provider(self, finite=finite, native=native, pipette=pipette,
-            tray_location=tray_location, z_current_down=current, sleep=self.sleep)
+            tray_location=tray_location, z_current_down=current, sleep=self.sleep,
+            pickup_effect=pickup_effect)
         try:
             result = (manual_load_tip(ManualTipLoadRequest(**arguments), bindings)
                       if operation == "sourceManualLoadTip" else
@@ -12804,7 +12964,19 @@ class Serial206OemInitializationProvider:
             target = row.z_low if operation == "sourceLowerTo" else row.z_high if height is None else row.z_low - height
             if type(target) is not int:
                 raise RuntimeError("source_pipette_z_calibration_missing")
-            return {**self.moveZ(target), "source_return": target if operation == "sourceLowerTo" else 0}
+            from .pipette.tip_length import tip_z_offset
+            transport = getattr(self.primitives, "pipette_transport", None)
+            loaded_type = getattr(transport, "_tip_type", None)
+            loaded = _transport_tip_loaded(transport)
+            tip_offset = tip_z_offset(loaded_type if loaded and isinstance(loaded_type, int) else None)
+            target += int(tip_offset["offset_steps"])
+            depth = {"offset_steps": 0}
+            if operation == "sourceLowerTo":
+                from .pipette.depth_offsets import resolve
+                depth = resolve(tip_type=loaded_type if loaded else None, location=LOCATION_ID_TO_NAME[arguments["location"]])
+                target += int(depth["offset_steps"])
+            return {**self.moveZ(target), "source_return": target if operation == "sourceLowerTo" else 0,
+                    "tip_z_offset": tip_offset, "depth_offset": depth}
         if operation == "sourceMoveXY":
             # This finite source leaf is invoked by the OEM protocol motion
             # worker, not the manual STA button. Seal its MTA wait schedule.

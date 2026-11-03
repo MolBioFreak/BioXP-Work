@@ -174,9 +174,9 @@ def build_mechanism_handlers(*, get_tester, get_camera, get_executor, save_snaps
             return {**receipt, "setpoint_accepted": receipt.get("ok") is True, "temperature_reached": None}
         if kind == K.CHILLER_SETPOINT:
             tester = get_tester()
-            tester.chiller_activate()
             bank = tester.CHILLER_BANK_RC if p["bank"] == "rc" else tester.CHILLER_BANK_OC
-            receipt = tester.chiller_set_target_temp(bank, p["target_temp_c"], verify=True)
+            # OEM ClassChillerBoard.setChillerTemp: fan target, cool-time check, then setpoint.
+            receipt = dict(tester.oem_chiller_set_temperature(bank, float(p["target_temp_c"])))
             return {**receipt, "setpoint_accepted": receipt.get("ok") is True, "temperature_reached": None}
         if kind == K.THERMAL_HOLD:
             return hold(action, p, action.action_id)

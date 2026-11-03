@@ -809,9 +809,16 @@ class BioXpCanDriver:
 
     def _apply_pipette_provenance(self, provenance: Any, command_name: str | None) -> dict[str, Any]:
         state = dict(getattr(self, "_pipette_message_state", {}))
+        multipart = False
         for frame in provenance.get("frames", []) if isinstance(provenance, dict) else []:
             if not isinstance(frame, dict):
                 continue
+            # Multipart reports: only the first part (function 3) carries the status byte. Later
+            # parts (function 4, and the closing report frame) are reply text such as ".030-12/".
+            function = frame.get("arbitration_id") & 0x7 if type(frame.get("arbitration_id")) is int else None
+            if function == 4 or (function == 6 and multipart):
+                continue
+            multipart = multipart or function == 3
             state = self.process_pipette_message(
                 int(frame.get("dlc", len(frame.get("data", [])))),
                 list(frame.get("data", [])),

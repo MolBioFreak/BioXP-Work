@@ -617,6 +617,10 @@ async def _run_transport_call(
             result["delivery_verified"] = False
             result["controller_acknowledged"] = False
             result["completion_verified"] = False
+    if isinstance(result, dict):
+        from ..pipette.audit import normalize_eject_result_flags
+
+        result = normalize_eject_result_flags(str(operation_name or label), result)
     if receipt_store is not None and isinstance(result, dict):
         try:
             effective_candidate = result.get("effective")
@@ -1432,7 +1436,7 @@ class _OemPipetteBody:
         args = self.action.params["arguments"]
         self.model.allow_to_stop = False
         self.pressure_base()
-        tip_types = {"T50": 50, "T200": 200, "UNKNOWN": 201}
+        tip_types = {"T10": 10, "T50": 50, "T200": 200, "UNKNOWN": 201}
         tip_type = tip_types[args[0]] if args[0] in tip_types else int(args[0])
         force = len(args) > 1 and args[1] in ("T", "True")
         pipette = int(args[2]) if len(args) > 2 else -1

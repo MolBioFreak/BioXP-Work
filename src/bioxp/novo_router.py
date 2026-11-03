@@ -1068,7 +1068,7 @@ class NovoRouter:
                 self._pipette_completions.pop(channel, None)
         frame = completion.frame
         generation_changed = completion.owner_generation != self._reader_generation
-        valid = bool(
+        framed = bool(
             signaled
             and not generation_changed
             and completion.rejected_reason is None
@@ -1084,8 +1084,10 @@ class NovoRouter:
             and (frame.arbitration_id & 0x7) == completion.command_family
             and (frame.dlc == 2 or ((completion.command_name == "cavro_active_diagnostic" or completion.response_descriptors) and 2 <= frame.dlc <= 8))
             and len(frame.data) == frame.dlc
-            and frame.data[0] == 0x20
         )
+        # A well-framed reply with a nonzero status byte is a device error, not a corrupt frame.
+        device_error = bool(framed and frame.data[0] != 0x20)
+        valid = bool(framed and not device_error)
         if valid:
             with self._completion_lock:
                 # Self-heal: a channel that completes validly again is no
@@ -1094,7 +1096,8 @@ class NovoRouter:
         if not valid and not generation_changed and completion.rejected_reason is None:
             with self._completion_lock:
                 self._pipette_completion_taints[channel] = {
-                    "reason": "malformed_completion" if frame is not None else "completion_timeout",
+                    "reason": ("device_error_completion" if device_error else "malformed_completion")
+                    if frame is not None else "completion_timeout",
                     "owner_token": completion.owner_token,
                     "transaction_id": completion.transaction_id,
                     "command_name": completion.command_name,
@@ -1122,7 +1125,7 @@ class NovoRouter:
             "duplicate_terminal_count": completion.duplicate_terminal_count,
             "outcome": "completion" if valid else (
                 completion.rejected_reason
-                or ("malformed" if frame is not None else "timeout")
+                or ("device_error" if device_error else "malformed" if frame is not None else "timeout")
             ),
             "observed_rx_id": frame.arbitration_id if frame is not None else None,
             "observed_rx_dlc": frame.dlc if frame is not None else None,

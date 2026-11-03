@@ -19,7 +19,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
@@ -35,7 +35,7 @@ from .operator_controls import (
     _MAX_INPUT_BYTES,
 )
 from .operator_receipt_store import runtime_state_root
-from .operator_command_receipts import CommandReceiptReader
+from .operator_command_receipts import CommandReceiptReader, UNKNOWN_OUTCOME_STATES
 from .runtime_audit_store import open_runtime_connection, runtime_write_coordinator
 from .oem_runtime_store import (
     LEGACY_OPERATOR_COMMAND_PLANE_SCHEMA_SHA256,
@@ -50,6 +50,7 @@ from .oem_deck_movement import (
     MovExecutionPlan,
     DeckExecutionFailure,
     FINITE_PLATE_OPERATIONS,
+    OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS,
     WP8_OPERATION_INTENT_KEYS,
     canonical_movable_object_locations,
     canonical_plate_name,
@@ -88,6 +89,15 @@ COMMAND_STATES = frozenset({
 })
 COMMAND_NONTERMINAL = frozenset({"queued", "dispatched", "issued_pending", "stop_requested", "abort_requested"})
 COMMAND_TERMINAL = COMMAND_STATES - COMMAND_NONTERMINAL
+
+# Successful homes that re-reference each axis. An unknown deck move (alias c)
+# is resolved once X, Y and Z have each completed a home after it finished.
+_X_HOMES = ("oem.xy.home", "oem.x.manual_panel_home", "oem.x.startup_home", "oem.x.move_to_origin_home", "meta.initialize_motion")
+_Y_HOMES = ("oem.xy.home", "oem.y.manual_panel_home", "meta.initialize_motion")
+_Z_HOMES = ("oem.z.manual_home", "oem.z.move_z_home", "oem.z.diagnostic_home_axis", "meta.initialize_motion")
+HOME_ACTIONS = tuple(sorted(set(_X_HOMES + _Y_HOMES + _Z_HOMES)))
+# Home resolution is derived from retained failed-step scope, never a blanket XYZ policy.
+_HOME_ACTIONS_BY_AXIS = {"x": _X_HOMES, "y": _Y_HOMES, "z": _Z_HOMES}
 
 ALLOWED_ACTIONS = frozenset({
     "oem.x.prepare",
@@ -814,6 +824,29 @@ class RecoveryResolveRequest(BaseModel):
     expected_safety_epoch: StrictInt = Field(ge=0)
     acknowledge_command_ids: list[str] = Field(max_length=10000)
     operation: str = Field(pattern=r"^(resume_undispatched|cancel_pending)$")
+
+
+class DeckRecordTipTray(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    # OEM tray numbers as used by load_tip: 1-4 TECANRACK1-4, 5 tip hotel.
+    tray: StrictInt = Field(ge=1, le=5)
+    tips: Literal["full", "empty"] | list[str] | None = None
+    # ClassTipTray.tipType: which tips the rack holds (10, 50 or 200 uL).
+    tip_type: Literal[10, 50, 200] | None = None
+
+
+class DeckRecordRequest(BaseModel):
+    """Record-only correction of what the robot believes is on the deck. No motion."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    schema_version: str = Field("bioxp.operator_deck_record_request.v1", pattern=r"^bioxp\.operator_deck_record_request\.v1$")
+    record_id: str = Field(default_factory=lambda: "auto-" + uuid.uuid4().hex,
+                           min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+    reason: str = Field("operator deck record", min_length=1, max_length=500)
+    movable_objects: dict[str, str] | None = None
+    tip_trays: list[DeckRecordTipTray] | None = None
+    # What the gripper holds: "empty" or a ClassMachineStatus object name.
+    # Same plain setter as OEM DefaultParameters.GantryLoad / LoadGantryNull.
+    gantry: str | None = None
 
 
 class DeckReconciliationRequest(BaseModel):
@@ -1739,7 +1772,8 @@ class OperatorCommandStore(CommandReceiptReader):
         ).fetchone()
         assert row is not None
         self._transition_pending = True
-        if command_id:
+        if command_id and event_kind != "recovery_resolved":
+            # Recovery is additive evidence, not a rewrite of terminal history.
             # Keep SQL claim/report lineage current, not a second rendered
             # receipt. Readers use the canonical owner on their own connection.
             command = conn.execute(
@@ -2222,11 +2256,20 @@ class OperatorCommandStore(CommandReceiptReader):
                 return None
             inputs = _json_load(row["requested_inputs_json"], {})
             payload = _json_load(row["receipt_json"], {}) or inputs.get("bundle", {})
-            return {**payload, "job_id": command_id, "status": row["status"], "command": {
+            resolution = self._home_recovery_resolution(command_id)
+            status = self._settled_status(row["status"], resolution)
+            return {**payload, "job_id": command_id, "status": status,
+                **({"recorded_status": row["status"]} if status != row["status"] else {}), "command": {
                 "command_id": command_id, "idempotency_key": row["idempotency_key"],
+                "recovery_resolution": resolution,
                 "ownership_generation": int(row["ownership_generation"]), "state_version": int(row["version"]),
-                "status": row["status"], "terminal": row["status"] in {"completed","failed","interrupted","ambiguous","cleared","rejected"},
+                "status": status, "terminal": status in {"completed","failed","interrupted","ambiguous","cleared","rejected"},
                 "status_path": f"/protocol/jobs/{command_id}"}}
+
+    @staticmethod
+    def _settled_status(status: str, resolution: Mapping[str, Any] | None) -> str:
+        """An unknown outcome settled by later successful homes reads as cleared."""
+        return "cleared" if resolution is not None and status in UNKNOWN_OUTCOME_STATES else status
 
     def get_workflow_observation(self, command_id: str) -> dict[str, Any] | None:
         """Read current control/review truth, not the retained scientific bundle.
@@ -2263,13 +2306,17 @@ class OperatorCommandStore(CommandReceiptReader):
             dry_run, workflow, review = _json_load(row["observation_json"])
             runtime = {"workflow": workflow} if row["workflow_type"] is not None else {}
             operator = {"pending_review": review} if row["review_type"] is not None else {}
+            resolution = self._home_recovery_resolution(command_id)
+            status = self._settled_status(row["status"], resolution)
             return {"schema_version": "bioxp.protocol_job_observation.v1",
-                "job_id": command_id, "status": row["status"],
+                "job_id": command_id, "status": status,
+                **({"recorded_status": row["status"]} if status != row["status"] else {}),
                 "execution": {**({"dry_run": dry_run} if row["dry_run_type"] is not None else {}),
                               "runtime_state": runtime}, "operator": operator,
                 "command": {"command_id": command_id,
+                    "recovery_resolution": resolution,
                     "ownership_generation": int(row["ownership_generation"]), "state_version": int(row["version"]),
-                    "status": row["status"], "terminal": row["status"] in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"}}}
+                    "status": status, "terminal": status in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"}}}
 
     def list_workflow_summaries(self, *, limit: int = 20) -> list[dict[str, Any]]:
         """Project discovery fields in SQLite; never hydrate full job bundles.
@@ -2306,13 +2353,16 @@ class OperatorCommandStore(CommandReceiptReader):
             result = []
             for row in rows:
                 fields = _json_load(row["summary_json"])
+                status = row["status"]
+                if status in UNKNOWN_OUTCOME_STATES:
+                    status = self._settled_status(status, self._home_recovery_resolution(row["command_id"]))
                 result.append(dict(zip(
                     ("dry_run", "protocol_id", "source_type", "created_at", "updated_at", "pending_review"),
-                    fields), job_id=row["command_id"], status=row["status"], command={
+                    fields), job_id=row["command_id"], status=status, command={
                         "command_id": row["command_id"], "idempotency_key": row["idempotency_key"],
                         "ownership_generation": int(row["ownership_generation"]),
-                        "state_version": int(row["version"]), "status": row["status"],
-                        "terminal": row["status"] in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"},
+                        "state_version": int(row["version"]), "status": status,
+                        "terminal": status in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"},
                         "status_path": f"/protocol/jobs/{row['command_id']}",
                     }))
             return result
@@ -2565,12 +2615,19 @@ class OperatorCommandStore(CommandReceiptReader):
                 "SELECT 1 FROM operator_commands c LEFT JOIN serial206_movement_commands m USING(command_id) "
                 "WHERE c.parent_command_id=? AND COALESCE(m.state,c.status) NOT IN ("
                 + ",".join("?" for _ in settled) + ") LIMIT 1", (command_id, *settled)).fetchone()
+            independent_unknown = status == "ambiguous"
             if pending or not lifecycle_settled:
                 status = "ambiguous"
             if status == "ambiguous":
                 payload = json.loads(_canonical(payload))
                 workflow = payload.setdefault("execution", {}).setdefault("runtime_state", {}).setdefault("workflow", {"command_id": command_id})
-                workflow.update(phase="reconciling", held_reason="workflow_settlement_unknown")
+                causes = (["children"] if pending else [])
+                if not lifecycle_settled:
+                    causes.append("lifecycle")
+                if independent_unknown or workflow.get("held_reason") not in {None, "workflow_settlement_unknown"}:
+                    causes.append("parent")
+                workflow.update(phase="reconciling", held_reason="workflow_settlement_unknown",
+                                settlement_unknown_causes=causes)
             if status == "completed":
                 try:
                     self._workflow_current(conn, command_id)
@@ -2806,7 +2863,9 @@ class OperatorCommandStore(CommandReceiptReader):
             "SELECT 1 FROM operator_plane_commands c LEFT JOIN operator_plane_deck_commands d USING(command_id) "
             "WHERE c.action_id IN ('oem.deck.move_to_location','oem.deck.move_to_well','oem.deck._mov_execution','oem.deck._finite_operation') "
             "AND (c.status IN ('ambiguous','interrupted') OR d.ambiguity_state='recovery_required') "
-            "AND NOT EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions r WHERE r.command_id=c.command_id) LIMIT 1"
+            "AND NOT EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions r WHERE r.command_id=c.command_id) "
+            "AND NOT EXISTS (SELECT 1 FROM operator_plane_transitions t WHERE t.command_id=c.command_id "
+            "AND t.event_kind='recovery_resolved') LIMIT 1"
         ).fetchone()
         semantic = conn.execute(
             "SELECT ambiguity_state FROM operator_plane_deck_semantic_state WHERE singleton=1"
@@ -2822,6 +2881,135 @@ class OperatorCommandStore(CommandReceiptReader):
     def deck_recovery_blocker(self) -> str | None:
         with self._lock:
             return self._deck_recovery_blocker(self.connection)
+
+    def settle_deck_recovery_by_home(self) -> bool:
+        """Link subsequent affected-axis homes to each unknown deck command, additively.
+
+        Partial settlement is visible even while another command remains
+        unresolved. Neither terminal history nor live resource owners change.
+        """
+        # The transition sequence is indexed and belongs to this existing owner.
+        # Lease renewals/telemetry are not relevant terminal evidence.
+        with self._lock:
+            high = self.connection.execute("SELECT COALESCE(MAX(transition_sequence),0) FROM operator_plane_transitions").fetchone()[0]
+            previous = getattr(self, "_home_settlement_sequence", None)
+            if previous == high:
+                return False
+            if previous is not None:
+                relevant = self.connection.execute(
+                    "SELECT 1 FROM operator_plane_transitions WHERE transition_sequence>? "
+                    "AND event_kind IN ('command_terminal','workflow_terminal','interrupt_terminal','recovery_resolved') LIMIT 1",
+                    (previous,)).fetchone()
+                if relevant is None:
+                    self._home_settlement_sequence = high
+                    return False
+        changed = False
+        with self._transaction() as conn:
+            # Every unknown command outcome (deck or not) is settled by later
+            # successful homes. Workflow parents are settled below.
+            candidates = conn.execute(
+                "SELECT c.command_id,COALESCE(c.finished_at,c.updated_at) AS failed_at "
+                "FROM operator_plane_commands c LEFT JOIN operator_plane_deck_commands d USING(command_id) "
+                "WHERE c.action_id<>'protocol.execute' "
+                "AND (c.status IN ('ambiguous','interrupted') OR d.ambiguity_state='recovery_required') "
+                "AND NOT EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions r WHERE r.command_id=c.command_id) "
+                "AND NOT EXISTS (SELECT 1 FROM operator_plane_transitions t WHERE t.command_id=c.command_id "
+                "AND t.event_kind='recovery_resolved' AND json_extract(t.payload_json,'$.resolution')='axes_homed_after_unknown_moves') "
+            ).fetchall()
+            for candidate in candidates:
+                command_id = str(candidate["command_id"])
+                if self._home_recovery_resolution(command_id) is not None:
+                    continue
+                if candidate["failed_at"] is None:
+                    continue
+                # Retained evidence names the affected axes when it can; when it
+                # cannot, a later successful X, Y and Z home settles the command.
+                scoped = self._unknown_affected_axes(command_id)
+                axes = scoped if scoped is not None else ["x", "y", "z"]
+                homes = []
+                for axis in axes:
+                    actions = _HOME_ACTIONS_BY_AXIS[axis]
+                    home = conn.execute(
+                        "SELECT command_id,action_id,CAST(finished_at AS REAL) AS at FROM operator_commands "
+                        "WHERE status='completed' AND CAST(finished_at AS REAL)>? AND action_id IN ("
+                        + ",".join("?" for _ in actions) + ") ORDER BY CAST(finished_at AS REAL),command_id LIMIT 1",
+                        (candidate["failed_at"], *actions),
+                    ).fetchone()
+                    if home is None:
+                        break
+                    homes.append({"axis": axis, **dict(home)})
+                if len(homes) != len(axes):
+                    continue
+                self._insert_transition(
+                    conn, command_id=command_id, event_kind="recovery_resolved", state="recovery_resolved",
+                    payload={"command_id": command_id, "resolution": "axes_homed_after_unknown_moves",
+                             "affected_axes": axes, "axes_scope": "retained" if scoped is not None else "all_axes",
+                             "home_evidence": homes},
+                )
+                changed = True
+            changed = self._settle_workflow_child_recovery(conn) or changed
+            hold = conn.execute("SELECT recovery_hold FROM operator_plane_safety WHERE singleton=1").fetchone()
+            semantic = conn.execute("SELECT ambiguity_state FROM operator_plane_deck_semantic_state WHERE singleton=1").fetchone()
+            if (hold is not None and hold[0]
+                    and self._deck_recovery_blocker(conn) == "deck_recovery_state_inconsistent"
+                    and not (semantic is not None and str(semantic[0]) in {"ambiguous", "recovery_required"})):
+                conn.execute("UPDATE operator_plane_safety SET recovery_hold=0,recovery_version=recovery_version+1,updated_at=? WHERE singleton=1", (_now(),))
+                changed = True
+            elif changed:
+                conn.execute("UPDATE operator_plane_safety SET recovery_version=recovery_version+1,updated_at=? WHERE singleton=1", (_now(),))
+            self._home_settlement_sequence = conn.execute(
+                "SELECT COALESCE(MAX(transition_sequence),0) FROM operator_plane_transitions").fetchone()[0]
+        if changed:
+            self._wake.set()
+        return changed
+
+    def _settle_workflow_child_recovery(self, conn: sqlite3.Connection) -> bool:
+        from .runtime_audit_store import TERMINAL_COMMAND_STATES
+        settled = (TERMINAL_COMMAND_STATES | COMMAND_TERMINAL) - {
+            "ambiguous", "outcome_unknown", "reconciliation_required", "interrupted"}
+        changed = False
+        for parent in conn.execute(
+                "SELECT command_id,receipt_json,COALESCE(finished_at,updated_at) AS failed_at FROM operator_commands "
+                "WHERE command_kind='protocol_workflow' AND status='ambiguous'").fetchall():
+            pid = parent["command_id"]
+            if self._home_recovery_resolution(pid) is not None:
+                continue
+            workflow = _json_load(parent["receipt_json"], {}).get("execution", {}).get("runtime_state", {}).get("workflow", {})
+            children = conn.execute(
+                "SELECT c.command_id,COALESCE(m.state,c.status) AS state FROM operator_commands c "
+                "LEFT JOIN serial206_movement_commands m USING(command_id) WHERE c.parent_command_id=?",
+                (pid,)).fetchall()
+            uncertain = [c for c in children if c["state"] not in settled]
+            resolutions = [self._home_recovery_resolution(c["command_id"]) for c in uncertain]
+            if not all(resolutions):
+                continue
+            homes = None
+            # Uncertainty only from children is settled by their resolutions.
+            # Parent/lifecycle or unrecorded causes are settled by a later
+            # successful X, Y and Z home, like any other unknown outcome.
+            if not (uncertain and workflow.get("settlement_unknown_causes") == ["children"]):
+                try:
+                    failed_at = float(parent["failed_at"])
+                except (TypeError, ValueError):
+                    continue
+                homes = []
+                for axis in ("x", "y", "z"):
+                    actions = _HOME_ACTIONS_BY_AXIS[axis]
+                    home = conn.execute(
+                        "SELECT command_id,action_id,CAST(finished_at AS REAL) AS at FROM operator_commands "
+                        "WHERE status='completed' AND CAST(finished_at AS REAL)>? AND action_id IN ("
+                        + ",".join("?" for _ in actions) + ") ORDER BY CAST(finished_at AS REAL),command_id LIMIT 1",
+                        (failed_at, *actions)).fetchone()
+                    if home is None:
+                        break
+                    homes.append({"axis": axis, **dict(home)})
+                if len(homes) != 3:
+                    continue
+            self._insert_transition(conn, command_id=pid, event_kind="recovery_resolved", state="recovery_resolved",
+                payload={"command_id": pid, "resolution": "children_recovery_resolved",
+                         "child_evidence": resolutions, **({"home_evidence": homes} if homes is not None else {})})
+            changed = True
+        return changed
 
     def bind_tip_tray_constructor_reader(self, reader: Callable[[int], Mapping[str, Any] | None]) -> None:
         if not callable(reader):
@@ -4536,6 +4724,12 @@ class OperatorCommandStore(CommandReceiptReader):
         with self._lock:
             safety = self.connection.execute("SELECT * FROM operator_plane_safety WHERE singleton=1").fetchone()
             unknown = self.connection.execute("SELECT command_id,status,stream_sequence FROM operator_plane_commands WHERE status IN ('ambiguous','interrupted') ORDER BY stream_sequence").fetchall()
+            unknown = [row for row in unknown
+                       if self._home_recovery_resolution(str(row["command_id"])) is None
+                       and self.connection.execute(
+                           "SELECT 1 FROM operator_plane_deck_recovery_decisions WHERE command_id=?",
+                           (str(row["command_id"]),),
+                       ).fetchone() is None]
             queued_rows = self.connection.execute("SELECT stream_sequence FROM operator_plane_commands WHERE status='queued' ORDER BY stream_sequence").fetchall()
             queued = len(queued_rows)
             lane = self.connection.execute("SELECT dispatcher_epoch FROM operator_plane_lane WHERE singleton=1").fetchone()
@@ -6248,6 +6442,10 @@ class OperatorCommandStore(CommandReceiptReader):
                     self._stop.set()
                     break
                 next_renewal = time.monotonic() + 1.0
+                try:
+                    self.settle_deck_recovery_by_home()
+                except sqlite3.OperationalError:
+                    pass
 
             self._settle_workflow_child_waiters()
             self._notify_workflow_interrupt()
@@ -6576,7 +6774,7 @@ class OperatorCommandPlane:
                 # stringifying it loses the Park pause/error callback boundary.
                 failure = exc if isinstance(exc, DeckExecutionFailure) else None
                 if failure is not None:
-                    delivery_attempted = delivery_attempted or failure.delivery_attempted
+                    delivery_attempted = failure.delivery_attempted
                 response = ({
                     "ok": False,
                     "delivery_attempted": delivery_attempted,
@@ -6586,7 +6784,9 @@ class OperatorCommandPlane:
                     "provider_results": failure.provider_results,
                 } if failure is not None else {})
                 response["child_outcomes"] = finite_child_outcomes(command_id, evidence)
-                if delivery_attempted:
+                unknown = delivery_attempted and not getattr(failure, "known_failure", False)
+                response["known_failure"] = getattr(failure, "known_failure", False)
+                if unknown:
                     self.store.mark_deck_recovery_required(
                         command_id, reason=str(exc)[:500],
                         controller_command_acknowledged=bool(response.get("controller_command_acknowledged")),
@@ -6596,13 +6796,13 @@ class OperatorCommandPlane:
                     )
                 self.store.finish(
                     command_id,
-                    status="ambiguous" if delivery_attempted else "failed",
+                    status="ambiguous" if unknown else "failed",
                     payload={
                         "error": f"wp8_operation_exception:{type(exc).__name__}",
                         "detail": str(exc)[:500],
                         "delivery_attempted": delivery_attempted,
                         "response": _bounded_json(response, 131072),
-                        **({"outcome_unknown": True} if delivery_attempted else {}),
+                        **({"outcome_unknown": True} if unknown else {}),
                     },
                     controller_acknowledged=bool(response.get("controller_command_acknowledged")),
                     claimed=claimed,
@@ -6614,7 +6814,8 @@ class OperatorCommandPlane:
             except (OSError, RuntimeError, ValueError, KeyError) as exc:
                 wp8_response["child_outcomes_error"] = type(exc).__name__
             ok = wp8_response.get("ok") is True
-            terminal_status = "completed" if ok else ("ambiguous" if delivery_attempted else "failed")
+            unknown = delivery_attempted and wp8_response.get("failed_child_delivery_attempted") is not False and wp8_response.get("known_failure") is not True
+            terminal_status = "completed" if ok else ("ambiguous" if unknown else "failed")
             terminal_payload = {
                 "response": _bounded_json(wp8_response, 131072),
                 "delivery_attempted": delivery_attempted,
@@ -6685,22 +6886,24 @@ class OperatorCommandPlane:
                     (command_id,),
                 ).fetchall()
                 delivery_attempted = (
+                    exc.delivery_attempted if isinstance(exc, DeckExecutionFailure) else
                     any(str(row["terminal_state"]) in {"completed", "ambiguous"} for row in stage_rows)
                     or self.store.has_delivery_attempt(command_id)
                 )
-                if delivery_attempted:
+                unknown = delivery_attempted and not getattr(exc, "known_failure", False)
+                if unknown:
                     self.store.mark_deck_recovery_required(
                         command_id, reason=str(exc)[:500], controller_command_acknowledged=False,
                         controller_completion_verified=False, hardware_postcondition_verified=False,
                         provider_results=None,
                     )
                 self.store.finish(
-                    command_id, status="ambiguous" if delivery_attempted else "failed",
+                    command_id, status="ambiguous" if unknown else "failed",
                     payload={
                         "error": f"mov_execution_exception:{type(exc).__name__}",
                         "detail": str(exc)[:500],
                         "delivery_attempted": delivery_attempted,
-                        **({"outcome_unknown": True} if delivery_attempted else {}),
+                        **({"outcome_unknown": True} if unknown else {}),
                     },
                     claimed=claimed,
                 )
@@ -6711,7 +6914,8 @@ class OperatorCommandPlane:
             response = dict(mov_response)
             ok = isinstance(response, Mapping) and response.get("ok") is True
             delivery_attempted = bool(isinstance(response, Mapping) and response.get("delivery_attempted") is True)
-            terminal_status = "completed" if ok else ("ambiguous" if delivery_attempted else "failed")
+            unknown = delivery_attempted and response.get("failed_child_delivery_attempted") is not False and response.get("known_failure") is not True
+            terminal_status = "completed" if ok else ("ambiguous" if unknown else "failed")
             if terminal_status == "ambiguous":
                 self.store.mark_deck_recovery_required(
                     command_id, reason=str(response.get("reason") or "mov_execution_outcome_unknown")[:500],
@@ -6753,7 +6957,8 @@ class OperatorCommandPlane:
             except DeckExecutionFailure as exc:
                 delivery_attempted = exc.delivery_attempted
                 controller_acknowledged = bool(exc.controller_command_acknowledged)
-                if delivery_attempted:
+                unknown = delivery_attempted and not exc.known_failure
+                if unknown:
                     mark_recovery = getattr(self.store, "mark_deck_recovery_required", None)
                     if callable(mark_recovery):
                         mark_recovery(
@@ -6766,12 +6971,12 @@ class OperatorCommandPlane:
                         )
                 self.store.finish(
                     command_id,
-                    status="ambiguous" if delivery_attempted else "failed",
+                    status="ambiguous" if unknown else "failed",
                     payload={
                         "error": f"deck_executor_exception:{type(exc).__name__}",
                         "detail": str(exc)[:500],
                         "delivery_attempted": delivery_attempted,
-                        **({"outcome_unknown": True} if delivery_attempted else {}),
+                        **({"outcome_unknown": True} if unknown else {}),
                     },
                     controller_acknowledged=controller_acknowledged,
                     claimed=claimed,
@@ -6993,6 +7198,157 @@ class OperatorCommandPlane:
         @router.post("/recovery/{recovery_epoch}/resolve")
         async def resolve_recovery(recovery_epoch: int, request: RecoveryResolveRequest) -> dict[str, Any]:
             return await asyncio.to_thread(self.store.resolve_recovery, recovery_epoch, request.model_dump())
+
+        @router.get("/deck/state")
+        async def deck_state() -> dict[str, Any]:
+            """Canonical SQLite deck record plus the provider fallback it is merged with."""
+            semantic = await asyncio.to_thread(self.store.deck_semantic_state)
+            provider = self._current_deck_provider()
+            loader = getattr(provider, "_load_state", None)
+            machine: dict[str, Any] = {}
+            if callable(loader):
+                try:
+                    machine = dict((await asyncio.to_thread(loader)).get("machine_status") or {})
+                except Exception as exc:  # observation loss is reported, never raised
+                    machine = {"unavailable": type(exc).__name__}
+            recorded = dict(semantic.get("movable_plate_locations") or {})
+            fallback = dict(machine.get("movable_plate_locations") or {})
+            effective = {**fallback, **recorded}
+            return {"schema_version": "bioxp.operator_deck_state.v1", "semantic": semantic,
+                    "movable_objects": {name: {"location": location,
+                        "source": "sqlite_record" if name in recorded else "provider_machine_status"}
+                        for name, location in sorted(effective.items())},
+                    "physical_observation": False}
+
+        @router.get("/tip-trays")
+        async def tip_trays() -> dict[str, Any]:
+            def read() -> list[dict[str, Any]]:
+                rows = []
+                for tray_id in range(5):
+                    try:
+                        row = self.store.tip_tray_state(tray_id)
+                    except (RuntimeError, ValueError) as exc:
+                        rows.append({"tray": tray_id + 1, "tray_id": tray_id, "unavailable": str(exc)})
+                        continue
+                    occupancy = row.get("occupancy")
+                    reader = getattr(self._current_deck_provider(), "tip_tray_type", None)
+                    tip_type = reader(tray_id) if callable(reader) else None
+                    rows.append({"tray": tray_id + 1, **row, "tip_type": tip_type,
+                                 "tips_present": sum(1 for tip in occupancy if tip) if isinstance(occupancy, list) else None,
+                                 "four_channel_groups_available": row.get("available_count")})
+                return rows
+            return {"schema_version": "bioxp.operator_tip_trays.v1", "trays": await asyncio.to_thread(read),
+                    "tray_numbering": "tray = OEM/load_tip tray 1-5 (5 = tip hotel); tray_id = internal 0-4",
+                    "physical_observation": False}
+
+        @router.post("/deck/record")
+        async def record_deck(request: DeckRecordRequest) -> dict[str, Any]:
+            """Correct the robot's record of plates/covers/tip trays. Records only; moves nothing.
+
+            Same effect as OEM ClassMachineStatus.updatePlateLocation and
+            ClassTipTray.loadAllTips/removeAllTips/removeTip setters.
+            """
+            payload = request.model_dump()
+            if not payload["movable_objects"] and not payload["tip_trays"] and payload["gantry"] is None:
+                raise HTTPException(status_code=422, detail={"error": "deck_record_empty"})
+            gantry_plate: Any = None
+            if payload["gantry"] is not None:
+                if payload["gantry"].strip().lower() != "empty":
+                    try:
+                        gantry_plate = canonical_plate_name(payload["gantry"])
+                    except ValueError as exc:
+                        raise HTTPException(status_code=422, detail={"error": "deck_record_invalid_gantry",
+                            "reason": str(exc), "valid": ["empty", *sorted(OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS)]}) from exc
+            provider = self._current_deck_provider()
+            recorder = getattr(provider, "record_movable_object_locations", None)
+            tray_publisher = getattr(provider, "publish_tip_tray_transition", None)
+            type_recorder = getattr(provider, "record_tip_tray_type", None)
+            if not callable(recorder) or not callable(tray_publisher) or not callable(type_recorder):
+                raise HTTPException(status_code=503, detail={"error": "deck_record_owner_unavailable"})
+            objects = payload["movable_objects"] or {}
+            if objects:
+                try:
+                    canonical_movable_object_locations(objects, require_complete=False)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail={"error": "deck_record_invalid_objects",
+                        "reason": str(exc), "valid_objects": sorted(OEM_MOVABLE_OBJECT_DEFAULT_LOCATIONS)}) from exc
+            trays = []
+            tray_types = []
+            for row in payload["tip_trays"] or []:
+                tips = row["tips"]
+                if tips is None and row["tip_type"] is None:
+                    raise HTTPException(status_code=422, detail={"error": "deck_record_tray_empty", "tray": row["tray"]})
+                if row["tip_type"] is not None:
+                    tray_types.append((row["tray"], row["tip_type"]))
+                if tips is None:
+                    continue
+                if isinstance(tips, list):
+                    present = set()
+                    for well in tips:
+                        text = str(well).strip().upper()
+                        if (len(text) < 2 or text[0] not in "ABCDEFGH" or not text[1:].isdigit()
+                                or not 1 <= int(text[1:]) <= 12):
+                            raise HTTPException(status_code=422, detail={"error": "deck_record_invalid_well", "well": well})
+                        present.add((ord(text[0]) - 65) * 12 + int(text[1:]) - 1)
+                    missing = [index for index in range(96) if index not in present]
+                    trays.append((row["tray"], missing))
+                else:
+                    trays.append((row["tray"], tips))
+
+            loader = getattr(provider, "gantry_load", None)
+            if payload["gantry"] is not None and not callable(loader):
+                raise HTTPException(status_code=503, detail={"error": "deck_record_owner_unavailable"})
+
+            def apply() -> dict[str, Any]:
+                result: dict[str, Any] = {"tip_trays": [], "warnings": []}
+                # Record writes serialize in the canonical SQLite transaction; never wait on motion.
+                if objects:
+                    result["deck"] = recorder(locations=objects,
+                                              source_command_id=f"operator-record:{payload['record_id']}")
+                if payload["gantry"] is not None:
+                    current = self.store.deck_semantic_state()
+                    tip_loaded = current.get("tip_loaded")
+                    # Keep the recorded tip state; GantryLoad derives pseudo-Z home from both.
+                    result["gantry"] = loader(tip_loaded=tip_loaded if type(tip_loaded) is bool else None,
+                                              plate_on_gantry=gantry_plate, source_operation="GantryLoad")
+                    after = self.store.deck_semantic_state()
+                    result["gantry"]["plate_on_gantry"] = after.get("plate_on_gantry")
+                    held = [name for name, location in dict(after.get("movable_plate_locations") or {}).items()
+                            if location == "LOC_GANTRY" and canonical_plate_name(name) != gantry_plate]
+                    if held:
+                        result["warnings"].append({"code": "object_recorded_on_gantry", "objects": held,
+                            "message": "These objects are still recorded at LOC_GANTRY; set their deck location too."})
+                for tray, tips in trays:
+                    provenance = {"source_operation": "operator_deck_record", "record_id": payload["record_id"],
+                                  "reason": payload["reason"], "physical_observation": False}
+                    base = f"operator-record:{payload['record_id']}:tray{tray}"
+                    # load_all first: remove_all/camera_missing read the prior
+                    # occupancy, which an unconstructed (revision 0) tray lacks.
+                    published = tray_publisher(tray_id=tray - 1, transition="load_all",
+                        operation_id=base + ":load_all", command_id=base, provenance=provenance)
+                    if tips == "empty":
+                        published = tray_publisher(tray_id=tray - 1, transition="remove_all",
+                            operation_id=base + ":remove_all", command_id=base, provenance=provenance)
+                    else:
+                        if isinstance(tips, list) and tips:
+                            published = tray_publisher(tray_id=tray - 1, transition="camera_missing",
+                                operation_id=base + ":missing", command_id=base, provenance=provenance,
+                                well_ids=tips)
+                    result["tip_trays"].append({"tray": tray, **dict(published)})
+                result["tip_types"] = [type_recorder(tray_id=tray - 1, tip_type=tip_type)
+                                       for tray, tip_type in tray_types]
+                return result
+
+            try:
+                applied = await asyncio.to_thread(apply)
+            except sqlite3.IntegrityError as exc:
+                raise HTTPException(status_code=409, detail={"error": "deck_record_id_already_used",
+                    "record_id": payload["record_id"]}) from exc
+            except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+                raise HTTPException(status_code=409, detail={"error": "deck_record_rejected",
+                    "reason": f"{type(exc).__name__}: {exc}"[:500]}) from exc
+            return {"schema_version": "bioxp.operator_deck_record_result.v1", "record_id": payload["record_id"],
+                    "motion_commanded": False, "physical_observation": False, **applied}
 
         @router.post("/recovery/deck/{command_id}/reconcile")
         async def reconcile_deck_recovery(command_id: str, request: DeckReconciliationRequest) -> dict[str, Any]:

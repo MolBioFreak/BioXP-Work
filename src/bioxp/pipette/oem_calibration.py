@@ -19,14 +19,29 @@ from ..oem_compat.position_table import well_id_from_label
 Result = dict[str, Any]
 
 
+RELEASE_LIFT_MM = 10.0  # lift before ejecting unneeded tips back into the rack
+Z_STEPS_PER_MM = 2015.748
+
+
 @dataclass(frozen=True)
 class ManualTipLoadRequest:
     tray: int  # OEM UI is one-based, including hotel = 5
     well: str  # tipLocation: A1,B1,...,A12,B12 (four-channel pickup)
     overpress: bool = False
     lift_z: bool = False
+    # Channels (0-3) that keep their tips. The others are ejected back into
+    # their rack wells right after pickup, after a short lift. None keeps all four.
+    keep_channels: tuple[int, ...] | None = None
+    release_lift_mm: float = RELEASE_LIFT_MM
 
     def __post_init__(self) -> None:
+        if self.keep_channels is not None:
+            keep = tuple(self.keep_channels)
+            if not keep or len(set(keep)) != len(keep) or any(type(c) is not int or c not in range(4) for c in keep):
+                raise ValueError("keep_channels must be distinct channels 0..3")
+            object.__setattr__(self, "keep_channels", tuple(sorted(keep)))
+        if not 0 <= float(self.release_lift_mm) <= 10:
+            raise ValueError("release_lift_mm must be 0..10")
         if type(self.tray) is not int or not 1 <= self.tray <= 5:
             raise ValueError("tray must be an OEM tray number 1..5")
         if not isinstance(self.well, str) or not re.fullmatch(r"[ABab](?:[1-9]|1[0-2])", self.well):
@@ -65,6 +80,7 @@ class CalibrationBindings:
     stop_z: Callable[[], Result]
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
+    pickup_effect: Callable[[str, list[int]], Result] | None = None
 
 
 class CalibrationExecutionError(RuntimeError):
@@ -84,16 +100,38 @@ class _Sequence:
         except Exception as exc:
             if isinstance(exc, CalibrationExecutionError) and exc.evidence is self.result:
                 raise
-            self.result["ok"] = False
+            self.result.update(ok=False, failed_step=name)
+            evidence = getattr(exc, "evidence", None)
+            if evidence is None:
+                evidence = getattr(exc, "detail", None)
+            if evidence is None:
+                evidence = getattr(exc, "details", None)
             self.result["steps"].append({"operation": name, "error": repr(exc),
-                                          "evidence": getattr(exc, "evidence", None)})
+                                          "evidence": evidence})
             raise CalibrationExecutionError(str(exc), self.result) from exc
         self.result["steps"].append({"operation": name, "result": result})
         # Preserve actual native failures. This is not an extra observation gate.
         if result.get("ok") is False and not allow_false:
-            self.result["ok"] = False
+            self.result.update(ok=False, failed_step=name)
             raise CalibrationExecutionError(f"{name} failed", self.result)
         return result
+
+
+def _find_target(value: Any) -> int | None:
+    """The lowerPipette Z target, wherever the step receipt nests it."""
+    if isinstance(value, Mapping):
+        if type(value.get("target_position_steps")) is int:
+            return value["target_position_steps"]
+        for v in value.values():
+            found = _find_target(v)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for v in value:
+            found = _find_target(v)
+            if found is not None:
+                return found
+    return None
 
 
 def manual_load_tip(request: ManualTipLoadRequest, bindings: CalibrationBindings) -> Result:
@@ -113,7 +151,79 @@ def manual_load_tip(request: ManualTipLoadRequest, bindings: CalibrationBindings
     seq.step("updateLocation", lambda: b.finite("pipette_location", dict(destination=location, well=well)))
     seq.step("lowerPipette", lambda: b.native("lowerPipette", lambda: b.lower_pipette(location, request.overpress),
                                                {"location": location, "overpress": request.overpress}))
-    seq.step("queryTipStatus", lambda: b.pipette("query_tip_status_all", lambda t: t.query_tip_status_all()))
+    lowered = seq.result["steps"][-1] if seq.result.get("steps") else {}
+    seq.result.update(picked_up_channels=[], released_channels=[], pickup_accounting=[])
+
+    def account(transition, channels):
+        key = "picked_up_channels" if transition == "remove" else "released_channels"
+        channels = sorted(set(channels) - set(seq.result[key]))
+        if not channels:
+            return
+        seq.result[key].extend(channels)
+        if transition == "restore":
+            seq.result["release_unverified_channels"] = [
+                ch for ch in seq.result["release_unverified_channels"] if ch not in channels]
+        if b.pickup_effect is not None:
+            # Record failure without adding a new stop to the physical sequence.
+            try:
+                record = b.pickup_effect(transition, channels)
+            except Exception as exc:
+                record = {"error": repr(exc), "published": False}
+            seq.result["pickup_accounting"].append(
+                {"transition": transition, "channels": channels, "result": record})
+
+    def observe_pickup(t):
+        try:
+            result = t.query_tip_status_all()
+        except Exception as exc:
+            rows = getattr(exc, "details", {}).get("observed_channels", [])
+            account("remove", observed_loaded(rows))
+            raise
+        account("remove", observed_loaded(result.get("channels", [])))
+        return result
+
+    def observed_loaded(rows):
+        return [r["channel"] for r in rows
+                if r.get("channel") in range(4) and r.get("tip_loaded") is True
+                and r.get("result", {}).get("ok") is True
+                and r["result"].get("semantic_ok") is True
+                and r["result"].get("hardware_truth_level") == "hardware_query"]
+
+    seq.step("queryTipStatus", lambda: b.pipette("query_tip_status_all", observe_pickup))
+    drop = [c for c in range(4) if request.keep_channels is not None and c not in request.keep_channels]
+    if drop:
+        # Intended releases are not evidence of completion. Retain the unresolved
+        # set even if the transport/receipt publisher unwinds partway through.
+        seq.result["release_unverified_channels"] = list(drop)
+        target = _find_target(lowered)
+        if target is None:
+            raise CalibrationExecutionError("pickup depth unknown; cannot release unneeded tips", seq.result)
+        lift = int(round(float(request.release_lift_mm) * Z_STEPS_PER_MM))
+        seq.step("releaseLift", lambda: b.finite("pipette_move_z", {"value": int(target) - lift}))
+
+        def release(t):
+            def completed(sends):
+                channels = []
+                for row in sends:
+                    proof = row.get("completion", row.get("result", {}))
+                    ch = row.get("channel")
+                    if ch in drop and proof.get("ok") is True and proof.get("completion_verified") is True:
+                        t._transports[ch]._tip_loaded = False
+                        channels.append(ch)
+                account("restore", channels)
+
+            try:
+                sends = t._eject_tip_channels_once(drop, wait_for_completion=True)
+            except Exception as exc:
+                completed(getattr(exc, "details", {}).get("sends", []))
+                raise
+            completed(sends)
+            # Preserve the existing source setters on a normal transport return.
+            for ch in drop:
+                t._transports[ch]._tip_loaded = False
+            return {"ok": True, "channels": drop, "sends": sends}
+        seq.step("releaseUnneededTips", lambda: b.pipette("release_unneeded_tips", release))
+        seq.result.update(kept_channels=list(request.keep_channels), release_lift_steps=lift)
     if request.lift_z:
         home = seq.step("MoveZHome", lambda: b.finite("pipette_home", {"rehome": False}))
         lost = home.get("source_return")
@@ -242,7 +352,8 @@ def measure_fluid_height(request: FluidHeightRequest, bindings: CalibrationBindi
 def bind_calibration_provider(provider: Any, *, finite: Callable, native: Callable,
                               pipette: Callable, tray_location: Callable[[int], int],
                               z_current_down: int | None, sleep: Callable = time.sleep,
-                              clock: Callable = time.monotonic) -> CalibrationBindings:
+                              clock: Callable = time.monotonic,
+                              pickup_effect: Callable | None = None) -> CalibrationBindings:
     """Connect real provider primitives to the existing owner's child runners.
 
     finite takes (compiler-operation, explicit inputs); native takes (name,
@@ -267,7 +378,7 @@ def bind_calibration_provider(provider: Any, *, finite: Callable, native: Callab
         lower_pipette=lower,
         z_low=lambda location: load_bound_oem_position_table().resolve(location_id=LOCATION_ID_TO_NAME[location]).z_low,
         set_z_speed=provider.primitives.z_set_max_speed, detection_move=detection_move,
-        stop_z=provider.primitives.z_stop, sleep=sleep, clock=clock)
+        stop_z=provider.primitives.z_stop, sleep=sleep, clock=clock, pickup_effect=pickup_effect)
 
 
 CALIBRATION_PLATES = {"TC": (2, 0, 12, 25), "MS": (0, 0, 12, 25),

@@ -1,6 +1,7 @@
 """Lossless operational projections, separate from bounded diagnostic trees."""
 import json
 from collections.abc import Mapping
+from typing import Any
 from ..critical_logging import critical_receipt
 
 OUTCOME_FIELDS = frozenset({
@@ -13,6 +14,7 @@ OUTCOME_FIELDS = frozenset({
     'command_id', 'receipt_id', 'operation_index', 'requested_control', 'partial_effects',
     'source_anchor', 'source_return_code', 'reason',
     'failed_channel', 'failure_details', 'completion_wait_started', 'source_timeout_termination',
+    'known_failure', 'failed_child_delivery_attempted', 'outcome_unknown',
 })
 
 
@@ -62,11 +64,13 @@ def application_outcome(value):
         'active_answers', 'active_answer_overflow_count', 'observation_completion_only',
         'occupancy', 'detection', 'geometry_used', 'observation', 'vessel_state',
         'height_mm', 'head_mm', 'head_target_steps', 'mounted_tip_footprints', 'authored', 'physical_fit_verified',
+        'liquid_levels', 'surface_aspirations', 'missing_liquid_channels', 'liquid_volume_mismatch_channels', 'liquid_mismatch_response',
     })
     if isinstance(value, Mapping):
         return {k: (critical_receipt(v) if k in {"reports", "response_descriptors", "buffer_context", "active_answers"}
                     else v if k in {"failure_details", "source_timeout_termination", "requested", "warnings", "command_effects", "program", "observation_error",
-                                   "occupancy", "detection", "vessel_state", "head_mm", "head_target_steps", "mounted_tip_footprints", "authored", "target_steps"}
+                                   "occupancy", "detection", "vessel_state", "head_mm", "head_target_steps", "mounted_tip_footprints", "authored", "target_steps",
+                                   "liquid_levels", "surface_aspirations", "missing_liquid_channels", "liquid_volume_mismatch_channels"}
                     else application_outcome(v)) for k, v in value.items() if k in fields}
     if isinstance(value, (list, tuple)):
         return [application_outcome(row) for row in value]
@@ -87,10 +91,48 @@ def compact_application(value):
     return result
 
 
+def compact_manual_pickup(value: Any) -> Any:
+    """Keep every ordered pickup step and failure, not repeated wire trees.
+
+    This is a receipt projection only. Native execution still consumes the
+    original result; a diagnostic size limit must not erase its last step.
+    """
+    fields = OUTCOME_FIELDS | frozenset({
+        'kind', 'operation', 'order', 'child_order', 'status', 'outcome',
+        'steps', 'result', 'evidence', 'failure_evidence', 'completed_children',
+        'source_children', 'provider_results', 'motion_evidence', 'failed_child',
+        'failed_step', 'exception_message', 'message', 'detail', 'code',
+        'home', 'move', 'wait', 'set_z_current_param6', 'read_z_current_param6',
+        'value', 'position', 'position_steps', 'target_position_steps',
+        'before_position_steps', 'after_position_steps', 'stopped', 'signaled',
+        'home_completion_proven', 'controller_home_proof_verified',
+        'delivery_verified', 'controller_acknowledged', 'completion_verified',
+        'channels', 'channel', 'sends', 'completion', 'error_code', 'event_error_code',
+        'command_name', 'ascii_command', 'tx_ok', 'completion_deferred',
+        'tray', 'well', 'location', 'overpress', 'kept_channels', 'released_channels',
+        'release_lift_steps', 'rack_tips_removed', 'rack_record', 'tip_type_set',
+        'lost_steps', 'lost_steps_warning', 'calibration_persisted', 'tip_type',
+        'tip_location', 'tip_loaded', 'tip_dirty', 'hardware_commanded',
+        'known_failure', 'failed_child_delivery_attempted', 'outcome_unknown',
+        'accounting', 'accounting_error', 'bookkeeping_error', 'pickup_accounting',
+        'picked_up_channels', 'release_unverified_channels', 'rack_tips_restored',
+        'transition', 'published', 'details', 'observed_channels', 'semantic_ok',
+        'hardware_truth_level', 'tray_id', 'revision', 'available_count', 'operation_id',
+        'record_id',
+    })
+    if isinstance(value, Mapping):
+        return {key: compact_manual_pickup(item) for key, item in value.items() if key in fields}
+    if isinstance(value, (list, tuple)):
+        return [compact_manual_pickup(item) for item in value]
+    return value
+
+
 def compact_operational(value):
     """Keep source child order/results, not recursive controller diagnostics."""
     if not isinstance(value, Mapping):
         return value
+    if value.get('kind') == 'manual_load_tip':
+        return compact_manual_pickup(value)
     result = {key: item for key, item in value.items() if key in OUTCOME_FIELDS}
     for key in ('source_children', 'completed_children', 'provider_results'):
         children = value.get(key)

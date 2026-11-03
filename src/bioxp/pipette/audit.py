@@ -328,6 +328,37 @@ def _normal_exchange(row: Mapping[str, Any], result: Mapping[str, Any]) -> dict[
     }
 
 
+def normalize_eject_result_flags(operation: str, result: dict[str, Any]) -> dict[str, Any]:
+    """Expose known eject child proof to both receipt owners, not source ``ok``.
+
+    Manual release returns channel IDs plus sends; diagnostic eject returns
+    channel/result rows. Do not search arbitrary nested observations for proof,
+    reinterpret failures, or promote empty/no-command returns to completion.
+    """
+    if operation not in {"release_unneeded_tips", "eject_tip", "eject_all_tips"} or result.get("ok") is not True:
+        return result
+    rows = result.get("sends", result.get("channels"))
+    if not isinstance(rows, list):
+        return result
+    complete_rows = bool(rows) and all(
+        isinstance(row, Mapping) and isinstance(row.get("result"), Mapping)
+        for row in rows)
+    channels = result.get("channels")
+    if isinstance(channels, list) and all(type(channel) is int for channel in channels):
+        # A prefix of a manual release is not proof of the whole requested set.
+        complete_rows = complete_rows and sorted(channels) == sorted(
+            row.get("channel") for row in rows if type(row.get("channel")) is int)
+    normalized = dict(result)
+    for flag in ("delivery_verified", "controller_acknowledged", "completion_verified"):
+        if isinstance(result.get(flag), bool):
+            continue  # Explicit aggregate truth remains owned by its producer.
+        normalized[flag] = bool(complete_rows and all(
+            row["result"].get(flag) is True
+            and (flag != "completion_verified" or row["result"].get("completion_deferred") is not True)
+            for row in rows))
+    return normalized
+
+
 def normalize_pipette_command_outcome(result: Mapping[str, Any]) -> dict[str, Any]:
     """Only semantic channel outcomes; no exchange/sample normalization."""
     from ..critical_logging import critical_receipt

@@ -1175,6 +1175,18 @@ async def lifespan(app: FastAPI):
             detail = getattr(exc, "detail", None) or str(exc)
             _startup_error = f"OEM automatic USB startup failed: {detail}"
             print(f"[WARN] {_startup_error}")
+        else:
+            # OEM program start runs activateBoard(); startFanService() for every
+            # board.  Boards may already be active here, so start the thermal and
+            # chiller fan/pedestal services directly.  Reads and fan writes only.
+            tester_now = _tester
+            if tester_now is not None and hasattr(tester_now, "_oem_ensure_fan_service"):
+                for board in (tester_now.BOARD_THERMAL, tester_now.BOARD_CHILLER):
+                    try:
+                        started = await asyncio.to_thread(tester_now._oem_ensure_fan_service, board)
+                        print(f"[INFO] fan service board {board}: {started}")
+                    except Exception as exc:
+                        print(f"[WARN] fan service board {board} failed to start: {exc}")
     def start_operator_control_plane() -> None:
         global _operator_control_plane_installed
         command_plane_to_start = None
@@ -2688,7 +2700,7 @@ class PipetteTipRequest(BaseModel):
 class PipetteTipTypeRequest(BaseModel):
     """OEM combo selection: software type only, never physical pickup."""
     model_config = ConfigDict(extra="forbid")
-    tip_type: Literal[50, 200, 201]
+    tip_type: Literal[10, 50, 200, 201]
 
 
 class PipetteEjectAllRequest(BaseModel):
@@ -2945,7 +2957,9 @@ class ProtocolExecuteRequest(ProtocolCompileRequest):
     live_execution_ack: bool = Field(False, description="Explicit operator acknowledgement for dry_run=false live protocol execution.")
     operator_id: Optional[str] = Field(None, max_length=120)
     physical_console_verified: bool = Field(False)
-    deck_manifest: Optional[dict[str, Any]] = None
+    deck_manifest: Optional[dict[str, Any]] = Field(None, description=(
+        "Record-only caller annotation saved with the live contract and preflight. It does not seed tip trays, "
+        "well contents or plate/cover locations; use POST /operator/deck/record to correct the deck record."))
     preflight: Optional[dict[str, Any]] = None
     artifact_refs: list[str] = Field(default_factory=list)
     snapshot_refs: list[str] = Field(default_factory=list)
@@ -2958,6 +2972,9 @@ class ManualPipettingExecuteRequest(ManualPipettingRequest):
     idempotency_key: StrictStr | None = Field(default=None, min_length=1, max_length=256)
     live_execution: dict[str, Any] | None = None
     live_execution_ack: bool = False
+    operator_id: Optional[str] = Field(None, max_length=120)
+    deck_manifest: Optional[dict[str, Any]] = Field(None, description="Record-only annotation; same meaning as /protocol/execute.")
+    preflight: Optional[dict[str, Any]] = None
 
 
 class ProtocolControlTarget(BaseModel):
@@ -6736,6 +6753,24 @@ def _prepare_operator_motion_state(tester, authority, *, before_publication=None
     }
 
 
+@app.post("/motion/oem/deactivate")
+async def motion_oem_deactivate():
+    """Operator motion-off switch. Sends nothing to the controller.
+
+    Blocks new motion admissions until meta.activate_motion runs again (which
+    clears this latch). Does not stop a move already in progress; use Stop.
+    """
+    global _maintenance_latch_generation
+    with _maintenance_state_lock:
+        _maintenance_latch_generation += 1
+        state = _set_maintenance_state(
+            transition="operator_motion_off", motion_blocked=True, recovery_required=True,
+            block_reason="operator_motion_off", recovery_hint="Activate motion to turn it back on.",
+            blocked_by="operator")
+    return {"ok": True, "motion_enabled": False, "hardware_motion_commanded": False,
+            "maintenance_state": state}
+
+
 @app.post("/motion/oem/prepare_without_motion")
 async def motion_oem_prepare_without_motion():
     try:
@@ -9006,6 +9041,12 @@ async def chiller_baseline():
     return await _run_blocking("Chiller baseline", lambda: tester.chiller_apply_vendor_baseline(verify=True), timeout_s=30.0)
 
 
+@app.get("/thermal/fan-services")
+async def thermal_fan_services():
+    tester = _get_tester()
+    return tester.oem_fan_service_status()
+
+
 @app.get("/chiller/snapshot")
 async def chiller_snapshot():
     projection = hardware_state.project("chiller")
@@ -9019,10 +9060,7 @@ async def set_chiller_temp(req: ChillerRequest):
     bank = _CHILLER_BANK_MAP[req.bank]
     return await _run_blocking(
         "Chiller setpoint",
-        lambda: (
-            tester.chiller_activate(),
-            tester.chiller_set_target_temp(bank, req.target_temp_c, verify=True),
-        )[1],
+        lambda: dict(tester.oem_chiller_set_temperature(bank, float(req.target_temp_c))),
         timeout_s=25.0,
     )
 
@@ -9489,7 +9527,7 @@ async def liquid_tip(req: PipetteTipRequest):
 
 @app.post("/liquid/pipette/tip-type")
 async def liquid_pipette_tip_type(req: PipetteTipTypeRequest):
-    return await run_pipette_operation(
+    result = await run_pipette_operation(
         "select_tip_type",
         lambda transport: transport.loadTip(req.tip_type),
         get_transport=_get_pipette_transport,
@@ -9498,6 +9536,12 @@ async def liquid_pipette_tip_type(req: PipetteTipTypeRequest):
         receipt_store=_pipette_receipts,
         requested_inputs={"tip_type": req.tip_type},
     )
+    # Republish the cache-only pipette projection so status shows the new type.
+    try:
+        hardware_state.collect(["pipette"], {"pipette": lambda _: _get_pipette_transport().get_status()})
+    except Exception as exc:  # status refresh only; the selection already applied
+        result = {**result, "status_refresh_error": str(exc)[:300]}
+    return result
 
 @app.post("/liquid/eject-all")
 async def liquid_eject_all(req: PipetteEjectAllRequest):
@@ -10231,8 +10275,13 @@ def _protocol_deck_action_result(command_id: str) -> dict[str, Any]:
     except (OSError, RuntimeError, ValueError, KeyError, TypeError, HTTPException) as exc:
         # Observation loss is evidence, never a new execution predicate.
         children, evidence_error = [], type(exc).__name__
+    terminal = command.get("terminal_evidence") if isinstance(command.get("terminal_evidence"), Mapping) else {}
+    # Surface the recorded failure cause on the job's action result (report only).
+    failure = {key: terminal[key] for key in ("error", "detail", "outcome_unknown", "delivery_attempted")
+               if key in terminal} if command.get("status") != "completed" else {}
     return {"ok": command.get("status") == "completed", "command_id": command_id,
             "command": command, "child_outcomes": children,
+            **({"status": command.get("status"), "failure": failure} if failure else {}),
             **({"child_outcomes_error": evidence_error} if evidence_error else {})}
 
 
@@ -10995,7 +11044,15 @@ async def protocol_execute(req: ProtocolExecuteRequest):
     except ProtocolLiveContractError as exc:
         raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        from .protocols.input_errors import ProtocolInputError
+        payload = exc.to_payload() if isinstance(exc, ProtocolInputError) else ProtocolInputError(str(exc)).to_payload()
+        raise HTTPException(status_code=400, detail={"error": "protocol_input_invalid", **payload}) from exc
+    except (RuntimeError, KeyError, OSError) as exc:
+        # Same outcome as before (no job created by this request path), but the
+        # cause is reported instead of an opaque 500.
+        raise HTTPException(status_code=500, detail={
+            "error": "protocol_execute_internal_error", "type": type(exc).__name__,
+            "reason": str(exc)[:500]}) from exc
 
 
 from .calibration_analysis import AnalysisRequest, AnalysisResult, analyze as analyze_calibration
@@ -11081,6 +11138,102 @@ async def pipette_tip_tray_set(req: ManualTipTraySet):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+class TipOffsetConfirm(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    tip_type: Literal[10, 50, 200, 201]
+    offset_steps: int
+    source: str = Field(min_length=1, max_length=300)
+
+
+@app.get("/liquid/pipette/tip-offsets")
+async def pipette_tip_offsets_read():
+    from .pipette.tip_length import offsets_table
+    return offsets_table()
+
+
+@app.put("/liquid/pipette/tip-offsets")
+async def pipette_tip_offsets_save(req: TipOffsetConfirm):
+    """Record-only: stores a confirmed offset for later lowering. No motion."""
+    from datetime import datetime, timezone
+    from .pipette.tip_length import save_confirmed
+    try:
+        return await run_in_threadpool(save_confirmed, req.tip_type, req.offset_steps, req.source,
+                                       at=datetime.now(timezone.utc).isoformat())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class LldProfileSave(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    filtered_tips: bool | None = None
+    tip_type: Literal[10, 50, 200] | None = None
+    kind: Literal["filtered", "unfiltered"] | None = None
+    threshold_adc: int | None = None
+    threshold_duration_ms: int | None = None
+    speed_increments_per_second: int | None = None
+    source: str | None = Field(default=None, max_length=300)
+
+
+class DepthOffsetSave(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    tip_type: Literal[10, 50, 200] | None = None
+    location: str | None = Field(default=None, max_length=40)
+    plate_type: str | None = Field(default=None, max_length=80)
+    offset_mm: float
+    source: str | None = Field(default=None, max_length=300)
+
+
+class DepthOffsetRemove(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    tip_type: Literal[10, 50, 200] | None = None
+    location: str | None = Field(default=None, max_length=40)
+    plate_type: str | None = Field(default=None, max_length=80)
+
+
+@app.get("/liquid/pipette/depth-offsets")
+async def pipette_depth_offsets_read():
+    from .pipette.depth_offsets import table
+    return table()
+
+
+@app.put("/liquid/pipette/depth-offsets")
+async def pipette_depth_offsets_save(req: DepthOffsetSave):
+    """Record-only: the next lowering move or liquid search at a matching station uses it. No motion."""
+    from .pipette.depth_offsets import save
+    try:
+        return await run_in_threadpool(lambda: save(**req.model_dump()))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/liquid/pipette/depth-offsets/remove")
+async def pipette_depth_offsets_remove(req: DepthOffsetRemove):
+    from .pipette.depth_offsets import remove
+    try:
+        return await run_in_threadpool(lambda: remove(**req.model_dump()))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
+
+
+@app.get("/liquid/pipette/lld-profiles")
+async def pipette_lld_profiles_read():
+    from .pipette.lld_profiles import profiles
+    return profiles()
+
+
+@app.put("/liquid/pipette/lld-profiles")
+async def pipette_lld_profiles_save(req: LldProfileSave):
+    """Record-only: saved settings are applied at the next liquid search. No motion."""
+    from .pipette.lld_profiles import save
+    values = {k: v for k, v in req.model_dump().items()
+              if k in ("threshold_adc", "threshold_duration_ms", "speed_increments_per_second") and v is not None}
+    try:
+        return await run_in_threadpool(lambda: save(filtered_tips=req.filtered_tips, tip_type=req.tip_type,
+                                                    kind=req.kind, values=values, source=req.source))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/liquid/pipette/settings")
 async def pipette_operation_settings_read():
     return await run_in_threadpool(read_pipette_operation_settings, get_active_oem_runtime_state_store())
@@ -11115,7 +11268,8 @@ async def liquid_manual_execute(req: ManualPipettingExecuteRequest):
     return await protocol_execute(ProtocolExecuteRequest(
         source_type="native", document=document.to_payload(), dry_run=req.dry_run,
         idempotency_key=req.idempotency_key, live_execution=req.live_execution,
-        live_execution_ack=req.live_execution_ack,
+        live_execution_ack=req.live_execution_ack, operator_id=req.operator_id,
+        deck_manifest=req.deck_manifest, preflight=req.preflight,
     ))
 
 
@@ -11131,7 +11285,10 @@ async def protocol_job_detail(job_id: str, observation: bool = Query(False)):
     try:
         return await run_in_threadpool(get_protocol_job, job_id, observation=observation, command_store=_protocol_command_store())
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail={"error": "protocol_job_not_found", "message": str(exc)}) from exc
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail={"error": "protocol_job_bundle_unreadable",
+                                                     "job_id": job_id, "reason": str(exc)[:300]}) from exc
 
 
 @app.post("/protocol/jobs/{job_id}/control")
@@ -11159,6 +11316,6 @@ async def protocol_job_review(job_id: str, req: ProtocolReviewRequest):
     except ProtocolLiveContractError as exc:
         raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail={"error": "protocol_job_not_found", "message": str(exc)}) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=409, detail={"error": "protocol_review_refused", "message": str(exc)}) from exc

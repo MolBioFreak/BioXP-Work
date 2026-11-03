@@ -66,7 +66,9 @@ def test_z_absolute_requested_values_encode_absolute_not_relative(monkeypatch, r
     assert {k: frames[0][k] for k in ('board', 'command', 'mode', 'motor', 'value')} == {
         'board': 4, 'command': 4, 'mode': 0, 'motor': 1, 'value': effective}
     assert result['controller_command_acknowledged'] is True
-    assert result['controller_terminal_state_verified'] is False
+    # The consumed OEM target event is the controller's terminal report.
+    assert result['completion_class'] == 'event_128'
+    assert result['controller_terminal_state_verified'] is True
     assert result['physical_effect_verified'] is False
     assert result['after_position_steps'] is None  # OEM event return does not query arrival.
     output = os.environ.get('Z_ABSOLUTE_REPLAY_OUTPUT')

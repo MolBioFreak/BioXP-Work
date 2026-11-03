@@ -2720,33 +2720,50 @@ class FourPipetteTransport:
         timeout_s: float = 8.0,
     ) -> list[dict[str, Any]]:
         sends: list[dict[str, Any]] = []
-        for channel in channels:
-            transport = self._transports[channel]
-            result = _call_eject_tip(
-                transport._get_driver(),
-                initialized=bool(transport._initialized),
-                wait_for_completion=wait_for_completion,
-            )
-            if not isinstance(result, dict) or result.get("ok") is not True:
-                raise PipetteCommandError(
-                    "Pipette eject did not receive a valid controller acknowledgement.",
-                    details={"channel": channel, "result": result, "sends": sends},
+        try:
+            for channel in channels:
+                transport = self._transports[channel]
+                result = _call_eject_tip(
+                    transport._get_driver(),
+                    initialized=bool(transport._initialized),
+                    wait_for_completion=wait_for_completion,
                 )
-            sends.append({"channel": channel, "result": result})
+                if not isinstance(result, dict) or result.get("ok") is not True:
+                    raise PipetteCommandError(
+                        "Pipette eject did not receive a valid controller acknowledgement.",
+                        details={"channel": channel, "result": result, "sends": sends},
+                    )
+                sends.append({"channel": channel, "result": result})
 
-        if wait_for_completion and sends:
-            deadline = time.monotonic() + max(0.0, float(timeout_s))
-            for row in sends:
-                channel = int(row["channel"])
-                wait_fn = getattr(self._transports[channel]._get_driver(), "wait_pipette_command_completion", None)
-                if callable(wait_fn) and row["result"].get("outcome") == "tx_only":
-                    completion = wait_fn(max(0.0, deadline - time.monotonic()))
-                    row["completion"] = completion
-                    if not isinstance(completion, dict) or completion.get("ok") is not True:
-                        raise PipetteCommandError(
-                            "Pipette eject completion was not verified.",
-                            details={"channel": channel, "completion": completion, "sends": sends},
-                        )
+            if wait_for_completion and sends:
+                deadline = time.monotonic() + max(0.0, float(timeout_s))
+                for row in sends:
+                    channel = int(row["channel"])
+                    wait_fn = getattr(self._transports[channel]._get_driver(), "wait_pipette_command_completion", None)
+                    if callable(wait_fn) and row["result"].get("outcome") == "tx_only":
+                        completion = wait_fn(max(0.0, deadline - time.monotonic()))
+                        row["completion"] = completion
+                        if not isinstance(completion, dict) or completion.get("ok") is not True:
+                            raise PipetteCommandError(
+                                "Pipette eject completion was not verified.",
+                                details={"channel": channel, "completion": completion, "sends": sends},
+                            )
+        except Exception as exc:
+            # Keep the original driver exception/owner and the already acquired
+            # evidence. A later SEND/WAIT failure cannot undo earlier ejections.
+            details = getattr(exc, "details", None)
+            partial = getattr(exc, "pipette_partial_result", None)
+            try:
+                setattr(exc, "details", {
+                    **(dict(details) if isinstance(details, Mapping) else {}), "sends": sends})
+                setattr(exc, "pipette_partial_result", {
+                    **(dict(partial) if isinstance(partial, Mapping) else {}),
+                    "ok": False, "channels": list(channels), "sends": sends,
+                })
+            except (AttributeError, TypeError):
+                # An immutable exception must still propagate unchanged.
+                pass
+            raise
         return sends
 
     def eject_all_tips(

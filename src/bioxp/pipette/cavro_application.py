@@ -118,6 +118,67 @@ class Plld(_Selected):
         return value
 
 
+class LiquidSearch(_Selected):
+    """Find each active channel's liquid surface in one shared descent.
+
+    Start and floor come from the station's calibrated high/low with the loaded
+    tip offset; Z stops once every channel reports or the floor is reached.
+    """
+    operation: Literal["liquid_search"]
+    location_id: int = Field(ge=0)
+    detection_id: str = Field(default="last_detection", min_length=1)
+    start_mode: Literal[0, 1] = 0
+    floor_clearance_steps: int = Field(default=2016, ge=0)  # 1 mm above calibrated low
+    # Optional plate type, so a saved plate-type depth offset can apply (see depth_offsets).
+    plate_type: str | None = Field(default=None, max_length=80)
+    search_speed_native: int = Field(default=300, gt=0)      # OEM btnDetectFluid speed
+    z_motor_current: int = 25                                 # OEM Z_MOTOR_MAX_CURRENT_DOWN
+    # ADP LLD mode (M 30053815-C U70/U71/U72). pLLD is onboard; cLLD/hybrid need an external cLLD board.
+    sensing: Literal["pressure", "capacitive", "hybrid"] = "pressure"
+    # Channels whose wells are listed as holding liquid. A miss here holds the run.
+    expected_channels: list[Annotated[int, Field(ge=0, le=3)]] | None = None
+    # Optional: aspirate on each channel as it touches while Z keeps descending.
+    on_contact: "OnContact | None" = None
+    # Optional: compare found surfaces with expected volumes (plate table + well-bottom gap).
+    volume_check: "VolumeCheck | None" = None
+
+
+class OnContact(_Input):
+    volume_ul: NonnegativeNumber
+    speed_ul_s: PositiveNumber
+    delay_ms: int = Field(default=0, ge=0, le=5000)   # wait after contact so Z submerges the tip
+    target_liquid_ul: NonnegativeNumber | None = None
+    accounting_intent: StrokeIntent | None = None
+
+
+class VolumeCheck(_Input):
+    expected_ul: dict[str, float] = Field(default_factory=dict)   # channel -> expected well volume
+    table: list[Annotated[list[float], Field(min_length=2, max_length=2)]] | None = None  # [height_mm, volume_ul]
+    gap_mm: float | None = None             # calibrated low above the well bottom, for the loaded tip
+    tolerance_mm: float = Field(default=1.0, ge=0)
+    tolerance_fraction: float = Field(default=0.15, ge=0)
+    response: Literal["proceed", "pause", "fail"] = "pause"
+
+
+LiquidSearch.model_rebuild()
+
+
+class SurfaceAspirate(_Selected):
+    """Aspirate below each channel's detected surface, grouped by liquid level."""
+    operation: Literal["surface_aspirate"]
+    detection_id: str = Field(default="last_detection", min_length=1)
+    mode: Literal["by_level", "together", "one_at_a_time"] = "by_level"
+    level_tolerance_steps: int = Field(default=1008, ge=0)    # 0.5 mm counts as one level
+    submerge_steps: int = Field(default=2016, ge=0)          # 1 mm below the surface
+    follow_steps: int = Field(default=0, ge=0)               # extra descent while aspirating
+    z_speed_native: int = Field(default=1791, gt=0)
+    follow_speed_native: int = Field(default=300, gt=0)
+    volume_ul: NonnegativeNumber
+    speed_ul_s: PositiveNumber
+    target_liquid_ul: NonnegativeNumber | None = None
+    accounting_intent: StrokeIntent | None = None
+
+
 class TrackedAspirate(_Selected):
     operation: Literal["tracked_aspirate"]
     volume_ul: NonnegativeNumber
@@ -144,7 +205,7 @@ class PressureCapture(_Input):
     capture: PressureCaptureRequest
 
 
-Instruction = Annotated[Union[Stroke, Empty, Settings, Delay, Position, ZMove, Plld,
+Instruction = Annotated[Union[Stroke, Empty, Settings, Delay, Position, ZMove, Plld, LiquidSearch, SurfaceAspirate,
                               SurfaceMove, TrackedAspirate, DeviceCommandInstruction, DeviceProgramInstruction,
                               ProfilePickup, PressureCapture],
                         Field(discriminator="operation")]
@@ -310,6 +371,14 @@ def compile_application(request: Mapping[str, Any]) -> dict[str, Any]:
                 if (instruction.after_detection_steps is None) != (instruction.after_detection_speed_native is None):
                     raise ValueError("after_detection_steps and after_detection_speed_native must be specified together")
                 op["wire_commands"] = [{"field": "plld", "ascii": "B1R" if instruction.start_mode == 1 else "BR"}]
+            elif isinstance(instruction, LiquidSearch):
+                op.update(instruction.model_dump())  # defaults are part of the executed search
+                op["wire_commands"] = [{"field": "plld", "ascii": "B1R" if instruction.start_mode == 1 else "BR"},
+                    {"field": "sensing", "ascii": {"pressure": "U70R", "capacitive": "U71R", "hybrid": "U72R"}[instruction.sensing]}]
+            elif isinstance(instruction, SurfaceAspirate):
+                op.update(instruction.model_dump(exclude_none=True))
+                op["wire_commands"] = [{"field": "speed_ul_s", "ascii": f"V{_number(instruction.speed_ul_s)},1R"},
+                                       {"field": "volume_ul", "ascii": f"P{_number(instruction.volume_ul)},1R"}]
             elif isinstance(instruction, SurfaceMove):
                 resolve_displacement(op["displacement"])
                 if instruction.reference.kind in {"authored", "vessel", "rack"}:
@@ -436,6 +505,71 @@ def _send_wire(group, channels, wire, timeout_ms, *, after_sends=None, effect="c
     return outcome
 
 
+def _detect_and_aspirate_on_contact(group, op, contact, start_z, stop_z):
+    """Shared-Z search where each channel aspirates as soon as it reports liquid.
+
+    Detection commands go to every active channel, Z starts, then one waiter per
+    channel takes that channel's own completion; a touched channel aspirates at
+    once (after the optional delay) while Z keeps descending for the others.
+    """
+    import threading
+    sent = group._run_group_liquid_operation("fluid detection", op["channels"],
+        lambda channel, transport, defer: _send_one(transport, op["wire_commands"][0]["ascii"], "start_fluid_detection"),
+        timeout_ms=op["timeout_ms"], defer_completion=False, after_sends=start_z, set_allow_to_stop=False)
+    epoch = group._interrupt_epoch
+    deadline = time.monotonic() + op["timeout_ms"] / 1000.0
+    rows, aspirated, lock = [], {}, threading.Lock()
+    stopped = {}
+    def watch(row):
+        channel = int(row["channel"])
+        completion = group._wait_channel_completion(group._transports[channel], max(0.0, deadline - time.monotonic()),
+                                                    owner_token=row.get("completion_owner_token"))
+        with lock:
+            rows.append({"channel": channel, "result": row["result"], "completion": completion})
+            last = len(rows) == len(sent["channels"])
+        if last:
+            # Every channel has reported (contact or none): stop Z now, before the remaining draws finish.
+            stopped.update(monotonic=time.monotonic(), wall=time.time())
+            stop_z()
+        if completion.get("ok") is True and group._interrupt_epoch == epoch and not group._forceabort():
+            if contact.get("delay_ms"):
+                time.sleep(contact["delay_ms"] / 1000.0)
+            inputs = {"volume_ul": contact["volume_ul"], "front_air": False, "liquid_phase": "aspirate",
+                      "target_liquid_ul": contact.get("target_liquid_ul"), "commanded_displacement_ul": contact["volume_ul"],
+                      **({"accounting_intent": contact["accounting_intent"]} if contact.get("accounting_intent") else {})}
+            try:
+                outcome = _send_wire(group, [channel], f"P{_number(contact['volume_ul'])},1R", op["timeout_ms"],
+                                     effect="aspirate", inputs=inputs)
+            except Exception as exc:
+                outcome = {"ok": False, "error": str(exc), "exception_type": type(exc).__name__}
+            with lock:
+                aspirated[str(channel)] = {"ok": outcome.get("ok") is True, "error": outcome.get("error")}
+    threads = [threading.Thread(target=watch, args=(row,), daemon=True) for row in sent["channels"]]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()) + op["timeout_ms"] / 1000.0)
+    interrupted = group._interrupt_epoch != epoch
+    rows.sort(key=lambda r: r["channel"])
+    if not stopped:
+        stopped.update(monotonic=time.monotonic(), wall=time.time())
+        stop_z()
+    return {"z_stopped_at": stopped, "ok": not interrupted and all(a["ok"] for a in aspirated.values()), "search_complete":
+            all(r["completion"].get("ok") is True for r in rows), "interrupted_by_terminate": interrupted,
+            "detection": {"channels": rows}, "aspirated_on_contact": aspirated}
+
+
+def _send_one(transport, wire, command_name):
+    transport._require_initialized()
+    driver = transport._get_driver()
+    raw = driver._send_pipette_command(wire, command_name=command_name, wait_for_completion=False)
+    token = (raw.get("provenance") or {}).get("completion_owner_token")
+    if isinstance(token, str) and token:
+        driver._pipette_completion_owner_token = token
+    transport._assert_driver_result("fluid detection", raw)
+    return {"ok": raw.get("ok") is True, "driver_result": raw, **transport._driver_evidence(raw)}
+
+
 def run_application_inline(provider, request: Mapping[str, Any], *, command_id: str,
                            owner_identity: Mapping[str, Any]) -> dict[str, Any]:
     from .effect_accounting import accounting_occurrence
@@ -455,6 +589,10 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
         return {**result, "issues": plan["issues"]}
     group = provider.primitives.pipette_transport
     epoch = group._interrupt_epoch
+    # Pump cleanup after a failed detection bumps the same epoch an operator Stop does.
+    # Only that cleanup's own bump is accepted; any other bump is still an interruption.
+    accepted = {"epoch": epoch}
+    z_speed_changed = []
     events = result["events"]
     detections = {}
     last_rack = None
@@ -463,7 +601,7 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
 
     def fence(identity):
         provider._wp8_execution_fence_checker(command_id, boundary=identity)
-        if epoch != group._interrupt_epoch or group._forceabort():
+        if accepted["epoch"] != group._interrupt_epoch or group._forceabort():
             raise PipetteCommandError("Cavro application interrupted; no replay")
 
     def record(name, call, *, inputs, pipette=False):
@@ -496,6 +634,15 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                 getattr(exc, "detail", getattr(exc, "pipette_partial_result", None))))
             raise
 
+    def cleanup_terminate(t, label):
+        fence(f"{owner_identity['source_identity']}:{label}:terminate")
+        before = group._interrupt_epoch
+        termination = t.terminate()
+        own = termination.get("interrupt_epoch") if isinstance(termination, dict) else None
+        if own == before + 1 == group._interrupt_epoch:
+            accepted["epoch"] = own
+        return termination
+
     def trajectory_evidence(body, targets, transform=None, channels=()):
         if request.get("shared_head") is not None:
             try:
@@ -504,7 +651,33 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                 body["observation_error"] = str(exc)
         return body
 
+    def apply_lld_profile(op) -> None:
+        # pLLD threshold/duration/speed follow the loaded tip type (filtered or unfiltered).
+        from .lld_profiles import profile_for, wires
+        profile = profile_for(getattr(group, "_tip_type", None))
+        result.setdefault("lld_profiles", []).append(profile)
+        if profile is None:
+            return  # unknown tip type: leave the pumps' current settings unchanged
+        for wire in wires(profile):
+            record("lld_profile", lambda t, w=wire: _send_wire(t, op["channels"], w, op["timeout_ms"]),
+                   inputs={"ascii": wire, "profile": profile}, pipette=True)
+
+    def tip_offset() -> dict:
+        # Loaded-tip length correction for authored absolute Z (0 with no tip or unmeasured type).
+        reader = getattr(provider.primitives, "_loaded_tip_z_offset", None)
+        info = reader() if callable(reader) else {"offset_steps": 0}
+        result.setdefault("tip_z_offsets", []).append(info)
+        return info
+
+    def authored(geometry):
+        # Detected references come from this tip's own contact, so they need no length correction.
+        if geometry.get("authored", {}).get("reference", {}).get("kind") == "detected":
+            return geometry
+        steps = int(tip_offset()["offset_steps"])
+        return {**geometry, "target_steps": geometry["target_steps"] + steps, "tip_z_offset_steps": steps}
+
     def z_move(target, speed):
+        z_speed_changed.append(speed)
         record("z_speed", lambda: provider.primitives.z_set_max_speed(speed), inputs={"speed_native": speed})
         head_targets.pop("z", None)
         body = record("z_move", lambda: trajectory_evidence(provider.moveZ(target),
@@ -516,6 +689,170 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
     def footprints(geometry, move, channels=()):
         transform = move["reference"].get("transform") if move["reference"]["kind"] == "rack" else last_rack
         return trajectory_evidence(geometry, {**head_targets, "z": geometry["target_steps"]}, transform, channels)
+
+    def liquid_search(op):
+        from ..oem_compat.pathing import LOCATION_ID_TO_NAME
+        from ..oem_compat.position_table import load_bound_oem_position_table
+        from .liquid_detection import contact_from_timestamps, height_above_floor_mm, search_window
+        row = load_bound_oem_position_table().resolve(location_id=LOCATION_ID_TO_NAME[op["location_id"]])
+        if type(row.z_low) is not int or type(row.z_high) is not int:
+            raise PipetteCommandError("liquid search needs calibrated high and low heights for this station")
+        apply_lld_profile(op)
+        offset = int(tip_offset()["offset_steps"])
+        reader = getattr(provider.primitives, "_depth_offset", None)
+        depth = reader(LOCATION_ID_TO_NAME[op["location_id"]], op.get("plate_type")) if callable(reader) else {"offset_steps": 0}
+        result.setdefault("depth_offsets", []).append(depth)
+        # The search may reach the saved extra depth; its start height stays the calibrated high.
+        start, floor = search_window(row.z_high, row.z_low, offset, op["floor_clearance_steps"] - int(depth["offset_steps"]))
+        z_move(start, op["search_speed_native"])
+        record("lld_sensing_mode", lambda t: _send_wire(t, op["channels"], op["wire_commands"][1]["ascii"], op["timeout_ms"]),
+               inputs={"sensing": op.get("sensing"), "ascii": op["wire_commands"][1]["ascii"]}, pipette=True)
+        clocks = {}
+        def start_z():
+            state = provider._offset_deck_semantic_state(gripper_confirmed=False, pseudo_home_only=True)
+            clocks["monotonic"], clocks["wall"] = time.monotonic(), time.time()
+            head_targets.pop("z", None)
+            return provider.primitives.oem_move_z(floor, pseudo_home_steps=state["pseudo_z_home"],
+                motor_current=op["z_motor_current"], wait_for_stop=False)
+        contact = op.get("on_contact")
+        if contact is not None:
+            # Top speed first, on every active channel, so each aspirate starts the moment it touches.
+            record("set_top_speed", lambda t: _send_wire(t, op["channels"], f"V{_number(contact['speed_ul_s'])},1R",
+                   op["timeout_ms"], effect="set_top_speed"), inputs={"speed_ul_s": contact["speed_ul_s"]}, pipette=True)
+        def detect(t):
+            if contact is not None:
+                return _detect_and_aspirate_on_contact(t, op, contact, start_z,
+                    lambda: provider.primitives.z_stop())
+            body = _send_wire(t, op["channels"], op["wire_commands"][0]["ascii"], op["timeout_ms"],
+                              after_sends=start_z, effect="fluid detection")
+            if body.get("ok") is False and not body.get("interrupted_by_terminate"):
+                try:
+                    body["source_timeout_termination"] = cleanup_terminate(t, "liquid_search")
+                except Exception as exc:
+                    body["source_timeout_termination"] = {"error": str(exc), "exception_type": type(exc).__name__}
+            # A channel without contact is a per-channel result, not a failed search.
+            return {"ok": True, "search_complete": body.get("ok") is True, "detection": body}
+        try:
+            detected = record("liquid_search", detect, inputs=op, pipette=True)
+            stopped = detected.get("z_stopped_at") or {"monotonic": time.monotonic(), "wall": time.time()}
+            record("liquid_search_z_stop", lambda: provider.primitives.z_stop(), inputs={})
+        except BaseException:
+            # Once Z has started, any failure before the normal stop completes still stops Z.
+            # The original error is re-raised; the stop is reported as it actually returned.
+            if clocks and not any(e.get("operation") == "liquid_search_z_stop" and e.get("status") == "completed"
+                                  for e in events):
+                try:
+                    body = provider.primitives.z_stop()
+                    events.append({"operation": "liquid_search_z_stop_after_failure", "result": body,
+                                   "status": "completed" if isinstance(body, dict) and body.get("ok") is True else "failed"})
+                except Exception as exc:
+                    events.append({"operation": "liquid_search_z_stop_after_failure", "status": "failed", "error": str(exc)})
+            raise
+        final = provider.primitives._read_axis_position("z")
+        head_targets["z"] = final
+        if contact is None:
+            # OEM scrFluidDetection: liftTo, then DispenseAll, so the air drawn while
+            # searching never stays in the tip and later pipetting starts from zero.
+            z_move(start, 1791)
+            record("liquid_search_dispense_all", lambda t: _send_wire(t, op["channels"], "A0,0R", op["timeout_ms"],
+                   effect="dispense_all"), inputs={"ascii": "A0,0R", "source": "ControlLib.scrFluidDetection DispenseAll"},
+                   pipette=True)
+        channels = {}
+        for row_ in detected.get("detection", {}).get("channels", []):
+            completion = row_.get("completion") or {}
+            stamp = (completion.get("pipette_message_state") or {}).get("fluid_timestamp")
+            found = completion.get("ok") is True and stamp is not None
+            contact, method = None, "no_contact"
+            if found:
+                for basis in ("monotonic", "wall"):
+                    contact, method = contact_from_timestamps(start_steps=start, stop_steps=final,
+                        started_at=clocks.get(basis, 0.0), stopped_at=stopped[basis], stamp=stamp,
+                        floor_steps=floor, speed_native=op["search_speed_native"])
+                    if contact is not None:
+                        method = f"{method}:{basis}"
+                        break
+                if contact is None:
+                    contact, method = final, "z_at_stop"  # contact time not on the descent clock
+            channels[str(row_["channel"])] = {"found": found, "contact_steps": contact, "method": method,
+                "fluid_timestamp": stamp, "height_above_floor_mm": height_above_floor_mm(contact, floor),
+                "outcome": completion.get("outcome"), "device_error": completion.get("event_error_code")
+                if completion.get("event_error_code") not in (None, 0, 0x20) else None}
+        for channel in op["channels"]:
+            channels.setdefault(str(channel), {"found": False, "contact_steps": None, "method": "no_report"})
+        search = {"location_id": op["location_id"], "start_steps": start, "floor_steps": floor,
+                  "final_position_steps": final, "tip_z_offset_steps": offset, "depth_offset": depth, "channels": channels,
+                  "estimate": "contact heights interpolated over a constant-speed descent"}
+        if contact is not None:
+            search["aspirated_on_contact"] = detected.get("aspirated_on_contact", {})
+        mismatched = []
+        if op.get("volume_check"):
+            from .liquid_detection import volume_check
+            low = int(row.z_low) + offset + int(depth["offset_steps"])
+            for key, value in channels.items():
+                value["volume_check"] = volume_check(contact_steps=value["contact_steps"], low_steps=low,
+                                                     check=op["volume_check"], channel=int(key))
+                if value["volume_check"].get("within_tolerance") is False:
+                    mismatched.append(int(key))
+        detections[op["detection_id"]] = search
+        result.setdefault("liquid_levels", []).append({"detection_id": op["detection_id"], **search})
+        from .liquid_detection import missing_channels
+        missing = missing_channels(search, op.get("expected_channels") or [])
+        if missing:
+            result["missing_liquid_channels"] = missing
+            reasons = {c: (f"device error {channels[str(c)]['device_error']}" if channels[str(c)].get("device_error")
+                           else channels[str(c)].get("outcome") or "no contact") for c in missing}
+            raise PipetteCommandError(f"No liquid found by channel(s) {missing} at location {op['location_id']} "
+                                      f"({', '.join(f'{c}: {r}' for c, r in reasons.items())}); "
+                                      "nothing was aspirated there", details={"liquid_search": search})
+        response = (op.get("volume_check") or {}).get("response", "pause")
+        if mismatched:
+            result["liquid_volume_mismatch_channels"] = mismatched
+            if response != "proceed":
+                result["liquid_mismatch_response"] = response
+                raise PipetteCommandError(f"Liquid volume differs from expected on channel(s) {mismatched} "
+                                          f"at location {op['location_id']}", details={"liquid_search": search})
+
+    def surface_aspirate(op):
+        from .liquid_detection import aspirate_target, level_groups
+        search = detections.get(op["detection_id"])
+        if search is None:
+            raise PipetteCommandError(f"surface aspirate has no liquid search {op['detection_id']!r}")
+        contacts = {c: search["channels"][str(c)]["contact_steps"] for c in op["channels"]
+                    if search["channels"].get(str(c), {}).get("found")}
+        tolerance = -1 if op["mode"] == "one_at_a_time" else op["level_tolerance_steps"]
+        groups = level_groups(contacts, "together" if op["mode"] == "together" else "by_level", tolerance)
+        plan_rows = []
+        for channels, surface in groups:
+            target = aspirate_target(surface, op["submerge_steps"], search["floor_steps"])
+            z_move(target, op["z_speed_native"])
+            follow_to = min(target + op["follow_steps"], search["floor_steps"])
+            def follow():
+                if follow_to == target:
+                    return None
+                head_targets.pop("z", None)
+                z_speed_changed.append(op["follow_speed_native"])
+                record("z_speed", lambda: provider.primitives.z_set_max_speed(op["follow_speed_native"]),
+                       inputs={"speed_native": op["follow_speed_native"]})
+                state = provider._offset_deck_semantic_state(gripper_confirmed=False, pseudo_home_only=True)
+                return provider.primitives.oem_move_z(follow_to, pseudo_home_steps=state["pseudo_z_home"],
+                    motor_current=25, wait_for_stop=False)
+            inputs = {"volume_ul": op["volume_ul"], "front_air": False, "target_liquid_ul": op.get("target_liquid_ul"),
+                      "commanded_displacement_ul": op["volume_ul"], "liquid_phase": "aspirate"}
+            if op.get("accounting_intent") is not None:
+                inputs["accounting_intent"] = op["accounting_intent"]
+            for command in op["wire_commands"]:
+                effect = "set_top_speed" if command["field"] == "speed_ul_s" else "aspirate"
+                record(effect, lambda t, w=command["ascii"], e=effect, ch=channels, values=inputs:
+                    _send_wire(t, ch, w, op["timeout_ms"], effect=e, inputs=values,
+                               after_sends=follow if e == "aspirate" else None),
+                    inputs={"field": command["field"], "ascii": command["ascii"], "channels": channels, **inputs}, pipette=True)
+            if follow_to != target:
+                record("follow_z_wait", lambda: provider.wp8_wait_z("waitZ", {"timeout_ms": op["timeout_ms"]}),
+                       inputs={"timeout_ms": op["timeout_ms"]})
+                head_targets["z"] = follow_to
+            plan_rows.append({"channels": channels, "surface_steps": surface, "aspirate_steps": target, "follow_to_steps": follow_to})
+        result.setdefault("surface_aspirations", []).append({"detection_id": op["detection_id"], "mode": op["mode"],
+            "groups": plan_rows, "skipped_channels": [c for c in op["channels"] if c not in contacts]})
 
     try:
         for index, op in enumerate(plan["operations"]):
@@ -564,7 +901,7 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                 if (op.get("resolved_rack") or {}).get("geometry_used") and positioned.get("ok") is True:
                     last_rack = op["calibration"]["rack_transform"]
                     head_targets.update({a: op["resolved_rack"]["target_steps"][a] for a in ("x", "y")})
-                geometry = resolve_surface_move(op["calibration"]["pickup"], detections)
+                geometry = authored(resolve_surface_move(op["calibration"]["pickup"], detections))
                 footprints(geometry, op["calibration"]["pickup"])
                 record("profile_pickup_geometry", lambda: {"ok": True, **geometry,
                     "profile": op["profile"], "calibration": op["calibration"],
@@ -572,17 +909,20 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                 z_move(geometry["target_steps"], geometry["speed_native"])
                 record("query_tip_status_all", lambda t: t.query_tip_status_all(), inputs=op, pipette=True)
                 if op["calibration"]["retract"] is not None:
-                    geometry = resolve_surface_move(op["calibration"]["retract"], detections)
+                    geometry = authored(resolve_surface_move(op["calibration"]["retract"], detections))
                     z_move(geometry["target_steps"], geometry["speed_native"])
             elif kind == "z_move":
-                z_move(op["target_steps"], op["speed_native"])
+                z_move(op["target_steps"] + int(tip_offset()["offset_steps"]), op["speed_native"])
             elif kind == "surface_move":
-                geometry = resolve_surface_move(op, detections)
+                geometry = authored(resolve_surface_move(op, detections))
                 footprints(geometry, op)
                 record("surface_reference", lambda: {"ok": True, **geometry}, inputs=geometry)
                 z_move(geometry["target_steps"], geometry["speed_native"])
             elif kind == "plld":
-                z_move(op["start_steps"], op["search_speed_native"])
+                # Start and search floor are authored heights: correct both for the loaded tip length.
+                apply_lld_profile(op)
+                plld_offset = int(tip_offset()["offset_steps"])
+                z_move(op["start_steps"] + plld_offset, op["search_speed_native"])
                 search = {"z_search_attempted": False, "z_stop_attempted": False,
                           "final_position_steps": None, "z_settled": None}
                 result["plld"] = search
@@ -592,7 +932,7 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                     def dispatch():
                         search["z_search_attempted"] = True
                         head_targets.pop("z", None)
-                        return provider.primitives.oem_move_z(op["search_target_steps"],
+                        return provider.primitives.oem_move_z(op["search_target_steps"] + plld_offset,
                             pseudo_home_steps=state["pseudo_z_home"],
                             motor_current=op["z_motor_current"], wait_for_stop=False)
                     search["start_result"] = record("plld_z_start", dispatch, inputs=op)
@@ -604,8 +944,7 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                         # pumps, not Z. No finally lift/home/Stop is in source.
                         # Existing Stop/owner fences remain authoritative.
                         try:
-                            fence(f"{owner_identity['source_identity']}:plld:terminate")
-                            body["source_timeout_termination"] = t.terminate()
+                            body["source_timeout_termination"] = cleanup_terminate(t, "plld")
                         except Exception as exc:
                             body["source_timeout_termination"] = {"error": str(exc),
                                 "exception_type": type(exc).__name__}
@@ -629,16 +968,22 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                               final_position_steps=position["position_steps"], fluid_timestamps=timestamps)
                 search["shared_head"] = shared_head_evidence(request.get("shared_head"), op["channels"])
                 search["start_mode"] = op.get("start_mode", 0)
+                search["tip_z_offset_steps"] = plld_offset
                 detections[op.get("detection_id", "last_detection")] = deepcopy(search)
                 if op.get("after_detection_steps") is not None:
-                    z_move(op["after_detection_steps"], op["after_detection_speed_native"])
+                    z_move(op["after_detection_steps"] + plld_offset, op["after_detection_speed_native"])
+            elif kind == "liquid_search":
+                liquid_search(op)
+            elif kind == "surface_aspirate":
+                surface_aspirate(op)
             else:
                 tracking: dict[str, Any] = {}
                 if kind == "tracked_aspirate":
-                    tracking = resolve_surface_move(op["trajectory"], detections)
+                    tracking = authored(resolve_surface_move(op["trajectory"], detections))
                     footprints(tracking, op["trajectory"], op["channels"])
                     tracking["shared_head"] = shared_head_evidence(request.get("shared_head"), op["channels"])
                     record("tracking_reference", lambda: {"ok": True, **tracking}, inputs=op)
+                    z_speed_changed.append(tracking["speed_native"])
                     record("z_speed", lambda: provider.primitives.z_set_max_speed(tracking["speed_native"]),
                            inputs={"speed_native": tracking["speed_native"]})
                 def start_tracking():
@@ -673,11 +1018,25 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
         result.update(ok=True, completed=True, source_return_completed=True,
                       has_unknown_outcomes=any(e["status"] == "unknown" for e in events))
     except Exception as exc:
+        # No liquid where liquid was listed: nothing aspirated; hold for the operator.
+        control = ("pause_for_operator" if result.get("missing_liquid_channels")
+                   or result.get("liquid_mismatch_response") == "pause"
+                   else "stop" if result.get("liquid_mismatch_response") == "fail" else request.get("event_policy", "stop"))
         result.update(error=str(exc), exception_type=type(exc).__name__,
-                      interrupted=epoch != group._interrupt_epoch,
+                      interrupted=accepted["epoch"] != group._interrupt_epoch or group._forceabort(),
                       event_policy=request.get("event_policy", "stop"),
-                      requested_control=request.get("event_policy", "stop"),
+                      requested_control=control,
                       partial_effects=True)
+    if z_speed_changed:
+        # OEM scripts return Z to its default max speed (1791) after slow moves; a later
+        # home or move otherwise runs at the last search/follow speed.
+        try:
+            body = provider.primitives.z_set_max_speed(0)
+            events.append({"operation": "z_speed_restore", "origin": "robot_orchestration", "result": body,
+                           "status": "completed" if isinstance(body, dict) and body.get("ok") is True else "failed"})
+        except Exception as exc:
+            events.append({"operation": "z_speed_restore", "origin": "robot_orchestration", "status": "failed",
+                           "error": str(exc)})
     if request.get("accounting_context") is not None:
         from .effect_accounting import application_accounting
         try:

@@ -784,6 +784,9 @@ def _compact_pipette_response(value: Any) -> Any:
     """
     if not isinstance(value, Mapping):
         return value
+    if value.get("kind") == "manual_load_tip" or str(value.get("source_anchor") or "").startswith("ControlLib.btnLoadTip_Click:"):
+        from .protocols.operational_results import compact_manual_pickup
+        return {**compact_manual_pickup(value), "kind": "manual_load_tip"}
     if value.get("kind") == "cavro_application":
         # Versioned application events are operational fields, not diagnostic
         # previews: retain channels, partial settings and control at every child.
@@ -794,7 +797,8 @@ def _compact_pipette_response(value: Any) -> Any:
     if value.get("kind") in _ADDITIONAL_PIPETTE_KINDS:
         return _compact_additional_pipette(value)
     source = str(value.get("source") or value.get("source_anchor") or "")
-    kinds = {"ControlLib.calwithFluid:": "source_calwith_fluid",
+    kinds = {"ControlLib.btnLoadTip_Click:": "manual_load_tip",
+             "ControlLib.calwithFluid:": "source_calwith_fluid",
              "ControlLib.btnDetectFluid_Click:": "diagnostic_detect_fluid",
              "ControlLib.zOffset:": "source_fluid_offset",
              "ControlLib.scrFluidDetection:": "measure_fluid_height"}
@@ -889,7 +893,7 @@ def _bounded_json(value: Any, limit: int) -> Any:
         return json.loads(raw)
     if isinstance(value, Mapping) and isinstance(value.get("kind"), str) and value["kind"] in {
             "source_calwith_fluid", "diagnostic_detect_fluid",
-            "source_fluid_offset", "measure_fluid_height", *_ADDITIONAL_PIPETTE_KINDS}:
+            "source_fluid_offset", "measure_fluid_height", "manual_load_tip", *_ADDITIONAL_PIPETTE_KINDS}:
         return json.loads(raw)
     if isinstance(value, Mapping) and any(key in value for key in ("pipette_result", "barcode_result", "child_outcomes")):
         # Critical source data is not diagnostic preview data. Drop the redundant
@@ -979,12 +983,18 @@ _LATCH_CAPABLE_INITIALIZATION_PATHS = {
 }
 
 _NO_MOTION_PREPARATION_PATHS = {
+    # Motion Off only sets the host motion latch; it never needs power/door checks.
+    "/motion/oem/deactivate",
     "/liquid/manual/compile",
     "/motion/oem/calibration_settings",
     "/motion/oem/calibration_settings/runs/{run_id}/decision",
     "/motion/oem/pipette/tip_tray_set",
     "/liquid/pipette/settings",
     "/liquid/pipette/tip-type",
+    "/liquid/pipette/tip-offsets",
+    "/liquid/pipette/lld-profiles",
+    "/liquid/pipette/depth-offsets",
+    "/liquid/pipette/depth-offsets/remove",
     "/motion/oem/prepare_without_motion",
     "/motion/arm/strict_startup",
     # ClassMotor.setHome is a controller-coordinate write (SAP1=0), not a
@@ -1625,6 +1635,16 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
     z_authority_value = provider_state.get("z_authority") if isinstance(provider_state, Mapping) else None
     z_authority: Mapping[str, Any] = z_authority_value if isinstance(z_authority_value, Mapping) else {}
     terminal_state = z_authority.get("terminal_state") if isinstance(z_authority.get("terminal_state"), Mapping) else {}
+    axes_observed = (domains.get("axes") or {}).get("observed_unix") if isinstance(domains.get("axes"), Mapping) else None
+    terminal_observed = terminal_state.get("observed_at")
+    if (z_axis is not None and type(terminal_state.get("position_steps")) is int
+            and type(terminal_observed) in (int, float)
+            and (type(axes_observed) not in (int, float) or terminal_observed > axes_observed)):
+        # The provider's terminal read is newer than the cached snapshot row: show the newer one.
+        axes.remove(z_axis)
+        z_axis = None
+    if z_axis is not None:
+        z_axis["observed_at"] = axes_observed if type(axes_observed) in (int, float) else None
     if z_axis is None and (
         type(terminal_state.get("position_steps")) is int
         or type(terminal_state.get("speed_steps_s")) is int
@@ -1650,6 +1670,7 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
             "motor_temperature_c": None,
             "motor_temperature_available": False,
             "telemetry_authority": terminal_state.get("authority"),
+            "observed_at": terminal_observed if type(terminal_observed) in (int, float) else None,
         }
         axes.append(z_axis)
     provider_z_available = bool(
@@ -2385,6 +2406,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         None,
     )
     prepare_bound = prepare_provider is not None and prepare_provider.get("provider_available") is True
+    deactivate_bound = any(row["method"] == "POST" and row["path"] == "/motion/oem/deactivate" for row in dispatch.values())
     recovery_bound = recovery_provider is not None and recovery_provider.get("provider_available") is True
 
     home_xy_bound = home_xy_provider is not None and home_xy_provider.get("provider_available") is True
@@ -2413,6 +2435,29 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             "timeout_seconds": 120.0,
             "inputs": list(prepare_provider.get("inputs", [])) if prepare_provider else [],
             "stages": ["serial-206 authority", "24 V/door/latch query", "activate uninitialized boards", "bind current board lifecycle", "initializeMotorsWithoutMotion", "exact parameter readback"],
+        },
+        {
+            "action_id": "meta.deactivate_motion",
+            "label": "Motion Off",
+            "subsystem": "meta",
+            "category": "activation",
+            "kind": "meta",
+            "safety_class": "service",
+            "description": "Turn motion off: new moves are refused until Activate Motion runs again. Sends nothing to the controller and does not stop a move in progress.",
+            "source_anchor": "host motion switch (not OEM)",
+            "informational_method": "POST",
+            "informational_path": "/motion/oem/deactivate",
+            "provider_available": deactivate_bound,
+            "provider_unavailable_reason": None if deactivate_bound else "Motion-off route is not bound.",
+            "available": deactivate_bound,
+            "unavailable_reason": None if deactivate_bound else "Motion-off route is not bound.",
+            "enabled": deactivate_bound,
+            "disabled_reason": None if deactivate_bound else "Motion-off route is not bound.",
+            "dependencies": [],
+            "requires_confirmation": False,
+            "timeout_seconds": 10.0,
+            "inputs": [],
+            "stages": ["set motion off"],
         },
         {
             "action_id": "meta.recover_motion_non_homing",
@@ -2521,6 +2566,9 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         dispatch["meta.home_xy"] = home_route
     if prepare_route:
         dispatch["meta.activate_motion"] = prepare_route
+    deactivate_route = next((row for row in dispatch.values() if row["method"] == "POST" and row["path"] == "/motion/oem/deactivate"), None)
+    if deactivate_route:
+        dispatch["meta.deactivate_motion"] = deactivate_route
     if recovery_route:
         dispatch["meta.recover_motion_non_homing"] = {
             **dict(recovery_route),
@@ -3075,7 +3123,7 @@ class _OperatorPollCache:
                 # A different cold view must not queue behind a held provider.
                 # Retrying this metadata GET is safe; no action is submitted.
                 if pending is None or self._pending_key != key:
-                    raise HTTPException(503, detail="operator_poll_warming")
+                    raise HTTPException(503, detail="operator_poll_warming", headers={"Retry-After": "1"})
             try:
                 # Host metadata response bound only; never cancels provider or
                 # transport work and never starts a replacement on timeout.
@@ -3086,7 +3134,7 @@ class _OperatorPollCache:
                 wrapped.add_done_callback(lambda done: None if done.cancelled() else done.exception())
                 result = await asyncio.wait_for(asyncio.shield(wrapped), timeout=0.5)
             except asyncio.TimeoutError:
-                raise HTTPException(503, detail="operator_poll_warming") from None
+                raise HTTPException(503, detail="operator_poll_warming", headers={"Retry-After": "1"}) from None
             if self._generation() != generation:
                 raise HTTPException(503, detail="operator_poll_ownership_changed")
             return copy.deepcopy(result)
@@ -4975,8 +5023,11 @@ def install_operator_control_plane(
                 )
                 linked_status = None
                 if isinstance(pipette_truth, Mapping):
+                    from .pipette.receipts import _host_state_success
                     linked_status = (
-                        "observed"
+                        "completed"
+                        if isinstance(response, Mapping) and _host_state_success(response)
+                        else "observed"
                         if pipette_truth.get("semantic_query_response_verified") is True
                         else "completed"
                         if pipette_truth.get("completion_verified") is True

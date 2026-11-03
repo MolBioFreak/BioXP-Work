@@ -30,6 +30,27 @@ from .audit import PipetteAuditIntegrityError, normalize_pipette_result, normali
 _LINKED_FINALIZATION_KEY = "_bioxp_linked_pipette_finalization"
 
 
+
+def _host_state_success(result: Mapping[str, Any]) -> bool:
+    """A host-only setting (e.g. OEM tip type) that succeeded; no hardware was commanded."""
+    return (result.get("ok") is True and result.get("outcome") == "host_state_only"
+            and result.get("hardware_commanded") is False)
+
+def _completion_wait_returned(result: Mapping[str, Any]) -> bool:
+    """A completion-wait command whose every channel reported back: the call is over.
+
+    Completion attribution can stay unverified (shared device buffer), but the
+    record must still be terminal; 'acknowledged' would leave it open forever.
+    """
+    channels = result.get("channels")
+    # Group sends report the wait as wait_mode="completion" or as a shared-deadline wait_policy.
+    waited = result.get("wait_mode") == "completion" or str(result.get("wait_policy") or "").startswith("shared_deadline")
+    return (waited and isinstance(channels, list) and bool(channels)
+            and result.get("interrupted_by_terminate") is not True
+            and all(isinstance(row, Mapping) and isinstance((row.get("completion") or {}).get("ok"), bool)
+                    for row in channels))
+
+
 class PipetteReceiptError(RuntimeError):
     """A pipette operation cannot be durably represented."""
 
@@ -546,6 +567,7 @@ class PipetteReceiptStore:
                 and not any(value for key, value in receipt["truth"].items()
                             if key != "physical_effect_claim_suppressed")
             )
+            returned = _completion_wait_returned(result)
             target_status = (
                 "observed"
                 if (
@@ -553,9 +575,12 @@ class PipetteReceiptStore:
                     or receipt["truth"]["hardware_postcondition_verified"]
                 )
                 else "completed"
-                if receipt["truth"]["completion_verified"] or empty_pressure_return or (
+                if receipt["truth"]["completion_verified"] or empty_pressure_return or _host_state_success(result) or (
                     result.get("kind") == "scientific_pressure_capture" and
                     result.get("ok") is True and result.get("source_return_completed") is True)
+                or (returned and result.get("ok") is True)
+                else "failed"
+                if returned
                 else "acknowledged"
                 if receipt["truth"]["controller_acknowledged"]
                 else "dispatched"

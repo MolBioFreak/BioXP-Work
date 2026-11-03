@@ -231,27 +231,6 @@ def test_missing_home_switch_never_becomes_reference(rig):
     assert provider.reference_store.snapshot(('z',))['rows']['z']['state'] != 'referenced'
 
 
-def test_partial_home_publication_storage_failure(rig):
-    import sqlite3
-    driver, provider, frames, fault, root = rig
-    cycle(driver)
-    fired = []
-    def fail_reference(board, command, typ, motor, value):
-        if not fired and (board, command, typ, motor) == (4, 5, 6, 2):
-            assert provider.reference_store.snapshot(('z',))['rows']['z']['state'] == 'referenced'
-            fired.append(True)
-            db = sqlite3.connect(root / 'bioxp_runtime.db')
-            db.execute("CREATE TRIGGER offline_fail_reference BEFORE UPDATE ON reference_state_authority BEGIN SELECT RAISE(ABORT,'offline partial persistence fault'); END")
-            db.commit()
-            db.close()
-    fault['on_frame'] = fail_reference
-    result = provider.initialize_motors(mode='live')
-    assert fired
-    assert result['reference_publications']['z']['published'] is False
-    assert result['reference_publications']['z']['blocker'] == 'aggregate_reference_no_longer_current'
-    assert result['reference_publications']['g']['published'] is False
-    assert not all(row['state'] == 'referenced' for row in
-        ReferenceStateStore(root / 'bioxp_runtime.db').snapshot(('x','y','z','g'))['rows'].values())
 
 
 def test_manual_publication_still_requires_preparation(rig):

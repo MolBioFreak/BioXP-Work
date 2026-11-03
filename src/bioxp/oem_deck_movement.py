@@ -16,6 +16,62 @@ def _tip_exists(collection: Mapping[str, Any] | None) -> bool | None:
     return None if not isinstance(collection, Mapping) else collection.get("tip_exists")
 
 
+def _failed_child_delivery(result: Mapping[str, Any]) -> bool | None:
+    """Use the failed source step, never successful earlier sends, for ambiguity.
+
+    Missing failure evidence remains unknown. Only the ordered manual-pickup
+    sequence has this shape; do not recursively infer truth from diagnostics.
+    """
+    if str(result.get("source_anchor", "")).startswith("ControlLib.btnLoadTip_Click:"):
+        steps = result.get("steps")
+        if not isinstance(steps, list) or not steps:
+            return None
+        # The source stops at the first failure. Prior effects must be known,
+        # otherwise a last-step pre-send failure cannot settle their uncertainty.
+        if not all(isinstance(s, Mapping) and isinstance(s.get("result"), Mapping)
+                   and s["result"].get("ok") is True for s in steps[:-1]):
+            return None
+        last = steps[-1]
+        if not isinstance(last, Mapping):
+            return None
+        failure = last.get("result") if "result" in last else last.get("evidence")
+        if not isinstance(failure, Mapping):
+            return None
+        return _failed_child_delivery(failure)
+    # Service exception envelope: only the failed channel result, plus the
+    # explicitly retained earlier sends. Never search arbitrary diagnostics.
+    if result.get("error") == "command_failed" and isinstance(result.get("details"), Mapping):
+        details = result["details"]
+        failure = details.get("result")
+        sends = details.get("sends")
+        if not isinstance(failure, Mapping) or not isinstance(sends, list):
+            return None
+        if not all(isinstance(send, Mapping) and isinstance(send.get("result"), Mapping)
+                   and send["result"].get("ok") is True for send in sends):
+            return None
+        return _failed_child_delivery(failure)
+    if "failure_evidence" in result:
+        failures = result.get("failure_evidence")
+        completed = result.get("completed_children")
+        if (not isinstance(failures, list) or len(failures) != 1
+                or not isinstance(completed, list)):
+            return None
+        if not all(isinstance(child, Mapping) and isinstance(child.get("result"), Mapping)
+                   and child["result"].get("ok") is True for child in completed):
+            return None
+        failure = failures[0]
+        if not isinstance(failure, Mapping) or not isinstance(failure.get("result"), Mapping):
+            return None
+        return _failed_child_delivery(failure["result"])
+    if result.get("controller_command_acknowledged") is True or result.get("delivery_verified") is True:
+        return True
+    if type(result.get("delivery_attempted")) is bool:
+        return result["delivery_attempted"]
+    if result.get("tx_ok") is False and result.get("delivery_verified") is False:
+        return False
+    return None
+
+
 def _controller_terminal_truth(result: Mapping[str, Any]) -> bool:
     """Require acknowledged source motion and non-contradictory terminal proof."""
     if result.get("source_noop") is True:
@@ -448,9 +504,12 @@ class DeckExecutionFailure(RuntimeError):
         controller_completion_verified: bool = False,
         hardware_postcondition_verified: bool = False,
         provider_results: list[Mapping[str, Any]] | None = None,
+        known_failure: bool = False,
     ) -> None:
         super().__init__(message)
         self.delivery_attempted = bool(delivery_attempted)
+        # Every step's outcome is recorded: a failure, not an unknown outcome.
+        self.known_failure = bool(known_failure)
         self.controller_command_acknowledged = bool(controller_command_acknowledged)
         self.controller_completion_verified = bool(controller_completion_verified)
         self.hardware_postcondition_verified = bool(hardware_postcondition_verified)
@@ -827,6 +886,19 @@ def _mov_terminal_truth(result: Any) -> bool:
     )
 
 
+def _known_cavro_failure(result: Any) -> bool:
+    """A Cavro application that failed with every step's outcome recorded.
+
+    Its effects are known (each event completed or failed), so the stage is a
+    failure, not an unknown outcome. Interrupted or unrecorded steps stay ambiguous.
+    """
+    if not isinstance(result, Mapping) or result.get("kind") != "cavro_application" or result.get("ok") is not False:
+        return False
+    events = result.get("events")
+    return (result.get("interrupted") is not True and isinstance(events, list) and bool(events)
+            and all(isinstance(e, Mapping) and e.get("status") in {"completed", "failed"} for e in events))
+
+
 def execute_mov_execution(command_id: str, plan: MovExecutionPlan, *, provider: Any, command_store: Any) -> dict[str, Any]:
     """Execute one precompiled movExecution plan without replaying ambiguous I/O."""
     persist = getattr(command_store, "persist_mov_execution_plan", None)
@@ -956,7 +1028,8 @@ def execute_mov_execution(command_id: str, plan: MovExecutionPlan, *, provider: 
                     if callable(assert_current):
                         assert_current(command_id, boundary=f"before_terminalize:{step.order}:{step.operation}")
                     terminalize(
-                        command_id, step, state="ambiguous" if delivery_attempted else "failed",
+                        command_id, step,
+                        state="ambiguous" if current_stage_delivery and not getattr(exc, "known_failure", False) else "failed",
                         reason=f"provider_stage_exception:{type(exc).__name__}",
                         result={"ok": False, "exception_type": type(exc).__name__, "exception": str(exc),
                                 "provider_results": getattr(exc, "provider_results", None)},
@@ -964,7 +1037,10 @@ def execute_mov_execution(command_id: str, plan: MovExecutionPlan, *, provider: 
                     )
                 return {
                     "ok": False, "delivery_attempted": delivery_attempted,
-                    "ambiguity_state": "ambiguous" if delivery_attempted else "failed",
+                    "ambiguity_state": "ambiguous" if current_stage_delivery and not getattr(exc, "known_failure", False) else "failed",
+                    "failed_child_delivery_attempted": current_stage_delivery,
+                    "known_failure": getattr(exc, "known_failure", False),
+                    "provider_results": [*provider_results, *getattr(exc, "provider_results", [])],
                     "semantic_state_committed": False,
                 }
             result_map = dict(result) if isinstance(result, Mapping) else {"source_return": result}
@@ -974,7 +1050,11 @@ def execute_mov_execution(command_id: str, plan: MovExecutionPlan, *, provider: 
                 or any(row.get("delivery_attempted") is True for row in provider_results)
             )
             if not _mov_terminal_truth(result):
-                terminal_state = "ambiguous" if delivery_attempted else "failed"
+                failed_delivery = _failed_child_delivery(result_map)
+                if failed_delivery is None:
+                    failed_delivery = delivery_attempted
+                known_failure = _known_cavro_failure(result) or result_map.get("known_failure") is True
+                terminal_state = "ambiguous" if failed_delivery and not known_failure else "failed"
                 if callable(terminalize):
                     if callable(assert_current):
                         assert_current(command_id, boundary=f"before_terminalize:{step.order}:{step.operation}")
@@ -989,7 +1069,9 @@ def execute_mov_execution(command_id: str, plan: MovExecutionPlan, *, provider: 
                     "controller_command_acknowledged": bool(result_map.get("controller_command_acknowledged")),
                     "controller_completion_verified": False,
                     "semantic_state_committed": False,
-                    "ambiguity_state": "ambiguous" if delivery_attempted else "failed",
+                    "ambiguity_state": terminal_state,
+                    "failed_child_delivery_attempted": failed_delivery,
+                    "known_failure": known_failure,
                     "source_return_disposition": "ignored",
                     "provider_results": [*provider_results, result_map],
                 }
@@ -1054,6 +1136,12 @@ def _wp8_child(
     })
 
 
+def arguments_have_float(children: list[dict[str, Any]]) -> bool:
+    """Plans carrying fractional values (e.g. a 5.0 mm release lift) use the
+    owner's RFC8785 digest, where 5.0 and 5 are the same JSON number."""
+    return any(isinstance(v, float) for c in children for v in (c.get("arguments") or {}).values())
+
+
 def _wp8_plan(operation: str, children: list[dict[str, Any]], **metadata: Any) -> dict[str, Any]:
     plan = {
         "schema_version": "bioxp.oem_wp8_operation.v1",
@@ -1078,7 +1166,7 @@ def _wp8_plan(operation: str, children: list[dict[str, Any]], **metadata: Any) -
             "terminal_source_point" if child["operation"] == "updatePlateLocation"
             else "immediate_after_source_call" if mutation else "none"
         )
-    if operation in {"manual_source_pipette", "diagnostic_pipette", "cavro_application"}:
+    if operation in {"manual_source_pipette", "diagnostic_pipette", "cavro_application"} or arguments_have_float(children):
         # Typed source calls carry fractional values. Match the existing
         # SQLite owner's RFC8785 digest (10.0 and 10 are the same JSON number).
         import rfc8785
@@ -1224,7 +1312,12 @@ def _compile_finite_plate_operation_unchecked(
         return _wp8_plan(operation, children, source_caller="ControlLib.DefaultParameters.ForceToHighHome")
     if operation in OEM_PIPETTE_LEAVES:
         leaf, keys = OEM_PIPETTE_LEAVES[operation]
-        _wp8_child(children, leaf, arguments={key: inputs[key] for key in keys})
+        arguments = {key: inputs[key] for key in keys}
+        if operation == "manual_load_tip" and inputs.get("keep_channels") is not None:
+            # Partial pickup: keep these channels, release the rest back into the rack.
+            arguments.update(keep_channels=[int(c) for c in inputs["keep_channels"]],
+                             release_lift_mm=float(inputs.get("release_lift_mm", 10.0)))
+        _wp8_child(children, leaf, arguments=arguments)
         return _wp8_plan(operation, children)
     if operation == "pipette_shift_camera":
         _wp8_child(children, "sourceHomeZ", arguments={"rehome": False})
@@ -1893,10 +1986,11 @@ def make_wp8_operation_executor(
                     )
                     command_store.terminalize_wp8_child(
                         command_id, order,
-                        state="ambiguous" if child_delivery_attempted else "failed",
+                        state="ambiguous" if child_delivery_attempted and not getattr(exc, "known_failure", False) else "failed",
                         result={
                             "exception_type": type(exc).__name__, "exception": str(exc),
                             "delivery_attempted": child_delivery_attempted,
+                            "known_failure": getattr(exc, "known_failure", False),
                             **({"provider_results": exc.provider_results}
                                if isinstance(exc, DeckExecutionFailure) else {}),
                         },
@@ -1918,9 +2012,13 @@ def make_wp8_operation_executor(
                     command_store.assert_deck_execution_current(
                         command_id, boundary=f"before_terminalize_wp8_child_{order}",
                     )
+                    failed_delivery = _failed_child_delivery(result)
+                    if failed_delivery is not None:
+                        child_delivery_attempted = failed_delivery
+                    known = _known_cavro_failure(result) or result.get("known_failure") is True
                     command_store.terminalize_wp8_child(
                         command_id, order,
-                        state="ambiguous" if child_delivery_attempted else "failed",
+                        state="ambiguous" if child_delivery_attempted and not known else "failed",
                         result=result,
                         dispatch_attempt_id=child_dispatch_attempt_id,
                     )
@@ -1928,6 +2026,7 @@ def make_wp8_operation_executor(
                         f"wp8 child failed: {child['operation']}",
                         delivery_attempted=child_delivery_attempted,
                         provider_results=[dict(result)],
+                        known_failure=known,
                     )
                 if not bool(child.get("awaited", True)):
                     if (
@@ -2018,7 +2117,9 @@ def make_wp8_operation_executor(
                     "ok": False, "exception_suppressed": False,
                     "exception_type": type(exc).__name__, "exception": str(exc),
                     "delivery_attempted": delivery_attempted,
-                    "outcome_unknown": delivery_attempted,
+                    "outcome_unknown": (exc.delivery_attempted if isinstance(exc, DeckExecutionFailure) else delivery_attempted) and not getattr(exc, "known_failure", False),
+                    "known_failure": getattr(exc, "known_failure", False),
+                    "failed_child_delivery_attempted": exc.delivery_attempted if isinstance(exc, DeckExecutionFailure) else None,
                     "background_pending": any(not bool(row.get("awaited", True)) for row in plan.get("children", [])),
                 }
                 finalize = getattr(command_store, "finalize_wp8_operation", None)

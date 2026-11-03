@@ -17,6 +17,8 @@ LOCATION_ID_TO_NAME = {
 LOCATION_NAME_TO_ID = {v: k for k, v in LOCATION_ID_TO_NAME.items()}
 TECAN_RACK_IDS = {7, 8, 9, 10}
 TECAN_RACK_OR_STRIP4_IDS = {7, 8, 9, 10, 15}
+# Fixed deck stations of tip trays 1-5 (ControlLib constructor). Hardware facts, not occupancy.
+TIP_TRAY_LOCATIONS = (7, 8, 9, 10, 15)
 TECAN_DIRECT_DESTINATION_IDS = frozenset({11, 12, 13, 14, 16})
 WASTE_BIN_ID = 6
 SOURCE_LINES = "ClassControlInterface.cs:3734-4014"
@@ -71,6 +73,9 @@ class OemPathPlanner:
             z = target.z_low
         if z is None:
             z = state.default_parameters.pseudo_z_home
+        elif int(positionflag) in (1, 2) and state.tip_loaded:
+            # Loaded-tip length correction (0 unless measured); clearance height is untouched.
+            z = int(z) + int(state.tip_z_offset_steps)
         return {
             "x": int(target.base_coordinates.get("x", 0)) + int(target.inc_factor) * OEM_X_INCREMENT * int(column),
             "y": int(target.base_coordinates.get("y", 0)) + int(target.inc_factor) * OEM_Y_INCREMENT * effective_row,

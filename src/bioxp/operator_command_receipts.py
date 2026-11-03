@@ -13,6 +13,8 @@ from collections.abc import Mapping
 from typing import Any
 
 RECEIPT_SCHEMA = "bioxp.operator_command_receipt.v1"
+# Outcomes a later successful home settles; receipts then report "cleared".
+UNKNOWN_OUTCOME_STATES = frozenset({"ambiguous", "interrupted", "outcome_unknown", "reconciliation_required"})
 ROBOT_IDENTITY = os.getenv("BIOXP_ROBOT_IDENTITY", "serial206").strip() or "serial206"
 
 
@@ -31,6 +33,80 @@ class CommandReceiptReader:
     def __init__(self, connection: sqlite3.Connection, lock: Any) -> None:
         self.connection = connection
         self._lock = lock
+
+    def _unknown_affected_axes(self, command_id: str) -> list[str] | None:
+        """None means retained evidence cannot identify the uncertain axes.
+
+        Completed earlier steps do not enlarge the failed step's scope. This
+        recognises native source operations, not arbitrary nested axis labels.
+        """
+        scopes = {"MoveZHome": {"z"}, "moveTo": {"x", "y", "z"},
+                  "sourceHomeZ": {"z"}, "sourceMoveZ": {"z"},
+                  "sourceMoveX": {"x"}, "sourceMoveXY": {"x", "y"}}
+
+        def failed_scope(operation, evidence):
+            if "failure_evidence" not in evidence:
+                return scopes.get(str(operation))
+            failures = evidence.get("failure_evidence")
+            completed = evidence.get("completed_children")
+            if (not isinstance(failures, list) or not failures
+                    or not isinstance(completed, list)
+                    or not all(isinstance(child, dict) and isinstance(child.get("result"), dict)
+                               and child["result"].get("ok") is True for child in completed)):
+                return None
+            scope = set()
+            for failure in failures:
+                if not isinstance(failure, dict) or str(failure.get("operation")) not in scopes:
+                    return None
+                scope.update(scopes[str(failure["operation"])])
+            return scope
+
+        rows = self.connection.execute(
+            "SELECT terminal_evidence_json FROM operator_plane_wp8_children "
+            "WHERE command_id=? AND terminal_state IN ('ambiguous','interrupted')",
+            (command_id,),
+        ).fetchall()
+        axes = set()
+        if not rows:
+            return None
+        for row in rows:
+            result = _json_load(row[0], {}).get("result", {})
+            steps = result.get("steps") if isinstance(result, dict) else None
+            if not isinstance(steps, list) or not steps:
+                return None
+            if not all(isinstance(step, dict) for step in steps):
+                return None
+            # A retained exception step still names its operation even when
+            # older producers dropped the exception's detailed return evidence.
+            if any((step.get("result", step.get("evidence")) is not None
+                    and not isinstance(step.get("result", step.get("evidence")), dict))
+                   or (step.get("result", step.get("evidence")) is None and "error" not in step)
+                   for step in steps):
+                return None
+            uncertain = [step for step in steps
+                         if (step.get("result", step.get("evidence")) or {}).get("ok") is not True]
+            if not uncertain:
+                return None
+            for step in uncertain:
+                scope = failed_scope(step.get("operation"), step.get("result", step.get("evidence")) or {})
+                if scope is None:
+                    return None
+                axes.update(scope)
+        return sorted(axes) or None
+
+    def _home_recovery_resolution(self, command_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT transition_sequence,payload_json FROM operator_plane_transitions "
+            "WHERE command_id=? AND event_kind='recovery_resolved' "
+            "AND json_extract(payload_json,'$.resolution') IN ('axes_homed_after_unknown_moves','children_recovery_resolved') "
+            "ORDER BY transition_sequence DESC LIMIT 1", (str(command_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        payload = _json_load(row["payload_json"], {})
+        if payload.get("command_id") != str(command_id):
+            return None
+        return {**payload, "transition_sequence": int(row["transition_sequence"])}
 
     def _deck_command_detail(self, command_id: str) -> dict[str, Any] | None:
         row = self.connection.execute(
@@ -217,6 +293,14 @@ class CommandReceiptReader:
             deck_detail = self._deck_command_detail(str(row["command_id"]))
             if deck_detail is None:
                 deck_detail = self._wp8_finite_recovery_detail(str(row["command_id"]))
+        home_resolution = self._home_recovery_resolution(str(row["command_id"]))
+        if home_resolution is not None and response["status"] in UNKNOWN_OUTCOME_STATES:
+            # Later successful homes settled this unknown outcome: report it as
+            # cleared, keeping the original terminal status alongside.
+            response["recorded_status"] = response["status"]
+            response["status"] = "cleared"
+            if response["completion_class"] == "recovery_required":
+                response["completion_class"] = None
         if deck_detail is not None:
             response["deck_movement"] = deck_detail
             # A retained post-delivery exception can lack the outer class even
@@ -228,6 +312,9 @@ class CommandReceiptReader:
                     and response["finished_at"] is not None
                     and deck_detail.get("ambiguity_state") == "recovery_required"):
                 response["completion_class"] = "recovery_required"
+        response["recovery_resolution"] = home_resolution
+        if response["status"] in {"ambiguous", "interrupted"}:
+            response["affected_axes"] = self._unknown_affected_axes(str(row["command_id"]))
         return response
 
     def get_command(self, command_id: str) -> dict[str, Any] | None:

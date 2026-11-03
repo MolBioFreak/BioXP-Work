@@ -88,6 +88,14 @@ class ManualLoadTip(_Request):
     well: str = Field(pattern=r"^[ABab](?:[1-9]|1[0-2])$")
     overpress: bool = False
     lift_z: bool = False
+    keep_channels: list[int] | None = Field(default=None, min_length=1, max_length=4)
+    release_lift_mm: float = Field(default=10.0, ge=0, le=10)
+
+    @field_validator("keep_channels", mode="before")
+    @classmethod
+    def thaw_keep_channels(cls, value):
+        # Protocol documents freeze lists into tuples.
+        return list(value) if isinstance(value, tuple) else value
 
 
 class SourceLoadTips(_Request):
@@ -327,8 +335,10 @@ def manual_physical_plan(params: Mapping[str, Any]) -> dict[str, Any]:
                  "source_calwith_fluid" if isinstance(step, ManualCalwithFluid) else
                  "manual_load_tip" if isinstance(step, ManualLoadTip) else
                  "source_fluid_offset" if isinstance(step, ManualFluidOffset) else "measure_fluid_height")
-    return compile_finite_plate_operation(operation, source_leaf_available=True,
-                                         **step.model_dump(exclude={"operation"}))
+    dumped = step.model_dump(exclude={"operation"})
+    if isinstance(step, ManualLoadTip) and step.keep_channels is None:
+        dumped.pop("keep_channels"); dumped.pop("release_lift_mm")
+    return compile_finite_plate_operation(operation, source_leaf_available=True, **dumped)
 
 
 def bind_manual_physical_handler(*, command_store: Any, execute_plan: Callable,
