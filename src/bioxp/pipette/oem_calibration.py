@@ -155,6 +155,9 @@ def manual_load_tip(request: ManualTipLoadRequest, bindings: CalibrationBindings
         if not channels:
             return
         seq.result[key].extend(channels)
+        if transition == "restore":
+            seq.result["release_unverified_channels"] = [
+                ch for ch in seq.result["release_unverified_channels"] if ch not in channels]
         if b.pickup_effect is not None:
             # Record failure without adding a new stop to the physical sequence.
             try:
@@ -184,6 +187,9 @@ def manual_load_tip(request: ManualTipLoadRequest, bindings: CalibrationBindings
     seq.step("queryTipStatus", lambda: b.pipette("query_tip_status_all", observe_pickup))
     drop = [c for c in range(4) if request.keep_channels is not None and c not in request.keep_channels]
     if drop:
+        # Intended releases are not evidence of completion. Retain the unresolved
+        # set even if the transport/receipt publisher unwinds partway through.
+        seq.result["release_unverified_channels"] = list(drop)
         target = _find_target(lowered)
         if target is None:
             raise CalibrationExecutionError("pickup depth unknown; cannot release unneeded tips", seq.result)

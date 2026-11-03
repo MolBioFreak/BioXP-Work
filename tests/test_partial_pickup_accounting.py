@@ -31,6 +31,7 @@ def sent(ch, complete=True):
     ('query_partial', [0, 2], []),
     ('lower', [], []),
     ('metadata', [2], [0, 1, 3]),
+    ('accounting', [0, 1, 2, 3], [0, 1, 3]),
 ])
 def test_provider_partial_effects_survive_tail_failures(named, monkeypatch, failure, remaining, released):
     _, provider, store, _, frames, _ = named
@@ -89,19 +90,31 @@ def test_provider_partial_effects_survive_tail_failures(named, monkeypatch, fail
     monkeypatch.setattr(provider, '_wp8_execution_fence_checker', lambda *a, **k: None, raising=False)
     monkeypatch.setattr(provider, '_wp8_execute_nested_plan', nested)
     monkeypatch.setattr(provider.primitives, 'z_pipette_position', lower)
+    if failure == 'accounting':
+        publisher = provider._tip_tray_state_publisher
+        def fail_restore(**kwargs):
+            if kwargs['transition'] == 'retip':
+                raise RuntimeError('inventory publication unavailable')
+            return publisher(**kwargs)
+        monkeypatch.setattr(provider, '_tip_tray_state_publisher', fail_restore)
     frames.clear()
     result = provider.wp8_manual_pipette_physical('sourceManualLoadTip',
         {'tray': 1, 'well': 'A10', 'keep_channels': [2], 'lift_z': True},
         command_id='partial-pickup', child_order=0, plan_digest='test',
         owner_identity={'source_identity': 'partial-pickup:0'})
-    assert result['ok'] is (failure == 'none'), result
+    assert result['ok'] is (failure in ('none', 'accounting')), result
     wells = [9, 33, 57, 81]
     state = store.tip_tray_state(0)
     assert [ch for ch, well in enumerate(wells) if not state['occupancy'][well]] == remaining, result
     assert sum(state['occupancy']) == 96 - len(remaining)
     if failure != 'lower':
         assert result['released_channels'] == released
-        assert all('error' not in r['result'] for r in result['pickup_accounting']), result
+        errors = [r for r in result['pickup_accounting'] if 'error' in r['result']]
+        assert bool(errors) is (failure == 'accounting'), result
+        if failure == 'release_partial':
+            assert result['release_unverified_channels'] == [1, 3]
+        elif released:
+            assert result['release_unverified_channels'] == []
     if 'eject' in calls:
         assert calls.index('lower') < calls.index('query') < calls.index('pipette_move_z') < calls.index('eject')
     assert calls.count('eject') <= 1 and calls.count('lower') == 1
@@ -115,3 +128,23 @@ def test_provider_partial_effects_survive_tail_failures(named, monkeypatch, fail
         assert reopened.tip_tray_state(0)['occupancy'] == state['occupancy']
     finally:
         reopened.stop()
+
+
+@pytest.mark.parametrize('channels', [[0, 2], [0, 1, 3]])
+def test_two_and_three_channel_bookkeeping_uses_supported_store_transitions(named, channels):
+    _, provider, store, _, frames, _ = named
+    provider.publish_tip_tray_transition(tray_id=0, transition='load_all', operation_id='seed',
+        command_id='seed', provenance={})
+    calls = []
+    def finite(name, inputs):
+        calls.append(inputs)
+        return provider.publish_tip_tray_transition(**inputs, operation_id=f'partial:{len(calls)}',
+            command_id='partial', provenance={})
+    frames.clear()
+    result = provider._manual_pickup_bookkeeping({'tray': 1, 'well': 'A10'}, finite,
+        None, channels=channels)
+    assert result['rack_tips_removed'] == [9 + 24 * ch for ch in channels]
+    assert len(calls) == len(channels)
+    assert all(len(call['well_ids']) == 1 for call in calls)
+    assert sum(store.tip_tray_state(0)['occupancy']) == 96 - len(channels)
+    assert frames == []
