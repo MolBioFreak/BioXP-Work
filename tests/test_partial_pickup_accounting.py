@@ -169,8 +169,8 @@ from tests.test_cover_carry_release_connected import connected  # noqa: F401
 
 
 @pytest.mark.parametrize('reopen', [False, True])
-@pytest.mark.parametrize('fail_home', [False, True])
-def test_pickup_publication_inside_active_receipt(connected, monkeypatch, reopen, fail_home):
+@pytest.mark.parametrize('fail_home,release_error', [(False,False), (True,False), (False,True)])
+def test_pickup_publication_inside_active_receipt(connected, monkeypatch, reopen, fail_home, release_error):
     import json
     from bioxp.pipette.transport import CanPipetteTransport, FourPipetteTransport
     from bioxp.pipette.receipts import PipetteReceiptStore
@@ -194,6 +194,8 @@ def test_pickup_publication_inside_active_receipt(connected, monkeypatch, reopen
             return {'ok': True, 'semantic_ok': True, 'hardware_truth_level': 'hardware_query',
                     'tip_loaded': True, 'source_return': 1, 'reader_generation': 1}
         def pipette_eject_tip(self, **kwargs):
+            if release_error:
+                return {'ok': False, 'delivery_attempted': False}
             return {'ok': True, 'delivery_verified': True, 'controller_acknowledged': True,
                     'completion_verified': True, 'outcome': 'completed'}
     channels = [CanPipetteTransport(driver_factory=Driver, pipette_id=i) for i in range(4)]
@@ -257,7 +259,7 @@ def test_pickup_publication_inside_active_receipt(connected, monkeypatch, reopen
     publications = []
     def publish(**kwargs):
         pending = receipts.connection.execute(
-            "select operation,status from pipette_operations where status='pending'").fetchall()
+            "select operation,status from pipette_operations where status='reserved'").fetchall()
         publications.append([(r['operation'], r['status']) for r in pending])
         return store.publish_tip_tray_transition(**kwargs)
     p.bind_tip_tray_state_publisher(publish)
@@ -276,32 +278,40 @@ def test_pickup_publication_inside_active_receipt(connected, monkeypatch, reopen
     action = SimpleNamespace(action_id='connected-pickup', params={'operation':'load_tip',
         'tray':1, 'well':'A10', 'overpress':False, 'lift_z':True,
         'keep_channels':[2], 'release_lift_mm':10.0})
-    if fail_home:
+    if fail_home or release_error:
         from bioxp.oem_deck_movement import DeckExecutionFailure
         with pytest.raises(DeckExecutionFailure):
             handler(action, SimpleNamespace(job_id='rca-parent'))
     else:
         assert handler(action, SimpleNamespace(job_id='rca-parent'))['ok'] is True
     result = results[-1]
-    assert result['ok'] is (not fail_home)
+    assert result['ok'] is (not (fail_home or release_error))
     assert result['picked_up_channels'] == [0,1,2,3]
-    assert result['released_channels'] == [0,1,3]
+    assert result['released_channels'] == ([] if release_error else [0,1,3])
+    if release_error:
+        assert result['failed_step'] == 'releaseUnneededTips'
+        evidence = result['steps'][-1]['evidence']
+        assert evidence['error'] == 'command_failed'
+        assert evidence['details']['channel'] == 0
+        assert evidence['details']['result'] == {'ok':False, 'delivery_attempted':False}
+        assert evidence['details']['sends'] == []
     assert all('error' not in row['result'] and 'bookkeeping_error' not in row['result']
         for row in result['pickup_accounting']), result['pickup_accounting']
     assert transport._tip_type == 50
     assert any(ch._tip_loaded for ch in channels)
     assert publications and all(publications), publications
-    assert publications[0] == [('query_all_pipette_tip_states', 'pending')]
-    assert all(rows == [('release_unneeded_tips', 'pending')] for rows in publications[1:])
+    assert publications[0] == [('query_all_pipette_tip_states', 'reserved')]
+    assert all(rows == [('release_unneeded_tips', 'reserved')] for rows in publications[1:])
     from bioxp.operator_command_plane import OperatorCommandStore
     cold = OperatorCommandStore(connected.root)
     try:
         occupancy = cold.tip_tray_state(0)['occupancy']
-        assert [occupancy[w] for w in [9,33,57,81]] == [True,True,False,True]
-        assert sum(occupancy) == 95
+        assert [occupancy[w] for w in [9,33,57,81]] == (
+            [False]*4 if release_error else [True,True,False,True])
+        assert sum(occupancy) == (92 if release_error else 95)
     finally:
         cold.stop()
-    assert len(homes) == 1
+    assert len(homes) == (0 if release_error else 1)
 
 
 @pytest.mark.parametrize('envelope', ['evidence', 'detail', 'details', 'none', 'false_return'])
@@ -331,5 +341,5 @@ def test_sequence_preserves_explicit_failure_envelope(envelope):
         assert step['result'] is payload
     else:
         expected = details if envelope == 'details' else None if envelope == 'none' else payload
-        assert step['evidence'] is expected
+        assert step['evidence'] == expected
 
