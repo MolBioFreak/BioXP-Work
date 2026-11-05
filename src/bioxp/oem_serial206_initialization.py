@@ -7936,7 +7936,71 @@ class Serial206OemInitializationProvider:
                         "recording_failure": str(record_exc),
                         "critical_evidence": copy.deepcopy(exc.motion_evidence)}
 
-    def execute_xy_intent(self, x: int, y: int, values: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def execute_xy_sequence(self, targets: list[dict[str, int]], values: Mapping[str, Any]) -> dict[str, Any]:
+        """One finite worker-owned handoff, using the existing XY receipt owner.
+
+        Each source call settles before the next target is issued. Interrupt
+        generations are retained for the whole root, not renewed at handoffs.
+        No initialization, controller connection or executor is created here.
+        """
+        values = dict(values)
+        children: list[dict[str, Any]] = []
+        with self._x_interrupt_state_lock:
+            x_epoch = self._x_interrupt_epoch
+        interrupt_reader = getattr(self.state_store, "axis_interrupt_snapshot", None)
+        y_interrupt = interrupt_reader("y") if callable(interrupt_reader) else None
+        generation = int(self.generation_provider())
+
+        def interrupted() -> bool:
+            with self._x_interrupt_state_lock:
+                if self._x_interrupt_active or self._x_interrupt_epoch != x_epoch:
+                    return True
+            if y_interrupt is not None and callable(interrupt_reader):
+                current = interrupt_reader("y")
+                if current["active"] or current["epoch"] != y_interrupt["epoch"]:
+                    return True
+            return int(self.generation_provider()) != generation
+
+        # Same reentrant provider mutex as execute_xy_intent; Stop retains its
+        # independent priority delivery and generation updates outside this lock.
+        with self._lock:
+            for index, target in enumerate(targets):
+                if interrupted():
+                    return {"ok": False, "failure": "xy_sequence_interrupted", "interrupted": True,
+                            "next_target_index": index, "children": children,
+                            "completed_targets": sum(child["ok"] for child in children)}
+                child_id = f"{values['command_id']}:xy:{index}"
+                result = self.execute_xy_intent(target["x"], target["y"], {
+                    **values, "command_id": child_id, "parent_command_id": values["command_id"],
+                    "idempotency_key": f"{values['idempotency_key']}:xy:{index}",
+                }, source_context="ControlLib.MotionThread", interrupt_check=interrupted)
+                primitive = result.get("result")
+                primitive = primitive if isinstance(primitive, Mapping) else {}
+                # The existing manual call can return normally after a source
+                # WaitAll timeout. That is not a license to overwrite a still
+                # unfinished target in this ordered sequence. Do not alter its
+                # source return, retry, query again or change the legacy action.
+                settled = (primitive.get("controller_terminal_state_verified") is True
+                           or primitive.get("source_noop_verified") is True)
+                child = {"index": index, "command_id": child_id, "target": dict(target),
+                         "ok": result.get("ok") is True and settled, "state": result.get("state"),
+                         "source_return_ok": result.get("ok") is True,
+                         "failure": result.get("failure") or primitive.get("failure"),
+                         "branch": primitive.get("branch"),
+                         "controller_command_acknowledged": primitive.get("controller_command_acknowledged") is True,
+                         "controller_terminal_state_verified": primitive.get("controller_terminal_state_verified") is True,
+                         "source_noop": primitive.get("source_noop") is True}
+                children.append(child)
+                if not child["ok"]:
+                    return {"ok": False, "failure": "xy_sequence_child_failed" if result.get("ok") is not True else "xy_sequence_child_unsettled",
+                            "outcome_unknown": result.get("ok") is True and not settled, "failed_target_index": index,
+                            "children": children, "completed_targets": index, "failed_child": result}
+            stopped = interrupted()
+            return {"ok": not stopped, "failure": "xy_sequence_interrupted" if stopped else None,
+                    "interrupted": stopped, "children": children, "completed_targets": len(children),
+                    "physical_effect_verified": False}
+
+    def execute_xy_intent(self, x: int, y: int, values: Mapping[str, Any] | None = None, *, source_context: str | None = None, interrupt_check: Callable[[], bool] | None = None) -> dict[str, Any]:
         values = dict(values or {})
         with self._x_interrupt_state_lock:
             admitted_interrupt_epoch = self._x_interrupt_epoch
@@ -8046,7 +8110,12 @@ class Serial206OemInitializationProvider:
                 active = {"command_id": command_id, "intent": "move_xy", "idempotency_key": idempotency_key, "generation": generation, "target_x": int(x), "target_y": int(y), "inputs": safe_inputs, "status": "executing", "result": None, "composite_authority": {"admitted": _json_safe(admitted_authority)}}
                 lifecycle.update({"state": "executing", "generation": generation, "active_receipt": active, "pending_ticket": None})
                 self._save_state(state)
-                result = self.primitives.move_xy(int(x), int(y), speed=values.get("speed"), acc=values.get("acc"), wait_timeout_s=float(values.get("wait_timeout_s", 5.0)))
+                if callable(interrupt_check) and interrupt_check():
+                    lifecycle.update(state=prior_state, reference_state=prior_reference_state, active_receipt=None)
+                    self._save_state(state)
+                    return {"ok": False, "failure": "xy_sequence_interrupted", "interrupted": True}
+                move_options = {"source_context": source_context} if source_context is not None else {}
+                result = self.primitives.move_xy(int(x), int(y), speed=values.get("speed"), acc=values.get("acc"), wait_timeout_s=float(values.get("wait_timeout_s", 5.0)), **move_options)
                 result = dict(result) if isinstance(result, Mapping) else {"ok": False, "failure": "xy_result_not_mapping"}
                 current_authority = self._xy_authority_snapshot(
                     lifecycle, validate=False

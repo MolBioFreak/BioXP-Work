@@ -6113,7 +6113,7 @@ class OperatorCommandStore(CommandReceiptReader):
         }:
             # scriptmove_to is an XYZ source plan despite its historical Z name.
             return {"x", "y", "z"}
-        if action_id in {"oem.xy.move_absolute", "oem.xy.home"}:
+        if action_id in {"oem.xy.move_absolute", "oem.xy.move_sequence", "oem.xy.home"}:
             return {"x", "y"}
         axis = AXIS_BY_ACTION.get(action_id)
         return {axis} if axis in {"x", "y", "z"} else set()

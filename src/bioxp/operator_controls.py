@@ -1889,6 +1889,7 @@ _PRIVATE_METHOD_ACTION_IDS = frozenset({
 _CANONICAL_COMPOSITE_ACTION_IDS = frozenset({
     "oem.xy.home",
     "oem.xy.move_absolute",
+    "oem.xy.move_sequence",
 })
 
 
@@ -2127,6 +2128,14 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         description="Exact OEM parallel X/Y absolute composite.",
         source_anchor="ClassControlInterface.moveXY",
         fixed_inputs={"timeout_s": 120.0},
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.xy.move_sequence",
+        path="/motion/oem/move_xy_sequence",
+        label="OEM ordered absolute XY sequence",
+        description="One finite local worker handoff through existing moveXY calls; first failure or Stop ends the sequence.",
+        source_anchor="ControlLib:6398-6412; ClassControlInterface.moveXY:4285-4367",
         required_provider_capability="initialize_motors",
     )
     add_semantic_alias(
@@ -4932,7 +4941,7 @@ def install_operator_control_plane(
                     claim_expected_status = str(dispatched["status"])
                     if claim_expected_status != "dispatched":
                         return dispatched
-                if action_id == "meta.activate_motion":
+                if action_id in {"meta.activate_motion", "oem.xy.move_sequence"}:
                     # OEM preparation is one synchronous controller transaction.
                     # A disconnected caller must not abandon it after the durable
                     # command reservation or release the action lock while its
@@ -4981,6 +4990,13 @@ def install_operator_control_plane(
                         or receipt_source.get("outcome_unknown") is True
                         or receipt_source.get("error") == "tester_operation_completion_ambiguous"
                     )
+                    if action_id == "oem.xy.move_sequence":
+                        # Operational ordered outcomes must survive diagnostic
+                        # response summarization (which intentionally drops lists).
+                        receipt["xy_sequence"] = {key: receipt_source[key] for key in (
+                            "ok", "failure", "interrupted", "next_target_index", "failed_target_index",
+                            "completed_targets", "children",
+                        ) if key in receipt_source}
                     if action_id in {"oem.xy.move_absolute", "oem.xy.move_xy", "oem.xy.home", "oem.xy.home_xy"}:
                         evidence = receipt_source.get("critical_evidence")
                         if isinstance(evidence, Mapping):

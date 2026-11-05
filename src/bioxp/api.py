@@ -2621,6 +2621,17 @@ class OemMoveXYRequest(BaseModel):
     timeout_s: StrictFloat = Field(default=20.0, gt=0.1, le=120.0)
 
 
+class OemXYSequenceTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    x: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
+    y: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
+
+
+class OemXYSequenceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    targets: list[OemXYSequenceTarget] = Field(min_length=1, max_length=64)
+
+
 class OemHomeXYRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -8545,6 +8556,25 @@ async def motion_oem_move_xy(req: OemMoveXYRequest):
         ),
         timeout_s=min(max(float(req.timeout_s) + 15.0, 30.0), 180.0),
     )
+
+
+@app.post("/motion/oem/move_xy_sequence")
+async def motion_oem_move_xy_sequence(req: OemXYSequenceRequest):
+    context = current_operator_dispatch_context()
+    if context is None or context.get("action_id") != "oem.xy.move_sequence":
+        raise HTTPException(status_code=409, detail={"error": "xy_sequence_requires_canonical_action"})
+    provider = _serial206_oem_initialization_provider
+    if provider is None:
+        raise HTTPException(status_code=503, detail={"error": "serial206_movexy_provider_unavailable"})
+    # The retained canonical root owns the whole blocking worker, not one HTTP
+    # waiter per point. Controller/source timeouts remain inside moveXY.
+    result = await _run_blocking("serial-206 provider moveXY sequence", lambda: provider.execute_xy_sequence(
+        [target.model_dump() for target in req.targets], {
+            "command_id": str(context["operator_command_id"]),
+            "idempotency_key": str(context["idempotency_key"]),
+            "expected_generation": int(context["expected_ownership_generation"]),
+        }), timeout_s=None)
+    return result
 
 
 @app.post("/motion/oem/home_xy")
