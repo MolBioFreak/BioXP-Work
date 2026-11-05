@@ -7976,14 +7976,10 @@ class Serial206OemInitializationProvider:
                 }, source_context="ControlLib.MotionThread", interrupt_check=interrupted)
                 primitive = result.get("result")
                 primitive = primitive if isinstance(primitive, Mapping) else {}
-                # The existing manual call can return normally after a source
-                # WaitAll timeout. That is not a license to overwrite a still
-                # unfinished target in this ordered sequence. Do not alter its
-                # source return, retry, query again or change the legacy action.
-                settled = (primitive.get("controller_terminal_state_verified") is True
-                           or primitive.get("source_noop_verified") is True)
+                # Preserve the existing source/provider outcome. Missing target
+                # evidence remains an observation, not a new sequence stop rule.
                 child = {"index": index, "command_id": child_id, "target": dict(target),
-                         "ok": result.get("ok") is True and settled, "state": result.get("state"),
+                         "ok": result.get("ok") is True, "state": result.get("state"),
                          "source_return_ok": result.get("ok") is True,
                          "failure": result.get("failure") or primitive.get("failure"),
                          "branch": primitive.get("branch"),
@@ -7992,8 +7988,7 @@ class Serial206OemInitializationProvider:
                          "source_noop": primitive.get("source_noop") is True}
                 children.append(child)
                 if not child["ok"]:
-                    return {"ok": False, "failure": "xy_sequence_child_failed" if result.get("ok") is not True else "xy_sequence_child_unsettled",
-                            "outcome_unknown": result.get("ok") is True and not settled, "failed_target_index": index,
+                    return {"ok": False, "failure": "xy_sequence_child_failed", "failed_target_index": index,
                             "children": children, "completed_targets": index, "failed_child": result}
             stopped = interrupted()
             return {"ok": not stopped, "failure": "xy_sequence_interrupted" if stopped else None,

@@ -188,7 +188,7 @@ def test_native_addressed_x_stop_delivers_while_root_owns_provider_lock(connecte
     returned[0]()  # Existing post-delivery reconciliation, after root settles.
 
 
-def test_missing_target_notification_never_overwrites_unfinished_target(connected, monkeypatch):
+def test_missing_target_notification_preserves_source_outcome_without_new_gate(connected, monkeypatch):
     http, provider, frames, fault, driver = connected
     from tests import test_motor_receive_identity
     receive = test_motor_receive_identity.receive
@@ -198,12 +198,11 @@ def test_missing_target_notification_never_overwrites_unfinished_target(connecte
     monkeypatch.setattr(test_motor_receive_identity, 'receive', missing_y)
     cid, receipt = submit(http, request())
     result = sequence_body(receipt)
-    assert receipt['status'] != 'completed', receipt
-    assert result['failure'] == 'xy_sequence_child_unsettled'
-    assert result['completed_targets'] == 0
+    assert receipt['status'] == 'completed', receipt
+    assert result['completed_targets'] == 3
     assert result['children'][0]['source_return_ok'] is True
     assert result['children'][0]['controller_terminal_state_verified'] is False
-    assert len([f for f in frames if f[1] == 4]) == 2
+    assert len([f for f in frames if f[1] == 4]) == 6
 
 
 def test_full_22_target_ledger_survives_canonical_publication(connected):
