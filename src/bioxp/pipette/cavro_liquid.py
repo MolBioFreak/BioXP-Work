@@ -217,12 +217,21 @@ def compile_liquid_recipe(request: dict[str, Any]) -> dict[str, Any]:
                 if r.accounting_context is not None:
                     extra.setdefault("accounting_intent", {"role": role})
                 stroke("dispense", s.volume_ul, s.speed_ul_s, **extra)
+        # Plain searches lift and DispenseAll (OEM cleanup), so an authored
+        # air gap must be drawn afterwards. Keep positioning before the search;
+        # defer the air and its phase settings, not the positioning instructions.
+        defer_leading_air = (r.leading_air is not None and r.liquid_detection is not None
+                             and r.liquid_detection.mode != "on_contact")
+        def leading_air():
+            if r.leading_air is not None:
+                settings("leading_air")
+                stroke("leading_air", r.leading_air.volume_ul, r.leading_air.speed_ul_s)
         append_motion(r.before_leading_air)
-        if r.leading_air is not None:
-            settings("leading_air")
-            stroke("leading_air", r.leading_air.volume_ul, r.leading_air.speed_ul_s)
+        if not defer_leading_air:
+            leading_air()
         append_motion(r.before_liquid)
-        settings("aspirate")
+        if not defer_leading_air:
+            settings("aspirate")
         if r.liquid_detection is not None:
             if r.aspiration_tracking is not None:
                 raise ValueError("choose liquid detection or authored aspiration tracking, not both")
@@ -239,6 +248,9 @@ def compile_liquid_recipe(request: dict[str, Any]) -> dict[str, Any]:
                 **({"expected_channels": [c for c in r.channels if c in d.expected_channels]}
                    if d.expected_channels is not None else {"expected_channels": r.channels} if d.expected else {})})
             if d.mode != "on_contact":
+                if defer_leading_air:
+                    leading_air()
+                    settings("aspirate")
                 operations.append({"operation": "surface_aspirate", **base, "detection_id": d.detection_id,
                     "mode": d.mode, "level_tolerance_steps": d.level_tolerance_steps, "submerge_steps": d.submerge_steps,
                     "follow_steps": d.follow_steps, "volume_ul": commanded, "speed_ul_s": r.aspiration_speed_ul_s,
