@@ -2915,8 +2915,12 @@ class OperatorCommandStore(CommandReceiptReader):
                 "WHERE c.action_id<>'protocol.execute' "
                 "AND (c.status IN ('ambiguous','interrupted') OR d.ambiguity_state='recovery_required') "
                 "AND NOT EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions r WHERE r.command_id=c.command_id) "
-                "AND NOT EXISTS (SELECT 1 FROM operator_plane_transitions t WHERE t.command_id=c.command_id "
-                "AND t.event_kind='recovery_resolved' AND json_extract(t.payload_json,'$.resolution')='axes_homed_after_unknown_moves') "
+                # One uncorrelated pass over transitions. The correlated form
+                # rescanned the table per command (~17 s on the robot) on the
+                # dispatcher thread, starving the 5 s lane-lease renewal.
+                "AND c.command_id NOT IN (SELECT t.command_id FROM operator_plane_transitions t "
+                "WHERE t.command_id IS NOT NULL AND t.event_kind='recovery_resolved' "
+                "AND json_extract(t.payload_json,'$.resolution')='axes_homed_after_unknown_moves') "
             ).fetchall()
             for candidate in candidates:
                 command_id = str(candidate["command_id"])
