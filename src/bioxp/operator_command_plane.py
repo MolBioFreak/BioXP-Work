@@ -358,8 +358,8 @@ def _validate_inputs(action_id: str, inputs: Any) -> dict[str, Any]:
         "oem.x.move_steps": {"steps"},
         "oem.y.move_steps": {"steps"},
         "oem.z.move_absolute": {"position_steps"},
-        "oem.x.move_absolute": {"position_steps"},
-        "oem.y.move_absolute": {"target_steps"},
+        "oem.x.move_absolute": {"position_steps", "wait_for_stop"},
+        "oem.y.move_absolute": {"target_steps", "wait_for_stop"},
         "oem.xy.move_absolute": {"x", "y"},
         "oem.xy.home": set(),
         "oem.xyz.move_to": {
@@ -518,6 +518,8 @@ def _validate_inputs(action_id: str, inputs: Any) -> dict[str, Any]:
         steps = result.get("steps")
         if type(steps) is not int or not -2_147_483_648 <= steps <= 2_147_483_647:
             raise HTTPException(status_code=422, detail={"error": "invalid_steps", "required": "signed int32"})
+    if "wait_for_stop" in result and type(result["wait_for_stop"]) is not bool:
+        raise HTTPException(status_code=422, detail={"error": "invalid_wait_for_stop", "required": "boolean"})
     if action_id.endswith("move_absolute"):
         field = "target_steps" if action_id.startswith("oem.y.") else "position_steps"
         target = result.get(field)
@@ -6113,7 +6115,7 @@ class OperatorCommandStore(CommandReceiptReader):
         }:
             # scriptmove_to is an XYZ source plan despite its historical Z name.
             return {"x", "y", "z"}
-        if action_id in {"oem.xy.move_absolute", "oem.xy.move_sequence", "oem.xy.home"}:
+        if action_id in {"oem.xy.move_absolute", "oem.xy.move_sequence", "oem.xy.retarget", "oem.xy.home"}:
             return {"x", "y"}
         axis = AXIS_BY_ACTION.get(action_id)
         return {axis} if axis in {"x", "y", "z"} else set()

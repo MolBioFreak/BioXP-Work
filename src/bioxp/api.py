@@ -2145,6 +2145,7 @@ class OemYMoveAbsoluteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     target_steps: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
+    wait_for_stop: StrictBool = True
 
 
 class OemYAccelerationOverloadRequest(BaseModel):
@@ -2185,6 +2186,7 @@ class OemXMoveAbsoluteRequest(BaseModel):
 
     position_steps: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
     acceleration: StrictInt | None = Field(default=None, ge=-(2**31), le=2**31 - 1)
+    wait_for_stop: StrictBool = True
 
 
 
@@ -2627,9 +2629,52 @@ class OemXYSequenceTarget(BaseModel):
     y: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
 
 
+class OemXYNamedTarget(BaseModel):
+    """Same names/semantics as oem.deck.move_to_location."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    target: str
+    camera_offset: StrictBool
+
+    @field_validator("target")
+    @classmethod
+    def known_target(cls, value: str) -> str:
+        from .oem_deck_catalog import public_target_keys
+        if value not in public_target_keys():
+            raise ValueError("unknown deck target")
+        return value
+
+    @model_validator(mode="after")
+    def no_contradiction(self):
+        if self.camera_offset and (self.target.endswith("_BARCODE") or self.target == "LOC_PARK"):
+            raise ValueError("contradictory_input")
+        return self
+
+
+class OemXYWellTarget(BaseModel):
+    """Same XY as oem.deck.move_to_well; Z stays at travel height (no position_flag)."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    location_id: StrictInt
+    well: StrictStr | StrictInt
+
+    @model_validator(mode="after")
+    def known_well(self):
+        from .manual_pipetting import ManualMove
+        ManualMove.model_validate({"operation": "move", "location_id": self.location_id,
+                                   "well": self.well, "position_flag": 0})
+        return self
+
+
+OemXYTarget = OemXYSequenceTarget | OemXYNamedTarget | OemXYWellTarget
+
+
 class OemXYSequenceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    targets: list[OemXYSequenceTarget] = Field(min_length=1, max_length=64)
+    targets: list[OemXYTarget] = Field(min_length=1, max_length=64)
+
+
+class OemXYRetargetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    target: OemXYTarget
 
 
 class OemHomeXYRequest(BaseModel):
@@ -7654,6 +7699,11 @@ def _execute_serial206_y_call(method_name: str, *args: Any, **kwargs: Any) -> di
         if method_name != "terminalize_absolute":
             kwargs.setdefault("command_id", str(context["operator_command_id"]))
     provider = _require_serial206_y_provider()
+    if method_name in {"move_steps", "move_absolute", "move_absolute_internal", "home", "set_home"}:
+        # Ordering only: a pending live-deck retarget settles first.
+        settle = getattr(_serial206_oem_initialization_provider, "await_pending_xy_retarget", None)
+        if callable(settle):
+            settle()
     method = getattr(provider, method_name)
     from .command_exchange_observer import current_exchange_owner
     owner = current_exchange_owner()
@@ -7713,9 +7763,9 @@ async def motion_oem_y_move_steps(req: OemYMoveStepsRequest):
 async def motion_oem_y_move_absolute(req: OemYMoveAbsoluteRequest):
     return await _run_blocking(
         "serial-206 Y moveY absolute",
-        # Manual panel btnMoveYTo_Click passes false,false (installed IL
-        # 29681–29745). Do not apply this policy to Board Test/Home/relative.
-        lambda: _execute_serial206_y_call("move_absolute", int(req.target_steps), wait_for_stop=False),
+        # Operator-approved default waits for stop like moveX; explicit
+        # wait_for_stop=false keeps the manual-panel btnMoveYTo_Click form.
+        lambda: _execute_serial206_y_call("move_absolute", int(req.target_steps), wait_for_stop=bool(req.wait_for_stop)),
         timeout_s=30.0,
     )
 
@@ -7817,6 +7867,8 @@ async def motion_oem_x_move_absolute(req: OemXMoveAbsoluteRequest):
     }
     if req.acceleration is not None:
         inputs["acceleration"] = int(req.acceleration)
+    if req.wait_for_stop is False:
+        inputs["wait_for_stop"] = False
     return await _run_blocking(
         "serial-206 X moveX",
         lambda: _execute_provider_x_intent("move_absolute", inputs),
@@ -8575,6 +8627,18 @@ async def motion_oem_move_xy_sequence(req: OemXYSequenceRequest):
             "expected_generation": int(context["expected_ownership_generation"]),
         }), timeout_s=None)
     return result
+
+
+@app.post("/motion/oem/xy_retarget")
+async def motion_oem_xy_retarget(req: OemXYRetargetRequest):
+    context = current_operator_dispatch_context()
+    if context is None or context.get("action_id") != "oem.xy.retarget":
+        raise HTTPException(status_code=409, detail={"error": "xy_retarget_requires_canonical_action"})
+    provider = _serial206_oem_initialization_provider
+    if provider is None:
+        raise HTTPException(status_code=503, detail={"error": "serial206_movexy_provider_unavailable"})
+    return await _run_blocking("serial-206 provider mxy retarget", lambda: provider.execute_xy_retarget(
+        req.target.model_dump(), {"command_id": str(context["operator_command_id"])}), timeout_s=60.0)
 
 
 @app.post("/motion/oem/home_xy")
@@ -10443,10 +10507,25 @@ def _protocol_live_thermal_door_handler(action, state):
 def _protocol_live_manual_position_handler(action, state):
     # Resolve only when invoked. Building a dry-run handler map is motionless
     # and must not acquire a live owner or demand initialized hardware.
+    def move_sequence(targets, action, state):
+        # Same provider sequence implementation as oem.xy.move_sequence, inside
+        # this protocol worker: no HTTP and no per-target admission.
+        provider = _serial206_oem_initialization_provider
+        if provider is None:
+            raise RuntimeError("serial206_movexy_provider_unavailable")
+        root = f"workflow:{state.job_id}:{action.action_id}"
+        result = provider.execute_xy_sequence(targets, {
+            "command_id": root, "idempotency_key": root,
+            "expected_generation": int(hardware_state.ownership_epoch)})
+        if result.get("ok") is not True:
+            raise RuntimeError(f"move_sequence_failed:{result.get('failure')}")
+        return {"ok": True, "xy_sequence": result}
+
     handler = bind_manual_position_handler(
         command_store=_protocol_command_store(),
         execute_plan=app.state.oem_workflow_plan_executor,
         require_motion_ready=_require_motion_route_ready,
+        move_sequence=move_sequence,
     )
     return handler(action, state)
 

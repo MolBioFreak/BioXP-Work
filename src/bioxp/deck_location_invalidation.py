@@ -25,7 +25,7 @@ STANDALONE_ACTIONS = frozenset({
     'oem.x.diagnostic_home_axis', 'oem.x.startup_home',
     'oem.x.move_to_origin_home', 'oem.x.caught_plate_recovery_home', 'oem.x.set_home',
     'oem.y.move_steps', 'oem.y.move_absolute', 'oem.y.manual_panel_home',
-    'oem.xy.home', 'oem.xy.home_xy', 'oem.xy.move_absolute', 'oem.xy.move_xy', 'oem.xy.move_sequence',
+    'oem.xy.home', 'oem.xy.home_xy', 'oem.xy.move_absolute', 'oem.xy.move_xy', 'oem.xy.move_sequence', 'oem.xy.retarget',
     'oem.z.manual_home', 'oem.z.diagnostic_home_axis', 'oem.z.move_steps',
     'oem.z.move_absolute', 'oem.z.set_home', 'oem.z.clear', 'oem.z.move_z_home',
     'oem.z.move_gz', 'oem.z.home_gz', 'oem.z.lower_pipette', 'oem.z.lift_pipette',

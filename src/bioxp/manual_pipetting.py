@@ -56,6 +56,40 @@ class ManualMove(_Location):
         return value
 
 
+class _NamedTarget(_Request):
+    target: str
+    camera_offset: bool
+
+    @field_validator("target")
+    @classmethod
+    def known_target(cls, value: str) -> str:
+        from .oem_deck_catalog import public_target_keys
+        if value not in public_target_keys():
+            raise ValueError("unknown deck target")
+        return value
+
+
+class _WellTarget(_Location):
+    well: str | int
+
+    @field_validator("well")
+    @classmethod
+    def valid_well(cls, value: str | int) -> str | int:
+        well_id_from_label(value)
+        return value
+
+
+class ManualMoveSequence(_Request):
+    """Fast-lane endpoint sequence; raw {x,y} targets are not workflow inputs."""
+    operation: Literal["move_sequence"]
+    targets: list[_NamedTarget | _WellTarget] = Field(min_length=1, max_length=64)
+
+    @field_validator("targets", mode="before")
+    @classmethod
+    def thaw(cls, value):
+        return [dict(item) if isinstance(item, Mapping) else item for item in value] if isinstance(value, (list, tuple)) else value
+
+
 class ManualLower(_Location):
     operation: Literal["lower"]
 
@@ -204,7 +238,7 @@ class ManualCalwithFluid(_Request):
     operation: Literal["source_calwith_fluid"]
 
 
-ManualStep = Annotated[Union[ManualMove, ManualLower, ManualLift, ManualLiquid, ManualMix,
+ManualStep = Annotated[Union[ManualMove, ManualMoveSequence, ManualLower, ManualLift, ManualLiquid, ManualMix,
     ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset, DiagnosticDetectFluid,
     ManualCalwithFluid, SourceLoadTips, SourceMix, SourceAir, SourcePurge,
     ManualDiagnosticPipette, ManualCavroApplication, ManualCavroRecipe, ProfilePickup], Field(discriminator="operation")]
@@ -238,7 +272,7 @@ def compile_manual_pipetting(request: ManualPipettingRequest | Mapping[str, Any]
         add(kind, command.to_payload(), step)
 
     for index, step in enumerate(req.steps):
-        if isinstance(step, (ManualMove, ManualLower, ManualLift)):
+        if isinstance(step, (ManualMove, ManualMoveSequence, ManualLower, ManualLift)):
             add(ProtocolActionKind.PIPETTE_POSITION, step.model_dump(), index)
         elif isinstance(step, (ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset,
                                DiagnosticDetectFluid, ManualCalwithFluid, ManualDiagnosticPipette,
@@ -276,7 +310,8 @@ def manual_position_plan(params: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def bind_manual_position_handler(*, command_store: Any, execute_plan: Callable,
-                                 require_motion_ready: Callable[[], None]) -> Callable:
+                                 require_motion_ready: Callable[[], None],
+                                 move_sequence: Callable | None = None) -> Callable:
     """Bind to app.state.oem_workflow_plan_executor; never spawn a worker here.
 
     Add returned callable to _protocol_live_handlers()[PIPETTE_POSITION]. Pass
@@ -284,6 +319,16 @@ def bind_manual_position_handler(*, command_store: Any, execute_plan: Callable,
     _require_motion_route_ready. The generic native executor supplies action/state.
     """
     def handle(action: ProtocolAction, state: Any) -> Mapping[str, Any]:
+        if action.params.get("operation") == "move_sequence":
+            if move_sequence is None:
+                raise RuntimeError("source_authority_missing:move_sequence")
+            step = ManualMoveSequence.model_validate(dict(action.params))
+            require_motion_ready()
+            identity = f"manual:{action.action_id}"
+            with command_store.workflow_context(state.job_id, source_occurrence_id=identity):
+                command_store.assert_workflow_current(state.job_id)
+                result = move_sequence([target.model_dump() for target in step.targets], action, state)
+            return {**dict(result), "physical_effect_verified": False}
         plan = manual_position_plan(action.params)
         require_motion_ready()
         identity = f"manual:{action.action_id}"

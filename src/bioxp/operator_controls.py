@@ -1890,6 +1890,7 @@ _CANONICAL_COMPOSITE_ACTION_IDS = frozenset({
     "oem.xy.home",
     "oem.xy.move_absolute",
     "oem.xy.move_sequence",
+    "oem.xy.retarget",
 })
 
 
@@ -2092,7 +2093,7 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         ("oem.y.status", "/motion/oem/y/status", "OEM Y status", "Passive Serial-206 Y authority and controller-status projection.", "ClassControlInterface Y status", {}),
         ("oem.y.manual_panel_home", "/motion/oem/y/home", "OEM Y manual-panel Home", "Exact manual-panel Y home identity.", "ClassControlInterface.btnYHome_Click:1847-1856", {"source_mode": "manual_panel"}),
         ("oem.y.move_steps", "/motion/oem/y/move_steps", "OEM Y moveSteps", "Signed-int32 relative request; ClassMotor returns -1 without movement when the resulting target crosses its 20-step inner margin.", "ClassControlInterface.moveSteps:4165-4204", {}),
-        ("oem.y.move_absolute", "/motion/oem/y/move_absolute", "OEM manual Y absolute", "Signed-int32 manual-panel nonwaiting request (waitforstop=false, appAdjustment=false); source return is not target completion. ClassHeadBoard clamps negative values to zero and returns the current position without movement at or above the high guard.", "ClassControlInterface.btnMoveYTo_Click IL:29681-29745; moveY overloads:4206-4252", {}),
+        ("oem.y.move_absolute", "/motion/oem/y/move_absolute", "OEM manual Y absolute", "Signed-int32 absolute request; waits for stop by default (wait_for_stop=true), wait_for_stop=false keeps the manual-panel nonwaiting form. ClassHeadBoard clamps negative values to zero and returns the current position without movement at or above the high guard.", "ClassControlInterface.btnMoveYTo_Click IL:29681-29745; moveY overloads:4206-4252", {}),
         ("oem.y.stop", "/motion/oem/y/stop", "OEM Y Stop", "Independent priority-lane Y stop.", "ClassMotor.stopMotor", {}),
     )
     for action_id, path, label, description, source_anchor, fixed_inputs in y_semantic_actions:
@@ -2136,6 +2137,14 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
         label="OEM ordered absolute XY sequence",
         description="One finite local worker handoff through existing moveXY calls; first failure or Stop ends the sequence.",
         source_anchor="ControlLib:6398-6412; ClassControlInterface.moveXY:4285-4367",
+        required_provider_capability="initialize_motors",
+    )
+    add_semantic_alias(
+        action_id="oem.xy.retarget",
+        path="/motion/oem/xy_retarget",
+        label="OEM live XY retarget (mxy)",
+        description="Live deck only: moveX(x,400,false) then moveY(y,400,false); returns after the command exchange. Later motion first awaits the latest targets.",
+        source_anchor="WindowBoardTest.cs:1073-1082; ClassControlInterface.moveX/moveY:4206-4229",
         required_provider_capability="initialize_motors",
     )
     add_semantic_alias(
@@ -4941,7 +4950,7 @@ def install_operator_control_plane(
                     claim_expected_status = str(dispatched["status"])
                     if claim_expected_status != "dispatched":
                         return dispatched
-                if action_id in {"meta.activate_motion", "oem.xy.move_sequence"}:
+                if action_id in {"meta.activate_motion", "oem.xy.move_sequence", "oem.xy.retarget"}:
                     # OEM preparation is one synchronous controller transaction.
                     # A disconnected caller must not abandon it after the durable
                     # command reservation or release the action lock while its
@@ -4995,8 +5004,10 @@ def install_operator_control_plane(
                         # response summarization (which intentionally drops lists).
                         receipt["xy_sequence"] = {key: receipt_source[key] for key in (
                             "ok", "failure", "interrupted", "next_target_index", "failed_target_index",
-                            "completed_targets", "children",
+                            "completed_targets", "children", "z_raise", "location_publication",
                         ) if key in receipt_source}
+                    if action_id == "oem.xy.retarget" and isinstance(receipt_source.get("xy_retarget"), Mapping):
+                        receipt["xy_retarget"] = dict(receipt_source["xy_retarget"])
                     if action_id in {"oem.xy.move_absolute", "oem.xy.move_xy", "oem.xy.home", "oem.xy.home_xy"}:
                         evidence = receipt_source.get("critical_evidence")
                         if isinstance(evidence, Mapping):

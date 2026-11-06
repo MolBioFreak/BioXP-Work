@@ -4597,6 +4597,7 @@ class Serial206OemInitializationProvider:
         self._memory_state: dict[str, Any] | None = None
         self._board_transition_scope: dict[str, Any] | None = None
         self.y_provider: Any | None = None
+        self._pending_xy_retarget: dict[str, Any] | None = None
 
     @contextmanager
     def z_command_lease(self):
@@ -4608,6 +4609,7 @@ class Serial206OemInitializationProvider:
     def movement_lease(self):
         """Own the single source-ordered OEM deck movement stream."""
         with self._deck_movement_lock:
+            self.await_pending_xy_retarget()
             yield
 
     def bind_deck_semantic_state_reader(self, reader: Callable[[], Mapping[str, Any]]) -> None:
@@ -6867,6 +6869,8 @@ class Serial206OemInitializationProvider:
             return None
 
         with self._lock:
+            if selected not in {"terminal_status", "wait_for_motor"}:
+                self.await_pending_xy_retarget()
             with self._x_interrupt_state_lock:
                 if self._x_interrupt_active or admitted_interrupt_epoch != self._x_interrupt_epoch:
                     return {"ok": False, "axis": "x", "failure": "x_intent_superseded_by_safety_interrupt"}
@@ -7936,17 +7940,91 @@ class Serial206OemInitializationProvider:
                         "recording_failure": str(record_exc),
                         "critical_evidence": copy.deepcopy(exc.motion_evidence)}
 
-    def execute_xy_sequence(self, targets: list[dict[str, int]], values: Mapping[str, Any]) -> dict[str, Any]:
+    def execute_xy_retarget(self, target: Mapping[str, Any], values: Mapping[str, Any]) -> dict[str, Any]:
+        """WindowBoardTest.cs:1073-1082 mxy: moveX(x,400,false) then moveY(y,400,false).
+
+        Returns after the command exchange. A later retarget simply issues new
+        targets; any other provider motion first awaits the latest targets.
+        """
+        values = dict(values)
+        with self._x_interrupt_state_lock:
+            x_epoch = self._x_interrupt_epoch
+            if self._x_interrupt_active:
+                return {"ok": False, "failure": "x_safety_interrupt_in_progress"}
+        with self._lock:
+            try:
+                xy = self._resolve_xy_target(target)
+            except Exception as exc:
+                return {"ok": False, "failure": f"xy_retarget_target_unresolved:{type(exc).__name__}:{exc}"}
+            prior = self._pending_xy_retarget
+            z_raise = None
+            if prior is None:
+                # Z is only raised from rest; a moving retarget already sits at travel height.
+                z_raise = self._raise_to_travel_height()
+                if z_raise is not None and z_raise.get("ok") is not True:
+                    return {"ok": False, "failure": "xy_retarget_z_raise_failed", "z_raise": _json_safe(z_raise)}
+            with self._x_interrupt_state_lock:
+                if self._x_interrupt_active or self._x_interrupt_epoch != x_epoch:
+                    return {"ok": False, "failure": "xy_retarget_interrupted", "interrupted": True}
+            x = self.primitives.x_move_absolute(
+                position_steps=int(xy["x"]), acceleration=400, wait_for_stop=False,
+                source_mode="WindowBoardTest.mxy.moveX", clamp_low_to_60=True)
+            y_provider = self.primitives.y_provider
+            y = (y_provider.move_absolute_internal("board_test_my", int(xy["y"]),
+                                                   command_id=f"{values['command_id']}:y")
+                 if y_provider is not None else {"ok": False, "failure": "y_provider_unavailable"})
+            interrupt_reader = getattr(self.state_store, "axis_interrupt_snapshot", None)
+            self._pending_xy_retarget = {
+                "command_id": str(values["command_id"]), "x": _json_safe(x), "y": _json_safe(y),
+                "x_epoch": x_epoch,
+                "y_epoch": interrupt_reader("y")["epoch"] if callable(interrupt_reader) else None,
+                "superseded": (prior or {}).get("command_id"),
+            }
+            ok = x.get("ok") is True and y.get("ok") is True
+            return {"ok": ok, "failure": None if ok else "xy_retarget_source_call_failed",
+                    "xy_retarget": {"target": dict(target), "resolved_xy": {"x": xy["x"], "y": xy["y"]},
+                                    "motion_pending": True,
+                                    "replaced_command_id": (prior or {}).get("command_id")},
+                    "z_raise": _json_safe(z_raise), "x": _json_safe(x), "y": _json_safe(y),
+                    "physical_effect_verified": False}
+
+    def await_pending_xy_retarget(self) -> dict[str, Any] | None:
+        """Ordering only: settle the latest retarget targets with existing waits. No retry."""
+        with self._lock:
+            pending, self._pending_xy_retarget = self._pending_xy_retarget, None
+            if pending is None:
+                return None
+            evidence: dict[str, Any] = {"command_id": pending["command_id"]}
+            with self._x_interrupt_state_lock:
+                x_stopped = self._x_interrupt_active or self._x_interrupt_epoch != pending["x_epoch"]
+            x = pending["x"]
+            if x_stopped or not isinstance(x, Mapping) or x.get("command_issued") is not True:
+                evidence["x"] = {"skipped": "interrupted" if x_stopped else "no_pending_motion"}
+            else:
+                evidence["x"] = _json_safe(self.primitives.x_wait_for_motor(pending_ticket=x, wait_timeout_s=20.0))
+            y = pending["y"]
+            y_provider = self.primitives.y_provider
+            if (y_provider is None or not isinstance(y, Mapping)
+                    or y.get("state") != "issued_pending"):
+                evidence["y"] = {"skipped": "no_pending_motion"}
+            else:
+                evidence["y"] = _json_safe(y_provider.terminalize_absolute(y, timeout_s=20.0))
+            return evidence
+
+    def execute_xy_sequence(self, targets: list[dict[str, Any]], values: Mapping[str, Any]) -> dict[str, Any]:
         """One finite worker-owned handoff, using the existing XY receipt owner.
 
         Each source call settles before the next target is issued. Interrupt
         generations are retained for the whole root, not renewed at handoffs.
-        No initialization, controller connection or executor is created here.
+        Named/well targets resolve to the equivalent move's XY; Z is raised once
+        (never lowered) and the final named/well location is published.
         """
         values = dict(values)
         children: list[dict[str, Any]] = []
         with self._x_interrupt_state_lock:
             x_epoch = self._x_interrupt_epoch
+        with self._z_interrupt_state_lock:
+            z_epoch = self._z_interrupt_epoch
         interrupt_reader = getattr(self.state_store, "axis_interrupt_snapshot", None)
         y_interrupt = interrupt_reader("y") if callable(interrupt_reader) else None
         generation = int(self.generation_provider())
@@ -7954,6 +8032,9 @@ class Serial206OemInitializationProvider:
         def interrupted() -> bool:
             with self._x_interrupt_state_lock:
                 if self._x_interrupt_active or self._x_interrupt_epoch != x_epoch:
+                    return True
+            with self._z_interrupt_state_lock:
+                if self._z_interrupt_active or self._z_interrupt_epoch != z_epoch:
                     return True
             if y_interrupt is not None and callable(interrupt_reader):
                 current = interrupt_reader("y")
@@ -7964,13 +8045,28 @@ class Serial206OemInitializationProvider:
         # Same reentrant provider mutex as execute_xy_intent; Stop retains its
         # independent priority delivery and generation updates outside this lock.
         with self._lock:
-            for index, target in enumerate(targets):
+            pending = self.await_pending_xy_retarget()
+            try:
+                resolved = [self._resolve_xy_target(target) for target in targets]
+            except Exception as exc:
+                return {"ok": False, "failure": f"xy_sequence_target_unresolved:{type(exc).__name__}:{exc}",
+                        "children": [], "completed_targets": 0, "retarget_settle": pending}
+            z_raise = None
+            if any(row["publish"] is not None for row in resolved):
                 if interrupted():
                     return {"ok": False, "failure": "xy_sequence_interrupted", "interrupted": True,
-                            "next_target_index": index, "children": children,
+                            "next_target_index": 0, "children": [], "completed_targets": 0}
+                z_raise = self._raise_to_travel_height()
+                if z_raise is not None and z_raise.get("ok") is not True:
+                    return {"ok": False, "failure": "xy_sequence_z_raise_failed", "z_raise": _json_safe(z_raise),
+                            "children": [], "completed_targets": 0}
+            for index, (target, xy) in enumerate(zip(targets, resolved)):
+                if interrupted():
+                    return {"ok": False, "failure": "xy_sequence_interrupted", "interrupted": True,
+                            "next_target_index": index, "children": children, "z_raise": _json_safe(z_raise),
                             "completed_targets": sum(child["ok"] for child in children)}
                 child_id = f"{values['command_id']}:xy:{index}"
-                result = self.execute_xy_intent(target["x"], target["y"], {
+                result = self.execute_xy_intent(xy["x"], xy["y"], {
                     **values, "command_id": child_id, "parent_command_id": values["command_id"],
                     "idempotency_key": f"{values['idempotency_key']}:xy:{index}",
                 }, source_context="ControlLib.MotionThread", interrupt_check=interrupted)
@@ -7979,6 +8075,7 @@ class Serial206OemInitializationProvider:
                 # Preserve the existing source/provider outcome. Missing target
                 # evidence remains an observation, not a new sequence stop rule.
                 child = {"index": index, "command_id": child_id, "target": dict(target),
+                         "resolved_xy": {"x": xy["x"], "y": xy["y"]},
                          "ok": result.get("ok") is True, "state": result.get("state"),
                          "source_return_ok": result.get("ok") is True,
                          "failure": result.get("failure") or primitive.get("failure"),
@@ -7989,11 +8086,25 @@ class Serial206OemInitializationProvider:
                 children.append(child)
                 if not child["ok"]:
                     return {"ok": False, "failure": "xy_sequence_child_failed", "failed_target_index": index,
-                            "children": children, "completed_targets": index, "failed_child": result}
+                            "children": children, "completed_targets": index, "failed_child": result,
+                            "z_raise": _json_safe(z_raise)}
             stopped = interrupted()
+            publication = None
+            final = resolved[-1]["publish"] if resolved else None
+            if not stopped and final is not None:
+                try:
+                    published = self._publish_deck_owner_state(
+                        source_operation="updateLocation", source_command_id=str(values["command_id"]),
+                        updates=final)
+                    publication = {"ok": True, **final,
+                                   "semantic_state_revision": published.get("semantic_state_revision")}
+                except Exception as exc:
+                    # Recording failure is evidence; motion outcome is unchanged.
+                    publication = {"ok": False, **final, "failure": f"{type(exc).__name__}:{exc}"}
             return {"ok": not stopped, "failure": "xy_sequence_interrupted" if stopped else None,
                     "interrupted": stopped, "children": children, "completed_targets": len(children),
-                    "physical_effect_verified": False}
+                    "z_raise": _json_safe(z_raise), "location_publication": publication,
+                    "retarget_settle": pending, "physical_effect_verified": False}
 
     def execute_xy_intent(self, x: int, y: int, values: Mapping[str, Any] | None = None, *, source_context: str | None = None, interrupt_check: Callable[[], bool] | None = None) -> dict[str, Any]:
         values = dict(values or {})
@@ -8002,6 +8113,7 @@ class Serial206OemInitializationProvider:
             if self._x_interrupt_active:
                 return {"ok": False, "axis": "xy", "state": "failed_latched", "failure": "xy_blocked_by_x_interrupt"}
         with self._lock:
+            self.await_pending_xy_retarget()
             with self._x_interrupt_state_lock:
                 if self._x_interrupt_active or self._x_interrupt_epoch != admitted_interrupt_epoch:
                     return {"ok": False, "axis": "xy", "state": "failed_latched", "failure": "xy_blocked_by_x_interrupt"}
@@ -8217,6 +8329,7 @@ class Serial206OemInitializationProvider:
             if self._x_interrupt_active:
                 return {"ok": False, "axis": "xy", "state": "failed_latched", "failure": "homexy_blocked_by_x_interrupt"}
         with self._lock:
+            self.await_pending_xy_retarget()
             with self._x_interrupt_state_lock:
                 if self._x_interrupt_active or self._x_interrupt_epoch != admitted_interrupt_epoch:
                     return {"ok": False, "axis": "xy", "state": "failed_latched", "failure": "homexy_blocked_by_x_interrupt"}
@@ -9922,6 +10035,7 @@ class Serial206OemInitializationProvider:
         with self._x_interrupt_state_lock:
             admitted_x_interrupt_epoch = self._x_interrupt_epoch
         with self._lock:
+            self.await_pending_xy_retarget()
             with self._z_interrupt_state_lock:
                 if (
                     self._z_interrupt_active
@@ -11443,18 +11557,7 @@ class Serial206OemInitializationProvider:
         # distinct callers of the offset overload, not synonyms for TC/RC.
         if type(barcode) is not bool or (barcode and (location_id not in {2, 3} or not camera_offset)):
             raise ValueError("barcode requires TC/RC with camera offsets")
-        table = load_bound_oem_position_table()
-        target_name = LOCATION_ID_TO_NAME[location_id]
-        target = table.resolve(location_id=target_name)
-        camera = table.resolve(location_id="CAMERA_OFFSET") if camera_offset else None
-        if barcode:
-            assert camera is not None
-            source_x = {2: -11847, 3: -23930}[location_id]
-            offset_x = source_x + int(camera.base_coordinates["x"])
-            offset_y = 7582 + int(camera.base_coordinates["y"])
-        else:
-            offset_x = int(camera.base_coordinates["x"]) if camera is not None else 0
-            offset_y = int(camera.base_coordinates["y"]) if camera is not None else 0
+        table, target, offset_x, offset_y, coordinates = self._named_move_xy(location_id, camera_offset, barcode)
         semantics = self._deck_execution_semantics(authority_snapshot)
         pseudo_home = int(semantics["pseudo_z_home"])
         gripper_confirmed = self._deck_gripper_confirmed()
@@ -11462,12 +11565,6 @@ class Serial206OemInitializationProvider:
                 and semantics["gripper_confirmed"] is not gripper_confirmed):
             raise RuntimeError("deck_authority_changed_before_first_tx")
         location19 = table.resolve(location_id="LOC_RC_COVER")
-        coordinates = target.oem_offset_move_coordinates(
-            offset_x=offset_x,
-            offset_y=offset_y,
-            x_high_limit=90263,
-            y_high_limit=102956,
-        )
         primitive = getattr(self.primitives, "oem_move_to", None)
         if not callable(primitive):
             raise RuntimeError("source_authority_missing:oem_move_to")
@@ -11511,6 +11608,67 @@ class Serial206OemInitializationProvider:
             "source_anchor": "ClassControlInterface.btnLOC1_Click:1932-1959->moveTo:3691-3716",
             "primitive_result": result,
         }
+
+    @staticmethod
+    def _named_move_xy(location_id: int, camera_offset: bool, barcode: bool):
+        """btnLOC1_Click offset-overload XY, shared by moveTo and sequences."""
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+        table = load_bound_oem_position_table()
+        target = table.resolve(location_id=LOCATION_ID_TO_NAME[location_id])
+        camera = table.resolve(location_id="CAMERA_OFFSET") if camera_offset else None
+        if barcode:
+            assert camera is not None
+            source_x = {2: -11847, 3: -23930}[location_id]
+            offset_x = source_x + int(camera.base_coordinates["x"])
+            offset_y = 7582 + int(camera.base_coordinates["y"])
+        else:
+            offset_x = int(camera.base_coordinates["x"]) if camera is not None else 0
+            offset_y = int(camera.base_coordinates["y"]) if camera is not None else 0
+        coordinates = target.oem_offset_move_coordinates(
+            offset_x=offset_x, offset_y=offset_y, x_high_limit=90263, y_high_limit=102956,
+        )
+        return table, target, offset_x, offset_y, coordinates
+
+    def _resolve_xy_target(self, target: Mapping[str, Any]) -> dict[str, Any]:
+        """Movement-mode target union -> XY of the equivalent named/well move.
+
+        Returns the publication the equivalent move would make (None for raw).
+        Pure resolution: position/gripper queries only, never motion.
+        """
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+        from .oem_compat.position_table import well_id_from_label
+        if "x" in target:
+            return {"x": int(target["x"]), "y": int(target["y"]), "publish": None}
+        if "target" in target:
+            from .oem_deck_catalog import DeckCatalog
+            destination = DeckCatalog.from_position_table(load_bound_oem_position_table()).resolve(str(target["target"]))
+            barcode = destination.branch == "barcode"
+            *_, coordinates = self._named_move_xy(destination.location_id, bool(target["camera_offset"]) or barcode, barcode)
+            return {"x": int(coordinates["x"]), "y": int(coordinates["y"]),
+                    "publish": {"current_location": destination.location_name, "current_well": 0}}
+        location = int(target["location_id"])
+        well = well_id_from_label(target["well"])
+        # Same scriptmoveTo target formula (incl. TipLocation row compensation)
+        # as oem.deck.move_to_well; position_flag 0 keeps Z at travel height.
+        from types import SimpleNamespace
+        from .oem_compat.machine_state import PSEUDO_Z_HOME_HIGH
+        tip_location = self._canonical_deck_semantic_state(require_latch_observation=False).get("tip_location")
+        planner = OemPathPlanner(load_bound_oem_position_table(), x_high_limit=90263, y_high_limit=102956)
+        xy = planner._xy_z_for_script_target(location, column=well % 12, row=well // 12, positionflag=0,
+            state=SimpleNamespace(tip_location=int(tip_location) if type(tip_location) is int else -1,
+                                  tip_loaded=False, tip_z_offset_steps=0,
+                                  default_parameters=SimpleNamespace(pseudo_z_home=PSEUDO_Z_HOME_HIGH)))
+        return {"x": int(xy["x"]), "y": int(xy["y"]),
+                "publish": {"current_location": LOCATION_ID_TO_NAME[location], "current_well": well}}
+
+    def _raise_to_travel_height(self) -> dict[str, Any] | None:
+        """Raise only, to the named move's ForceToHighHome clearance (PSEUDO_Z_HOME_HIGH)."""
+        from .oem_compat.machine_state import PSEUDO_Z_HOME_HIGH
+        current = self.primitives._read_axis_position("z")
+        if int(current) <= PSEUDO_Z_HOME_HIGH:
+            return None
+        return self.primitives.oem_move_z(PSEUDO_Z_HOME_HIGH, pseudo_home_steps=PSEUDO_Z_HOME_HIGH,
+                                          motor_current=31, wait_for_stop=True)
 
     @staticmethod
     def _deck_primitive_receipt(result: Any, *, source_anchor: str) -> dict[str, Any]:
