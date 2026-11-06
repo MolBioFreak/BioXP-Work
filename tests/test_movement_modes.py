@@ -216,6 +216,28 @@ def test_stop_during_retarget_stops_and_skips_wait(connected):
     assert settle['x'] == {'skipped': 'interrupted'}
 
 
+def test_retarget_reads_actual_pose_while_moving_without_blocking_next_move(connected, monkeypatch):
+    http, provider, frames, fault, driver, positions = connected
+    tester = provider.primitives.tester
+    reads = []
+    original = tester.motor_get_position
+    def read(board, motor=0):
+        reads.append((int(board), int(motor), time.monotonic()))
+        return original(board, motor=motor)
+    monkeypatch.setattr(tester, 'motor_get_position', read)
+    cid, receipt = submit(http, 'oem.xy.retarget', 'pose-rt-0001', {'target': {'x': 20000, 'y': 30000}})
+    assert receipt['status'] == 'completed', receipt
+    issued = time.monotonic()
+    time.sleep(0.7)
+    sampled = [r for r in reads if r[2] > issued]
+    assert {(5, 0), (4, 0)} <= {(b, m) for b, m, _ in sampled}, reads
+    # A following normal move is not held behind the display sampler.
+    cid, moved = submit(http, 'oem.xy.move_sequence', 'pose-seq-0001', {'targets': [{'x': 21000, 'y': 31000}]})
+    assert moved['status'] == 'completed', moved
+    provider._retarget_pose_thread.join(2)
+    assert not provider._retarget_pose_thread.is_alive()
+
+
 def test_retarget_named_target(connected):
     http, provider, frames, fault, driver, positions = connected
     cid, receipt = submit(http, 'oem.xy.retarget', 'rt-named-key0', {'target': {'target': 'LOC_RC', 'camera_offset': True}})

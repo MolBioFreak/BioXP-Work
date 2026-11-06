@@ -7979,7 +7979,9 @@ class Serial206OemInitializationProvider:
                 "x_epoch": x_epoch,
                 "y_epoch": interrupt_reader("y")["epoch"] if callable(interrupt_reader) else None,
                 "superseded": (prior or {}).get("command_id"),
+                "target_xy": (int(xy["x"]), int(xy["y"])),
             }
+            self._start_retarget_pose_sampler()
             ok = x.get("ok") is True and y.get("ok") is True
             return {"ok": ok, "failure": None if ok else "xy_retarget_source_call_failed",
                     "xy_retarget": {"target": dict(target), "resolved_xy": {"x": xy["x"], "y": xy["y"]},
@@ -7987,6 +7989,45 @@ class Serial206OemInitializationProvider:
                                     "replaced_command_id": (prior or {}).get("command_id")},
                     "z_raise": _json_safe(z_raise), "x": _json_safe(x), "y": _json_safe(y),
                     "physical_effect_verified": False}
+
+    def _start_retarget_pose_sampler(self) -> None:
+        """Display only: read actual X/Y while a retarget moves, so the live pose
+        feed shows where the head is, not its last pre-move reading.
+
+        Never blocks motion: each tick tries the provider lock without waiting
+        and skips when any command holds it. Ends when no retarget is pending,
+        the head reaches the latest target, or after 30 s.
+        """
+        existing = getattr(self, "_retarget_pose_thread", None)
+        if existing is not None and existing.is_alive():
+            return
+        tester = getattr(self.primitives, "tester", None)
+        if tester is None or not callable(getattr(tester, "motor_get_position", None)):
+            return
+
+        def sample() -> None:
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline:
+                time.sleep(0.2)
+                if not self._lock.acquire(blocking=False):
+                    continue
+                try:
+                    pending = self._pending_xy_retarget
+                    if pending is None:
+                        return
+                    x = tester.motor_get_position(5, motor=0)
+                    y = tester.motor_get_position(4, motor=0)
+                    if (isinstance(x, Mapping) and isinstance(y, Mapping)
+                            and (x.get("position"), y.get("position")) == pending.get("target_xy")):
+                        return
+                except Exception:
+                    return
+                finally:
+                    self._lock.release()
+
+        thread = threading.Thread(target=sample, daemon=True, name="bioxp-retarget-pose")
+        self._retarget_pose_thread = thread
+        thread.start()
 
     def await_pending_xy_retarget(self) -> dict[str, Any] | None:
         """Ordering only: settle the latest retarget targets with existing waits. No retry."""
