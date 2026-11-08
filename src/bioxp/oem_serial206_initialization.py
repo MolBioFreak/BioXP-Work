@@ -7994,9 +7994,10 @@ class Serial206OemInitializationProvider:
         """Display only: read actual X/Y while a retarget moves, so the live pose
         feed shows where the head is, not its last pre-move reading.
 
-        Never blocks motion: each tick tries the provider lock without waiting
-        and skips when any command holds it. Uses bounded query-only reads, not
-        OEM motion getters with their 60 s synchronous response waits. Ends when no retarget is pending,
+        Never queues behind motion: each tick tries the provider lock without
+        waiting and skips when any command holds it. An admitted display read
+        holds that lock only for the existing bounded query-only exchange, not
+        the OEM motion getter's 60 s waits/resends. Ends when no retarget is pending,
         the head reaches the latest target, or after 30 s.
         """
         existing = getattr(self, "_retarget_pose_thread", None)

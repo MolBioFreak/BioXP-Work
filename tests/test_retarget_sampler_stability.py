@@ -1,5 +1,7 @@
 """Real API/SQLite/provider/driver; only TMCL transport is inert."""
 import threading
+import sys
+import traceback
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -37,11 +39,25 @@ def test_missing_display_reply_does_not_hold_next_retarget_for_motion_timeout(co
         deadline = time.monotonic() + 2
         while not future.done() and time.monotonic() < deadline:
             time.sleep(.01)
-        assert future.done(), "display query held provider lock and stranded the next retarget"
+        if not future.done():
+            blocked = []
+            for frame in sys._current_frames().values():
+                current = frame
+                while current is not None:
+                    if (current.f_code.co_filename.endswith("oem_serial206_initialization.py")
+                            and current.f_code.co_name in {"sample", "execute_xy_retarget"}):
+                        blocked.append("".join(traceback.format_stack(frame, limit=8)))
+                        break
+                    current = current.f_back
+            raise AssertionError("display query held provider lock and stranded the next retarget\n"
+                                 + "\n".join(blocked))
         _, second = future.result()
         assert second["status"] == "completed", second
         assert second["source_receipt"]["xy_retarget"]["motion_pending"] is True
         assert second["physical_effect_verified"] is False
+        assert second["source_receipt"]["completion_verified"] is False
+        assert [(b, v) for b, c, t, m, v in frames if c == 4 and b in (4, 5)] == [
+            (5, 20000), (4, 30000), (5, 25000), (4, 35000)]
         assert reads
         assert all((command, typ, motor) == (6, 1, 0)
                    and kw["read_timeout_ms"] == 90
