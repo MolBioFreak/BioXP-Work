@@ -27,6 +27,7 @@ def connected(rig, monkeypatch):
         reference_store=provider.reference_store)
     provider.y_provider = provider.primitives.y_provider
     positions = {}
+    driver._motor_last_tx_ts = {}  # constructor state used by bounded query-only telemetry
     wire = driver.send_tmcl
     def exchange(board, command, typ, motor, value, **kw):
         result = wire(board, command, typ, motor, value, **kw)
@@ -220,11 +221,11 @@ def test_retarget_reads_actual_pose_while_moving_without_blocking_next_move(conn
     http, provider, frames, fault, driver, positions = connected
     tester = provider.primitives.tester
     reads = []
-    original = tester.motor_get_position
-    def read(board, motor=0):
+    original = tester.query_only_tmcl
+    def read(board, command, typ, motor=0, value=0):
         reads.append((int(board), int(motor), time.monotonic()))
-        return original(board, motor=motor)
-    monkeypatch.setattr(tester, 'motor_get_position', read)
+        return original(board, command, typ, motor, value)
+    monkeypatch.setattr(tester, 'query_only_tmcl', read)
     cid, receipt = submit(http, 'oem.xy.retarget', 'pose-rt-0001', {'target': {'x': 20000, 'y': 30000}})
     assert receipt['status'] == 'completed', receipt
     issued = time.monotonic()

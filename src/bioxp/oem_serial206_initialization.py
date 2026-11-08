@@ -7995,14 +7995,15 @@ class Serial206OemInitializationProvider:
         feed shows where the head is, not its last pre-move reading.
 
         Never blocks motion: each tick tries the provider lock without waiting
-        and skips when any command holds it. Ends when no retarget is pending,
+        and skips when any command holds it. Uses bounded query-only reads, not
+        OEM motion getters with their 60 s synchronous response waits. Ends when no retarget is pending,
         the head reaches the latest target, or after 30 s.
         """
         existing = getattr(self, "_retarget_pose_thread", None)
         if existing is not None and existing.is_alive():
             return
         tester = getattr(self.primitives, "tester", None)
-        if tester is None or not callable(getattr(tester, "motor_get_position", None)):
+        if tester is None or not callable(getattr(tester, "query_only_tmcl", None)):
             return
 
         def sample() -> None:
@@ -8015,10 +8016,19 @@ class Serial206OemInitializationProvider:
                     pending = self._pending_xy_retarget
                     if pending is None:
                         return
-                    x = tester.motor_get_position(5, motor=0)
-                    y = tester.motor_get_position(4, motor=0)
-                    if (isinstance(x, Mapping) and isinstance(y, Mapping)
-                            and (x.get("position"), y.get("position")) == pending.get("target_xy")):
+                    # Display-only: never borrow the source motion getter
+                    # (60 s + source resend) while holding the motion owner.
+                    # The existing query-only boundary also publishes valid
+                    # actual coordinates under its pre-query captured epoch.
+                    x = tester.query_only_tmcl(5, 6, 1, 0, 0)
+                    if not (isinstance(x, Mapping) and x.get("status") == 100
+                            and type(x.get("value")) is int):
+                        return
+                    y = tester.query_only_tmcl(4, 6, 1, 0, 0)
+                    if not (isinstance(y, Mapping) and y.get("status") == 100
+                            and type(y.get("value")) is int):
+                        return
+                    if (x["value"], y["value"]) == pending.get("target_xy"):
                         return
                 except Exception:
                     return
