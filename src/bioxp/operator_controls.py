@@ -4091,6 +4091,20 @@ def install_operator_control_plane(
             "interrupt_evidence": row.get("interrupt_evidence"),
             "z_move": row.get("z_move"),
             "xy_failure": row.get("xy_failure"),
+            # These persisted operational facts describe source-call outcomes,
+            # not physical arrival. Never infer them from completed/terminal.
+            # Full ordered children and wire evidence remain detail-only.
+            **({"xy_retarget": {
+                key: _bounded_json(row["xy_retarget"][key], 512) for key in (
+                    "motion_pending", "replaced_command_id", "target", "resolved_xy",
+                ) if key in row["xy_retarget"]
+            }} if isinstance(row.get("xy_retarget"), Mapping) else {}),
+            **({"xy_sequence": {
+                key: _bounded_json(row["xy_sequence"][key], 512) for key in (
+                    "ok", "failure", "interrupted", "next_target_index",
+                    "failed_target_index", "completed_targets",
+                ) if key in row["xy_sequence"]
+            }} if isinstance(row.get("xy_sequence"), Mapping) else {}),
         }
 
     def _v2_y_axis(state: Mapping[str, Any]) -> dict[str, Any]:

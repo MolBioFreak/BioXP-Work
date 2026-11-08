@@ -152,8 +152,20 @@ def read_history_page(root: str | Path, limit: int, cursor: str | None = None) -
                 assessment = """(SELECT detail_json FROM operator_transitions t
                     WHERE t.command_id=d.command_id AND json_type(t.detail_json,'$.operator_assessment')='text'
                     ORDER BY transition_id DESC LIMIT 1)""" if "operator_transitions" in tables else "NULL"
+                # Select operational XY summary leaves only, never the sequence
+                # children ledger. json_type preserves absent vs null and booleans.
+                xy_fields = {
+                    "xy_retarget": ("motion_pending", "replaced_command_id", "target", "resolved_xy"),
+                    "xy_sequence": ("ok", "failure", "interrupted", "next_target_index",
+                                    "failed_target_index", "completed_targets"),
+                }
+                xy_projection = ",".join(
+                    f"json_{function}(d.receipt_json,'$.{group}.{key}') AS {group}_{key}_{function}"
+                    for group, keys in xy_fields.items() for key in keys
+                    for function in ("extract", "type")
+                )
                 rows = db.execute(f"""
-                    SELECT d.command_id,d.sequence,d.action_id,d.status,d.ownership_generation,
+                    SELECT {xy_projection},d.command_id,d.sequence,d.action_id,d.status,d.ownership_generation,
                         d.controller_acknowledged,d.physical_effect_verified,d.response_summary_json,
                         json_extract(d.receipt_json,'$.schema_version') AS source_schema,
                         json_extract(d.receipt_json,'$.accepted_at') AS accepted_at,
@@ -179,6 +191,17 @@ def read_history_page(root: str | Path, limit: int, cursor: str | None = None) -
                 """, direct_ids).fetchall()
                 for row in rows:
                     item = dict(row)
+                    for group, keys in xy_fields.items():
+                        summary = {}
+                        for key in keys:
+                            value = item.pop(f"{group}_{key}_extract")
+                            kind = item.pop(f"{group}_{key}_type")
+                            if kind is not None:
+                                summary[key] = (json.loads(value) if kind in {"object", "array"}
+                                                else kind == "true" if kind in {"true", "false"}
+                                                else value)
+                        if summary:
+                            item[group] = summary
                     assessment_value = _json(item.pop("assessment_json"), {})
                     item["response"] = _json(item.pop("response_summary_json"))
                     item["interrupt_evidence"] = _json(item.pop("interrupt_json"))
