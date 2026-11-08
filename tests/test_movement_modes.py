@@ -52,7 +52,11 @@ def connected(rig, monkeypatch):
         lambda *a, include_lifecycle=False, **kw: project(*a, **kw))
     frames.clear()
     with TestClient(app) as http:
-        yield http, provider, frames, fault, driver, positions
+        app.state.operator_command_plane.start()
+        try:
+            yield http, provider, frames, fault, driver, positions
+        finally:
+            app.state.operator_command_plane.store.stop()
 
 
 def body(key, inputs):

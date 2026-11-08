@@ -45,7 +45,11 @@ def connected(rig, monkeypatch):
         lambda *a, include_lifecycle=False, **kw: project(*a, **kw))
     frames.clear()
     with TestClient(app) as http:
-        yield http, provider, frames, fault, driver
+        app.state.operator_command_plane.start()
+        try:
+            yield http, provider, frames, fault, driver
+        finally:
+            app.state.operator_command_plane.store.stop()
 
 
 def request(key='sequence-test-0001', targets=None):
@@ -214,7 +218,7 @@ def test_full_22_target_ledger_survives_canonical_publication(connected):
     assert [child['target'] for child in result['children']] == targets
 
 
-def test_existing_singleflight_owner_is_held_for_whole_sequence(connected, monkeypatch):
+def test_existing_durable_owner_queues_next_root_for_whole_sequence(connected, monkeypatch):
     http, provider, frames, fault, driver = connected
     waiting, release = threading.Event(), threading.Event()
     original = driver.motor_wait_target_reached_many
@@ -228,14 +232,18 @@ def test_existing_singleflight_owner_is_held_for_whole_sequence(connected, monke
         assert admitted.status_code == 200, admitted.text
         assert waiting.wait(3)
         competitor = http.post('/operator/v2/actions/oem.xy.move_sequence', json=request('different-root-key'))
-        assert competitor.status_code == 409, competitor.text
+        assert competitor.status_code == 200, competitor.text
+        assert competitor.json()["command_id"] != admitted.json()["command_id"]
+        assert len([f for f in frames if f[1] == 4]) == 2
         replay = http.post('/operator/v2/actions/oem.xy.move_sequence', json=request())
         assert replay.status_code == 200 and replay.json()['command_id'] == admitted.json()['command_id']
     finally:
         release.set()
     cid, receipt = submit(http, request())
     assert receipt['status'] == 'completed'
-    assert len([f for f in frames if f[1] == 4]) == 6
+    cid2, second = submit(http, request('different-root-key'))
+    assert cid2 == competitor.json()['command_id'] and second['status'] == 'completed'
+    assert len([f for f in frames if f[1] == 4]) == 12
 
 
 def test_direct_route_cannot_create_another_owner(connected):

@@ -3342,8 +3342,8 @@ def install_operator_control_plane(
             axis = str((inputs or {}).get("axis") or "x")
             return f"diagnostics-{axis}"
         return "interrupt"
-    # Retain one direct owner, not a new motion queue. Competing normal actions
-    # receive a prompt busy response; interrupts retain their separate lane.
+    # Retain the existing direct owner for direct actions (including Retarget).
+    # Named/well/Fast roots use the existing durable FIFO; Stops stay independent.
     direct_requests: dict[str, tuple[dict[str, Any], asyncio.Future, asyncio.Task]] = {}
     pending_named_admissions = 0
     # Query-refresh priority only; SQLite and the existing execution fences
@@ -3354,7 +3354,7 @@ def install_operator_control_plane(
     )
     router = APIRouter(prefix="/operator", tags=["operator-controls"])
 
-    def machine_state() -> dict[str, Any]:
+    def machine_state(*, intent_only: bool = False) -> dict[str, Any]:
         domain_names = ("transport", "boards", "axes", "range", "power", "interlock", "latch", "gripper", "thermal", "chiller", "pipette")
         domains: dict[str, Any] = {}
         # One coherent observation, not eleven copies of the same snapshot.
@@ -3382,6 +3382,13 @@ def install_operator_control_plane(
                 "error": None if pipette_status.get("ok") is True else "passive pipette status unavailable",
             }
         ownership_projection = hardware_state.ownership_projection()
+        intent_provider = oem_deck_provider() if intent_only and oem_deck_provider is not None else None
+        intent_projection = getattr(intent_provider, "deck_intent_admission_projection", None)
+        provider_state = (
+            intent_projection() if callable(intent_projection) else
+            serial206_initialization_state_provider() if serial206_initialization_state_provider else
+            {"bound": False, "initialize_motors_live_available": False, "initialize_motion_live_available": False}
+        )
         return {
             "ownership_generation": int(ownership_projection["ownership_epoch"]),
             "ownership": ownership_projection["ownership"],
@@ -3391,11 +3398,7 @@ def install_operator_control_plane(
                 "block_reason": "Motion state is not bound to the operator plane.",
             },
             "lifecycle": dict(lifecycle_state_provider()) if lifecycle_state_provider else lifecycle_state.projection(),
-            "serial206_initialization_provider": (
-                dict(serial206_initialization_state_provider())
-                if serial206_initialization_state_provider
-                else {"bound": False, "initialize_motors_live_available": False, "initialize_motion_live_available": False}
-            ),
+            "serial206_initialization_provider": dict(provider_state),
             "references": dict(reference_state_provider()) if reference_state_provider else {"rows": {}},
             "domains": domains,
             "freshness": freshness or {"state": "missing", "age_s": None, "fresh_for_s": 30.0},
@@ -3603,8 +3606,8 @@ def install_operator_control_plane(
         app.state.oem_mov_execution_admitter = admit_mov_execution
         app.state.oem_wp8_operation_admitter = admit_wp8_operation
 
-    # Named admission is owned command work, not a short-lived metadata view.
-    admission_state_reader = _OperatorStateReader(machine_state)
+    # Movement-intent admission is owned work, not a short-lived metadata view.
+    admission_state_reader = _OperatorStateReader(lambda: machine_state(intent_only=True))
     preview_state_reader = _OperatorStateReader(machine_state, metadata=True)
     invoke_state_reader = _OperatorStateReader(machine_state)
     app.state.operator_admission_state_reader = admission_state_reader
@@ -4291,7 +4294,7 @@ def install_operator_control_plane(
             # Keep the approved independent delivery and canonical v2 receipt.
             # invoke_action reconciles the deck queue only after delivery.
             return _v2_compact_receipt(await invoke_action(action_id, payload))
-        if action_id in {"oem.deck.move_to_location", "oem.deck.move_to_well"}:
+        if action_id in {"oem.deck.move_to_location", "oem.deck.move_to_well", "oem.xy.move_sequence"}:
             if not isinstance(payload, OperatorActionRequestV2):
                 raise HTTPException(status_code=422, detail={"error": "normal_action_request_schema_required"})
             request = {**payload.model_dump(), "action_id": action_id}
@@ -4302,12 +4305,29 @@ def install_operator_control_plane(
             if existing is not None:
                 return _v2_compact_receipt(await asyncio.to_thread(
                     command_plane.store.admit_command, request, state={}))
+            if action_id == "oem.xy.move_sequence" and await asyncio.to_thread(
+                    store.by_idempotency, payload.idempotency_key, include_evidence=False) is not None:
+                # A concurrent FIFO admission can commit between these reads.
+                # Let its existing immutable key owner resolve that race first.
+                if await asyncio.to_thread(command_plane.store.idempotency, "command", payload.idempotency_key) is not None:
+                    return _v2_compact_receipt(await asyncio.to_thread(
+                        command_plane.store.admit_command, request, state={}))
+                # Pre-FIFO roots retain their original direct receipt/key owner.
+                # Recover through its existing immutable binding checks, never
+                # attempt another SQL claim or another source call for that key.
+                return _v2_compact_receipt(await retain_direct_action(action_id, InvokeRequest(
+                    expected_generation=payload.expected_ownership_generation,
+                    idempotency_key=payload.idempotency_key, inputs=dict(payload.inputs),
+                    expected_board_epoch_by_board=dict(payload.expected_board_epoch_by_board))))
             # SQLite owns the only queue. No invoke-lock waiter or controller
-            # sampling is needed to accept another deliberate named intent.
+            # sampling is needed to accept another deliberate movement intent.
             pending_named_admissions += 1
             try:
                 state = await admission_state_reader.read()
                 assessment = await _drain_operator_work(asyncio.create_task(
+                    asyncio.to_thread(
+                        assessed_action, by_id[action_id], state, payload.inputs)
+                    if action_id == "oem.xy.move_sequence" else
                     asyncio.to_thread(deck_contract, state, intent_only=True)))
                 if not assessment["enabled"]:
                     raise HTTPException(409, detail={"error": assessment["disabled_reason"],

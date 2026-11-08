@@ -8625,7 +8625,7 @@ async def motion_oem_move_xy_sequence(req: OemXYSequenceRequest):
             "command_id": str(context["operator_command_id"]),
             "idempotency_key": str(context["idempotency_key"]),
             "expected_generation": int(context["expected_ownership_generation"]),
-        }), timeout_s=None)
+        }, interrupt_check=context.get("interrupt_check")), timeout_s=None)
     return result
 
 

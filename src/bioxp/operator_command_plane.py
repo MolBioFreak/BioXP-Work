@@ -139,6 +139,7 @@ ALLOWED_ACTIONS = frozenset({
     "oem.y.move_steps",
     "oem.y.move_absolute",
     "oem.xy.move_absolute",
+    "oem.xy.move_sequence",
     "oem.xy.home",
     "oem.deck.move_to_location",
     "oem.deck.move_to_well",
@@ -361,6 +362,7 @@ def _validate_inputs(action_id: str, inputs: Any) -> dict[str, Any]:
         "oem.x.move_absolute": {"position_steps", "wait_for_stop"},
         "oem.y.move_absolute": {"target_steps", "wait_for_stop"},
         "oem.xy.move_absolute": {"x", "y"},
+        "oem.xy.move_sequence": {"targets"},
         "oem.xy.home": set(),
         "oem.xyz.move_to": {
             "x",
@@ -2799,7 +2801,7 @@ class OperatorCommandStore(CommandReceiptReader):
         motor_by_axis = {"y": 0, "z": 1}
         composite_xy = action_id.startswith("oem.xy.")
         deck_movement = action_id in {"oem.deck.move_to_location", "oem.deck.move_to_well", "oem.deck._mov_execution", "oem.deck._finite_operation"}
-        composite_xyz = action_id.startswith("oem.xyz.") or action_id == "oem.z.scriptmove_to"
+        composite_xyz = action_id.startswith("oem.xyz.") or action_id in {"oem.z.scriptmove_to", "oem.xy.move_sequence"}
         axis_scope = "xyz" if composite_xyz or deck_movement else "xy" if composite_xy else axis
         board_scope = (
             {"4": [0, 1], "5": [0]}
@@ -4494,7 +4496,7 @@ class OperatorCommandStore(CommandReceiptReader):
         }
         observed_board_epochs = _active_board_epochs(state, action_id)
         expected_board_epochs: dict[str, int] = {}
-        if action_id in {"oem.deck.move_to_location", "oem.deck.move_to_well", "oem.deck._mov_execution", "oem.deck._finite_operation"}:
+        if action_id in {"oem.xy.move_sequence", "oem.deck.move_to_location", "oem.deck.move_to_well", "oem.deck._mov_execution", "oem.deck._finite_operation"}:
             if schema_version != ACTION_REQUEST_SCHEMA:
                 raise HTTPException(status_code=422, detail={"error": "deck_action_requires_v2"})
             raw_board_epochs = request.get("expected_board_epoch_by_board")
@@ -4526,10 +4528,13 @@ class OperatorCommandStore(CommandReceiptReader):
             replay_response = current or saved
             replay_response["idempotent_replay"] = True
             return replay_response
-        # Provider -> runtime writer is the established lock order. Resolving
-        # live bindings under a writer alone deadlocks passive provider readers.
+        # Provider -> runtime writer remains the internal execution lock order.
+        # Public FIFO intents must not wait for the previous root's motion
+        # mutex. Bind observed generation stamps from the admission read; the
+        # existing executor revalidates at dispatch/pre-TX. Internal finite
+        # plans keep their original provider-before-writer custody boundary.
         owner_scope = (self._deck_owner_authority_scope()
-                       if action_id.startswith("oem.deck.") else nullcontext())
+                       if internal else nullcontext())
         with owner_scope, self._transaction() as conn:
             replay = self._saved_idempotency(conn, "command", key, fingerprint)
             if replay is not None:
@@ -4540,14 +4545,15 @@ class OperatorCommandStore(CommandReceiptReader):
                 replay_response = self._command_response(current_row) if current_row is not None else replay
                 replay_response["idempotent_replay"] = True
                 return replay_response
-            if action_id in {"oem.deck.move_to_location", "oem.deck.move_to_well", "oem.deck._mov_execution", "oem.deck._finite_operation"}:
+            if action_id in {"oem.xy.move_sequence", "oem.deck.move_to_location", "oem.deck.move_to_well", "oem.deck._mov_execution", "oem.deck._finite_operation"}:
                 actual_generation = int(state.get("ownership_generation") or -1)
                 if expected_generation != actual_generation:
                     raise HTTPException(status_code=409, detail={"error": "ownership_generation_mismatch", "actual": actual_generation})
                 # Bind this new command to the actual owner, never the caller's
                 # cached catalog. Keep the original requested map in the request
                 # fingerprint so replay cannot change its immutable identity.
-                observed_board_epochs = self._current_deck_board_epochs(state, action_id)
+                observed_board_epochs = (self._current_deck_board_epochs(state, action_id)
+                                         if internal else _active_board_epochs(state, action_id))
                 expected_board_epochs = dict(observed_board_epochs)
             count, bytes_used = self._capacity(conn)
             proposed_bytes = len(_canonical(inputs).encode("utf-8")) + len(_canonical(canonical_request).encode("utf-8"))
@@ -5597,7 +5603,7 @@ class OperatorCommandStore(CommandReceiptReader):
             action_axis = AXIS_BY_ACTION.get(action_id)
             axis_epoch = (
                 int(safety["x_epoch"]) + int(safety["y_epoch"]) + int(safety["z_epoch"])
-                if action_id.startswith("oem.xyz.") or action_id == "oem.z.scriptmove_to"
+                if action_id.startswith("oem.xyz.") or action_id in {"oem.z.scriptmove_to", "oem.xy.move_sequence"}
                 else int(safety["x_epoch"]) + int(safety["y_epoch"])
                 if action_id.startswith("oem.xy.")
                 else int(safety[{"x": "x_epoch", "y": "y_epoch", "z": "z_epoch"}.get(action_axis or "", "z_epoch")])
@@ -5689,6 +5695,22 @@ class OperatorCommandStore(CommandReceiptReader):
             row = conn.execute("SELECT * FROM operator_plane_commands WHERE command_id=?", (command_id,)).fetchone()
             if row is None:
                 return {"command_id": command_id, "status": "missing"}
+            if (row["action_id"] == "oem.xy.move_sequence"
+                    and isinstance(payload.get("xy_sequence"), Mapping)
+                    and str(row["status"]) != "dispatched" and claimed is not None
+                    and row["dispatch_attempt_id"] == claimed["dispatch_attempt_id"]
+                    and row["dispatcher_epoch"] == claimed["dispatcher_epoch"]):
+                lane = conn.execute("SELECT * FROM operator_plane_lane WHERE singleton=1").fetchone()
+                if (lane is not None and lane["owner_id"] == self.owner_id
+                        and float(lane["owner_lease_until"] or 0.0) > _now()):
+                    # Stop may have won terminal CAS before this source return.
+                    # Retain its operational ledger as additive evidence under
+                    # the same attempt, without rewriting the interrupt outcome.
+                    evidence = self._store_evidence(conn, command_id=command_id,
+                        evidence_kind="xy_sequence_source_return", payload=payload["xy_sequence"])
+                    self._insert_transition(conn, event_kind="command_source_return",
+                        command_id=command_id, state=str(row["status"]),
+                        payload={"response_evidence": evidence})
             if str(row["status"]) in COMMAND_TERMINAL:
                 return self._command_response(row)
             if claimed is not None:
@@ -6115,9 +6137,9 @@ class OperatorCommandStore(CommandReceiptReader):
     def _axes_for_action(action_id: str) -> set[str]:
         if action_id in {
             "oem.deck.move_to_location", "oem.deck.move_to_well", "oem.deck._mov_execution", "oem.deck._finite_operation",
-            "oem.z.scriptmove_to",
+            "oem.z.scriptmove_to", "oem.xy.move_sequence",
         }:
-            # scriptmove_to is an XYZ source plan despite its historical Z name.
+            # Fast can raise Z once; scriptmove_to is XYZ despite its Z name.
             return {"x", "y", "z"}
         if action_id in {"oem.xy.move_absolute", "oem.xy.move_sequence", "oem.xy.retarget", "oem.xy.home"}:
             return {"x", "y"}
@@ -7070,7 +7092,11 @@ class OperatorCommandPlane:
             return
         target = self._action_target(action_id)
         token = _DISPATCH_CONTEXT.set({"operator_command_id": command_id, "idempotency_key": f"dispatch:{claimed['dispatch_attempt_id']}", "expected_ownership_generation": claimed["ownership_generation"], "action_id": action_id,
-            "caller_class": "manual_operator"})
+            "caller_class": "manual_operator",
+            **({"interrupt_check": lambda: (
+                self.store.action_fenced(action_id)
+                or self.store.get_command_summary(command_id)["status"] != "dispatched"
+            )} if action_id == "oem.xy.move_sequence" else {})})
         try:
             status_code, response = asyncio.run(_dispatch_asgi(self.app, str(target["method"]), str(target["path"]), {**dict(target.get("fixed_inputs") or {}), **effective}, target["locations"]))
         except Exception as exc:
@@ -7123,6 +7149,14 @@ class OperatorCommandPlane:
         )
         event_sequence = _state_value(response, "controller_event_sequence", "event_sequence", "event_cursor_sequence")
         payload = {"receipt_id": f"terminal:{command_id}", "http_status": int(status_code), "response": _bounded_json(response, 131072), "event_128": event128, "position_readback": position_readback, "observed_position_steps": observed_position_steps, "effective_target_steps": effective_target_steps, "home_completion_proven": home_proof, "dispatch_attempt_id": claimed["dispatch_attempt_id"], "controller_event_sequence": event_sequence if type(event_sequence) is int and event_sequence >= 0 else None}
+        if action_id == "oem.xy.move_sequence" and isinstance(response, Mapping):
+            # This durable root dispatches the existing finite provider body once.
+            # Keep its child ledger outside diagnostic response bounding, exactly
+            # as the direct receipt owner did; source return is not arrival proof.
+            payload["xy_sequence"] = {key: response[key] for key in (
+                "ok", "failure", "interrupted", "next_target_index", "failed_target_index",
+                "completed_targets", "children", "z_raise", "location_publication",
+            ) if key in response}
         source_completed_noop = bool(
             isinstance(response, Mapping)
             and response.get("state") == "completed"

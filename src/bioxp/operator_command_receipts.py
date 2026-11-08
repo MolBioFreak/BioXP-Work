@@ -265,6 +265,18 @@ class CommandReceiptReader:
             "completion_class": terminal.get("completion_class") if isinstance(terminal, Mapping) else None,
             "transition_sequence": transition_sequence,
         }
+        if isinstance(terminal, Mapping) and isinstance(terminal.get("xy_sequence"), Mapping):
+            response["xy_sequence"] = dict(terminal["xy_sequence"])
+        elif row["action_id"] == "oem.xy.move_sequence" and row["status"] not in {"queued", "dispatched"}:
+            # A Stop owns terminal status even if the source worker returns
+            # later. Read its additive same-root ledger, never replay work.
+            source_return = self.connection.execute(
+                "SELECT payload_json FROM operator_plane_evidence WHERE command_id=? "
+                "AND evidence_kind='xy_sequence_source_return' ORDER BY created_at DESC LIMIT 1",
+                (str(row["command_id"]),),
+            ).fetchone()
+            if source_return is not None:
+                response["xy_sequence"] = _json_load(source_return[0], {})
         if compact:
             association = self.connection.execute(
                 "SELECT json_extract(payload_json,'$.method_id'),"

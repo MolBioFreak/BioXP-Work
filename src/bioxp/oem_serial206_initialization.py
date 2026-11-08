@@ -4786,6 +4786,18 @@ class Serial206OemInitializationProvider:
         with self._lock:
             yield
 
+    def deck_intent_admission_projection(self) -> dict[str, Any]:
+        # HTTP admission records intent, not physical readiness. These existing
+        # generation owners have their own synchronization; taking the motion
+        # mutex here would wait for a retained Fast root before it can enqueue.
+        # The finite executor/provider still revalidates under its original lock.
+        stamps = self._deck_owner_authority_stamps_locked()
+        return {
+            "bound": True, **self.capability_status(),
+            "x_authority": {"current_board_lifecycle_generation": stamps["board_epoch_5"]},
+            "board4_authority": {"active_board_epoch": stamps["board_epoch_4"]},
+        }
+
     def deck_owner_authority_stamps(self) -> dict[str, int]:
         # Passive operator polls must not stall on the provider lock (see
         # projection_scope); they report busy instead of queueing.
@@ -8063,7 +8075,7 @@ class Serial206OemInitializationProvider:
                 evidence["y"] = _json_safe(y_provider.terminalize_absolute(y, timeout_s=20.0))
             return evidence
 
-    def execute_xy_sequence(self, targets: list[dict[str, Any]], values: Mapping[str, Any]) -> dict[str, Any]:
+    def execute_xy_sequence(self, targets: list[dict[str, Any]], values: Mapping[str, Any], *, interrupt_check: Callable[[], bool] | None = None) -> dict[str, Any]:
         """One finite worker-owned handoff, using the existing XY receipt owner.
 
         Each source call settles before the next target is issued. Interrupt
@@ -8082,6 +8094,11 @@ class Serial206OemInitializationProvider:
         generation = int(self.generation_provider())
 
         def interrupted() -> bool:
+            # The durable root's existing Stop/cutoff owner must also fence
+            # handoffs: addressed Y Stop has source-void semantics and need not
+            # mutate this provider's local software-interrupt epoch.
+            if callable(interrupt_check) and interrupt_check():
+                return True
             with self._x_interrupt_state_lock:
                 if self._x_interrupt_active or self._x_interrupt_epoch != x_epoch:
                     return True
