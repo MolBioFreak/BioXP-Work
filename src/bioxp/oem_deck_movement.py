@@ -1269,6 +1269,8 @@ WP8_COMPILED_CHILD_OPERATIONS = frozenset({
 
 FINITE_PLATE_OPERATIONS |= frozenset(OEM_PIPETTE_LEAVES) | {"pipette_shift_camera", "pipette_script_waste", "pipette_unlock"}
 WP8_OPERATION_INTENT_KEYS.update({name: frozenset(keys) for name, (_, keys) in OEM_PIPETTE_LEAVES.items()})
+for _name in ("pipette_lower", "pipette_lift"):
+    WP8_OPERATION_INTENT_KEYS[_name] = WP8_OPERATION_INTENT_KEYS[_name] | {"holder_row"}
 WP8_OPERATION_INTENT_KEYS.update({name: frozenset() for name in ("pipette_shift_camera", "pipette_script_waste", "pipette_unlock")})
 WP8_COMPILED_CHILD_OPERATIONS |= frozenset(leaf for leaf, _ in OEM_PIPETTE_LEAVES.values()) | {"sourceRelativeX", "sourceRelativeY"}
 # ControlLib.inspectCover:3663-3768 branch inputs: the captured deck-inspection
@@ -1314,6 +1316,8 @@ def _compile_finite_plate_operation_unchecked(
     if operation in OEM_PIPETTE_LEAVES:
         leaf, keys = OEM_PIPETTE_LEAVES[operation]
         arguments = {key: inputs[key] for key in keys}
+        if operation in {"pipette_lower", "pipette_lift"} and inputs.get("holder_row") is not None:
+            arguments["holder_row"] = str(inputs["holder_row"])
         if operation == "manual_load_tip" and inputs.get("keep_channels") is not None:
             # Partial pickup: keep these channels, release the rest back into the rack.
             arguments.update(keep_channels=[int(c) for c in inputs["keep_channels"]],

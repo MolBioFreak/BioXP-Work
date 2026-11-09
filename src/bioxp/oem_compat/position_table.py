@@ -104,7 +104,7 @@ class PositionTable:
         self._bulk_reagent_holder = None
         if bulk_reagent_holder is not None:
             from ..oem_calibration_settings import BulkReagentHolder
-            self._bulk_reagent_holder = BulkReagentHolder.model_validate(bulk_reagent_holder).model_dump(mode="json")
+            self._bulk_reagent_holder = BulkReagentHolder.model_validate(bulk_reagent_holder).model_dump(mode="json", exclude_none=True)
         self._targets = tuple(targets)
         self.source_sha256 = source_sha256
         self.adjustment_ledger = tuple(dict(row) for row in adjustment_ledger)
@@ -129,6 +129,14 @@ class PositionTable:
     def bulk_reagent_holder(self) -> dict | None:
         # Callers cannot mutate the persisted geometry behind its digest.
         return None if self._bulk_reagent_holder is None else json.loads(json.dumps(self._bulk_reagent_holder))
+
+    def holder_row_z(self, holder_row: str) -> dict:
+        """Saved Z of one Bulk reagent holder row (None where not measured)."""
+        holder = self._bulk_reagent_holder
+        if holder is None or holder_row not in ("micro_row_1", "micro_row_2", "pcr_row_1", "pcr_row_2"):
+            raise KeyError(f"unknown Bulk reagent holder row: {holder_row}")
+        row = holder[holder_row]
+        return {"z_low": row.get("z_low"), "z_high": row.get("z_high")}
 
     @staticmethod
     def _clean(value: Any) -> str | None:

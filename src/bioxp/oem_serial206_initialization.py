@@ -13260,9 +13260,19 @@ class Serial206OemInitializationProvider:
                 provenance={"source_operation": operation, "source_child": identity}, well_ids=list(arguments["well_ids"]))
             return {"ok": True, "delivery_attempted": False, "published": result}
         if operation in {"sourceLiftTo", "sourceLowerTo"}:
-            row = load_bound_oem_position_table().resolve(location_id=LOCATION_ID_TO_NAME[arguments["location"]])
+            holder_row = arguments.get("holder_row")
+            if holder_row is None:
+                row = load_bound_oem_position_table().resolve(location_id=LOCATION_ID_TO_NAME[arguments["location"]])
+                z_low, z_high = row.z_low, row.z_high
+            else:
+                if arguments["location"] != 16:
+                    raise RuntimeError("holder_row_requires_bulk_reagent_holder")
+                from .oem_compat.machine_state import PSEUDO_Z_HOME_HIGH
+                held = load_bound_oem_position_table().holder_row_z(str(holder_row))
+                z_low = held["z_low"]
+                z_high = PSEUDO_Z_HOME_HIGH if held["z_high"] is None else held["z_high"]
             height = arguments.get("height")
-            target = row.z_low if operation == "sourceLowerTo" else row.z_high if height is None else row.z_low - height
+            target = z_low if operation == "sourceLowerTo" else z_high if height is None else (None if z_low is None else z_low - height)
             if type(target) is not int:
                 raise RuntimeError("source_pipette_z_calibration_missing")
             from .pipette.tip_length import tip_z_offset
@@ -13272,7 +13282,7 @@ class Serial206OemInitializationProvider:
             tip_offset = tip_z_offset(loaded_type if loaded and isinstance(loaded_type, int) else None)
             target += int(tip_offset["offset_steps"])
             depth = {"offset_steps": 0}
-            if operation == "sourceLowerTo":
+            if operation == "sourceLowerTo" and holder_row is None:
                 from .pipette.depth_offsets import resolve
                 depth = resolve(tip_type=loaded_type if loaded else None, location=LOCATION_ID_TO_NAME[arguments["location"]])
                 target += int(depth["offset_steps"])

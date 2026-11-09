@@ -87,6 +87,7 @@ class Multi(_Input):
 class LiquidDetection(_Input):
     """Find the source surface, then aspirate below it (replaces the calibrated source lower)."""
     location_id: int = Field(ge=0)
+    holder_row: Literal["micro_row_1", "micro_row_2", "pcr_row_1", "pcr_row_2"] | None = None   # Bulk reagent holder row Z (location 16)
     expected: bool = True                      # listed as holding liquid: a miss holds the run
     # Channels whose source well holds liquid per the plan; overrides `expected` when set.
     expected_channels: list[Annotated[int, Field(ge=0, le=3)]] | None = None
@@ -244,6 +245,7 @@ def compile_liquid_recipe(request: dict[str, Any]) -> dict[str, Any]:
                 **({"volume_check": d.volume_check} if d.volume_check else {}),
                 "location_id": d.location_id, "detection_id": d.detection_id, "start_mode": d.start_mode, "sensing": d.sensing,
                 **({"plate_type": d.plate_type} if d.plate_type else {}),
+                **({"holder_row": d.holder_row} if d.holder_row else {}),
                 "floor_clearance_steps": d.floor_clearance_steps, "search_speed_native": d.search_speed_native,
                 **({"expected_channels": [c for c in r.channels if c in d.expected_channels]}
                    if d.expected_channels is not None else {"expected_channels": r.channels} if d.expected else {})})

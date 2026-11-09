@@ -163,3 +163,72 @@ def test_all_named_destinations_through_existing_executor(named, tmp_path, monke
         z_moves = [v for b, c, t, m, v in frames if c == 4 and (b, m) == (zb, zm)]
         assert all(v == 500 for v in z_moves), z_moves
     store.close()
+
+
+HOLDER_Z = {**HOLDER, 'micro_row_1': dict(x=85555, y=63278, z_low=120000)}
+
+
+def test_holder_row_z_persists_and_xy_only_digest_unchanged(tmp_path, monkeypatch):
+    store, service, baseline = save_owner(tmp_path, monkeypatch)
+    table = load_bound_oem_position_table(baseline)
+    service.save(CalibrationSettingsPatch.model_validate({'bulk_reagent_holder': HOLDER}))
+    # XY-only holders publish exactly as before (no null Z keys).
+    assert service.read()['active_bulk_reagent_holder'] == HOLDER
+    service.save(CalibrationSettingsPatch.model_validate({'bulk_reagent_holder': HOLDER_Z}))
+    assert service.read()['active_bulk_reagent_holder']['micro_row_1'] == dict(x=85555, y=63278, z_low=120000)
+    store.close()
+    cold = load_bound_oem_position_table(load_saved_calibration(baseline, OEMRuntimeStore(tmp_path)))
+    assert cold.holder_row_z('micro_row_1') == {'z_low': 120000, 'z_high': None}
+    assert cold.holder_row_z('pcr_row_1') == {'z_low': None, 'z_high': None}
+    # Legacy trough heights are untouched.
+    assert cold.resolve(location_id='LOC_TROUGH').z_low == table.resolve(location_id='LOC_TROUGH').z_low
+
+
+@pytest.mark.parametrize('row', [dict(x=1, y=2, z_high=500), dict(x=1, y=2, z_low=1000, z_high=1000)])
+def test_holder_row_z_high_must_be_above_low(row):
+    with pytest.raises(Exception):
+        CalibrationSettingsPatch.model_validate({'bulk_reagent_holder': {**HOLDER, 'micro_row_1': row}})
+
+
+def test_manual_lower_lift_carry_holder_row_to_finite_leaf():
+    from bioxp.manual_pipetting import compile_manual_pipetting, manual_position_plan
+    doc = compile_manual_pipetting({'protocol_id': 'h', 'steps': [
+        {'operation': 'lower', 'location_id': 16, 'holder_row': 'micro_row_1'},
+        {'operation': 'lift', 'location_id': 16, 'holder_row': 'micro_row_1', 'height_steps': None},
+        {'operation': 'lower', 'location_id': 16}]})
+    params = [a.params for a in doc.stages[0].actions]
+    assert params[2] == {'operation': 'lower', 'location_id': 16}
+    lower = manual_position_plan(params[0])['children'][0]
+    assert lower['operation'] == 'sourceLowerTo' and lower['arguments'] == {'location': 16, 'holder_row': 'micro_row_1'}
+    lift = manual_position_plan(params[1])['children'][0]
+    assert lift['arguments'] == {'location': 16, 'height': None, 'holder_row': 'micro_row_1'}
+    with pytest.raises(Exception):
+        compile_manual_pipetting({'protocol_id': 'h', 'steps': [{'operation': 'lower', 'location_id': 3, 'holder_row': 'micro_row_1'}]})
+
+
+def test_lower_lift_leaf_uses_holder_row_z(tmp_path, monkeypatch):
+    import bioxp.oem_serial206_initialization as mod
+    from types import SimpleNamespace
+    store, service, baseline = save_owner(tmp_path, monkeypatch)
+    service.save(CalibrationSettingsPatch.model_validate({'bulk_reagent_holder': HOLDER_Z}))
+    table = load_bound_oem_position_table(service.active_snapshot)
+    monkeypatch.setattr(mod, 'load_bound_oem_position_table', lambda *a: table)
+    provider = object.__new__(mod.Serial206OemInitializationProvider)
+    moves = []
+    provider.moveZ = lambda target: moves.append(target) or {'ok': True}
+    provider.primitives = SimpleNamespace(pipette_transport=SimpleNamespace(_tip_type=50, _tip_loaded=True))
+    leaf = lambda op, **a: provider.wp8_pipette_source_leaf(op, a, command_id='c', child_order=0, plan_digest='d')
+    leaf('sourceLowerTo', location=16, holder_row='micro_row_1')
+    leaf('sourceLiftTo', location=16, holder_row='micro_row_1', height=None)
+    leaf('sourceLiftTo', location=16, holder_row='micro_row_1', height=20000)
+    assert moves == [120000, 500, 100000]
+    with pytest.raises(RuntimeError):
+        leaf('sourceLowerTo', location=16, holder_row='pcr_row_1')
+    store.close()
+
+
+def test_liquid_detection_passes_holder_row():
+    from bioxp.pipette.cavro_liquid import LiquidDetection
+    from bioxp.pipette.cavro_application import LiquidSearch
+    assert LiquidDetection.model_validate({'location_id': 16, 'holder_row': 'micro_row_1'}).holder_row == 'micro_row_1'
+    assert LiquidSearch.model_fields['holder_row'].default is None

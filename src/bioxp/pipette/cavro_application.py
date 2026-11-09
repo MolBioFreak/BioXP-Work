@@ -132,6 +132,8 @@ class LiquidSearch(_Selected):
     # Optional plate type, so a saved plate-type depth offset can apply (see depth_offsets).
     plate_type: str | None = Field(default=None, max_length=80)
     search_speed_native: int = Field(default=300, gt=0)      # OEM btnDetectFluid speed
+    # Bulk reagent holder row (location 16): search from its saved high (or travel height) to its saved low.
+    holder_row: Literal["micro_row_1", "micro_row_2", "pcr_row_1", "pcr_row_2"] | None = None
     z_motor_current: int = 25                                 # OEM Z_MOTOR_MAX_CURRENT_DOWN
     # ADP LLD mode (M 30053815-C U70/U71/U72). pLLD is onboard; cLLD/hybrid need an external cLLD board.
     sensing: Literal["pressure", "capacitive", "hybrid"] = "pressure"
@@ -694,13 +696,22 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
         from ..oem_compat.pathing import LOCATION_ID_TO_NAME
         from ..oem_compat.position_table import load_bound_oem_position_table
         from .liquid_detection import contact_from_timestamps, height_above_floor_mm, search_window
-        row = load_bound_oem_position_table().resolve(location_id=LOCATION_ID_TO_NAME[op["location_id"]])
+        if op.get("holder_row") is not None:
+            from types import SimpleNamespace
+            from ..oem_compat.machine_state import PSEUDO_Z_HOME_HIGH
+            if op["location_id"] != 16:
+                raise PipetteCommandError("holder_row requires location 16 (Bulk reagent holder)")
+            held = load_bound_oem_position_table().holder_row_z(op["holder_row"])
+            row = SimpleNamespace(z_low=held["z_low"], z_high=PSEUDO_Z_HOME_HIGH if held["z_high"] is None else held["z_high"])
+        else:
+            row = load_bound_oem_position_table().resolve(location_id=LOCATION_ID_TO_NAME[op["location_id"]])
         if type(row.z_low) is not int or type(row.z_high) is not int:
             raise PipetteCommandError("liquid search needs calibrated high and low heights for this station")
         apply_lld_profile(op)
         offset = int(tip_offset()["offset_steps"])
         reader = getattr(provider.primitives, "_depth_offset", None)
-        depth = reader(LOCATION_ID_TO_NAME[op["location_id"]], op.get("plate_type")) if callable(reader) else {"offset_steps": 0}
+        depth = (reader(LOCATION_ID_TO_NAME[op["location_id"]], op.get("plate_type"))
+                 if callable(reader) and op.get("holder_row") is None else {"offset_steps": 0})
         result.setdefault("depth_offsets", []).append(depth)
         # The search may reach the saved extra depth; its start height stays the calibrated high.
         start, floor = search_window(row.z_high, row.z_low, offset, op["floor_clearance_steps"] - int(depth["offset_steps"]))

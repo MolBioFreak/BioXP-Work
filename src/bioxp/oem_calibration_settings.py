@@ -62,10 +62,23 @@ class PositionCalibrationPatch(BaseModel):
 
 
 class HolderXY(BaseModel):
-    """Operator-aligned XY only; no pipetting depth is implied."""
+    """Operator-aligned row XY plus optional operator-measured row Z.
+
+    z_low: tube/well bottom with the reference (T50) tip, measured by touching it.
+    z_high: optional search/lift start; omitted means ordinary travel height.
+    No height is inherited from the legacy LOC_TROUGH row.
+    """
     model_config = ConfigDict(extra="forbid", frozen=True)
     x: OemInt32
     y: OemInt32
+    z_low: OemInt32 | None = None
+    z_high: OemInt32 | None = None
+
+    @model_validator(mode="after")
+    def high_above_low(self):
+        if self.z_high is not None and (self.z_low is None or self.z_high >= self.z_low):
+            raise ValueError("z_high must be above (less than) z_low")
+        return self
 
 
 class BulkReagentHolder(BaseModel):

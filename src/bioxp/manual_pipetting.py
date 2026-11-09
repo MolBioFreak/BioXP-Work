@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Callable, Literal, Mapping, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .oem_compat.pathing import LOCATION_ID_TO_NAME
 from .oem_compat.position_table import well_id_from_label
@@ -90,11 +90,22 @@ class ManualMoveSequence(_Request):
         return [dict(item) if isinstance(item, Mapping) else item for item in value] if isinstance(value, (list, tuple)) else value
 
 
-class ManualLower(_Location):
+class _HolderLocation(_Location):
+    # Bulk reagent holder row whose saved Z is used (location must be LOC_TROUGH, 16).
+    holder_row: Literal["micro_row_1", "micro_row_2", "pcr_row_1", "pcr_row_2"] | None = None
+
+    @model_validator(mode="after")
+    def holder_location(self):
+        if self.holder_row is not None and self.location_id != 16:
+            raise ValueError("holder_row requires location_id 16 (Bulk reagent holder)")
+        return self
+
+
+class ManualLower(_HolderLocation):
     operation: Literal["lower"]
 
 
-class ManualLift(_Location):
+class ManualLift(_HolderLocation):
     operation: Literal["lift"]
     # Required explicit null selects zHigh; integer means zLow - height_steps.
     height_steps: int | None
@@ -273,7 +284,10 @@ def compile_manual_pipetting(request: ManualPipettingRequest | Mapping[str, Any]
 
     for index, step in enumerate(req.steps):
         if isinstance(step, (ManualMove, ManualMoveSequence, ManualLower, ManualLift)):
-            add(ProtocolActionKind.PIPETTE_POSITION, step.model_dump(), index)
+            dumped = step.model_dump()
+            if "holder_row" in dumped and dumped["holder_row"] is None:
+                del dumped["holder_row"]
+            add(ProtocolActionKind.PIPETTE_POSITION, dumped, index)
         elif isinstance(step, (ManualLoadTip, ManualMeasureFluidHeight, ManualFluidOffset,
                                DiagnosticDetectFluid, ManualCalwithFluid, ManualDiagnosticPipette,
                                SourceLoadTips, SourceMix, SourceAir, SourcePurge, ManualCavroApplication, ManualCavroRecipe, ProfilePickup)):
@@ -298,6 +312,8 @@ def manual_position_plan(params: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("unknown manual positioning operation") from None
     step = model.model_validate(dict(params))
     inputs: dict[str, Any] = {"location": step.location_id}
+    if getattr(step, "holder_row", None) is not None:
+        inputs["holder_row"] = step.holder_row
     if isinstance(step, ManualMove):
         operation = "manual_pipette_move"
         inputs.update(well=well_id_from_label(step.well), position_flag=step.position_flag)
