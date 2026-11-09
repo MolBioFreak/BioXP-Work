@@ -18,6 +18,10 @@ class DeckDestination:
     location_id: int
     branch: str
     aliases: tuple[str, ...] = ()
+    xy: tuple[int, int] | None = None
+    holder_row: str | None = None
+    well_number: int | None = None
+    channel_wells: tuple[int, ...] = ()
 
 
 _ROWS = (
@@ -33,7 +37,7 @@ _ROWS = (
     ("LOC_STRIP3", "STRIP 3", "LOC_STRIP3", "ordinary"), ("LOC_STRIP4", "STRIP 4", "LOC_STRIP4", "ordinary"),
     ("LOC_OC_COVER_STORAGE", "LOC_OC_COVER_S", "LOC_OC_COVER_STORAGE", "ordinary"),
     ("LOC_RC_COVER_STORAGE", "LOC_RC_COVER_S", "LOC_RC_COVER_STORAGE", "ordinary"),
-    ("LOC_TROUGH", "LOC_TROUGH1", "LOC_TROUGH", "ordinary"), ("LOC_BSCS", "LOC_BSCS", "LOC_BSCS", "ordinary"),
+    ("LOC_TROUGH", "Bulk reagent holder", "LOC_TROUGH", "ordinary"), ("LOC_BSCS", "LOC_BSCS", "LOC_BSCS", "ordinary"),
     ("WASTE_BIN", "Waste Bin", "WASTE_BIN", "ordinary"), ("LOC_PARK", "Park", "LOC_PARK", "park"),
 )
 _ALIASES = {
@@ -48,7 +52,11 @@ def configured_location_names() -> tuple[str, ...]:
 
 
 def public_target_keys() -> frozenset[str]:
-    return frozenset(row[0] for row in _ROWS)
+    return frozenset(row[0] for row in _ROWS) | frozenset(
+        f"LOC_TROUGH_{kind}_ROW_{row}{suffix}"
+        for kind in ("MICRO", "PCR") for row in (1, 2)
+        for suffix in ([""] if kind == "MICRO" else [""] + [f"_WELL_{well}" for well in range(1, 9)])
+    )
 
 
 @lru_cache(maxsize=16)
@@ -64,7 +72,11 @@ def _catalog_entries(rows, aliases, locations):
 def _catalog_rows(entries, position_table_sha256):
     return [{"target": row.target, "panel_label": row.panel_label, "location_name": row.location_name,
              "location_id": row.location_id, "branch": row.branch, "aliases": list(row.aliases),
-             "position_table_sha256": position_table_sha256} for row in entries]
+             "position_table_sha256": position_table_sha256,
+             **({"xy": {"x": row.xy[0], "y": row.xy[1]}, "holder_row": row.holder_row,
+                 "well_number": row.well_number, "channel_wells": list(row.channel_wells),
+                 "calibration_axes": ["x", "y"], "station_target": "LOC_TROUGH"}
+                if row.xy is not None else {})} for row in entries]
 
 
 @lru_cache(maxsize=16)
@@ -90,6 +102,25 @@ class DeckCatalog:
         if missing:
             raise ValueError(f"catalog destination absent from Serial-206 PositionTable: {', '.join(missing)}")
         entries = _catalog_entries(_ROWS, tuple(_ALIASES.items()), tuple(LOCATION_NAME_TO_ID.items()))
+        holder = table.bulk_reagent_holder
+        if holder is not None:
+            additions = []
+            for kind in ("micro", "pcr"):
+                for number in (1, 2):
+                    row_id = f"{kind}_row_{number}"
+                    anchor = holder[row_id]
+                    key = f"LOC_TROUGH_{row_id.upper()}"
+                    label = f"Bulk reagent holder / {kind.upper()} row {number}"
+                    coverage = (1, 2, 3, 4) if kind == "micro" else (1, 3, 5, 7)
+                    additions.append(DeckDestination(key, label, "LOC_TROUGH", 16, "ordinary",
+                        xy=(anchor["x"], anchor["y"]), holder_row=row_id, channel_wells=coverage))
+                    if kind == "pcr":
+                        for well in range(1, 9):
+                            additions.append(DeckDestination(f"{key}_WELL_{well}", f"{label} / well {well}",
+                                "LOC_TROUGH", 16, "ordinary", xy=(anchor["x"], anchor["y"] + (well - 1) * holder["pcr_y_pitch"]),
+                                holder_row=row_id, well_number=well,
+                                channel_wells=tuple(range(well, 9, 2)) if well in (1, 2) else ()))
+            entries += tuple(additions)
         return cls(entries, table.digest)
 
     @staticmethod

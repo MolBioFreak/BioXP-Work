@@ -99,8 +99,12 @@ class PositionTarget:
 class PositionTable:
     """OEM PositionTable resolver/planner using ClassControlInterface formulas."""
 
-    def __init__(self, targets: Iterable[PositionTarget], *, source: str = "inline", source_sha256: str | None = None, adjustment_ledger: Iterable[Mapping[str, Any]] = ()) -> None:
+    def __init__(self, targets: Iterable[PositionTarget], *, source: str = "inline", source_sha256: str | None = None, adjustment_ledger: Iterable[Mapping[str, Any]] = (), bulk_reagent_holder: Mapping[str, Any] | None = None) -> None:
         self.source = source
+        self._bulk_reagent_holder = None
+        if bulk_reagent_holder is not None:
+            from ..oem_calibration_settings import BulkReagentHolder
+            self._bulk_reagent_holder = BulkReagentHolder.model_validate(bulk_reagent_holder).model_dump(mode="json")
         self._targets = tuple(targets)
         self.source_sha256 = source_sha256
         self.adjustment_ledger = tuple(dict(row) for row in adjustment_ledger)
@@ -117,7 +121,14 @@ class PositionTable:
             "rows": [target.to_payload() for target in self._targets],
             "adjustment_ledger": list(self.adjustment_ledger),
         }
+        if self._bulk_reagent_holder is not None:
+            canonical["bulk_reagent_holder"] = self._bulk_reagent_holder
         self.digest = hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+
+    @property
+    def bulk_reagent_holder(self) -> dict | None:
+        # Callers cannot mutate the persisted geometry behind its digest.
+        return None if self._bulk_reagent_holder is None else json.loads(json.dumps(self._bulk_reagent_holder))
 
     @staticmethod
     def _clean(value: Any) -> str | None:
@@ -223,12 +234,17 @@ class PositionTable:
         if isinstance(root_dir, OemMachineSnapshot):
             config_record = root_dir.records.get("GenBotApp/config.xml")
             source_sha256 = getattr(config_record, "sha256", None)
-            return cls.from_rows(
+            table = cls.from_rows(
                 root_dir.position_table,
                 source=("immutable_oem_machine_snapshot.PositionTable" if root_dir.calibration_revision is None
                         else "owner_applied_user_calibration.PositionTable"),
                 source_sha256=str(source_sha256) if source_sha256 else None,
             )
+            holder = None if root_dir.calibration_revision is None else root_dir.calibration_revision.get("bulk_reagent_holder")
+            if holder is None:
+                return table
+            return cls(table._targets, source=table.source, source_sha256=table.source_sha256,
+                       adjustment_ledger=table.adjustment_ledger, bulk_reagent_holder=holder)
         if root_dir is None:
             snapshot = get_active_oem_machine_snapshot()
             return cls.from_bound_machine_config(snapshot)

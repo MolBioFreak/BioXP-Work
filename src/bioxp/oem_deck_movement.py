@@ -450,7 +450,8 @@ def compile_named_location(intent: NamedLocationIntent, catalog: DeckCatalog, ta
             DeckPlanStep(4, "moveZCamera", "ClassControlInterface.btnLOC1_Click:1932-1945", ("z",), {"location_id": destination.location_id}),
         ))
     else:
-        steps.append(DeckPlanStep(3, "moveTo", "ClassControlInterface.btnLOC1_Click:ordinary", ("x", "y", "z"), {"location_id": destination.location_id, "camera_offset": bool(intent.camera_offset)}))
+        steps.append(DeckPlanStep(3, "moveTo", "ClassControlInterface.btnLOC1_Click:ordinary", ("x", "y", "z"), {"location_id": destination.location_id, "camera_offset": bool(intent.camera_offset),
+            **({"named_target": destination.target} if destination.xy is not None else {})}))
     pinned_binary_resolution = (
         "BARCODE_PARK_INVALID_IL_RESOLVED_FROM_PINNED_BINARY:"
         "BioXPControlLib.dll:sha256=163db8f7835cecbc87da4d14734a8224d79ea1e2ccc77bbb299998fa31bf14ed:"
@@ -475,7 +476,7 @@ def compile_named_location(intent: NamedLocationIntent, catalog: DeckCatalog, ta
         steps=tuple(steps), semantic_transition={
             "current_location_id": destination.location_id,
             "current_location": destination.location_name,
-            "current_well_id": 0,
+            "current_well_id": 0 if destination.well_number is None else destination.well_number - 1,
             "ownership_generation": authority.ownership_generation,
             "board_epoch_4": authority.board_epoch_4,
             "board_epoch_5": authority.board_epoch_5,

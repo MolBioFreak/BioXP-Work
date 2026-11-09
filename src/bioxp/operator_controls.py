@@ -3760,6 +3760,7 @@ def install_operator_control_plane(
                 {
                     "target": row["target"],
                     "label": row["panel_label"],
+                    **{key: row[key] for key in ("xy", "holder_row", "well_number", "channel_wells", "calibration_axes", "station_target") if key in row},
                     "aliases": list(row["aliases"]),
                     "location_id": int(row["location_id"]),
                     "branch_kind": row["branch"],

@@ -61,12 +61,40 @@ class PositionCalibrationPatch(BaseModel):
         return self
 
 
+class HolderXY(BaseModel):
+    """Operator-aligned XY only; no pipetting depth is implied."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    x: OemInt32
+    y: OemInt32
+
+
+class BulkReagentHolder(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    micro_row_1: HolderXY
+    micro_row_2: HolderXY
+    pcr_row_1: HolderXY
+    pcr_row_2: HolderXY
+    pcr_y_pitch: Annotated[int, Field(strict=True, gt=0, le=2147483647)]
+
+    @model_validator(mode="after")
+    def derived_coordinates(self):
+        for row in (self.pcr_row_1, self.pcr_row_2):
+            if not -2147483648 <= row.y + 7 * self.pcr_y_pitch <= 2147483647:
+                raise ValueError("PCR well coordinates exceed signed Int32")
+        return self
+
+
 class CalibrationSettingsPatch(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-    positions: tuple[PositionCalibrationPatch, ...] = Field(min_length=1)
+    positions: tuple[PositionCalibrationPatch, ...] = ()
+    bulk_reagent_holder: BulkReagentHolder | None = None
 
     @model_validator(mode="after")
     def unique_names(self):
+        if not self.positions and self.bulk_reagent_holder is None:
+            raise ValueError("supply positions or bulk_reagent_holder")
+        if "bulk_reagent_holder" in self.model_fields_set and self.bulk_reagent_holder is None:
+            raise ValueError("omit unchanged holder; null is not an XY calibration")
         if len({row.name for row in self.positions}) != len(self.positions):
             raise ValueError("duplicate PositionTable names")
         return self
@@ -131,6 +159,7 @@ class CalibrationRevision(BaseModel):
     saved_at: str
     positions: tuple[PositionCalibrationPatch, ...]
     liquid_calibration: dict[str, str | bool] | None = None
+    bulk_reagent_holder: BulkReagentHolder | None = None
 
 
 def _revision(snapshot: OemMachineSnapshot, payload: dict) -> CalibrationRevision:
@@ -229,6 +258,8 @@ class CalibrationSettingsService:
             "saved_motion_positions": saved_table.rows(),
             "active_loader_adjustments": list(active_table.adjustment_ledger),
             "saved_loader_adjustments": list(saved_table.adjustment_ledger),
+            "active_bulk_reagent_holder": active_table.bulk_reagent_holder,
+            "saved_bulk_reagent_holder": saved_table.bulk_reagent_holder,
             "physical_calibration_verified": False,
             "motion_commanded": False,
         }
@@ -265,6 +296,8 @@ class CalibrationSettingsService:
                 saved_at=timestamp,
                 positions=tuple(PositionCalibrationPatch.model_validate(merged[name]) for name in sorted(merged)),
                 liquid_calibration=liquid,
+                bulk_reagent_holder=(patch.bulk_reagent_holder if patch.bulk_reagent_holder is not None
+                                     else (None if prior is None else prior.bulk_reagent_holder)),
             ).model_dump(mode="json", exclude_unset=True)
             # Fill the schema default explicitly in the persisted contract.
             revision["schema_version"] = "bioxp.machine_calibration.v1"

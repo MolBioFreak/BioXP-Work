@@ -11613,6 +11613,7 @@ class Serial206OemInitializationProvider:
         location_id: int,
         camera_offset: bool = False,
         barcode: bool = False,
+        named_target: str | None = None,
         authority_snapshot: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Execute the finite diagnostic offset overload through OEM primitives."""
@@ -11626,7 +11627,7 @@ class Serial206OemInitializationProvider:
         # distinct callers of the offset overload, not synonyms for TC/RC.
         if type(barcode) is not bool or (barcode and (location_id not in {2, 3} or not camera_offset)):
             raise ValueError("barcode requires TC/RC with camera offsets")
-        table, target, offset_x, offset_y, coordinates = self._named_move_xy(location_id, camera_offset, barcode)
+        table, target, offset_x, offset_y, coordinates = self._named_move_xy(location_id, camera_offset, barcode, named_target)
         semantics = self._deck_execution_semantics(authority_snapshot)
         pseudo_home = int(semantics["pseudo_z_home"])
         gripper_confirmed = self._deck_gripper_confirmed()
@@ -11679,7 +11680,7 @@ class Serial206OemInitializationProvider:
         }
 
     @staticmethod
-    def _named_move_xy(location_id: int, camera_offset: bool, barcode: bool):
+    def _named_move_xy(location_id: int, camera_offset: bool, barcode: bool, named_target: str | None = None):
         """btnLOC1_Click offset-overload XY, shared by moveTo and sequences."""
         from .oem_compat.pathing import LOCATION_ID_TO_NAME
         table = load_bound_oem_position_table()
@@ -11693,6 +11694,13 @@ class Serial206OemInitializationProvider:
         else:
             offset_x = int(camera.base_coordinates["x"]) if camera is not None else 0
             offset_y = int(camera.base_coordinates["y"]) if camera is not None else 0
+        if named_target is not None:
+            from .oem_deck_catalog import DeckCatalog
+            destination = DeckCatalog.from_position_table(table).resolve(named_target)
+            if destination.xy is None or destination.location_id != location_id or barcode:
+                raise ValueError("named XY target does not match station")
+            offset_x += destination.xy[0] - int(target.base_coordinates["x"])
+            offset_y += destination.xy[1] - int(target.base_coordinates["y"])
         coordinates = target.oem_offset_move_coordinates(
             offset_x=offset_x, offset_y=offset_y, x_high_limit=90263, y_high_limit=102956,
         )
@@ -11712,9 +11720,11 @@ class Serial206OemInitializationProvider:
             from .oem_deck_catalog import DeckCatalog
             destination = DeckCatalog.from_position_table(load_bound_oem_position_table()).resolve(str(target["target"]))
             barcode = destination.branch == "barcode"
-            *_, coordinates = self._named_move_xy(destination.location_id, bool(target["camera_offset"]) or barcode, barcode)
+            *_, coordinates = self._named_move_xy(destination.location_id, bool(target["camera_offset"]) or barcode, barcode,
+                destination.target if destination.xy is not None else None)
             return {"x": int(coordinates["x"]), "y": int(coordinates["y"]),
-                    "publish": {"current_location": destination.location_name, "current_well": 0}}
+                    "publish": {"current_location": destination.location_name,
+                                "current_well": 0 if destination.well_number is None else destination.well_number - 1}}
         location = int(target["location_id"])
         well = well_id_from_label(target["well"])
         # Same scriptmoveTo target formula (incl. TipLocation row compensation)
