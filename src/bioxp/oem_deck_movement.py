@@ -1200,6 +1200,7 @@ OEM_PIPETTE_LEAVES = {
     "pipette_move_z": ("sourceMoveZ", ("value",)),
     "pipette_move_x": ("sourceMoveX", ("value",)),
     "pipette_move_xy": ("sourceMoveXY", ("x", "y")),
+    "pipette_named_move": ("sourceNamedMoveTo", ("target", "camera_offset")),
     "pipette_position": ("sourcePosition", ()),
     "pipette_home": ("sourceHomeZ", ("rehome",)),
     "pipette_current": ("sourceZCurrent", ("value",)),
@@ -1315,6 +1316,8 @@ def _compile_finite_plate_operation_unchecked(
         return _wp8_plan(operation, children, source_caller="ControlLib.DefaultParameters.ForceToHighHome")
     if operation in OEM_PIPETTE_LEAVES:
         leaf, keys = OEM_PIPETTE_LEAVES[operation]
+        if operation == "pipette_named_move":
+            _wp8_child(children, "sourceForceToHighHome", state_mutation={"pseudo_z_home": 500})
         arguments = {key: inputs[key] for key in keys}
         if operation in {"pipette_lower", "pipette_lift"} and inputs.get("holder_row") is not None:
             arguments["holder_row"] = str(inputs["holder_row"])

@@ -4519,6 +4519,7 @@ class Serial206OemInitializationProvider:
         "sourceLiftTo": "wp8_pipette_source_leaf",
         "sourceLowerTo": "wp8_pipette_source_leaf",
         "sourceMoveXY": "wp8_pipette_source_leaf",
+        "sourceNamedMoveTo": "wp8_pipette_source_leaf",
         "sourcePosition": "wp8_pipette_source_leaf",
         "sourceHomeZ": "wp8_pipette_source_leaf",
         "sourceZCurrent": "wp8_pipette_source_leaf",
@@ -13288,6 +13289,17 @@ class Serial206OemInitializationProvider:
                 target += int(depth["offset_steps"])
             return {**self.moveZ(target), "source_return": target if operation == "sourceLowerTo" else 0,
                     "tip_z_offset": tip_offset, "depth_offset": depth}
+        if operation == "sourceNamedMoveTo":
+            from .oem_deck_catalog import DeckCatalog
+            destination = DeckCatalog.from_position_table(load_bound_oem_position_table()).resolve(arguments["target"])
+            if destination.holder_row is None:
+                raise ValueError("nested named move requires a holder target")
+            result = self.moveTo(location_id=destination.location_id, named_target=destination.target,
+                                 camera_offset=arguments["camera_offset"])
+            if result.get("ok") is True:
+                publish("updateLocation", {"current_location": destination.location_name,
+                    "current_well": 0 if destination.well_number is None else destination.well_number - 1})
+            return result
         if operation == "sourceMoveXY":
             # This finite source leaf is invoked by the OEM protocol motion
             # worker, not the manual STA button. Seal its MTA wait schedule.

@@ -69,6 +69,18 @@ class _NamedTarget(_Request):
         return value
 
 
+class _NamedPosition(_NamedTarget):
+    """Nested holder XY positioning; legacy ManualMove keeps its required fields."""
+    operation: Literal["move"]
+
+    @field_validator("target")
+    @classmethod
+    def holder_target(cls, value: str) -> str:
+        if not value.startswith(("LOC_TROUGH_MICRO_ROW_", "LOC_TROUGH_PCR_ROW_")):
+            raise ValueError("nested named move requires a holder target")
+        return value
+
+
 class _WellTarget(_Location):
     well: str | int
 
@@ -305,6 +317,10 @@ def compile_manual_pipetting(request: ManualPipettingRequest | Mapping[str, Any]
 
 def manual_position_plan(params: Mapping[str, Any]) -> dict[str, Any]:
     """Validate untrusted native params again, then compile existing finite leaves."""
+    if params.get("operation") == "move" and "target" in params:
+        step = _NamedPosition.model_validate(dict(params))
+        return compile_finite_plate_operation("pipette_named_move", source_leaf_available=True,
+                                              target=step.target, camera_offset=step.camera_offset)
     models = {"move": ManualMove, "lower": ManualLower, "lift": ManualLift}
     try:
         model = models[params["operation"]]
