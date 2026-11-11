@@ -10553,7 +10553,9 @@ def _protocol_live_source_barcode_handler(action, state):
 
 def _protocol_live_park_handler(action, state):
     from .oem_deck_movement import compile_finite_plate_operation
-    plan = compile_finite_plate_operation("park_gantry", source_leaf_available=True, **action.params)
+    # OEM script park opts into HomeXY; shared/manual Park retains false.
+    params = {"rehome": True, **action.params}
+    plan = compile_finite_plate_operation("park_gantry", source_leaf_available=True, **params)
     _require_motion_route_ready()
     store = _protocol_command_store()
     with store.workflow_context(state.job_id, source_occurrence_id=action.action_id):
