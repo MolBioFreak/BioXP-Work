@@ -72,6 +72,48 @@ def _failed_child_delivery(result: Mapping[str, Any]) -> bool | None:
     return None
 
 
+def _source_stage_completed(result: Mapping[str, Any]) -> bool:
+    """Preserve OEM parallel moveXY log-and-continue, not controller proof.
+
+    Waiting motor branches and delivery/controller errors keep their policy.
+    """
+    if _controller_terminal_truth(result):
+        return True
+    primitive = result.get("primitive_result")
+    if not (result.get("ok") is True
+            and result.get("controller_command_acknowledged") is True
+            and isinstance(primitive, Mapping)
+            and primitive.get("ok") is True
+            and primitive.get("branch") == "confirmed_gripper_no_tip_moveXY"):
+        return False
+    operations = primitive.get("operations")
+    if not isinstance(operations, list) or not operations:
+        return False
+    saw_movexy = False
+    for row in operations:
+        if not isinstance(row, Mapping) or row.get("ok") is not True:
+            return False
+        if row.get("source_operation") != "ClassControlInterface.moveXY":
+            if row.get("controller_terminal_state_verified") is not True:
+                return False
+            continue
+        saw_movexy = True
+        if not (row.get("branch") == "parallel"
+                and row.get("source_calls_completed") is True
+                and row.get("controller_command_acknowledged") is True
+                and row.get("acceleration_setup_verified") is True
+                and row.get("acceleration_restore_verified") is True
+                and not row.get("failure")):
+            return False
+        axes = row.get("axis_evidence")
+        if not isinstance(axes, Mapping) or not axes or any(
+            not isinstance(axis, Mapping) or axis.get("controller_error_events")
+            for axis in axes.values()
+        ):
+            return False
+    return saw_movexy
+
+
 def _controller_terminal_truth(result: Mapping[str, Any]) -> bool:
     """Require acknowledged source motion and non-contradictory terminal proof."""
     if result.get("source_noop") is True:
@@ -2576,7 +2618,7 @@ def make_deck_command_executor(
                     terminal_truth = bool(
                         isinstance(result, Mapping)
                         and result.get("ok") is True
-                        and _controller_terminal_truth(result)
+                        and _source_stage_completed(result)
                     )
                     if not terminal_truth:
                         result_delivery_attempted = bool(
@@ -2656,8 +2698,10 @@ def make_deck_command_executor(
                     or row.get("controller_command_acknowledged") is True
                     for row in results
                 )
-                source_terminal_complete = bool(results) and all(_controller_terminal_truth(row) for row in results)
-                controller_complete = source_terminal_complete and not all_source_noop
+                source_terminal_complete = bool(results) and all(_source_stage_completed(row) for row in results)
+                controller_complete = bool(results) and all(
+                    _controller_terminal_truth(row) for row in results
+                ) and not all_source_noop
                 postcondition = controller_complete and not all_source_noop and all(
                     row.get("source_noop") is True
                     or row.get("hardware_postcondition_verified") is True
@@ -2686,6 +2730,7 @@ def make_deck_command_executor(
                 destination = catalog.resolve(plan.target)
                 return {
                     "ok": source_terminal_complete and semantic_committed,
+                    "source_calls_completed": source_terminal_complete,
                     "source_noop": all_source_noop,
                     "admitted": True,
                     "delivery_attempted": any(

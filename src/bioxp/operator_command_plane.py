@@ -4320,12 +4320,9 @@ class OperatorCommandStore(CommandReceiptReader):
         }.get(loc, current_tray)
 
     def commit_deck_success(self, command_id: str, plan: Any, results: list[Mapping[str, Any]], *, expected_authority: Mapping[str, Any] | None = None) -> None:
-        if not results or any(
-            row.get("source_noop") is not True
-            and row.get("controller_completion_verified") is not True
-            for row in results
-        ):
-            raise ValueError("deck semantic state requires verified controller completion")
+        from .oem_deck_movement import _source_stage_completed
+        if not results or any(not _source_stage_completed(row) for row in results):
+            raise ValueError("deck semantic state requires completed OEM source stages")
         # Final owner validation is live, just like pre-TX and reconciliation.
         # Match passive projection's provider -> writer order at this boundary.
         with self._deck_owner_authority_scope(), self._transaction() as conn:

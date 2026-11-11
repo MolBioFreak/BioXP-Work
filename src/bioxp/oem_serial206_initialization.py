@@ -11664,6 +11664,7 @@ class Serial206OemInitializationProvider:
             "ok": ok,
             "source_noop": source_noop,
             "delivery_attempted": not source_noop,
+            "source_calls_completed": ok,
             "provider_command_id": result.get("command_id") if isinstance(result, Mapping) else None,
             "controller_command_acknowledged": bool(
                 isinstance(result, Mapping) and result.get("controller_command_acknowledged") is True
