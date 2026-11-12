@@ -2649,6 +2649,16 @@ def _build_catalog(app: FastAPI) -> tuple[list[dict[str, Any]], dict[str, dict[s
             {"name": "position_flag", "required": True, "type": "integer", "enum": [0, 1, 2]},
         ],
     })
+    from .manual_plate_controls import PLATE_ACTION_OPERATIONS, plate_action_inputs
+    for action_id, operation in PLATE_ACTION_OPERATIONS.items():
+        actions.append({
+            **actions[-1],
+            "action_id": action_id,
+            "label": "OEM Pick Up Plate / Cover" if operation == "catch_plate" else "OEM Place Plate / Cover",
+            "description": "Explicit manual custody operation through the existing finite OEM worker.",
+            "source_anchor": "ControlLib.catchPlate" if operation == "catch_plate" else "ControlLib.releasePlate",
+            "inputs": plate_action_inputs(action_id),
+        })
     return actions, dispatch
 
 
@@ -3204,7 +3214,7 @@ def install_operator_control_plane(
                 "request_schema_version": "bioxp.operator_interrupt_request.v1" if str(action["safety_class"]) == "stop" else "bioxp.operator_action_request.v2",
                 "response_schema_version": "bioxp.operator_action_receipt.v2",
                 "interrupt": str(action["safety_class"]) == "stop",
-                **({"inputs": action["inputs"]} if action["action_id"] == "oem.deck.move_to_well" else {})}
+                **({"inputs": action["inputs"]} if action["action_id"] in {"oem.deck.move_to_well", "oem.deck.catch_plate", "oem.deck.release_plate"} else {})}
 
     catalog_metadata: dict[str, Any] = {"actions": _catalog_definitions(_v1_catalog_actions(actions))}
     canonical_metadata: dict[str, Any] = {"actions": [canonical_definition(action) for action in actions
@@ -4095,6 +4105,8 @@ def install_operator_control_plane(
             "interrupt_evidence": row.get("interrupt_evidence"),
             "z_move": row.get("z_move"),
             "xy_failure": row.get("xy_failure"),
+            **({"plate_operation": dict(row["plate_operation"])}
+               if isinstance(row.get("plate_operation"), Mapping) else {}),
             # These persisted operational facts describe source-call outcomes,
             # not physical arrival. Never infer them from completed/terminal.
             # Full ordered children and wire evidence remain detail-only.
@@ -4188,7 +4200,7 @@ def install_operator_control_plane(
         for action in actions:
             if str(action["action_id"]) not in v2_canonical_action_ids:
                 continue
-            assessment = deck_contract(state, intent_only=True) if action["action_id"] in {"oem.deck.move_to_location", "oem.deck.move_to_well"} else assessed_action(action, state)
+            assessment = deck_contract(state, intent_only=True) if action["action_id"] in {"oem.deck.move_to_location", "oem.deck.move_to_well", "oem.deck.catch_plate", "oem.deck.release_plate"} else assessed_action(action, state)
             action_rows.append({
                 **canonical_definition(action),
                 "enabled": bool(assessment.get("enabled")),
@@ -4199,8 +4211,9 @@ def install_operator_control_plane(
                     "required_references": assessment["required_references"],
                     "position_table_revision": assessment["position_table_revision"],
                     "destination_catalog_revision": assessment["destination_catalog_revision"],
-                    "destination_options": assessment["destination_options"],
-                } if action["action_id"] in {"oem.deck.move_to_location", "oem.deck.move_to_well"} else {}),
+                    **({"destination_options": assessment["destination_options"]}
+                       if action["action_id"] in {"oem.deck.move_to_location", "oem.deck.move_to_well"} else {}),
+                } if action["action_id"] in {"oem.deck.move_to_location", "oem.deck.move_to_well", "oem.deck.catch_plate", "oem.deck.release_plate"} else {}),
             })
         body = {"schema_version": "bioxp.operator_control_catalog.v2", "dashboard": dashboard, "actions": action_rows}
         if view == "assessment":
@@ -4295,7 +4308,7 @@ def install_operator_control_plane(
             # Keep the approved independent delivery and canonical v2 receipt.
             # invoke_action reconciles the deck queue only after delivery.
             return _v2_compact_receipt(await invoke_action(action_id, payload))
-        if action_id in {"oem.deck.move_to_location", "oem.deck.move_to_well", "oem.xy.move_sequence"}:
+        if action_id in {"oem.deck.move_to_location", "oem.deck.move_to_well", "oem.deck.catch_plate", "oem.deck.release_plate", "oem.xy.move_sequence"}:
             if not isinstance(payload, OperatorActionRequestV2):
                 raise HTTPException(status_code=422, detail={"error": "normal_action_request_schema_required"})
             request = {**payload.model_dump(), "action_id": action_id}

@@ -265,6 +265,8 @@ class CommandReceiptReader:
             "completion_class": terminal.get("completion_class") if isinstance(terminal, Mapping) else None,
             "transition_sequence": transition_sequence,
         }
+        if isinstance(terminal, Mapping) and isinstance(terminal.get("plate_operation"), Mapping):
+            response["plate_operation"] = dict(terminal["plate_operation"])
         if isinstance(terminal, Mapping) and isinstance(terminal.get("xy_sequence"), Mapping):
             response["xy_sequence"] = dict(terminal["xy_sequence"])
         elif row["action_id"] == "oem.xy.move_sequence" and row["status"] not in {"queued", "dispatched"}:
@@ -346,7 +348,8 @@ class CommandReceiptReader:
                 "ownership_generation,queued_at,dispatched_at,finished_at,source_noop,"
                 "source_noop_reason,remote_acknowledged,controller_acknowledged,physical_effect_verified,version,"
                 "'{}' AS requested_json,'{}' AS effective_json,"
-                "json_object('completion_class',json_extract(terminal_json,'$.completion_class')) AS terminal_json "
+                "json_object('completion_class',json_extract(terminal_json,'$.completion_class'),"
+                "'plate_operation',json_extract(terminal_json,'$.plate_operation')) AS terminal_json "
                 "FROM operator_plane_commands WHERE command_id=?", (command_id,),
             ).fetchone()
             return self._command_response(row, compact=True) if row else None
