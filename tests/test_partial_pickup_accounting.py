@@ -33,7 +33,8 @@ def sent(ch, complete=True):
     ('metadata', [2], [0, 1, 3]),
     ('accounting', [0, 1, 2, 3], [0, 1, 3]),
 ])
-def test_provider_partial_effects_survive_tail_failures(named, monkeypatch, failure, remaining, released):
+@pytest.mark.parametrize('lift_z', [False, True])
+def test_provider_partial_effects_survive_tail_failures(named, monkeypatch, failure, remaining, released, lift_z):
     _, provider, store, _, frames, _ = named
     provider.publish_tip_tray_transition(tray_id=0, transition='load_all', operation_id='seed',
         command_id='seed', provenance={})
@@ -108,10 +109,17 @@ def test_provider_partial_effects_survive_tail_failures(named, monkeypatch, fail
         monkeypatch.setattr(provider, '_tip_tray_state_publisher', fail_restore)
     frames.clear()
     result = provider.wp8_manual_pipette_physical('sourceManualLoadTip',
-        {'tray': 1, 'well': 'A10', 'keep_channels': [2], 'lift_z': True},
+        {'tray': 1, 'well': 'A10', 'keep_channels': [2], 'lift_z': lift_z},
         command_id='partial-pickup', child_order=0, plan_digest='test',
         owner_identity={'source_identity': 'partial-pickup:0'})
-    assert result['ok'] is (failure in ('none', 'accounting', 'metadata')), result
+    assert result['ok'] is (failure in ('none', 'accounting', 'metadata') or
+        (not lift_z and failure in ('home_false', 'home_throw'))), result
+    if failure != 'lower':
+        assert store.deck_semantic_state()['tip_loaded'] is True
+        assert store.deck_semantic_state()['pseudo_z_home'] == 500
+        assert provider._load_state()['machine_status']['psudo_z_home_steps'] == 500
+    else:
+        assert store.deck_semantic_state()['tip_loaded'] is False
     assert transport._tip_type == (201 if failure in ('lower', 'metadata') else 50)
     if failure == 'metadata':
         assert 'bookkeeping_error' in result['pickup_accounting'][0]['result']
@@ -138,6 +146,9 @@ def test_provider_partial_effects_survive_tail_failures(named, monkeypatch, fail
     reopened = OperatorCommandStore(store.root)
     try:
         assert reopened.tip_tray_state(0)['occupancy'] == state['occupancy']
+        if failure != 'lower':
+            assert reopened.deck_semantic_state()['tip_loaded'] is True
+            assert reopened.deck_semantic_state()['pseudo_z_home'] == 500
     finally:
         reopened.stop()
 

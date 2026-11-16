@@ -3520,6 +3520,11 @@ class OperatorCommandStore(CommandReceiptReader):
             "pseudo_z_home": int(current["pseudo_z_home"]),
         }
         merged.update({key: value for key, value in values.items() if key != "well_pierced"})
+        # ClassMachineStatus.TipLoaded setter calls GantryLoad(T50/null, null).
+        # This is a setter side effect, not a global invariant: explicit plate
+        # GantryLoad and ForceToHighHome retain their independent OEM behavior.
+        if operation in {"pipette_owner", "clearTipLoaded"} and "tip_loaded" in values:
+            merged["pseudo_z_home"] = 500 if values["tip_loaded"] else 65000
         if "well_pierced" in values:
             merged["well_pierced"][pierced_key] = True
         if operation == "updateLocation":

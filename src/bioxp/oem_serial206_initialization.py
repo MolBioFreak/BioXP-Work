@@ -4858,6 +4858,14 @@ class Serial206OemInitializationProvider:
         )
         if not isinstance(result, Mapping):
             raise RuntimeError("deck semantic state publisher returned malformed state")
+        if source_operation in {"pipette_owner", "clearTipLoaded"} and "tip_loaded" in updates:
+            # Keep the dependent provider projection aligned with the canonical
+            # OEM setter, including publications with no subsequent Home.
+            with self._lock:
+                state = self._load_state()
+                state["machine_status"].update(updates)
+                state["machine_status"]["psudo_z_home_steps"] = 500 if updates["tip_loaded"] else 65000
+                self._save_state(state)
         return {str(key): value for key, value in result.items()}
 
     def publish_pipette_owner_state(
@@ -13123,6 +13131,16 @@ class Serial206OemInitializationProvider:
                     provenance={"source_operation": "sourceManualLoadTip",
                                 "source_child": child_identity["source_identity"]})
             out = {}
+            try:
+                # Observed pickup establishes loaded state before optional Home;
+                # partial release must retain it while any channel remains loaded.
+                loaded = transition == "remove" or _transport_tip_loaded(self.primitives.pipette_transport)
+                out["tip_state"] = self._publish_deck_owner_state(
+                    source_operation="pipette_owner",
+                    source_command_id=identity("pickup_tip_state")["source_identity"],
+                    updates={"tip_loaded": loaded})
+            except Exception as exc:
+                out["tip_state_error"] = repr(exc)
             if transition == "remove":
                 # Host-only dependent state follows observed pickup, even if a
                 # later release/home fails. Already inside the query receipt's
@@ -13976,11 +13994,10 @@ class Serial206OemInitializationProvider:
         publisher = getattr(self, "_deck_semantic_state_publisher", None)
         if not callable(publisher):
             raise RuntimeError(f"source_authority_missing:{operation}")
-        result = publisher(
+        result = self._publish_deck_owner_state(
             source_operation=operation,
             source_command_id=self._wp8_identity(command_id, child_order, plan_digest),
             updates=dict(updates),
-            **self.deck_owner_authority_stamps(),
         )
         if not isinstance(result, Mapping):
             raise RuntimeError(f"source_authority_invalid:{operation}")
