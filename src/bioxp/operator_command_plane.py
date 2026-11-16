@@ -1871,6 +1871,28 @@ class OperatorCommandStore(CommandReceiptReader):
             changed = conn.execute("UPDATE operator_plane_lane SET owner_lease_until=?,updated_at=? WHERE singleton=1 AND owner_id=?", (_now() + float(lease_seconds), _now(), self.owner_id)).rowcount
             return changed == 1
 
+    def _restore_own_lapsed_lease(self, lane) -> bool:
+        """A lease that lapsed only because this live dispatcher was busy is still ours.
+
+        Replacement is fenced by owner_id and dispatcher_epoch, which
+        _acquire_owner changes under BEGIN IMMEDIATE. The same compare-and-set
+        here either proves nobody replaced this owner and restores its normal
+        lease, or leaves the lane untouched and authority lost. A stopped or
+        dead dispatcher never restores anything.
+        """
+        thread = self._thread
+        if thread is None or not thread.is_alive() or self._stop.is_set():
+            return False
+        try:
+            with self._transaction() as conn:
+                now = _now()
+                return conn.execute(
+                    "UPDATE operator_plane_lane SET owner_lease_until=?,updated_at=? "
+                    "WHERE singleton=1 AND owner_id=? AND dispatcher_epoch=?",
+                    (now + 5.0, now, self.owner_id, lane["dispatcher_epoch"])).rowcount == 1
+        except sqlite3.OperationalError:
+            return False
+
     def _startup_recover(self) -> None:
         with self._transaction() as conn:
             # Retained pre-workflow stores reconcile stopped leaf commands
@@ -2407,8 +2429,9 @@ class OperatorCommandStore(CommandReceiptReader):
         lane = conn.execute("SELECT * FROM operator_plane_lane WHERE singleton=1").fetchone()
         if (row is None or row["command_kind"] != "protocol_workflow" or row["status"] not in {"dispatched", "stop_requested", "abort_requested"}
                 or lane["workflow_command_id"] != command_id or lane["owner_id"] != self.owner_id
-                or (check_lease and float(lane["owner_lease_until"] or 0) <= _now())
-                or row["dispatcher_epoch"] != lane["dispatcher_epoch"]):
+                or row["dispatcher_epoch"] != lane["dispatcher_epoch"]
+                or (check_lease and float(lane["owner_lease_until"] or 0) <= _now()
+                    and not self._restore_own_lapsed_lease(lane))):
             raise ValueError("workflow_authority_lost")
         if not check_safety:
             return row
@@ -2983,8 +3006,10 @@ class OperatorCommandStore(CommandReceiptReader):
             "WHERE c.action_id IN ('oem.deck.move_to_location','oem.deck.move_to_well','oem.deck.catch_plate','oem.deck.release_plate','oem.deck._mov_execution','oem.deck._finite_operation') "
             "AND (c.status IN ('ambiguous','interrupted') OR d.ambiguity_state='recovery_required') "
             "AND NOT EXISTS (SELECT 1 FROM operator_plane_deck_recovery_decisions r WHERE r.command_id=c.command_id) "
-            "AND NOT EXISTS (SELECT 1 FROM operator_plane_transitions t WHERE t.command_id=c.command_id "
-            "AND t.event_kind='recovery_resolved') LIMIT 1"
+            # One uncorrelated pass over transitions (no command_id index): the
+            # correlated NOT EXISTS rescanned the table once per candidate.
+            "AND c.command_id NOT IN (SELECT t.command_id FROM operator_plane_transitions t "
+            "WHERE t.command_id IS NOT NULL AND t.event_kind='recovery_resolved') LIMIT 1"
         ).fetchone()
         semantic = conn.execute(
             "SELECT ambiguity_state FROM operator_plane_deck_semantic_state WHERE singleton=1"
@@ -6598,12 +6623,18 @@ class OperatorCommandStore(CommandReceiptReader):
                     self._stop.set()
                     break
                 next_renewal = time.monotonic() + 1.0
+                housekeeping = True
+            else:
+                housekeeping = False
+
+            # A completed step is handed to its waiting workflow before any
+            # recovery housekeeping runs on this thread.
+            self._settle_workflow_child_waiters()
+            if housekeeping:
                 try:
                     self.settle_deck_recovery_by_home()
                 except sqlite3.OperationalError:
                     pass
-
-            self._settle_workflow_child_waiters()
             self._notify_workflow_interrupt()
             spawned = False
             claimed: dict[str, Any] | None = None

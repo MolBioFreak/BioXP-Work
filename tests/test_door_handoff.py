@@ -148,3 +148,89 @@ def test_worker_setup_exception_preserves_bundle(named,monkeypatch,tmp_path):
     assert done['exception_type']=='RuntimeError'
     assert done['protocol']['document']['protocol_id']=='offline-door'
     assert children==called==frames==[]
+
+
+def start_dispatcher(store, monkeypatch, housekeeping):
+    """The real dispatcher loop; children are claimed by the harness admitter."""
+    import threading as th
+    claim = store.claim_next
+    monkeypatch.setattr(store, 'claim_next',
+        lambda: None if th.current_thread() is store._thread else claim())
+    monkeypatch.setattr(store, 'settle_deck_recovery_by_home', housekeeping)
+    renew = store._renew_owner
+    monkeypatch.setattr(store, '_renew_owner', lambda *, lease_seconds=0.3: renew(lease_seconds=0.3))
+    store._thread = th.Thread(target=store._dispatch_loop, args=(lambda c: pytest.fail('unexpected dispatch'),))
+    store._thread.start()
+
+
+def stop_dispatcher(store):
+    store._stop.set()
+    store._wake.set()
+    store._thread.join(10)
+    assert not store._thread.is_alive()
+
+
+def test_slow_housekeeping_does_not_fail_own_workflow(named, monkeypatch, tmp_path):
+    import time
+    started, order = threading.Event(), []
+    def slow_housekeeping():
+        order.append('housekeeping')
+        if not started.is_set():
+            started.set()
+            time.sleep(1.5)  # five times the 0.3 s lease renewed just before
+        return False
+    def lapse(store):
+        # Door child is terminal. Continue only once this owner's lease has
+        # lapsed behind the busy dispatcher.
+        assert started.wait(10)
+        time.sleep(0.6)
+        lane = store.connection.execute('SELECT owner_id,owner_lease_until FROM operator_plane_lane').fetchone()
+        assert lane['owner_id'] == store.owner_id and lane['owner_lease_until'] <= time.time()
+    store, claimed, called, children, frames = prepare(named, monkeypatch, tmp_path, fault=lapse)
+    settle = store._settle_workflow_child_waiters
+    monkeypatch.setattr(store, '_settle_workflow_child_waiters', lambda: (order.append('waiters'), settle())[1])
+    start_dispatcher(store, monkeypatch, slow_housekeeping)
+    try:
+        done = run_worker(store, claimed)
+    finally:
+        stop_dispatcher(store)
+    assert order[:2] == ['waiters', 'housekeeping'], order[:4]
+    assert done['command']['status'] == 'completed', done
+    assert called == ['after'] and len(children) == 1 and frames == []
+    lane = store.connection.execute('SELECT owner_id,dispatcher_epoch FROM operator_plane_lane').fetchone()
+    assert lane['owner_id'] == store.owner_id and lane['dispatcher_epoch'] == claimed['dispatcher_epoch']
+
+
+def test_replaced_owner_worker_ends_and_job_is_terminal(named, monkeypatch, tmp_path):
+    from bioxp.operator_command_plane import OperatorCommandStore
+    replacement = []
+    def replace(store):
+        # A different process takes the lapsed lane: new owner_id, new epoch,
+        # and its startup recovery closes the displaced workflow.
+        # The shared store lock keeps this dispatcher from renewing in between.
+        with store._lock:
+            with store._transaction() as conn:
+                conn.execute('UPDATE operator_plane_lane SET owner_lease_until=0 WHERE singleton=1')
+            replacement.append(OperatorCommandStore(store.root))
+        assert replacement[0]._owner_acquired
+    store, claimed, called, children, frames = prepare(named, monkeypatch, tmp_path, fault=replace)
+    start_dispatcher(store, monkeypatch, lambda: False)
+    try:
+        done = run_worker(store, claimed)
+        # The displaced, still-live dispatcher must not win the lane back.
+        with pytest.raises(ValueError, match='workflow_authority_lost'):
+            store.assert_workflow_current('door-parent')
+    finally:
+        stop_dispatcher(store)
+    lane = store.connection.execute('SELECT owner_id,dispatcher_epoch FROM operator_plane_lane').fetchone()
+    assert lane['owner_id'] == replacement[0].owner_id != store.owner_id
+    assert lane['dispatcher_epoch'] > claimed['dispatcher_epoch']
+    assert called == [] and frames == []
+    assert done['command']['status'] == 'ambiguous', done
+    for table in ('operator_commands', 'operator_plane_commands'):
+        row = store.connection.execute('SELECT status FROM ' + table + ' WHERE command_id=?', ('door-parent',)).fetchone()
+        assert row['status'] == 'ambiguous'
+    # Fixture teardown stops the original store as lane owner.
+    replacement[0].connection.close()
+    with store._transaction() as conn:
+        conn.execute('UPDATE operator_plane_lane SET owner_id=? WHERE singleton=1', (store.owner_id,))
