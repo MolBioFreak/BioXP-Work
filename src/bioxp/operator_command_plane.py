@@ -13,6 +13,7 @@ import json
 import math
 import os
 import sqlite3
+from datetime import datetime, timezone
 import threading
 import time
 import uuid
@@ -1763,6 +1764,7 @@ class OperatorCommandStore(CommandReceiptReader):
             try:
                 self.connection.execute("BEGIN IMMEDIATE")
                 with self._authority_write():
+                    self._keep_live_lease()
                     yield self.connection
                 self.connection.execute("COMMIT")
                 if self._transition_pending:
@@ -1870,6 +1872,24 @@ class OperatorCommandStore(CommandReceiptReader):
         with self._transaction(timeout_ms=100) as conn:
             changed = conn.execute("UPDATE operator_plane_lane SET owner_lease_until=?,updated_at=? WHERE singleton=1 AND owner_id=?", (_now() + float(lease_seconds), _now(), self.owner_id)).rowcount
             return changed == 1
+
+    def _keep_live_lease(self) -> None:
+        """Keep this live dispatcher's lease across a busy stretch.
+
+        Runs inside BEGIN IMMEDIATE. Another process can only take the lane
+        by changing owner_id, so a row still carrying our owner_id is ours.
+        Writes nothing unless the lease has lapsed. A stopped or dead
+        dispatcher restores nothing, so real loss of ownership still fences.
+        """
+        thread = getattr(self, "_thread", None)
+        if (not getattr(self, "_owner_acquired", False) or thread is None
+                or not thread.is_alive() or self._stop.is_set()):
+            return
+        now = _now()
+        self.connection.execute(
+            "UPDATE operator_plane_lane SET owner_lease_until=?,updated_at=? "
+            "WHERE singleton=1 AND owner_id=? AND COALESCE(owner_lease_until,0)<=?",
+            (now + 5.0, now, self.owner_id, now))
 
     def _restore_own_lapsed_lease(self, lane) -> bool:
         """A lease that lapsed only because this live dispatcher was busy is still ours.
@@ -2367,48 +2387,54 @@ class OperatorCommandStore(CommandReceiptReader):
                     "status": status, "terminal": status in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"}}}
 
     def list_workflow_summaries(self, *, limit: int = 20) -> list[dict[str, Any]]:
-        """Project discovery fields in SQLite; never hydrate full job bundles.
+        """Run list from small columns, as the OEM job list was.
 
-        The receipt wins as a whole, exactly as in get_workflow. Missing receipt
-        fields must not be filled from an older admission bundle.
+        Reads on its own read-only connection, so it never holds the writer
+        lock a running workflow needs. Immutable fields come from the small
+        admission bundle; whole job receipts are never parsed here.
         """
-        with self._lock:
-            rows = self.connection.execute("""
-                WITH recent AS (
-                    SELECT command_id, status, idempotency_key, ownership_generation,
-                           sequence, requested_inputs_json, receipt_json
-                    FROM operator_commands WHERE command_kind='protocol_workflow'
-                    ORDER BY sequence DESC LIMIT ?
-                ), payloads AS (
-                    SELECT c.*, p.version,
-                        CASE WHEN json_valid(c.receipt_json) THEN
-                            CASE WHEN json(c.receipt_json) NOT IN ('{}','null','[]','false','0','""')
-                                 THEN c.receipt_json END END AS receipt
-                    FROM recent c JOIN operator_plane_commands p USING(command_id)
-                )
-                SELECT command_id, status, idempotency_key, ownership_generation, version,
-                    CASE WHEN receipt IS NOT NULL THEN json_extract(receipt,
-                        '$.execution.dry_run',
-                        CASE WHEN json_extract(receipt,'$._workflow_receipt')=1 THEN '$._workflow_input.protocol_id' ELSE '$.protocol.document.protocol_id' END,
-                        CASE WHEN json_extract(receipt,'$._workflow_receipt')=1 THEN '$._workflow_input.source_type' ELSE '$.protocol.source_type' END, '$.created_at', '$.updated_at',
-                        '$.operator.pending_review')
-                    ELSE json_extract(CASE WHEN json_valid(requested_inputs_json)
-                                           THEN requested_inputs_json ELSE '{}' END,
-                        '$.bundle.execution.dry_run',
-                        CASE WHEN json_extract(requested_inputs_json,'$.bundle._workflow_receipt')=1 THEN '$.bundle._workflow_input.protocol_id' ELSE '$.bundle.protocol.document.protocol_id' END,
-                        CASE WHEN json_extract(requested_inputs_json,'$.bundle._workflow_receipt')=1 THEN '$.bundle._workflow_input.source_type' ELSE '$.bundle.protocol.source_type' END, '$.bundle.created_at', '$.bundle.updated_at',
-                        '$.bundle.operator.pending_review') END AS summary_json
-                FROM payloads ORDER BY sequence DESC
+        reader = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, timeout=2.0)
+        reader.row_factory = sqlite3.Row
+        try:
+            rows = reader.execute("""
+                SELECT c.command_id, c.status, c.idempotency_key, c.ownership_generation,
+                       c.updated_at, p.version,
+                       json_extract(CASE WHEN json_valid(c.requested_inputs_json)
+                                         THEN c.requested_inputs_json ELSE '{}' END,
+                           '$.bundle.execution.dry_run', '$.bundle._workflow_receipt',
+                           '$.bundle._workflow_input.protocol_id', '$.bundle.protocol.document.protocol_id',
+                           '$.bundle._workflow_input.source_type', '$.bundle.protocol.source_type',
+                           '$.bundle.created_at', '$.bundle.updated_at') AS bundle_json,
+                       CASE WHEN c.status NOT IN ('completed','cleared','rejected')
+                                 AND json_valid(c.receipt_json)
+                            THEN json_extract(c.receipt_json, '$.operator.pending_review') END AS review_json
+                FROM (SELECT * FROM operator_commands WHERE command_kind='protocol_workflow'
+                      ORDER BY sequence DESC LIMIT ?) AS c
+                JOIN operator_plane_commands p USING(command_id)
+                ORDER BY c.sequence DESC
             """, (limit,)).fetchall()
             result = []
             for row in rows:
-                fields = _json_load(row["summary_json"])
+                dry_run, wrapped, input_id, doc_id, input_type, doc_type, created, updated = _json_load(row["bundle_json"])
                 status = row["status"]
                 if status in UNKNOWN_OUTCOME_STATES:
-                    status = self._settled_status(status, self._home_recovery_resolution(row["command_id"]))
-                result.append(dict(zip(
-                    ("dry_run", "protocol_id", "source_type", "created_at", "updated_at", "pending_review"),
-                    fields), job_id=row["command_id"], status=status, command={
+                    resolved = reader.execute(
+                        "SELECT transition_sequence,payload_json FROM operator_plane_transitions "
+                        "WHERE command_id=? AND event_kind='recovery_resolved' "
+                        "AND json_extract(payload_json,'$.resolution') IN ('axes_homed_after_unknown_moves','children_recovery_resolved') "
+                        "ORDER BY transition_sequence DESC LIMIT 1", (row["command_id"],)).fetchone()
+                    resolution = _json_load(resolved["payload_json"], {}) if resolved else None
+                    if resolution is not None and resolution.get("command_id") != row["command_id"]:
+                        resolution = None
+                    status = self._settled_status(status, resolution)
+                if row["updated_at"] is not None:
+                    updated = datetime.fromtimestamp(float(row["updated_at"]), timezone.utc).isoformat(timespec="seconds")
+                result.append(dict(
+                    dry_run=dry_run, protocol_id=input_id if wrapped == 1 else doc_id,
+                    source_type=input_type if wrapped == 1 else doc_type,
+                    created_at=created, updated_at=updated,
+                    pending_review=_json_load(row["review_json"]) if row["review_json"] is not None else None,
+                    job_id=row["command_id"], status=status, command={
                         "command_id": row["command_id"], "idempotency_key": row["idempotency_key"],
                         "ownership_generation": int(row["ownership_generation"]),
                         "state_version": int(row["version"]), "status": status,
@@ -2416,6 +2442,8 @@ class OperatorCommandStore(CommandReceiptReader):
                         "status_path": f"/protocol/jobs/{row['command_id']}",
                     }))
             return result
+        finally:
+            reader.close()
 
     def list_workflows(self, *, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:

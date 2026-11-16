@@ -861,8 +861,8 @@ def get_protocol_job(job_id: str, *, observation: bool = False, store: ProtocolO
 
 
 def list_protocol_jobs(*, limit: int = 20, summary: bool = False, store: ProtocolOperatorBundleStore | None = None, command_store=None) -> list[dict[str, Any]]:
-    canonical = ((command_store.list_workflow_summaries(limit=limit) if summary else
-                  command_store.list_workflows(limit=limit)) if command_store is not None else [])
+    # The list is always the small summary; whole jobs are read one at a time.
+    canonical = command_store.list_workflow_summaries(limit=limit) if command_store is not None else []
     canonical = [{**row, "row_kind": "canonical_workflow"} for row in canonical]
     if len(canonical) >= limit:
         return canonical
