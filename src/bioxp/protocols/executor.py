@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import copy_context
 from time import monotonic
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from threading import Condition
 from typing import Any, Callable, Mapping
@@ -66,6 +67,47 @@ class OwnedOperation:
 
 class _Diversion(Exception):
     """Host progression only; never cancellation of an entered native call."""
+
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _scalars(row):
+    return {k: v for k, v in row.items() if not isinstance(v, (dict, list))} if isinstance(row, Mapping) else row
+
+
+def _lean_event(event):
+    # One line per native event: what was sent and whether each channel took it.
+    out = {k: event[k] for k in ("inputs", "operation", "origin", "status", "reported_applied", "source_identity") if k in event}
+    for key in ("result", "partial"):
+        row = event.get(key)
+        if isinstance(row, Mapping):
+            out[key] = {**_scalars(row), "channels": [_scalars(c) for c in row.get("channels") or []]}
+    return out
+
+
+def _lean_result(result) -> None:
+    # OEM executeScript keeps progress and outcome, not a copy of each child's
+    # evidence. The child command row (command_id) already holds that once.
+    for key in ("receipt", "command"):
+        row = result.get(key)
+        if isinstance(row, Mapping):
+            result[key] = {k: row[k] for k in ("command_id", "action_id", "status", "queued_at", "dispatched_at", "finished_at") if k in row}
+    for key in ("completed_children", "source_children", "provider_results"):
+        result.pop(key, None)
+    if isinstance(result.get("child_outcomes"), list):
+        result["child_outcomes"] = [_scalars(c) for c in result["child_outcomes"]]
+    application = result.get("pipette_result")
+    if isinstance(application, Mapping):
+        application = {k: v for k, v in application.items() if k != "requested"}
+        if isinstance(application.get("events"), list):
+            application["events"] = [_lean_event(e) if isinstance(e, Mapping) else e for e in application["events"]]
+        settings = application.get("liquid_settings")
+        if isinstance(settings, Mapping):
+            application["liquid_settings"] = {k: v for k, v in settings.items() if k not in ("bms_resolution", "resolved_recipe")}
+        result["pipette_result"] = application
 
 
 class ProtocolExecutor:
@@ -541,6 +583,10 @@ class ProtocolExecutor:
         children = payload.pop("owned_children", ())
         result.update(payload)
         result.pop("pending", None)
+        result["finished_at"] = _utc_now()
+        # Successful steps keep their outcome only; failures keep full diagnostics.
+        lean = (payload.get("ok") is True and not payload.get("uncertain")
+                and payload.get("status") != "ambiguous" and result.get("kind") != "lifecycle")
         application = payload.get("pipette_result")
         if isinstance(application, Mapping) and application.get("kind") == "cavro_application":
             # Publish the actual returned native events, not inferred liquid
@@ -548,7 +594,7 @@ class ProtocolExecutor:
             # original event identities/order and device evidence are retained.
             for event in application.get("events", ()):
                 self._state.record_event("cavro_application_event", stage_id=result.get("stage_id"),
-                    action_id=result.get("action_id"), detail=dict(event))
+                    action_id=result.get("action_id"), detail=_lean_event(event) if lean else dict(event))
         command_id = payload.get("command_id")
         if command_id and command_id not in self._state.workflow.child_command_ids:
             self._state.workflow.child_command_ids.append(command_id)
@@ -602,6 +648,8 @@ class ProtocolExecutor:
                 stage.completed_actions.append(result["action_id"])
             elif payload.get("ok") is not True:
                 stage.status = StageExecutionStatus.FAILED
+        if lean:
+            _lean_result(result)
         self._notify()
         self._publish()
 
@@ -958,7 +1006,7 @@ class ProtocolExecutor:
         result = {"stage_id": action.stage_id, "action_id": action.action_id,
                   "kind": action.kind.value, "source_occurrence_id": identity,
                   "metadata": action.to_payload()["metadata"], "on_error": action.on_error,
-                  "status": "running"}
+                  "status": "running", "started_at": _utc_now()}
         state.action_results.append(result)
         if action.kind in {ProtocolActionKind.NOTE, ProtocolActionKind.PAUSE_REVIEW}:
             value = {"ok": True, "host_only": True}
