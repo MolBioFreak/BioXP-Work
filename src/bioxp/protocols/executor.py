@@ -74,40 +74,38 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
-def _scalars(row):
-    return {k: v for k, v in row.items() if not isinstance(v, (dict, list))} if isinstance(row, Mapping) else row
+# OEM executeScript keeps progress and outcome per instruction, never a copy of
+# its evidence. Full evidence lives once on the child command (command_id).
+_STEP_FIELDS = ("stage_id", "action_id", "parent_action_id", "kind", "source_occurrence_id",
+                "status", "ok", "started_at", "finished_at", "command_id")
 
 
-def _lean_event(event):
-    # One line per native event: what was sent and whether each channel took it.
-    out = {k: event[k] for k in ("inputs", "operation", "origin", "status", "reported_applied", "source_identity") if k in event}
-    for key in ("result", "partial"):
-        row = event.get(key)
-        if isinstance(row, Mapping):
-            out[key] = {**_scalars(row), "channels": [_scalars(c) for c in row.get("channels") or []]}
-    return out
+def _step_record(result) -> None:
+    # Identity, status, timestamps, child command and the step's own scalar
+    # outcome flags (setpoint accepted, wait complete, run id). Nested
+    # evidence stays on the child command.
+    kept = {k: v for k, v in result.items() if k in _STEP_FIELDS or not isinstance(v, (dict, list))}
+    result.clear()
+    result.update(kept)
 
 
-def _lean_result(result) -> None:
-    # OEM executeScript keeps progress and outcome, not a copy of each child's
-    # evidence. The child command row (command_id) already holds that once.
-    for key in ("receipt", "command"):
-        row = result.get(key)
-        if isinstance(row, Mapping):
-            result[key] = {k: row[k] for k in ("command_id", "action_id", "status", "queued_at", "dispatched_at", "finished_at") if k in row}
-    for key in ("completed_children", "source_children", "provider_results"):
-        result.pop(key, None)
-    if isinstance(result.get("child_outcomes"), list):
-        result["child_outcomes"] = [_scalars(c) for c in result["child_outcomes"]]
-    application = result.get("pipette_result")
-    if isinstance(application, Mapping):
-        application = {k: v for k, v in application.items() if k != "requested"}
-        if isinstance(application.get("events"), list):
-            application["events"] = [_lean_event(e) if isinstance(e, Mapping) else e for e in application["events"]]
-        settings = application.get("liquid_settings")
-        if isinstance(settings, Mapping):
-            application["liquid_settings"] = {k: v for k, v in settings.items() if k not in ("bms_resolution", "resolved_recipe")}
-        result["pipette_result"] = application
+def _referenced_results(document) -> set:
+    # A later step of the same job may read an earlier step's result
+    # (calibration ResultReference, output "result"); keep only those whole.
+    found = set()
+    def visit(value):
+        if isinstance(value, Mapping):
+            if value.get("output") == "result" and isinstance(value.get("action_id"), str):
+                found.add(value["action_id"])
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+    for stage in document.stages:
+        for action in stage.actions:
+            visit(action.params)
+    return found
 
 
 class ProtocolExecutor:
@@ -182,6 +180,7 @@ class ProtocolExecutor:
         *,
         state: ProtocolRuntimeState | None = None,
     ) -> ProtocolRuntimeState:
+        self._kept_results = _referenced_results(document)
         if not self.dry_run:
             validate_protocol_support(document, handlers=self._handlers, oem_handlers=self._oem_handlers,
                                       lifecycle_handlers=self._lifecycle_handlers,
@@ -586,15 +585,8 @@ class ProtocolExecutor:
         result["finished_at"] = _utc_now()
         # Successful steps keep their outcome only; failures keep full diagnostics.
         lean = (payload.get("ok") is True and not payload.get("uncertain")
-                and payload.get("status") != "ambiguous" and result.get("kind") != "lifecycle")
-        application = payload.get("pipette_result")
-        if isinstance(application, Mapping) and application.get("kind") == "cavro_application":
-            # Publish the actual returned native events, not inferred liquid
-            # outcomes. Timestamp is publication time after finite completion;
-            # original event identities/order and device evidence are retained.
-            for event in application.get("events", ()):
-                self._state.record_event("cavro_application_event", stage_id=result.get("stage_id"),
-                    action_id=result.get("action_id"), detail=_lean_event(event) if lean else dict(event))
+                and payload.get("status") != "ambiguous" and result.get("kind") != "lifecycle"
+                and result.get("action_id") not in getattr(self, "_kept_results", ()))
         command_id = payload.get("command_id")
         if command_id and command_id not in self._state.workflow.child_command_ids:
             self._state.workflow.child_command_ids.append(command_id)
@@ -649,7 +641,7 @@ class ProtocolExecutor:
             elif payload.get("ok") is not True:
                 stage.status = StageExecutionStatus.FAILED
         if lean:
-            _lean_result(result)
+            _step_record(result)
         self._notify()
         self._publish()
 
