@@ -34,6 +34,17 @@ class CommandReceiptReader:
         self.connection = connection
         self._lock = lock
 
+    def _workflow_inputs(self, encoded):
+        inputs = _json_load(encoded, {})
+        evidence_id = inputs.pop("workflow_input_evidence_id", None)
+        if evidence_id is not None:
+            row = self.connection.execute("SELECT payload_json FROM operator_plane_evidence WHERE evidence_id=?",
+                                          (evidence_id,)).fetchone()
+            if row is None:
+                raise ValueError("workflow_input_evidence_missing")
+            inputs["bundle"] = _json_load(row[0], {})
+        return inputs
+
     def _unknown_affected_axes(self, command_id: str) -> list[str] | None:
         """None means retained evidence cannot identify the uncertain axes.
 
@@ -265,6 +276,13 @@ class CommandReceiptReader:
             "completion_class": terminal.get("completion_class") if isinstance(terminal, Mapping) else None,
             "transition_sequence": transition_sequence,
         }
+        if not compact and row["action_id"] == "protocol.execute":
+            response["requested_inputs"] = self._workflow_inputs(row["requested_json"])
+            if isinstance(terminal, Mapping) and terminal.get("_workflow_receipt") == 1:
+                initial = response["requested_inputs"].get("bundle", {})
+                response["terminal_evidence"] = {
+                    **initial, **{k: v for k, v in terminal.items() if not k.startswith("_workflow_")},
+                    "execution": {**initial.get("execution", {}), **terminal.get("execution", {})}}
         if isinstance(terminal, Mapping) and isinstance(terminal.get("plate_operation"), Mapping):
             response["plate_operation"] = dict(terminal["plate_operation"])
         if isinstance(terminal, Mapping) and isinstance(terminal.get("xy_sequence"), Mapping):

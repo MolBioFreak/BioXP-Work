@@ -1656,6 +1656,10 @@ class OperatorHistoryReader:
             "completion_class": terminal.get("completion_class") if isinstance(terminal, Mapping) else None,
             "transition_sequence": transition_sequence,
         }
+        if response["requested_inputs"].get("workflow_input_evidence_id") is not None:
+            from .operator_command_receipts import CommandReceiptReader
+            native = CommandReceiptReader(self.connection, self.lock).get_command(command_id)
+            response.update(requested_inputs=native["requested_inputs"], terminal_evidence=native["terminal_evidence"])
         if self._table_columns("runtime_retired_records") is not None:
             from .runtime_method_retirement_v15 import command_history
             history = command_history(self.connection, command_id)

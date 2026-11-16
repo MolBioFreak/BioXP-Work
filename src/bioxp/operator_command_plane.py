@@ -2250,13 +2250,21 @@ class OperatorCommandStore(CommandReceiptReader):
             captured = {**dict(requested_inputs), "plan_fingerprint": plan_fingerprint,
                         "workflow_footprint": {"resources": request["resources"], "safety_epochs": footprint,
                                                "board_epochs": dict(board_epochs)}}
+            # Reuse the existing immutable evidence owner, not a second workflow
+            # ledger. Both command rows and report snapshots carry a small ref.
+            bundle = captured.get("bundle", {})
+            bundle_bytes = _canonical(bundle)
+            evidence_id = f"{command_id}:workflow_input:{hashlib.sha256(bundle_bytes.encode()).hexdigest()}"
+            captured = {**captured, "bundle": self._workflow_receipt(bundle),
+                        "workflow_input_evidence_id": evidence_id}
             self._insert_plane_claim(conn, command_id=command_id, key=idempotency_key,
                 action_id="protocol.execute", inputs=captured, generation=ownership_generation,
                 kind="protocol_workflow", status="queued", digest=digest)
             sequence = conn.execute("SELECT COALESCE(MAX(stream_sequence),0)+1 FROM operator_plane_commands").fetchone()[0]
             conn.execute("INSERT INTO operator_plane_commands(command_id,stream_sequence,action_id,requested_json,effective_json,"
                          "status,version,ownership_generation,queued_at,updated_at) VALUES(?,?,?,?,?,'queued',1,?,?,?)",
-                         (command_id, sequence, "protocol.execute", _canonical(captured), "{}", ownership_generation, _now(), _now()))
+                         (command_id, sequence, "protocol.execute", _canonical({k: v for k, v in captured.items() if k != "bundle"}), "{}", ownership_generation, _now(), _now()))
+            self._store_evidence(conn, command_id=command_id, evidence_kind="workflow_input", payload=bundle)
             self._insert_transition(conn, event_kind="workflow_admitted", state="queued", command_id=command_id)
         self._wake.set()
         return self.get_workflow(command_id)
@@ -2270,6 +2278,10 @@ class OperatorCommandStore(CommandReceiptReader):
             payload = _json_load(row["receipt_json"], {})
             if not payload:
                 payload = _json_load(row["requested_inputs_json"], {}).get("bundle", {})
+            if payload.get("_workflow_receipt") == 1:
+                base = self._workflow_inputs(row["requested_inputs_json"])["bundle"]
+                payload = {**base, **{k: v for k, v in payload.items() if not k.startswith("_workflow_")},
+                    "execution": {**base.get("execution", {}), **payload.get("execution", {})}}
             resolution = self._home_recovery_resolution(command_id)
             status = self._settled_status(row["status"], resolution)
             return {**payload, "job_id": command_id, "status": status,
@@ -2354,13 +2366,15 @@ class OperatorCommandStore(CommandReceiptReader):
                 )
                 SELECT command_id, status, idempotency_key, ownership_generation, version,
                     CASE WHEN receipt IS NOT NULL THEN json_extract(receipt,
-                        '$.execution.dry_run', '$.protocol.document.protocol_id',
-                        '$.protocol.source_type', '$.created_at', '$.updated_at',
+                        '$.execution.dry_run',
+                        CASE WHEN json_extract(receipt,'$._workflow_receipt')=1 THEN '$._workflow_input.protocol_id' ELSE '$.protocol.document.protocol_id' END,
+                        CASE WHEN json_extract(receipt,'$._workflow_receipt')=1 THEN '$._workflow_input.source_type' ELSE '$.protocol.source_type' END, '$.created_at', '$.updated_at',
                         '$.operator.pending_review')
                     ELSE json_extract(CASE WHEN json_valid(requested_inputs_json)
                                            THEN requested_inputs_json ELSE '{}' END,
-                        '$.bundle.execution.dry_run', '$.bundle.protocol.document.protocol_id',
-                        '$.bundle.protocol.source_type', '$.bundle.created_at', '$.bundle.updated_at',
+                        '$.bundle.execution.dry_run',
+                        CASE WHEN json_extract(requested_inputs_json,'$.bundle._workflow_receipt')=1 THEN '$.bundle._workflow_input.protocol_id' ELSE '$.bundle.protocol.document.protocol_id' END,
+                        CASE WHEN json_extract(requested_inputs_json,'$.bundle._workflow_receipt')=1 THEN '$.bundle._workflow_input.source_type' ELSE '$.bundle.protocol.source_type' END, '$.bundle.created_at', '$.bundle.updated_at',
                         '$.bundle.operator.pending_review') END AS summary_json
                 FROM payloads ORDER BY sequence DESC
             """, (limit,)).fetchall()
@@ -2456,7 +2470,7 @@ class OperatorCommandStore(CommandReceiptReader):
                      "dispatcher_epoch": row["dispatcher_epoch"], "plan_fingerprint": inputs["plan_fingerprint"],
                      "ownership_generation": row["ownership_generation"],
                      "footprint": self._workflow_runtime_footprint(row), "control_id": control_id}
-            workflow = self.get_workflow(parent).get("execution", {}).get("runtime_state", {}).get("workflow", {})
+            workflow = self.get_workflow_observation(parent).get("execution", {}).get("runtime_state", {}).get("workflow", {})
             fence["gate_id"] = workflow.get("gate_id")
             fence["board4_transition_cursor"] = self.connection.execute(
                 "SELECT COALESCE(MAX(sequence),0) FROM serial206_board_transitions").fetchone()[0]
@@ -2605,14 +2619,88 @@ class OperatorCommandStore(CommandReceiptReader):
             "AND command_kind<>'protocol_control' ORDER BY rowid", (command_id,))]
         return payload
 
+    @staticmethod
+    def _workflow_receipt(payload):
+        """Mutable execution only; authored input has one immutable evidence row.
+
+        The marker is internal storage format, not a public bundle schema. Old
+        unmarked full receipts retain their original whole-receipt semantics.
+        """
+        receipt = {k: v for k, v in payload.items()
+                   if k not in {"protocol", "command", "execution", "recorded_status"}}
+        execution = payload.get("execution", {})
+        receipt["execution"] = {k: v for k, v in execution.items()
+                                if k not in {"live_contract", "idempotency_binding"}}
+        receipt["_workflow_receipt"] = 1
+        protocol = payload.get("protocol", {})
+        receipt["_workflow_input"] = payload.get("_workflow_input", {
+            "protocol_id": protocol.get("document", {}).get("protocol_id"),
+            "source_type": protocol.get("source_type")})
+        return receipt
+
+    def _write_workflow_receipt(self, conn, command_id, previous, receipt):
+        # SQLite already owns the current mutable receipt. Change only changed
+        # subtrees and append new history entries without encoding old history.
+        # This is one existing row/transaction, not an event replay mechanism.
+        if previous.get("_workflow_receipt") != 1:
+            conn.execute("UPDATE operator_commands SET receipt_json=?,updated_at=? WHERE command_id=?",
+                         (_canonical(receipt), _now(), command_id))
+            return
+        changes, removed = [], []
+        def compare(old, new, path):
+            for key in old.keys() - new.keys():
+                removed.append(path + '.' + json.dumps(key))
+            for key, value in new.items():
+                child = path + '.' + json.dumps(key)
+                if key in old and old[key] == value:
+                    continue
+                if child in {'$."execution"', '$."execution"."runtime_state"'} and isinstance(old.get(key), dict):
+                    compare(old[key], value, child)
+                else:
+                    changes.append((child, old.get(key), value))
+        compare(previous, receipt, '$')
+        expression, params = 'receipt_json', []
+        if removed:
+            expression = 'json_remove(' + expression + ',' + ','.join('?' for _ in removed) + ')'
+            params.extend(removed)
+        for path, old, value in changes:
+            if isinstance(old, list) and isinstance(value, list) and value[:len(old)] == old and len(value) > len(old):
+                # Append in bounded SQL chunks to respect SQLite argument limits.
+                for start in range(len(old), len(value), 32):
+                    additions = value[start:start + 32]
+                    expression = 'json_insert(' + expression + ',' + ','.join('?,json(?)' for _ in additions) + ')'
+                    for item in additions:
+                        params.extend((path + '[#]', _canonical(item)))
+            else:
+                expression = 'json_set(' + expression + ',?,json(?))'
+                params.extend((path, _canonical(value)))
+        conn.execute('UPDATE operator_commands SET receipt_json=' + expression + ',updated_at=? WHERE command_id=?',
+                     (*params, _now(), command_id))
+
     def publish_workflow(self, command_id: str, *, payload: Mapping[str, Any]) -> dict[str, Any]:
         with self._transaction() as conn:
             self._workflow_current(conn, command_id, check_safety=False)
             payload = self._workflow_child_publication(conn, command_id, payload)
-            conn.execute("UPDATE operator_commands SET receipt_json=?,updated_at=? WHERE command_id=? AND status IN ('dispatched','interrupting')",
-                         (_canonical(payload), _now(), command_id))
-            conn.execute("UPDATE operator_plane_commands SET version=version+1,updated_at=? WHERE command_id=?", (_now(), command_id))
-        return self.get_workflow(command_id)
+            receipt = self._workflow_receipt(payload)
+            previous = _json_load(conn.execute(
+                "SELECT receipt_json FROM operator_commands WHERE command_id=?", (command_id,)).fetchone()[0], {})
+            # Publication timestamps are not state changes. Do not advance the
+            # version or dirty SQLite for duplicate executor boundary callbacks.
+            if ({k: v for k, v in previous.items() if k != "updated_at"}
+                    != {k: v for k, v in receipt.items() if k != "updated_at"}):
+                self._write_workflow_receipt(conn, command_id, previous, receipt)
+                conn.execute("UPDATE operator_plane_commands SET version=version+1,updated_at=? WHERE command_id=?", (_now(), command_id))
+            else:
+                payload = {**payload, "updated_at": previous.get("updated_at")}
+            row = conn.execute("SELECT c.status,c.idempotency_key,c.ownership_generation,p.version FROM operator_commands c "
+                "JOIN operator_plane_commands p USING(command_id) WHERE c.command_id=?", (command_id,)).fetchone()
+            # The executor already owns the input. Never decode it back out of
+            # SQLite merely to return child IDs after a publication.
+            return {**payload, "job_id": command_id, "status": row["status"], "command": {
+                "command_id": command_id, "idempotency_key": row["idempotency_key"],
+                "recovery_resolution": None, "ownership_generation": int(row["ownership_generation"]),
+                "state_version": int(row["version"]), "status": row["status"], "terminal": False,
+                "status_path": f"/protocol/jobs/{command_id}"}}
 
     def finish_workflow(self, command_id: str, *, status: str, payload: Mapping[str, Any],
                         lifecycle_settled: bool) -> dict[str, Any]:
@@ -2643,7 +2731,7 @@ class OperatorCommandStore(CommandReceiptReader):
             if pending or not lifecycle_settled:
                 status = "ambiguous"
             if status == "ambiguous":
-                payload = json.loads(_canonical(payload))
+                payload = json.loads(_canonical(self._workflow_receipt(payload)))
                 runtime = payload.setdefault("execution", {}).setdefault("runtime_state", {})
                 # A setup exception can precede ProtocolExecutor's workflow
                 # initialization; the admitted runtime then has workflow=null.
@@ -2661,7 +2749,7 @@ class OperatorCommandStore(CommandReceiptReader):
                     self._workflow_current(conn, command_id)
                 except ValueError:
                     status = "interrupted"
-            payload = self._workflow_child_publication(conn, command_id, payload)
+            payload = self._workflow_receipt(self._workflow_child_publication(conn, command_id, payload))
             conn.execute("UPDATE operator_commands SET status=?,receipt_json=?,updated_at=?,finished_at=? WHERE command_id=?",
                          (status, _canonical(payload), _now(), str(_now()), command_id))
             conn.execute("UPDATE operator_plane_commands SET status=?,terminal_json=?,version=version+1,finished_at=?,updated_at=? WHERE command_id=?",
@@ -2793,9 +2881,9 @@ class OperatorCommandStore(CommandReceiptReader):
             workflow = dict(callback(control_id, request))
         except Exception as exc:
             refusal = exc
-            bundle = self.get_workflow(command_id)
+            bundle = self.get_workflow_observation(command_id)
             workflow = bundle.get("execution", {}).get("runtime_state", {}).get("workflow") or {}
-        current = self.get_workflow(command_id)["command"]
+        current = {**self.get_workflow_observation(command_id)["command"], "status_path": f"/protocol/jobs/{command_id}"}
         response = {"control_command_id": control_id, "idempotency_key": key, "command_id": command_id,
                     "job_id": command_id, "ownership_generation": current["ownership_generation"],
                     "state_version": current["state_version"], "accepted": refusal is None,
@@ -5576,7 +5664,8 @@ class OperatorCommandStore(CommandReceiptReader):
                     return {"command_id": candidate["command_id"], "command_kind": "protocol_workflow",
                         "action_id": candidate["action_id"], "dispatch_attempt_id": attempt,
                         "dispatcher_epoch": lane["dispatcher_epoch"], "ownership_generation": candidate["ownership_generation"],
-                        "requested_inputs": _json_load(candidate["requested_json"], {})}
+                        "requested_inputs": self._workflow_inputs(conn.execute("SELECT requested_inputs_json FROM operator_commands WHERE command_id=?",
+                            (candidate["command_id"],)).fetchone()[0])}
                 if self.action_fenced(str(candidate["action_id"])):
                     return None
                 candidate_canonical = conn.execute(

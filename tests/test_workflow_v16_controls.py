@@ -147,6 +147,8 @@ def test_v16_sigkill_reopen_retains_unknown_and_refuses_replay(installed_retaine
                 time.sleep(.02)
             conn = sqlite3.connect(root/'bioxp_runtime.db')
             before = json.loads(conn.execute("SELECT receipt_json FROM operator_commands WHERE command_id='crash-parent'").fetchone()[0])
+            authored = json.loads(conn.execute("SELECT payload_json FROM operator_plane_evidence WHERE command_id='crash-parent' AND evidence_kind='workflow_input'").fetchone()[0])
+            assert 'protocol' not in before
             conn.close()
             child.kill()
             assert child.wait(timeout=5) == -9
@@ -166,7 +168,7 @@ def test_v16_sigkill_reopen_retains_unknown_and_refuses_replay(installed_retaine
         wf = recovered['execution']['runtime_state']['workflow']
         assert wf['phase'] == 'reconciling' and wf['held_reason'] == 'workflow_owner_lost'
         assert recovered['execution']['runtime_state']['action_results'] == before['execution']['runtime_state']['action_results']
-        assert recovered['protocol'] == before['protocol']
+        assert recovered['protocol'] == authored['protocol']
         for action, extra in [('continue',{'gate':'ordinary_pause','gate_id':'wrong'}), ('abort',{})]:
             with pytest.raises(ValueError, match='workflow_authority_lost'):
                 control_protocol_job('crash-parent', control_body('crash-parent',7,action,**extra), command_store=store)

@@ -640,7 +640,6 @@ def bind_protocol_dispatcher(command_store, *, binding_factory, artifact_store=N
             def invoke(action, current):
                 identity = action.source_occurrence_id or action.action_id
                 with command_store.workflow_context(job_id, source_occurrence_id=identity):
-                    command_store.assert_workflow_current(job_id)
                     return handler(action, current)
             return invoke
 
@@ -651,7 +650,6 @@ def bind_protocol_dispatcher(command_store, *, binding_factory, artifact_store=N
                 return handler
             def invoke(current):
                 with command_store.workflow_context(job_id, source_occurrence_id=f"lifecycle:{name}"):
-                    command_store.assert_workflow_current(job_id)
                     return handler(current)
             return invoke
 
@@ -701,6 +699,8 @@ def bind_protocol_dispatcher(command_store, *, binding_factory, artifact_store=N
         command_store.bind_workflow_controls(job_id, control)
         try:
             executor.execute(document, state=state)
+            # Retain the final lease/owner check and any state changed during
+            # executor closeout. An unchanged publication performs no writes.
             publish(state)
             bundle["status"] = executor.outcome
             bundle = command_store.finish_workflow(
