@@ -59,13 +59,9 @@ disk scratch and exact occupancy assertion yielded the full clean run.
   injected lease expiry produces ambiguous parent with child evidence and actual
   exception; setup failure retains bundle. Replacement owner/epoch and known
   outcomes remain fenced.
-- **Not fully qualified:** actual complete eject action through its production
-  caller into unloaded->65000 publication. Existing test calls clearTipLoaded
-  directly, and partial-release coverage proves retained-tip behavior, not that
-  complete eject invokes the publication. Do not treat setter tests as closure.
-- **Not fully qualified:** explicit pause/abort/process-crash readback after V16
-  through real control/recovery owners. Review holds, park pauses, cold receipt
-  reads and injected worker exceptions are narrower coverage, not substitutes.
+- The two remaining acceptance gaps recorded below were closed by the follow-up
+  qualification in **Acceptance closure**. The initial 111-case run did not
+  establish complete eject publication or explicit pause/abort/crash recovery.
 - Historical dead-worker cause remains unknown; injected lease expiry is one
   reproducible mechanism. Persistent SQLite failure/owner replacement recovery
   is not overridden by this repair.
@@ -82,3 +78,90 @@ incompatibility identified. BMS tests/browser not rerun; API/fixture counts in i
 report are separate evidence, not part of the 111. BMS worktree not edited.
 
 No deployment, push, service restart, robot access or live DB write performed.
+
+## Acceptance closure
+
+Implementation/test commit: **5dc55c19c343b24b22d6ab9df1aefd2185a612f9**,
+following 629b8666dda1c856aae15da9e44b8b767fece373. This section is a
+documentation-only follow-up; the tested implementation and tests are unchanged.
+
+### Eject publication
+
+The real workflow TIP_EJECT handler and direct eject service had no canonical
+publication after transport verification; diagnostic eject updated channel flags
+only. The caller now observes the existing all-channel post-eject query and
+publishes through the existing provider tip setter while the real receipt is
+reserved, carrying that receipt's command ID. Diagnostic completion publishes
+through the same provider owner and preserves completed channel releases before
+a later channel failure. No extra query, eject, retry, motion, or admission gate
+was introduced; the transport's existing OEM retry behavior is unchanged.
+
+Nine cases exercise actual workflow admission/dispatcher/executor ->
+api._protocol_live_pipette_handler -> run_pipette_tip_command ->
+FourPipetteTransport.set_tip/eject_all_tips, direct eject-all, and
+run_diagnostic_inline/run_collection_diagnostic with real receipt stores and
+inert pump drivers. For each caller: selected partial ejection leaves tips and
+pseudo-home 500; full ejection publishes unloaded and 65000; injected canonical
+publication failure is retained as observation without failing/repeating the
+completed ejection. Cold canonical/provider reads are asserted. The workflow
+retains its real pipette child identity and reaches completed. Workflow/direct
+key replay after a later pickup neither sends again nor republishes old tip
+state. Direct/workflow pipette receipts retain the exact publication and
+all-channel observation across cold SQLite reads. Existing plate distinctions
+and pickup tests remain in the combined roster.
+
+The same complete-eject cases against the original three production files at
+629b8666dda1c856aae15da9e44b8b767fece373 fail **3/3** on missing
+`deck_state_publication`; the candidate passes. This intentional regression
+check is retained separately in eject-baseline-red.xml/.log and
+command-baseline-red.txt, not counted as passing qualification.
+
+### V16 controls and crash recovery
+
+Four new cases use real migrated/private V16 stores and native workflow owners:
+
+- Actual HTTP pause during an entered native leaf, reached ordinary_pause,
+  independent SQLite readback, then explicit Continue; only the second leaf
+  executes, and fresh-process readback matches the completed job.
+- The same explicit pause followed by HTTP Abort; the second leaf never runs,
+  the job becomes interrupted, and control-key replay/fresh-process readback
+  preserve the exact result. Receipt-only pause publications add no full report
+  snapshots; terminal status changes do.
+- SIGKILL a separate process during an entered action, then allow its real lease
+  to expire and reopen through OperatorCommandStore's actual startup recovery.
+- SIGKILL a separate process at a reached explicit pause and reopen identically.
+
+Both crash cases preserve action evidence and document, durably publish
+ambiguous/reconciling/workflow_owner_lost, refuse new Continue and Abort without
+an eligible owner, and retain the old pause acceptance when applicable. No
+lease/status row is fabricated to trigger recovery. A native-entry file proves
+only the first leaf entered; claim_next and a second cold reopen never replay
+it or enter the second leaf. Leaves are inert test callbacks, not physical
+hardware qualification. No V16 production-code change was needed.
+
+### Final combined evidence
+
+BigBoy only; image `bioxp-oem:2048334c8209`, image ID
+`sha256:0daee7b395b2a3eeb4026a7bee259bf12aea029e194f00805efd65e94090be0c`.
+Read-only committed source/OEM/retained fixture mounts, no network or devices,
+private writable scratch, and unchanged `tests.z_stop_offline_guard` imported
+before pytest. The unchanged prior roster plus the nine eject and four control
+cases yielded **124 passed, 0 failed, 0 errors, 0 skipped**, **227.805 s** by
+parsed JUnit (124 named testcases). One Starlette/httpx deprecation warning.
+
+Evidence directory remains:
+`/home/dalab/.hermes/profiles/fresh/cache/scratch/workflow-repair-integrated/`
+
+- `command-acceptance.txt`: exact production-image command and complete roster.
+- `acceptance-combined.xml`, `acceptance-combined.log`: final combined results.
+- `new-focused.xml/.log`: preceding guarded new-case run, 13 passed.
+- `eject-first`/`v16-first`: initial fixture failures (missing stable receipt key,
+  missing action stage ID); corrected without changing product admission.
+- `eject-fifth`: an invalid attempt to replay a workflow leaf outside its original
+  workflow context correctly conflicted. The final test re-admits the original
+  parent instead; no idempotency contract was relaxed.
+
+Remaining limits: not a full suite, BMS/browser run, deployment or physical
+acceptance. The historical dead-worker cause remains unknown; actual killed
+process recovery is now qualified, not claimed as that historical diagnosis.
+No robot connection, live DB mutation, restart, deployment, or push occurred.
