@@ -2698,6 +2698,7 @@ from . import oem_deck_recovery_schema_v12 as _recovery_v12
 from . import oem_deck_recovery_schema_v13 as _recovery_v13
 from . import oem_deck_schema_v14 as _deck_v14
 from . import runtime_method_retirement_v15 as _retirement_v15
+from . import runtime_workflow_pacing_v16 as _pacing_v16
 
 WORKFLOW_SCHEMA_VERSION = 11
 _WORKFLOW_DDL = (
@@ -2817,6 +2818,7 @@ def canonical_runtime_migration_registry() -> tuple[RuntimeMigrationIdentity, ..
         _recovery_v13.migration_identity(),
         _deck_v14.migration_identity(),
         _retirement_v15.migration_identity(),
+        _pacing_v16.migration_identity(),
     )
     versions = tuple(item.version for item in registry)
     if versions != tuple(sorted(set(versions))):
@@ -3135,7 +3137,7 @@ def _verify_report_identity_metadata_v1(connection: sqlite3.Connection) -> None:
 
 
 
-def canonical_runtime_schema_manifest(*, version: int = _retirement_v15.VERSION) -> dict[tuple[str, str], str]:
+def canonical_runtime_schema_manifest(*, version: int = _pacing_v16.VERSION) -> dict[tuple[str, str], str]:
     """Return the exact union of every registered non-SQLite schema object."""
     expected = _expected_foundation_connection()
     try:
@@ -3188,6 +3190,8 @@ def canonical_runtime_schema_manifest(*, version: int = _retirement_v15.VERSION)
         if version >= _retirement_v15.VERSION:
             expected.execute("PRAGMA foreign_keys=OFF")
             _retirement_v15.apply(expected)
+        if version >= _pacing_v16.VERSION:
+            _pacing_v16.apply(expected)
         return {
             (str(row[0]), str(row[1])): normalize_sql_definition(row[2])
             for row in expected.execute(
@@ -3732,13 +3736,16 @@ def _migrate_oem_deck_schema_v7_locked(
 
 
 def migrate_runtime_database_v2(connection: sqlite3.Connection, root: str | Path) -> None:
-    if int(connection.execute("PRAGMA user_version").fetchone()[0]) == _retirement_v15.VERSION:
+    if int(connection.execute("PRAGMA user_version").fetchone()[0]) == _pacing_v16.VERSION:
         verify_canonical_runtime_database(connection)
         return
     with runtime_write_coordinator(root).lock:
-        _migrate_runtime_database_through_v14(connection, root)
-        _retirement_v15.migrate(connection, Path(root).expanduser().resolve(strict=False),
-                               canonical_runtime_migration_registry()[-1])
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) < _retirement_v15.VERSION:
+            _migrate_runtime_database_through_v14(connection, root)
+            _retirement_v15.migrate(connection, Path(root).expanduser().resolve(strict=False),
+                                   canonical_runtime_migration_registry()[14])
+        _pacing_v16.migrate(connection, Path(root).expanduser().resolve(strict=False),
+                           canonical_runtime_migration_registry()[15])
 
 
 def _migrate_runtime_database_through_v14(connection: sqlite3.Connection, root: str | Path) -> None:
@@ -4115,7 +4122,7 @@ class OEMRuntimeStore:
         self._closed = False
         # A prepared database needs no writer fence or data audit. Only actual
         # schema preparation enters the authority fence (also supports new stores).
-        if int(self._db.execute("PRAGMA user_version").fetchone()[0]) == _retirement_v15.VERSION:
+        if int(self._db.execute("PRAGMA user_version").fetchone()[0]) == _pacing_v16.VERSION:
             verify_canonical_runtime_database(self._db)
         else:
             with self._authority_write():

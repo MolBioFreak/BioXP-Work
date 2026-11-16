@@ -2267,8 +2267,9 @@ class OperatorCommandStore(CommandReceiptReader):
                 "WHERE c.command_id=? AND c.command_kind='protocol_workflow'", (command_id,)).fetchone()
             if row is None:
                 return None
-            inputs = _json_load(row["requested_inputs_json"], {})
-            payload = _json_load(row["receipt_json"], {}) or inputs.get("bundle", {})
+            payload = _json_load(row["receipt_json"], {})
+            if not payload:
+                payload = _json_load(row["requested_inputs_json"], {}).get("bundle", {})
             resolution = self._home_recovery_resolution(command_id)
             status = self._settled_status(row["status"], resolution)
             return {**payload, "job_id": command_id, "status": status,
@@ -2593,9 +2594,12 @@ class OperatorCommandStore(CommandReceiptReader):
     def _workflow_child_publication(self, conn, command_id, payload):
         # Canonical admission order, never native completion/callback order.
         # Called only within the parent's existing writer transaction.
-        payload = json.loads(_canonical(payload))
-        workflow = payload.setdefault("execution", {}).setdefault("runtime_state", {}).setdefault(
-            "workflow", {"command_id": command_id})
+        # Copy only the path we change. The scientific bundle can be megabytes;
+        # serializing/deserializing it just to replace child IDs doubles the cost.
+        payload = dict(payload)
+        execution = payload["execution"] = dict(payload.get("execution", {}))
+        runtime = execution["runtime_state"] = dict(execution.get("runtime_state", {}))
+        workflow = runtime["workflow"] = dict(runtime.get("workflow", {"command_id": command_id}))
         workflow["child_command_ids"] = [row[0] for row in conn.execute(
             "SELECT command_id FROM operator_commands WHERE parent_command_id=? "
             "AND command_kind<>'protocol_control' ORDER BY rowid", (command_id,))]
