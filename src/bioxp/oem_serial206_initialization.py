@@ -4863,8 +4863,16 @@ class Serial206OemInitializationProvider:
             # OEM setter, including publications with no subsequent Home.
             with self._lock:
                 state = self._load_state()
+                recorded = state["machine_status"].get("tip_loaded")
                 state["machine_status"].update(updates)
-                state["machine_status"]["psudo_z_home_steps"] = 500 if updates["tip_loaded"] else 65000
+                # Follow the canonical owner's decision instead of recomputing
+                # it: a held plate or an unchanged "no tips" observation leaves
+                # this height untouched.
+                if updates["tip_loaded"]:
+                    state["machine_status"]["psudo_z_home_steps"] = 500
+                elif result.get("pseudo_z_home") == 65000 and (
+                        source_operation == "clearTipLoaded" or recorded is not False):
+                    state["machine_status"]["psudo_z_home_steps"] = 65000
                 self._save_state(state)
         return {str(key): value for key, value in result.items()}
 
