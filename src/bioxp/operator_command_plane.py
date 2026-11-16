@@ -2693,6 +2693,9 @@ class OperatorCommandStore(CommandReceiptReader):
         with self._lock:
             future = self._workflow_child_waiters.setdefault(
                 (command_id, bool(include_issued_pending)), Future())
+        # Subscribe before checking durable completion: the child can commit
+        # between the caller read and registration, with no later child event.
+        self._settle_workflow_child_waiters()
         self._wake.set()
         return future
 

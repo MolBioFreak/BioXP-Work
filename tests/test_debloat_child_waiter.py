@@ -45,3 +45,19 @@ def test_default_waiter_is_terminal_only():
     s._settle_workflow_child_waiters()
     assert not f.done()
     assert s.workflow_child_completion("c") is f
+
+
+def test_completion_before_subscription_is_delivered_at_registration():
+    s = _store("completed")
+    future = s.workflow_child_completion("c")
+    assert future.done()
+    assert future.result()["receipt"] == {"command_id": "c", "status": "completed"}
+    assert s._workflow_child_waiters == {}
+
+
+def test_failed_completion_before_subscription_retains_failure():
+    s = _store("failed")
+    future = s.workflow_child_completion("c")
+    assert future.done()
+    assert future.result()["ok"] is False
+    assert future.result()["receipt"]["status"] == "failed"
