@@ -2387,13 +2387,13 @@ class OperatorCommandStore(CommandReceiptReader):
                 "ORDER BY sequence DESC LIMIT ?", (limit,)).fetchall()
             return [self.get_workflow(row[0]) for row in ids]
 
-    def _workflow_current(self, conn, command_id, *, check_safety=True):
+    def _workflow_current(self, conn, command_id, *, check_safety=True, check_lease=True):
         row = conn.execute("SELECT p.*,c.command_kind,c.effective_inputs_json AS workflow_effective_json FROM operator_plane_commands p JOIN operator_commands c USING(command_id) "
                            "WHERE p.command_id=?", (command_id,)).fetchone()
         lane = conn.execute("SELECT * FROM operator_plane_lane WHERE singleton=1").fetchone()
         if (row is None or row["command_kind"] != "protocol_workflow" or row["status"] not in {"dispatched", "stop_requested", "abort_requested"}
                 or lane["workflow_command_id"] != command_id or lane["owner_id"] != self.owner_id
-                or float(lane["owner_lease_until"] or 0) <= _now()
+                or (check_lease and float(lane["owner_lease_until"] or 0) <= _now())
                 or row["dispatcher_epoch"] != lane["dispatcher_epoch"]):
             raise ValueError("workflow_authority_lost")
         if not check_safety:
@@ -2622,7 +2622,14 @@ class OperatorCommandStore(CommandReceiptReader):
             row = conn.execute("SELECT status FROM operator_commands WHERE command_id=?", (command_id,)).fetchone()
             if row and row[0] in {"completed","failed","interrupted","cleared","ambiguous"}:
                 return self.get_workflow(command_id)
-            self._workflow_current(conn, command_id, check_safety=False)
+            # Recording an unknown outcome is not permission to execute. A
+            # worker whose own lease expired must still leave durable terminal
+            # truth, rather than dying with its parent forever dispatched.
+            # The transaction retains the owner, epoch and parent-lane fences;
+            # a replacement owner still excludes this writer. Native entry and
+            # every known-outcome closeout continue to require a live lease.
+            self._workflow_current(conn, command_id, check_safety=False,
+                                   check_lease=status != "ambiguous")
             from .runtime_audit_store import TERMINAL_COMMAND_STATES
             # Unknown terminal receipts retain custody; ordinary query observations
             # and every known canonical/plane terminal outcome settle their child.
@@ -2637,7 +2644,11 @@ class OperatorCommandStore(CommandReceiptReader):
                 status = "ambiguous"
             if status == "ambiguous":
                 payload = json.loads(_canonical(payload))
-                workflow = payload.setdefault("execution", {}).setdefault("runtime_state", {}).setdefault("workflow", {"command_id": command_id})
+                runtime = payload.setdefault("execution", {}).setdefault("runtime_state", {})
+                # A setup exception can precede ProtocolExecutor's workflow
+                # initialization; the admitted runtime then has workflow=null.
+                workflow = runtime.get("workflow") or {"command_id": command_id}
+                runtime["workflow"] = workflow
                 causes = (["children"] if pending else [])
                 if not lifecycle_settled:
                     causes.append("lifecycle")
@@ -6539,9 +6550,14 @@ class OperatorCommandStore(CommandReceiptReader):
             if claimed.get("command_kind") == "protocol_workflow":
                 try:
                     self._workflow_dispatcher(claimed)
-                except Exception:
+                except Exception as exc:
+                    # Retain the last durable action/child evidence and the
+                    # actual exception instead of replacing the job by a stub.
+                    payload = self.get_workflow(claimed["command_id"]) or {}
+                    payload.update(error="workflow_dispatcher_exception", outcome_unknown=True,
+                                   exception_type=type(exc).__name__, exception_message=str(exc))
                     self.finish_workflow(claimed["command_id"], status="ambiguous",
-                        payload={"error": "workflow_dispatcher_exception", "outcome_unknown": True}, lifecycle_settled=False)
+                        payload=payload, lifecycle_settled=False)
                 return
             parent = self.connection.execute("SELECT parent_command_id,requested_inputs_json FROM operator_commands WHERE command_id=?",
                                              (claimed["command_id"],)).fetchone()
