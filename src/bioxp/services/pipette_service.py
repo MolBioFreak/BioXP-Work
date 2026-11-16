@@ -239,6 +239,7 @@ async def _run_transport_call(
     receipt_store: PipetteReceiptStore | None = None,
     runtime_binding: dict[str, Any] | None = None,
     requested_inputs: dict[str, Any] | None = None,
+    observe_result: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
     requested_for_receipt = (
         dict(requested_inputs)
@@ -453,7 +454,15 @@ async def _run_transport_call(
         stage = "transport"
         transport = get_transport()
         stage = "dispatch"
-        result = await run_blocking(label, lambda: operation(transport), timeout_s=timeout_s)
+        def execute():
+            result = operation(transport)
+            if observe_result is not None:
+                # Observe a new physical return while its real receipt is active;
+                # retained-key replay above never republishes current tip state.
+                observe_result(result, source_command_id=str(
+                    (claim_record or {}).get("command_id") or "pipette-operation:" + uuid4().hex))
+            return result
+        result = await run_blocking(label, execute, timeout_s=timeout_s)
         if isinstance(result, dict) and effective_runtime_binding.get("callback_session_id"):
             callback_session_id = str(effective_runtime_binding["callback_session_id"])
             result.setdefault("callback_session_id", callback_session_id)
@@ -682,6 +691,7 @@ async def run_pipette_operation(
     requested_inputs: dict[str, Any] | None = None,
     preflight: PipettePreflight | None = None,
     runtime_binding: dict[str, Any] | None = None,
+    observe_result: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
     """Route a non-command OEM control through the same receipt/error owner."""
     return await _run_transport_call(
@@ -690,6 +700,7 @@ async def run_pipette_operation(
         get_transport=get_transport,
         run_blocking=run_blocking,
         operation=operation,
+        observe_result=observe_result,
         operation_name=operation_name,
         preflight=preflight,
         receipt_store=receipt_store,
@@ -748,6 +759,7 @@ async def run_pipette_tip_command(
     preflight: PipettePreflight | None = None,
     receipt_store: PipetteReceiptStore | None = None,
     runtime_binding: dict[str, Any] | None = None,
+    observe_result: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
     return await _run_transport_call(
         "Pipette tip",
@@ -755,6 +767,7 @@ async def run_pipette_tip_command(
         get_transport=get_transport,
         run_blocking=run_blocking,
         operation=lambda transport: transport.set_tip(command),
+        observe_result=observe_result,
         operation_name="tip",
         command=command,
         preflight=preflight,

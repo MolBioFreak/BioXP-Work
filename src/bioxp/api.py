@@ -9613,6 +9613,7 @@ async def liquid_init(req: PipetteInitRequest):
 async def liquid_tip(req: PipetteTipRequest):
     return await run_pipette_tip_command(
         PipetteTipCommand.from_request(req),
+        observe_result=_publish_eject_tip_state,
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         receipt_store=_pipette_receipts,
@@ -9637,6 +9638,29 @@ async def liquid_pipette_tip_type(req: PipetteTipTypeRequest):
         result = {**result, "status_refresh_error": str(exc)[:300]}
     return result
 
+
+def _publish_eject_tip_state(result, *, source_command_id):
+    """Publish the completed eject's all-channel observation, without more IO.
+
+    Selected-channel success is not all-tip absence. Recording failure remains
+    evidence, not a new eject failure or a reason to repeat physical work.
+    """
+    after = result.get("after")
+    if not isinstance(after, dict) or after.get("hardware_query_verified") is not True:
+        return result  # e.g. host-only LOAD has no eject observation
+    try:
+        provider = getattr(app.state, "oem_deck_provider", None)
+        published = provider._publish_observed_tip_presence(
+            bool(after["channels_with_tips"]),
+            source_command_id=source_command_id,
+        )
+        result["deck_state_publication"] = {"status": "published",
+            "semantic_state_revision": published["semantic_state_revision"]}
+    except Exception as exc:
+        result["deck_state_publication"] = {"status": "blocked", "reason": str(exc)}
+    return result
+
+
 @app.post("/liquid/eject-all")
 async def liquid_eject_all(req: PipetteEjectAllRequest):
     return await run_pipette_operation(
@@ -9646,6 +9670,7 @@ async def liquid_eject_all(req: PipetteEjectAllRequest):
             wait=req.wait,
             channels=req.channels,
         ),
+        observe_result=_publish_eject_tip_state,
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         timeout_s=120.0,
@@ -10251,6 +10276,7 @@ def _protocol_live_pipette_handler(action, state):
         result = asyncio.run(
             run_pipette_tip_command(
                 command,
+                observe_result=_publish_eject_tip_state,
                 get_transport=_get_pipette_transport,
                 run_blocking=inline_run,
                 receipt_store=_pipette_receipts,
@@ -10262,6 +10288,7 @@ def _protocol_live_pipette_handler(action, state):
         result = asyncio.run(
             run_pipette_tip_command(
                 command,
+                observe_result=_publish_eject_tip_state,
                 get_transport=_get_pipette_transport,
                 run_blocking=inline_run,
                 receipt_store=_pipette_receipts,

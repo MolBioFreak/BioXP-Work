@@ -73,7 +73,7 @@ def _firmware_text(row):
     return raw.get("firmware")
 
 
-def run_collection_diagnostic(group, request, record, result=None):
+def run_collection_diagnostic(group, request, record, result=None, *, publish_tip_state=None):
     """Run under the finite owner; record uses the existing receipt owner.
 
     No outer transaction lock across waits: addressed TR must stay interruptible.
@@ -169,9 +169,15 @@ def run_collection_diagnostic(group, request, record, result=None):
                 record("eject_tip", lambda t, ch=channel: {"ok": True, "channels":
                     t._eject_tip_channels_once([ch], wait_for_completion=True)})
                 result["ejected_channels"].append(channel)
-        # Software tip state follows the eject, so no later move applies a tip-length offset.
-        for ch in result["ejected_channels"]:
-            group._transports[ch]._tip_loaded = False
+                # Retain each completed release even if a later channel fails.
+                group._transports[channel]._tip_loaded = False
+        if publish_tip_state is not None:
+            try:
+                published = publish_tip_state(bool(_cached(group)))
+                result["deck_state_publication"] = {"status": "published",
+                    "semantic_state_revision": published["semantic_state_revision"]}
+            except Exception as exc:
+                result["deck_state_publication"] = {"status": "blocked", "reason": str(exc)}
     elif action == "get_data":
         result["channels"] = []
         for channel in range(4):
@@ -274,7 +280,9 @@ def run_diagnostic_inline(provider, diagnostic, *, command_id, owner_identity):
                     result.update(ok=False, completed=False, failure=name)
                     return result
         else:
-            run_collection_diagnostic(provider.primitives.pipette_transport, request, record, result)
+            run_collection_diagnostic(provider.primitives.pipette_transport, request, record, result,
+                publish_tip_state=lambda loaded: provider._publish_observed_tip_presence(
+                    loaded, source_command_id=command_id))
         result.update(completed=True,
             controller_outcome_ok=all(e["result"].get("ok") is not False for e in events))
         interrupted = any(e["result"].get("interrupted_by_terminate") for e in events)
