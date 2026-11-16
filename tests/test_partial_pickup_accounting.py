@@ -286,6 +286,7 @@ def test_pickup_publication_inside_active_receipt(connected, monkeypatch, reopen
         p.bind_pipette_collection_state_reader(lambda: {'tip_exists':any(ch._tip_loaded for ch in channels)})
         raw = p.wp8_manual_pipette_physical
         monkeypatch.setattr(p, 'wp8_manual_pipette_physical', observe)
+    before_occupancy = list(store.tip_tray_state(0)['occupancy'])
     action = SimpleNamespace(action_id='connected-pickup', params={'operation':'load_tip',
         'tray':1, 'well':'A10', 'overpress':False, 'lift_z':True,
         'keep_channels':[2], 'release_lift_mm':10.0})
@@ -319,7 +320,13 @@ def test_pickup_publication_inside_active_receipt(connected, monkeypatch, reopen
         occupancy = cold.tip_tray_state(0)['occupancy']
         assert [occupancy[w] for w in [9,33,57,81]] == (
             [False]*4 if release_error else [True,True,False,True])
-        assert sum(occupancy) == (92 if release_error else 95)
+        expected = list(before_occupancy)
+        for index, well in enumerate([9,33,57,81]):
+            expected[well] = False if release_error else index != 2
+        assert occupancy == expected  # retained racks need not begin full
+        assert cold.deck_semantic_state()['tip_loaded'] is True
+        assert cold.deck_semantic_state()['pseudo_z_home'] == 500
+        assert p._load_state()['machine_status']['psudo_z_home_steps'] == 500
     finally:
         cold.stop()
     assert len(homes) == (0 if release_error else 1)
