@@ -9144,6 +9144,13 @@ class BioXpTester:
             result['source_module_updates'] = {'TC': False}
         return result
 
+    def oem_turn_off_lid(self):
+        # ClassThermalBoard.setTCorLidPWM(1, 0): lid PWM off, LID_Target_Temp -99.
+        result = self._oem_thermal_result()
+        if self._oem_board_present(self.BOARD_THERMAL):
+            self._oem_thermal_pwm(result, self.BOARD_THERMAL, self.THERMAL_BANK_LID, 0)
+        return result
+
     def oem_set_chiller_pwm(self, chiller=None, pwm=0):
         result = self._oem_thermal_result()
         banks = (1, 0) if chiller is None else (1,) if chiller in ('OC', 'oc') else (0,) if chiller in ('RC', 'rc') else ()

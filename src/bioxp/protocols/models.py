@@ -92,6 +92,8 @@ class ProtocolActionKind(str, Enum):
     THERMAL_DOOR = "thermal_door"
     MOVE_COVER = "move_cover"
     CHILLER_SETPOINT = "chiller_setpoint"
+    CHILLER_OFF = "chiller_off"
+    THERMAL_OFF = "thermal_off"
     THERMAL_SETPOINT = "thermal_setpoint"
     THERMAL_HOLD = "thermal_hold"
     THERMAL_PROFILE = "thermal_profile"

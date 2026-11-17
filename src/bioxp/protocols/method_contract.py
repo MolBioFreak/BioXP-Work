@@ -45,6 +45,8 @@ def method_contract():
         'thermal_profile': obj({'segments': {'type': 'array', 'minItems': 1, 'items': hold},
                                 'repeat': {'type': 'integer', 'minimum': 0}}, ('segments', 'repeat')),
         'chiller_setpoint': obj({'bank': {'enum': ['rc', 'oc']}, 'target_temp_c': number}, ('bank', 'target_temp_c')),
+        'chiller_off': obj({'bank': {'enum': ['rc', 'oc']}}, ('bank',)),
+        'thermal_off': obj({'bank': {'enum': ['nest', 'lid']}}, ('bank',)),
         'snapshot': obj({}),
         'camera_illumination': obj({'channel': {'type': 'integer', 'enum': [1, 2, 3]}, 'on': boolean}, ('channel', 'on')),
         'barcode_read': obj({'mode': {'enum': ['stationary', 'job_id', 'reagent_id']}}, ('mode',)),

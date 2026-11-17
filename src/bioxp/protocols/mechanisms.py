@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from .models import ProtocolActionKind as K
 
 KINDS = {K.WAIT, K.THERMAL_SETPOINT, K.THERMAL_HOLD, K.THERMAL_PROFILE,
-         K.CHILLER_SETPOINT, K.SNAPSHOT, K.CAMERA_ILLUMINATION,
+         K.CHILLER_SETPOINT, K.CHILLER_OFF, K.THERMAL_OFF, K.SNAPSHOT, K.CAMERA_ILLUMINATION,
          K.TIMER_START, K.TIMER_WAIT, K.BARCODE_READ, K.LED, K.SEAL_SEPARATE}
 
 
@@ -19,7 +19,7 @@ def validate_mechanism(kind, p):
         return
     fields = {
         K.WAIT: {"seconds"}, K.TIMER_START: {"timer_id", "seconds"}, K.TIMER_WAIT: {"timer_id"},
-        K.THERMAL_SETPOINT: {"bank", "target_temp_c", "fan_speed", "cool_rate_c_s", "heat_rate_c_s"}, K.CHILLER_SETPOINT: {"bank", "target_temp_c"},
+        K.THERMAL_SETPOINT: {"bank", "target_temp_c", "fan_speed", "cool_rate_c_s", "heat_rate_c_s"}, K.CHILLER_SETPOINT: {"bank", "target_temp_c"}, K.CHILLER_OFF: {"bank"}, K.THERMAL_OFF: {"bank"},
         K.THERMAL_HOLD: {"bank", "target_temp_c", "duration_s", "start", "tolerance_c", "timeout_s", "fan_speed", "cool_rate_c_s", "heat_rate_c_s"},
         K.THERMAL_PROFILE: {"segments", "repeat"}, K.SNAPSHOT: set(),
         K.CAMERA_ILLUMINATION: {"channel", "on"}, K.BARCODE_READ: {"mode"},
@@ -41,6 +41,12 @@ def validate_mechanism(kind, p):
             raise ValueError("timer_id requires a nonempty string")
         if kind == K.TIMER_START:
             number("seconds", True)
+    elif kind == K.CHILLER_OFF:
+        if p.get("bank") not in {"rc", "oc"}:
+            raise ValueError("chiller_off.bank requires rc or oc")
+    elif kind == K.THERMAL_OFF:
+        if p.get("bank") not in {"nest", "lid"}:
+            raise ValueError("thermal_off.bank requires nest or lid")
     elif kind == K.BARCODE_READ:
         if p.get("mode") not in {"stationary", "job_id", "reagent_id"}:
             raise ValueError("barcode_read.mode requires stationary, job_id or reagent_id")
@@ -178,6 +184,15 @@ def build_mechanism_handlers(*, get_tester, get_camera, get_executor, save_snaps
             # OEM ClassChillerBoard.setChillerTemp: fan target, cool-time check, then setpoint.
             receipt = dict(tester.oem_chiller_set_temperature(bank, float(p["target_temp_c"])))
             return {**receipt, "setpoint_accepted": receipt.get("ok") is True, "temperature_reached": None}
+        if kind == K.CHILLER_OFF:
+            # OEM ClassControlInterface.setChillerPWM(chiller, 0).
+            receipt = dict(get_tester().oem_set_chiller_pwm(p["bank"], 0))
+            return {**receipt, "switched_off": receipt.get("ok") is True}
+        if kind == K.THERMAL_OFF:
+            # OEM turnOffHeater() for the block; setTCorLidPWM(1, 0) for the lid.
+            tester = get_tester()
+            receipt = dict(tester.oem_turn_off_heater() if p["bank"] == "nest" else tester.oem_turn_off_lid())
+            return {**receipt, "switched_off": receipt.get("ok") is True}
         if kind == K.THERMAL_HOLD:
             return hold(action, p, action.action_id)
         if kind == K.THERMAL_PROFILE:

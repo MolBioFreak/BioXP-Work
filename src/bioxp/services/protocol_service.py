@@ -597,7 +597,7 @@ def _workflow_resources(document: ProtocolDocument) -> list[str]:
             resources.add("pipette")
         if action.kind.value.startswith("thermal"):
             resources.add("thermal")
-        if action.kind is ProtocolActionKind.CHILLER_SETPOINT:
+        if action.kind in {ProtocolActionKind.CHILLER_SETPOINT, ProtocolActionKind.CHILLER_OFF}:
             resources.add("chiller")
         if action.kind in {ProtocolActionKind.SNAPSHOT, ProtocolActionKind.CAMERA_ILLUMINATION, ProtocolActionKind.BARCODE_READ}:
             resources.add("camera")

@@ -30,6 +30,8 @@ _ACTION_CAPABILITY_MAP: dict[ProtocolActionKind, CapabilityName | None] = {
     ProtocolActionKind.THERMAL_DOOR: CapabilityName.THERMAL,
     ProtocolActionKind.MOVE_COVER: CapabilityName.MOTION,
     ProtocolActionKind.CHILLER_SETPOINT: CapabilityName.CHILLER,
+    ProtocolActionKind.CHILLER_OFF: CapabilityName.CHILLER,
+    ProtocolActionKind.THERMAL_OFF: CapabilityName.THERMAL,
     ProtocolActionKind.THERMAL_SETPOINT: CapabilityName.THERMAL,
     ProtocolActionKind.LOOP_MARKER: None,
     ProtocolActionKind.SEAL_SEPARATE: None,
