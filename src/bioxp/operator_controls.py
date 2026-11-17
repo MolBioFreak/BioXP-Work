@@ -841,6 +841,7 @@ def _compact_pipette_response(value: Any) -> Any:
     result = dict(value)
     critical = result.get("pipette_result")
     barcode = result.get("barcode_result")
+    hoisted: list[Any] = []
     for key in ("result", "response", "completed_children", "source_children", "provider_results"):
         child = result.get(key)
         if isinstance(child, Mapping):
@@ -860,6 +861,7 @@ def _compact_pipette_response(value: Any) -> Any:
                 barcode = candidate["barcode_result"]
             if isinstance(candidate.get("pipette_result"), Mapping):
                 critical = candidate["pipette_result"]
+                hoisted.append(candidate)
             anchor = str(candidate.get("source") or candidate.get("source_anchor") or "")
             child_kind = next((k for prefix, k in kinds.items() if anchor.startswith(prefix)), None)
             child_kind = candidate.get("kind") if candidate.get("kind") in _ADDITIONAL_PIPETTE_KINDS else child_kind
@@ -869,6 +871,10 @@ def _compact_pipette_response(value: Any) -> Any:
         result["barcode_result"] = barcode
     if critical is not None:
         result["pipette_result"] = critical
+        # One copy: the top-level pipette_result. Nested envelopes drop theirs.
+        for candidate in hoisted:
+            if isinstance(candidate, dict) and candidate.get("pipette_result") is critical:
+                candidate.pop("pipette_result")
     return result
 
 

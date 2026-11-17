@@ -4030,6 +4030,9 @@ class OperatorCommandStore(CommandReceiptReader):
             }
         else:
             bounded = _bounded_json(result, 131072)
+        if state == "completed" and isinstance(bounded, Mapping) and bounded.get("kind") == "cavro_application":
+            # Failed or uncertain children keep everything for diagnosis.
+            bounded = {k: v for k, v in bounded.items() if len(_canonical(v)) <= 4096}
         evidence = {"result": bounded, "terminalized_at": _now()}
         with self._deck_owner_authority_scope(), self._transaction() as conn:
             active = conn.execute(
@@ -5951,8 +5954,11 @@ class OperatorCommandStore(CommandReceiptReader):
                 "UPDATE serial206_movement_commands SET state=?,state_version=state_version+1,finished_at=?,terminal_receipt_id=? WHERE command_id=? AND state NOT IN ('completed','failed','cleared','interrupted','ambiguous','rejected')",
                 (canonical_status, now, str(payload.get("receipt_id")) if payload.get("receipt_id") is not None else None, command_id),
             )
-            transition = self._insert_transition(conn, event_kind="command_terminal", command_id=command_id, state=status, payload={"source_noop": source_noop, "reason": source_noop_reason, **dict(payload)})
-            conn.execute("INSERT INTO operator_plane_outbox(outbox_id,command_id,transition_sequence,state,payload_json,updated_at) VALUES(?,?,?,?,?,?)", (str(uuid.uuid4()), command_id, transition, "pending", _canonical(_bounded_json(payload, 131072)), _now()))
+            # The terminal payload lives once, in terminal_json. History and
+            # outbox rows keep only its scalar outcome fields.
+            outcome = {k: v for k, v in dict(payload).items() if v is None or isinstance(v, (bool, int, float, str))}
+            transition = self._insert_transition(conn, event_kind="command_terminal", command_id=command_id, state=status, payload={**outcome, "source_noop": source_noop, "reason": source_noop_reason})
+            conn.execute("INSERT INTO operator_plane_outbox(outbox_id,command_id,transition_sequence,state,payload_json,updated_at) VALUES(?,?,?,?,?,?)", (str(uuid.uuid4()), command_id, transition, "pending", _canonical(outcome), _now()))
 
             updated = conn.execute("SELECT * FROM operator_plane_commands WHERE command_id=?", (command_id,)).fetchone()
             assert updated is not None
