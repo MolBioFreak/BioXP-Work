@@ -312,6 +312,12 @@ def get_protocol_jobs_root() -> Path:
     configured = os.environ.get(BIOXP_PROTOCOL_JOBS_ROOT_ENV)
     if configured:
         return Path(configured).expanduser().resolve()
+    state_root = os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT")
+    if state_root:
+        # Durable host state survives release cutovers; the container tree does not.
+        root = Path(state_root).expanduser().resolve() / "protocol_jobs"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
     try:
         DEFAULT_PROTOCOL_JOBS_ROOT.mkdir(parents=True, exist_ok=True)
         return DEFAULT_PROTOCOL_JOBS_ROOT

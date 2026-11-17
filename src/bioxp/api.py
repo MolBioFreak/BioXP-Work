@@ -1742,7 +1742,10 @@ def _constructor_pipette_action() -> dict[str, Any]:
     )
     return {
         **result,
-        "ok": bool(result.get("ok")),
+        # ControlLib constructor logs a failed pipette status and continues to
+        # initializeMotorsWithoutMotion; the pipette receipt keeps the failure.
+        "ok": True,
+        "pipettes_ready": bool(result.get("ok")),
         "channel_count": 4,
         "channels_constructed_unconditionally": [0, 1, 2, 3],
         "predecessor": "CAN_READY",
@@ -10594,7 +10597,7 @@ def _protocol_mechanism_handlers(source_executor=None):
     from .protocols.mechanisms import build_mechanism_handlers
     def save_snapshot(frame, action, state):
         return {**_deck_cover_inspection_save(frame=frame.content, condition="method_photo_only",
-                    artifact_id=f"{state.job_id}:{action.action_id}"),
+                    artifact_id=f"{state.job_id}:{action.action_id}", folder=state.job_id),
                 "provider_generation": frame.provider_generation, "sequence": frame.sequence,
                 "captured_at": frame.captured_at.isoformat()}
     return build_mechanism_handlers(get_tester=_get_tester, get_camera=lambda: _camera_provider,
@@ -10785,13 +10788,14 @@ def _deck_cover_inspection_capture(*, condition: str, artifact_id: str) -> dict:
     }
 
 
-def _deck_cover_inspection_save(*, frame, condition: str, artifact_id: str) -> dict:
+def _deck_cover_inspection_save(*, frame, condition: str, artifact_id: str,
+                                folder: str = "deck-cover-inspection") -> dict:
     """Save the exact decision frame under the source condition label."""
     import hashlib as _hashlib
     from .services.protocol_service import get_protocol_jobs_root
     content = bytes(frame)
     digest = _hashlib.sha256(content).hexdigest()
-    root = get_protocol_jobs_root() / "deck-cover-inspection"
+    root = get_protocol_jobs_root() / folder
     path = root / (_hashlib.sha256(str(artifact_id).encode()).hexdigest() + ".jpg")
     artifact = {"ok": True, "capture_ok": True, "condition": condition,
                 "artifact_id": str(artifact_id), "path": str(path),

@@ -85,6 +85,11 @@ def _step_record(result) -> None:
     # outcome flags (setpoint accepted, wait complete, run id). Nested
     # evidence stays on the child command.
     kept = {k: v for k, v in result.items() if k in _STEP_FIELDS or not isinstance(v, (dict, list))}
+    artifact = result.get("artifact")
+    if isinstance(artifact, Mapping):
+        # A saved image is the step's own output: keep where it is, once.
+        kept.update({f"artifact_{k}": artifact[k] for k in ("path", "sha256", "size_bytes", "artifact_saved")
+                     if artifact.get(k) is not None})
     result.clear()
     result.update(kept)
 

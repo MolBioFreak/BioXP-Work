@@ -1399,38 +1399,18 @@ class FourPipetteTransport:
         self._constructor_started = True
         started = time.monotonic()
         initial_group = self._run_group_cycle(command, cycle="constructor_initiateGroup", constructor_detail=True)
-        if not initial_group.get("ok"):
-            self._last_group_transaction = {
-                "ok": False,
-                "outcome": "initial_group_cycle_failed",
-                "channels": [
-                    {"channel": row["channel"], "result": row}
-                    for row in self._channel_status_rows(include_transaction=False)
-                ],
-                "initial_group": initial_group,
-                # Move the selected pressure owner: no duplicate constructor attachment.
-                "pressure_epoch": initial_group.pop("pressure_epoch", None),
-                "pressure_offsets": initial_group.pop("pressure_offsets", {}),
-                "pressure_offset_evidence": initial_group.pop("pressure_offset_evidence", {}),
-                "pressure_offsets_valid": initial_group.pop("pressure_offsets_valid", None) is True,
-                "pressure_offset_order": initial_group.pop("pressure_offset_order", None),
-                "group_wait_ms": 10_000,
-            }
-            return dict(self._last_group_transaction)
-
         condition = self._query_condition()
         condition_ok = all(row["result"].get("ok") for row in condition)
         first_status = self._query_status()
         first_status_ok = all(row["result"].get("ok") for row in first_status)
         retry_group = None
         retry_status = None
-        if condition_ok and not first_status_ok:
+        if not first_status_ok:
             retry_group = self._run_group_cycle(command, cycle="single_conditional_status_retry", constructor_detail=True)
-            if retry_group.get("ok"):
-                retry_status = self._query_status()
+            retry_status = self._query_status()
         final_status = retry_status if retry_status is not None else first_status
         final_status_ok = all(row["result"].get("ok") for row in final_status)
-        ok = bool(condition_ok and final_status_ok and (retry_group is None or retry_group.get("ok")))
+        ok = bool(final_status_ok and (retry_group or initial_group).get("ok"))
         pressure_group = (
             retry_group
             if isinstance(retry_group, Mapping)
@@ -1444,7 +1424,7 @@ class FourPipetteTransport:
         # The group cycle owns the correlated sends and delayed completions.
         # Surface those facts on the completed constructor command itself:
         # the receipt store reads top-level truth, not nested diagnostics.
-        completed_groups = [initial_group] + ([retry_group] if retry_group is not None else [])
+        completed_groups = [retry_group] if retry_group is not None else [initial_group]
         self._last_group_transaction = {
             "ok": ok,
             "outcome": "completion" if ok else "condition_or_status_failed",
