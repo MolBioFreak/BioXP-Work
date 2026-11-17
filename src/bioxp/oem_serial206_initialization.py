@@ -3517,36 +3517,24 @@ class Serial206ProductionPrimitiveAdapter:
         acc: int | None = None,
         wait_timeout_s: float,
     ) -> dict[str, Any]:
-        profile = self._axis_profile(axis)
-        before = self._read_axis_position(axis)
-        prepared = self._prepare_path_axis(axis, speed=speed, acc=acc)
-        move = self.tester.motor_move_relative(
-            profile["board"],
-            int(delta),
-            motor=profile.get("motor", 0),
+        """ClassControlInterface.moveSteps:3833: board.moveSteps, then getCurrentPosition.
+
+        No axis preparation, speed or acceleration writes, as on the OEM.
+        """
+        del speed, acc
+        key = str(axis).lower()
+        steps = int(delta)
+        if key == "x":
+            return self.x_move_steps(steps=steps, wait_timeout_s=float(wait_timeout_s))
+        if key == "z":
+            return self.z_move_steps(steps=steps, wait_timeout_s=float(wait_timeout_s))
+        if key == "y" and self.y_provider is not None:
+            return self.y_provider.move_steps(steps, wait_timeout_s=float(wait_timeout_s))
+        profile = self._axis_profile(key)
+        return self.tester._motor_oem_move_steps_source(
+            board=profile["board"], motor=profile.get("motor", 0), axis=key,
+            steps=steps, timeout_s=float(wait_timeout_s),
         )
-        wait = self.tester.motor_wait_stopped(
-            profile["board"],
-            motor=profile.get("motor", 0),
-            timeout_s=float(wait_timeout_s),
-            require_seen_nonzero=True,
-        )
-        after = self._read_axis_position(axis)
-        return {
-            "ok": bool(
-                isinstance(move, Mapping)
-                and move.get("ok") is True
-                and isinstance(wait, Mapping)
-                and wait.get("stopped") is True
-                and after - before == int(delta)
-            ),
-            "axis": str(axis).lower(),
-            "delta": int(delta),
-            "prepare": _json_safe(prepared),
-            "move": _json_safe(move),
-            "wait": _json_safe(wait),
-            "position": {"before": before, "after": after},
-        }
 
     def move_xy(
         self,
