@@ -258,7 +258,8 @@ class CommandReceiptReader:
             "status": str(canonical["state"]) if canonical is not None else str(row["status"]),
             "ownership_generation": int(row["ownership_generation"]),
             "requested_inputs": _json_load(row["requested_json"], {}),
-            "effective_inputs": _json_load(row["effective_json"], {}),
+            "effective_inputs": (_json_load(row["requested_json"], {}) if row["effective_json"] == "{}"
+                                 else _json_load(row["effective_json"], {})),
             "accepted_at": float(row["queued_at"]),
             "queued_at": float(row["queued_at"]),
             "dispatched_at": row["dispatched_at"],

@@ -30,7 +30,7 @@ def test_v16_explicit_pause_then_control_and_cold_read(installed_retained, monke
     from bioxp.protocols.models import ProtocolActionKind
     app, _, _, _, root = installed_retained
     store = app.state.operator_command_plane.store
-    assert store.connection.execute('PRAGMA user_version').fetchone()[0] == 16
+    assert store.connection.execute('PRAGMA user_version').fetchone()[0] >= 16
     entered, release = threading.Event(), threading.Event()
     calls = []
     def leaf(action, state):
@@ -95,7 +95,7 @@ def crash_worker(root, mode):
     from bioxp.services.protocol_service import bind_protocol_dispatcher, control_protocol_job
     root = Path(root)
     store = OperatorCommandStore(root)
-    assert store.connection.execute('PRAGMA user_version').fetchone()[0] == 16
+    assert store.connection.execute('PRAGMA user_version').fetchone()[0] >= 16
     entered, release = threading.Event(), threading.Event()
     def leaf(action, state):
         with (root/'native-entry.log').open('a') as stream:

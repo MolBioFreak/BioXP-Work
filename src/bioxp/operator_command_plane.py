@@ -566,6 +566,12 @@ def _z_pseudo_home(state: Mapping[str, Any]) -> int:
     return 65000
 
 
+def _plane_effective(row: Any) -> dict[str, Any]:
+    """'{}' effective_json means 'same as the request' (one stored copy)."""
+    raw = row["effective_json"]
+    return _json_load(row["requested_json"], {}) if raw in (None, "{}") else _json_load(raw, {})
+
+
 def _effective_inputs(action_id: str, inputs: Mapping[str, Any], state: Mapping[str, Any]) -> dict[str, Any]:
     effective = dict(inputs)
     if action_id == "oem.x.move_absolute":
@@ -1805,8 +1811,11 @@ class OperatorCommandStore(CommandReceiptReader):
                     # moves; preserve their existing stored envelope unchanged.
                     plane = conn.execute("SELECT * FROM operator_plane_commands WHERE command_id=?", (command_id,)).fetchone()
                     receipt = self._command_response(plane, transition_sequence=int(row[0]))
+                    # Inputs and terminal evidence live once, on the plane row.
+                    stored = {k: v for k, v in receipt.items()
+                              if k not in ("requested_inputs", "effective_inputs", "terminal_evidence")}
                     conn.execute("UPDATE operator_commands SET status=?,receipt_json=?,updated_at=?,finished_at=? WHERE command_id=?",
-                                 (receipt["status"], _canonical(receipt), _now(), receipt["finished_at"], command_id))
+                                 (receipt["status"], _canonical(stored), _now(), receipt["finished_at"], command_id))
         return int(row[0])
 
     def _store_evidence(
@@ -2981,6 +2990,9 @@ class OperatorCommandStore(CommandReceiptReader):
         from .runtime_audit_store import workflow_claim_context
         binding = workflow_claim_context()
         canonical_inputs = {**dict(inputs), **({"workflow_binding": binding} if binding else {})}
+        if isinstance(canonical_inputs.get("prepared_plan"), Mapping):
+            # One copy of the plan: the plane request. The claim keeps its digest.
+            canonical_inputs["prepared_plan_digest"] = canonical_inputs.pop("prepared_plan").get("plan_digest")
         self._insert_plane_claim(conn, command_id=command_id, key=idempotency_key, action_id=action_id,
             inputs=canonical_inputs, generation=ownership_generation, kind="operator", status="queued", binding=binding)
         canonical_hash = _digest(dict(inputs))
@@ -3800,7 +3812,7 @@ class OperatorCommandStore(CommandReceiptReader):
                     raise ValueError("wp8 child order or dependency mismatch")
                 conn.execute(
                     "INSERT INTO operator_plane_wp8_children(command_id,child_order,operation,dependency_order_json,arguments_json,ignored_return,awaited,exception_policy,state_mutation_json) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (str(command_id), expected, str(child["operation"]), _canonical(list(child["depends_on"])), _canonical(dict(child.get("arguments") or {})), int(bool(child.get("ignored_return"))), int(bool(child.get("awaited", True))), str(child.get("exception_policy") or "propagate"), _canonical(dict(child.get("state_mutation") or {}))),
+                    (str(command_id), expected, str(child["operation"]), _canonical(list(child["depends_on"])), "{}", int(bool(child.get("ignored_return"))), int(bool(child.get("awaited", True))), str(child.get("exception_policy") or "propagate"), _canonical(dict(child.get("state_mutation") or {}))),
                 )
 
     def record_delivery_attempt(
@@ -4754,7 +4766,7 @@ class OperatorCommandStore(CommandReceiptReader):
             }
             conn.execute(
                 'INSERT INTO operator_plane_commands(command_id,stream_sequence,action_id,requested_json,effective_json,status,version,ownership_generation,queued_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
-                (command_id, sequence, action_id, _canonical(inputs), _canonical(effective), "queued", 1, expected_generation, row["queued_at"], row["queued_at"],),
+                (command_id, sequence, action_id, _canonical(inputs), "{}" if effective == dict(inputs) else _canonical(effective), "queued", 1, expected_generation, row["queued_at"], row["queued_at"],),
             )
             self._insert_canonical_command(
                 conn,
@@ -5242,7 +5254,7 @@ class OperatorCommandStore(CommandReceiptReader):
                 # children and issued-delivery checks below (and re-enforced by
                 # the v12 authorization trigger at insert).  Keep the strict
                 # comparison whenever a plan IS carried.
-                effective_inputs = _json_load(command["effective_json"], {})
+                effective_inputs = _plane_effective(command)
                 if (command["action_id"] != "oem.deck._finite_operation" or command["target"] not in {"thermal_door", "critical_item_images"}
                     or command["status"] not in {"ambiguous", "interrupted"}
                     or command["audit_status"] != command["status"] or command["movement_state"] != command["status"]
@@ -5263,14 +5275,16 @@ class OperatorCommandStore(CommandReceiptReader):
                     # Historical input is authority, not today's camera settings.
                     # In particular, an absent operation_inputs is not an empty one.
                     requested = _json_load(command["requested_json"], {})
-                    effective = _json_load(command["effective_json"], {})
+                    effective = _plane_effective(command)
                     claim = conn.execute("SELECT requested_inputs_json FROM operator_commands WHERE command_id=?",
                         (str(command_id),)).fetchone()
                     original_input = _json_load(claim[0], {}) if claim else {}
                     if (requested != effective or requested.get("operation") != "critical_item_images"
                         or requested.get("prepared_plan") != plan
                         or not isinstance(requested.get("operation_inputs"), dict)
-                        or any(original_input.get(k) != requested.get(k) for k in ("operation", "operation_inputs", "prepared_plan"))
+                        or any(original_input.get(k) != requested.get(k) for k in ("operation", "operation_inputs"))
+                        or (original_input.get("prepared_plan") != plan
+                            and original_input.get("prepared_plan_digest") != plan.get("plan_digest"))
                         or original_input.get("workflow_binding", {}).get("parent_command_id") != parent_id):
                         raise ValueError("finite critical images original input identity mismatch")
                 prior_decision = conn.execute(
@@ -5332,7 +5346,7 @@ class OperatorCommandStore(CommandReceiptReader):
                 for i, (child, original) in enumerate(zip(children, planned)):
                     if (child["child_order"] != i or original.get("order") != i
                         or child["operation"] != original.get("operation")
-                        or _json_load(child["arguments_json"], {}) != original.get("arguments")
+                        or (child["arguments_json"] != "{}" and _json_load(child["arguments_json"], {}) != original.get("arguments"))
                         or _json_load(child["dependency_order_json"], []) != ([] if i == 0 else [i-1])
                         or original.get("depends_on") != ([] if i == 0 else [i-1])
                         or bool(child["awaited"]) != original.get("awaited")
@@ -5834,7 +5848,7 @@ class OperatorCommandStore(CommandReceiptReader):
                 "method_sequence": None,
                 "action_id": str(claimed["action_id"]),
                 "requested_inputs": _json_load(claimed["requested_json"], {}),
-                "effective_inputs": _json_load(claimed["effective_json"], {}),
+                "effective_inputs": _plane_effective(claimed),
                 "dispatch_attempt_id": str(claimed["dispatch_attempt_id"]),
                 "dispatcher_epoch": int(claimed["dispatcher_epoch"]),
                 "dispatch_global_safety_epoch": int(claimed["dispatch_global_safety_epoch"]),

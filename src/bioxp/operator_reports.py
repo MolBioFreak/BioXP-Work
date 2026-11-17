@@ -155,10 +155,17 @@ def _versioned_source(table: str, identity: str, watermark: int, fields: tuple[s
 
 
 def _command_source(high_waters: Mapping[str, Any]) -> str:
-    return _versioned_source(
+    source = _versioned_source(
         "operator_plane_command_versions", "command_id",
         int(high_waters["operator_plane_command_versions"]), _COMMAND_VERSION_FIELDS, "source_sequence",
     )
+    # V17 snapshots omit inputs; they live once on operator_commands.
+    for field in ("requested_inputs_json", "effective_inputs_json"):
+        old = f"json_extract(v.row_json,'$.{field}') AS {field}"
+        assert source.count(old) == 1
+        source = source.replace(old, f"COALESCE(json_extract(v.row_json,'$.{field}'),"
+                                f"(SELECT oc.{field} FROM operator_commands oc WHERE oc.command_id=v.command_id)) AS {field}")
+    return source
 
 
 def _pipette_source(high_waters: Mapping[str, Any]) -> str:

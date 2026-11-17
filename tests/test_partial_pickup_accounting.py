@@ -259,7 +259,7 @@ def test_pickup_publication_inside_active_receipt(connected, monkeypatch, reopen
         cid = admitted['command_id']
         claimed = store.claim_next()
         assert claimed['command_id'] == cid
-        persisted = store.connection.execute('select requested_inputs_json from operator_commands where command_id=?', (cid,)).fetchone()
+        persisted = store.connection.execute('select requested_json from operator_plane_commands where command_id=?', (cid,)).fetchone()
         execution_plan = json.loads(persisted[0])['prepared_plan']
         assert execution_plan == plan
         response = execute_wp8(command_id=cid, plan=execution_plan)

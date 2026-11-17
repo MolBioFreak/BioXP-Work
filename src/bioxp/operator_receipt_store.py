@@ -1409,6 +1409,18 @@ class OperatorReceiptStore:
         if canonical is not None:
             return canonical
         receipt = json.loads(row["receipt_json"])
+        if row["entrypoint_id"] == "operator_command_plane" and not all(
+                key in receipt for key in ("requested_inputs", "effective_inputs", "terminal_evidence")):
+            # Plane-owned commands keep inputs and terminal evidence once, on the plane row.
+            plane = self.connection.execute(
+                "SELECT requested_json,effective_json,terminal_json FROM operator_plane_commands WHERE command_id=?",
+                (row["command_id"],)).fetchone()
+            if plane is not None:
+                requested = self._load_json(plane["requested_json"], {})
+                receipt.setdefault("requested_inputs", requested)
+                receipt.setdefault("effective_inputs", requested if plane["effective_json"] == "{}"
+                                   else self._load_json(plane["effective_json"], {}))
+                receipt.setdefault("terminal_evidence", self._load_json(plane["terminal_json"], None))
         # Historical receipt JSON can predate sequence publication. The SQL
         # ordering key is authoritative for both projection and pagination.
         receipt["sequence"] = int(row["sequence"])
@@ -1638,7 +1650,8 @@ class OperatorHistoryReader:
             "physical_outcome": "ambiguous" if nonterminal else None,
             "ownership_generation": int(row["ownership_generation"]),
             "requested_inputs": self._load_json(row["requested_json"], {}),
-            "effective_inputs": self._load_json(row["effective_json"], {}),
+            "effective_inputs": (self._load_json(row["requested_json"], {}) if row["effective_json"] == "{}"
+                                 else self._load_json(row["effective_json"], {})),
             "accepted_at": float(row["queued_at"]),
             "queued_at": float(row["queued_at"]),
             "dispatched_at": row["dispatched_at"],
