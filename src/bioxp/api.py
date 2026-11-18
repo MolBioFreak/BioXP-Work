@@ -10417,6 +10417,11 @@ def _protocol_live_plate_move_handler(action, state):
     intent = translate_oem_plate_move(
         str(plate_token), str(params.get("target_location")), params.get("move_mode"),
     )
+    if params.get("plate_type") and intent["plate"] == 1:
+        # The workflow names the labware: record it as the loaded output plate so its
+        # saved plate profile (gripper heights) applies to this and later moves.
+        from .plate_profiles import set_loaded
+        set_loaded(movable_object="OUTPUT_PLATE", plate_id=str(params["plate_type"]))
     position_table_provider = getattr(app.state, "oem_deck_position_table_provider", None)
     if not callable(position_table_provider):
         raise HTTPException(status_code=503, detail={"error": "serial206_position_table_unavailable"})
