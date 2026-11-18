@@ -1416,11 +1416,12 @@ class OperatorReceiptStore:
                 "SELECT requested_json,effective_json,terminal_json FROM operator_plane_commands WHERE command_id=?",
                 (row["command_id"],)).fetchone()
             if plane is not None:
-                requested = self._load_json(plane["requested_json"], {})
+                requested = json.loads(plane["requested_json"] or "{}")
                 receipt.setdefault("requested_inputs", requested)
-                receipt.setdefault("effective_inputs", requested if plane["effective_json"] == "{}"
-                                   else self._load_json(plane["effective_json"], {}))
-                receipt.setdefault("terminal_evidence", self._load_json(plane["terminal_json"], None))
+                receipt.setdefault("effective_inputs", requested if plane["effective_json"] in (None, "{}")
+                                   else json.loads(plane["effective_json"]))
+                receipt.setdefault("terminal_evidence", None if plane["terminal_json"] is None
+                                   else json.loads(plane["terminal_json"]))
         # Historical receipt JSON can predate sequence publication. The SQL
         # ordering key is authoritative for both projection and pagination.
         receipt["sequence"] = int(row["sequence"])
