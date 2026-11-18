@@ -1287,12 +1287,13 @@ class _OemPipetteBody:
             result = self.pipette("query_tip_status_for_oem_script", lambda t: t.query_tip_status_for_oem_script(pipette))
         return result["source_return"]
 
-    def eject(self, check=True):
+    def eject(self, check=True, *, verify_all=False):
         # Collection.ejectAllTips:1179-1186 selects MachineStatus.TipLocation.
         # The generic transport's omitted channels means all four, not that
         # source selection (notably after KeepTip on a consecutive request).
         return self.pipette("eject_all_tips", lambda t: t.eject_all_tips(
-            check_missing_tip=check, wait=True, channels=t._tip_location_channels()))
+            check_missing_tip=check, wait=True, channels=t._tip_location_channels(),
+            **({"oem_verify_all": True} if verify_all else {})))
 
     def move(self, location, column=0, row=0):
         return self.native("scriptmoveTo", self.n.script_move, location, column, row)
@@ -1610,7 +1611,7 @@ def build_oem_pipette_lifecycle_helpers(
         body.query_tips(); body.delay(500)
         if source_bindings.tip_exists(body.action, state):
             body.native("moveToWaste", move_to_waste)
-            body.eject(False); body.query_tips(); body.delay(100)
+            body.eject(False, verify_all=True); body.query_tips(); body.delay(100)
             if source_bindings.tip_exists(body.action, state):
                 message = "Please manually remove tips on Pipette then start"
                 body.signal_error(message)

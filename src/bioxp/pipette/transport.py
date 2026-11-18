@@ -2752,8 +2752,10 @@ class FourPipetteTransport:
         check_missing_tip: bool = True,
         wait: bool = True,
         channels: list[int] | None = None,
+        oem_verify_all: bool = False,
     ) -> dict[str, Any]:
         selected = self._selected_channels(channels)
+        verify = list(self.CHANNELS) if oem_verify_all else selected
         with self._transaction_lock:
             before = self.query_tip_status_all()
             loaded = set(before["channels_with_tips"])
@@ -2764,7 +2766,8 @@ class FourPipetteTransport:
                     details={"selected_channels": selected, "missing_channels": missing, "before": before},
                 )
 
-            targeted = [channel for channel in selected if channel in loaded]
+            targeted = (selected if oem_verify_all and self._tip_location != -1 and loaded
+                        else [channel for channel in selected if channel in loaded])
             sends = self._eject_tip_channels_once(
                 targeted,
                 wait_for_completion=bool(wait),
@@ -2775,20 +2778,20 @@ class FourPipetteTransport:
                 # invoking verifyEjectTip().
                 self._sleep(0.500)
             after = self.query_tip_status_all()
-            remaining = [channel for channel in selected if channel in set(after["channels_with_tips"])]
+            remaining = [channel for channel in verify if channel in set(after["channels_with_tips"])]
             retried = False
             if remaining:
                 # OEM verifyEjectTip(-1) performs one second pass and waits up
                 # to six seconds before its final query.
                 retried = True
                 retry_sends = self._eject_tip_channels_once(
-                    remaining,
+                    verify if oem_verify_all else remaining,
                     wait_for_completion=True,
                     timeout_s=6.0,
                 )
                 sends.extend(retry_sends)
                 after = self.query_tip_status_all()
-                remaining = [channel for channel in selected if channel in set(after["channels_with_tips"])]
+                remaining = [channel for channel in verify if channel in set(after["channels_with_tips"])]
             if remaining:
                 raise PipetteTipStateError(
                     "OEM ejectAllTips verification still reports loaded tips after one retry.",

@@ -67,7 +67,8 @@ def test_selected_oem_run_job_prefix(monkeypatch, case):
         with pytest.raises(PipetteTipStateError) as exc:
             prefix(state, source_occurrence_id="run-job")
         assert exc.value.details["remaining_channels"] == mounted
-        assert wire == query + query + eject + query + eject + query
+        retry = [(cmd, i) for cmd in ("E1R", "wait") for i in range(4)]
+        assert wire == query + query + eject + query + retry + query
         assert events == ["query_tip_status_all", .5, "waste"]
         assert state.source_model.logical_tip_present
         return
