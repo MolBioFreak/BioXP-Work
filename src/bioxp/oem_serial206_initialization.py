@@ -782,6 +782,14 @@ class Serial206ProductionPrimitiveAdapter:
             "receipt": _json_safe(raw),
         }
 
+    def bind_initialized_board_session(self) -> None:
+        """Bind existing native initialization only; never activate or prepare boards."""
+        result = self.tester.oem_bind_initialized_board_lifecycle_generation(
+            transport_generation=int(getattr(self.tester, "_oem_transport_generation", 0)),
+        )
+        if not result["ok"]:
+            raise RuntimeError(result["failure"])
+
     def current_board_lifecycle_generation(self) -> int | None:
         value = getattr(self.tester, "_oem_active_board_lifecycle_generation", None)
         return int(value) if type(value) is int else None
@@ -15593,7 +15601,17 @@ class Serial206OemInitializationProvider:
                 if invalidation.get("ok") is not True or invalidation.get("durable_clean") is not True:
                     self.reference_store.recover_untrusted_authority("initializeMotors invalidation failed")
                     return self._failure("failed_closed", ["aggregate_reference_invalidation_failed"])
+            binding_failure = None
+            try:
+                if self.preparation_provider.current_board_lifecycle_generation() is None:
+                    self.preparation_provider.bind_initialized_board_session()
+            except Exception as exc:
+                # No session means no reference proof, not an extra OEM motion gate.
+                binding_failure = str(exc)
             for axis in ("x", "y", "z", "g"):
+                if binding_failure is not None:
+                    reference_fences[axis] = {"blocker": binding_failure}
+                    continue
                 try:
                     reference_fences[axis] = self._aggregate_reference_fence(state, axis)
                 except Exception as exc:
@@ -15818,6 +15836,10 @@ class Serial206OemInitializationProvider:
                         motion = state["initialize_motion_ledger"]
                         receipts = motion["stage_receipts"]
                         receipt = receipts[-1]
+                        if raw.get("ok") is not True and not raw.get("failure") and raw.get("blockers"):
+                            raw["failure"] = raw["blockers"][0]
+                        receipt["motors_ready"] = raw.get("ready") is True
+                        receipt["reference_blockers"] = list(raw.get("reference_blockers") or [])
                         if not source_call_completed:
                             raw["physical_motion_commanded"] = any(
                                 row.get("command_id") not in prior_commands
@@ -15894,6 +15916,9 @@ class Serial206OemInitializationProvider:
         motion = state.get("initialize_motion_ledger") if isinstance(state, Mapping) else None
         machine = state.get("machine_status") if isinstance(state, Mapping) else None
         terminal = motion.get("terminal_state") if isinstance(motion, Mapping) else "failed_closed"
+        motor_stage = next((row for row in stage_receipts or ()
+                            if row["stage"] == "initializeMotion.initializeMotors"), {})
+        reference_blockers = motor_stage.get("reference_blockers", [])
         bootstrap = None
         if terminal == "initializeMotion_complete" and callable(
             getattr(self, "_deck_semantic_bootstrap_publisher", None)
@@ -15901,7 +15926,8 @@ class Serial206OemInitializationProvider:
             bootstrap = self.refresh_deck_semantic_bootstrap(expected_generation=int(self.generation_provider()))
         return {
             "ok": bool(ok),
-            "ready": bool(terminal == "initializeMotion_complete"),
+            "ready": bool(terminal == "initializeMotion_complete" and motor_stage.get("motors_ready") is True),
+            "reference_blockers": reference_blockers,
             "deck_semantic_bootstrap": bootstrap,
             "state": terminal,
             "schema": "bioxp.serial206_initializeMotion.v2",
@@ -15910,7 +15936,7 @@ class Serial206OemInitializationProvider:
             "physical_motion_commanded": bool(physical_motion_commanded),
             "physical_effect_verified": False,
             "failure": blockers[0] if blockers else None,
-            "blockers": list(blockers),
+            "blockers": [*blockers, *reference_blockers],
             "initialize_motion_ledger": _json_safe(motion),
             "movement_ledger": _json_safe(state.get("movement_ledger") if isinstance(state, Mapping) else None),
             "machine_status": _json_safe(machine),
