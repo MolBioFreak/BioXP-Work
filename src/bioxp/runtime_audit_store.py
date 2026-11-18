@@ -34,10 +34,20 @@ def workflow_claim_context() -> dict[str, Any] | None:
 
 
 def _normal_claim_eligibility(connection, *, binding, resources, command_id=None):
-    """Record-only since 2026-09-21: custody and unresolved outcomes never
-    refuse a normal claim. Kept as a single call site so the behavior stays
-    auditable and reversible in one place."""
-    return None
+    # Only this short-lived child, never its workflow or terminal history.
+    if not set(resources).intersection(TIP_PREFLIGHT_RESOURCES):
+        return
+    owner = connection.execute(
+        "SELECT parent_command_id FROM operator_commands WHERE action_id=? "
+        "AND status='dispatched' AND entrypoint_id='operator_command_plane' LIMIT 1",
+        (TIP_PREFLIGHT_ACTION,)).fetchone()
+    if owner and not (binding and binding["parent_command_id"] == owner[0]
+                      and binding["source_occurrence_id"].startswith(TIP_PREFLIGHT_ACTION + ":")):
+        raise ValueError("method_tip_preflight_active")
+
+
+TIP_PREFLIGHT_ACTION = "lifecycle:saved_method_tip_preflight"
+TIP_PREFLIGHT_RESOURCES = ("pipette", "axis:x", "axis:y", "axis:z", "motor:4:0", "motor:4:1", "motor:5:0")
 
 from dataclasses import dataclass, field
 from functools import wraps
@@ -1774,7 +1784,7 @@ class RuntimeAuditDatabase:
                 self._commit_write(owns_transaction)
                 return projection, False
 
-            if normal_mutation:
+            if normal_mutation or (pipette and payload["control_class"] not in {"physical_interrupt", "safety_interrupt"}):
                 _normal_claim_eligibility(connection, binding=workflow_claim_context(), resources=resources, command_id=command_id)
             receipt_json = canonical_json(
                 {

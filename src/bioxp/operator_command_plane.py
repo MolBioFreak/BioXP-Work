@@ -2821,6 +2821,34 @@ class OperatorCommandStore(CommandReceiptReader):
         return self.get_workflow(command_id)
 
     @contextmanager
+    def saved_method_tip_preflight(self, parent):
+        from .runtime_audit_store import TIP_PREFLIGHT_ACTION, TIP_PREFLIGHT_RESOURCES
+        command = f"tip-prefix-{uuid.uuid4().hex}"
+        with self.workflow_context(parent, source_occurrence_id=TIP_PREFLIGHT_ACTION) as binding:
+            with self._transaction() as conn:
+                row = self._workflow_current(conn, parent)
+                placeholders = ",".join("?" for _ in TIP_PREFLIGHT_RESOURCES)
+                if conn.execute(
+                    "SELECT 1 FROM operator_commands c LEFT JOIN serial206_movement_commands m USING(command_id) "
+                    "WHERE c.command_id<>? AND COALESCE(m.state,c.status) IN "
+                    "('reserved','admitted','executing','running','dispatched','acknowledged','issued_pending','interrupting') "
+                    "AND (c.command_kind='pipette' OR c.action_id=? OR EXISTS (SELECT 1 FROM "
+                    f"serial206_command_resources r WHERE r.command_id=c.command_id AND r.resource_key IN ({placeholders}))) LIMIT 1",
+                    (parent, TIP_PREFLIGHT_ACTION, *TIP_PREFLIGHT_RESOURCES)).fetchone():
+                    raise ValueError("method_tip_preflight_resource_busy")
+                self._insert_plane_claim(conn, command_id=command, key=command, action_id=TIP_PREFLIGHT_ACTION,
+                    inputs={"workflow_binding": binding}, generation=row["ownership_generation"],
+                    kind="operator", status="dispatched", binding=binding)
+            status = "ambiguous"
+            try:
+                yield
+                status = "completed"
+            finally:
+                with self._transaction() as conn:
+                    conn.execute("UPDATE operator_commands SET status=?,updated_at=? WHERE command_id=? AND status='dispatched'",
+                                 (status, _now(), command))
+
+    @contextmanager
     def normal_mutation_scope(self, *, resources: Sequence[str]):
         from .runtime_audit_store import workflow_claim_context, _normal_claim_eligibility
         from .operator_controls import current_operator_dispatch_context
