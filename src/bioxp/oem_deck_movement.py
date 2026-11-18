@@ -1185,6 +1185,16 @@ def arguments_have_float(children: list[dict[str, Any]]) -> bool:
     return any(isinstance(v, float) for c in children for v in (c.get("arguments") or {}).values())
 
 
+def _plate_gripper_offset(plate: int, destination: int) -> int:
+    """Loaded plate's saved z_low offset at this station; else OEM catch/releasePlate -30236."""
+    from .oem_compat.pathing import LOCATION_ID_TO_NAME
+    from .plate_profiles import OEM_MAGNET_BLOCK_OUTPUT_PLATE_Z_OFFSET, gripper_z_offset
+    name = {1: "OUTPUT_PLATE"}.get(int(plate))
+    saved = gripper_z_offset(name, LOCATION_ID_TO_NAME.get(int(destination), "")) if name else {}
+    value = saved.get("z_low_offset_steps")
+    return int(value) if type(value) is int else OEM_MAGNET_BLOCK_OUTPUT_PLATE_Z_OFFSET
+
+
 def _wp8_plan(operation: str, children: list[dict[str, Any]], **metadata: Any) -> dict[str, Any]:
     plan = {
         "schema_version": "bioxp.oem_wp8_operation.v1",
@@ -1572,7 +1582,8 @@ def _compile_finite_plate_operation_unchecked(
         _wp8_child(children, "Sleep", arguments={"milliseconds": 100})
         _wp8_child(children, "led2Off", ignored_return=True)
         output_location = inputs.get("output_plate_location")
-        offset = -30236 if destination == 25 and output_location in {25, 0} else 0
+        offset = (_plate_gripper_offset(plate, destination)
+                  if destination == 25 and output_location in {25, 0} else 0)
         _wp8_child(children, "moveZ", arguments={"location": destination, "z_low_offset": offset})
         _wp8_child(children, "Sleep", arguments={"milliseconds": 100})
         if plate == 0:
@@ -1596,7 +1607,7 @@ def _compile_finite_plate_operation_unchecked(
     if operation == "release_plate":
         destination = int(inputs["destination"])
         parallel = bool(inputs.get("run_in_parallel", True))
-        offset = (-30236 if destination == 25 and inputs.get("plate_on_gantry") == 1
+        offset = (_plate_gripper_offset(1, destination) if destination == 25 and inputs.get("plate_on_gantry") == 1
                   and inputs.get("output_plate_location") in {25, 29} else 0)
         _wp8_child(children, "scriptmoveTo", arguments={"destination": destination, "well": 0, "position_flag": 0}, ignored_return=True)
         _wp8_child(children, "moveZLow", arguments={"location": destination, "z_low_offset": offset})

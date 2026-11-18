@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 Z_STEPS_PER_MM = 2015.748
-SAVED_NAME = "depth_offsets.json"
+from ..plate_profiles import SAVED_NAME  # stored in the one plate profile file
 MAX_MM = 15.0
 # Values found experimentally on this robot; offered as quick picks, never applied unless saved.
 STANDARD_MM = [
@@ -29,35 +29,18 @@ STANDARD_MM = [
 ]
 
 
-def _path() -> Path:
-    root = os.environ.get("BIOXP_OEM_RUNTIME_STATE_ROOT", "/var/lib/bioxp-oem-runtime")
-    return Path(root) / SAVED_NAME
-
-
 def _key(entry: dict[str, Any]) -> tuple:
     return (entry.get("tip_type"), entry.get("location"), entry.get("plate_type"))
 
 
 def entries() -> list[dict[str, Any]]:
-    target = _path()
-    if not target.is_file():
-        return []
-    try:
-        data = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        # A damaged file is kept for inspection; the last good copy is used instead.
-        backup = target.with_suffix(".bak")
-        try:
-            data = json.loads(backup.read_text(encoding="utf-8")) if backup.is_file() else {}
-        except (OSError, ValueError):
-            data = {}
-    rows = data.get("entries") if isinstance(data, dict) else None
-    return [r for r in rows or [] if isinstance(r, dict) and isinstance(r.get("offset_mm"), (int, float))]
+    from ..plate_profiles import depth_offset_entries
+    return depth_offset_entries()
 
 
 def _norm_plate(value: Any) -> str | None:
-    text = str(value).strip().lower() if value not in (None, "") else ""
-    return text or None
+    from ..plate_profiles import normalize_plate
+    return normalize_plate(value)
 
 
 def resolve(*, tip_type: Any, location: Any, plate_type: Any = None) -> dict[str, Any]:
@@ -85,20 +68,8 @@ def table() -> dict[str, Any]:
 
 
 def _write(rows: list[dict[str, Any]]) -> None:
-    target = _path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.is_file():
-        try:
-            json.loads(target.read_text(encoding="utf-8"))  # only a readable file becomes the backup
-            target.with_suffix(".bak").write_bytes(target.read_bytes())
-        except (OSError, ValueError):
-            pass
-    tmp = target.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write(json.dumps({"schema_version": "bioxp.depth_offsets.v1", "entries": rows}, indent=2))
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, target)
+    from ..plate_profiles import write_depth_offsets
+    write_depth_offsets(rows)
 
 
 def save(*, tip_type: int | None, location: str | None, plate_type: str | None, offset_mm: float,

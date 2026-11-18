@@ -11332,6 +11332,43 @@ class DepthOffsetRemove(BaseModel):
     plate_type: str | None = Field(default=None, max_length=80)
 
 
+class PlateGripperSave(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    plate_id: str = Field(min_length=1, max_length=80)
+    location: str = Field(min_length=1, max_length=40)
+    z_low_offset_steps: int
+    source: str | None = Field(default=None, max_length=300)
+
+
+class PlateLoadedSave(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    movable_object: Literal["OUTPUT_PLATE"]
+    plate_id: str = Field(min_length=1, max_length=80)
+
+
+@app.get("/deck/plate-profiles")
+async def deck_plate_profiles_read():
+    from .plate_profiles import table
+    return table()
+
+
+@app.put("/deck/plate-profiles/gripper")
+async def deck_plate_profiles_gripper_save(req: PlateGripperSave):
+    """Record-only: the next catch/release of that plate at that station uses it. No motion."""
+    from .plate_profiles import save_gripper
+    try:
+        return await run_in_threadpool(lambda: save_gripper(**req.model_dump()))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.put("/deck/plate-profiles/loaded")
+async def deck_plate_profiles_loaded_save(req: PlateLoadedSave):
+    """Record-only: which plate type is loaded as the output plate. No motion."""
+    from .plate_profiles import set_loaded
+    return await run_in_threadpool(lambda: set_loaded(**req.model_dump()))
+
+
 @app.get("/liquid/pipette/depth-offsets")
 async def pipette_depth_offsets_read():
     from .pipette.depth_offsets import table
