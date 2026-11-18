@@ -1,4 +1,6 @@
 """Recovery cannot use a one-time idle check as an exclusive pipette lease."""
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 from tests.deck_scoped_rig import retained_rig
 
@@ -14,9 +16,9 @@ def test_launch_claim_exclusion_boundary(retained_rig, monkeypatch, order):
     store.admit_workflow(command_id="launch", idempotency_key="launch", plan_fingerprint="fixture",
                          requested_inputs={"bundle": {}}, ownership_generation=7,
                          resources=["pipette", "axis:z", "axis:x", "axis:y"], board_epochs={})
-    def claim_direct(key="pump"):
+    def claim_direct(key="pump", control="physical_liquid_command"):
         claim, created = pumps.claim(operation="aspirate", requested_inputs={}, entrypoint_id="direct",
-                                     caller_class="direct_api", control_class="physical_liquid_command",
+                                     caller_class="direct_api", control_class=control,
                                      idempotency_key=key, ownership_generation=7)
         assert created and claim["status"] == "reserved"
         return claim["command_id"]
@@ -29,8 +31,11 @@ def test_launch_claim_exclusion_boundary(retained_rig, monkeypatch, order):
     else:
         with pytest.raises(RuntimeError, match="injected"):
             with store.saved_method_tip_preflight("launch"):
-                with pytest.raises(ValueError, match="method_tip_preflight_active"):
-                    claim_direct()
+                # Independent callers have no workflow ContextVar.
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    for control in ("physical_liquid_command", "hardware_query"):
+                        with pytest.raises(ValueError, match="method_tip_preflight_active"):
+                            pool.submit(claim_direct, control, control).result(timeout=5)
                 with store.workflow_context("launch", source_occurrence_id="lifecycle:saved_method_tip_preflight:0:query"):
                     nested = claim_direct("nested")
                 assert store.connection.execute("SELECT parent_command_id FROM operator_commands WHERE command_id=?", (nested,)).fetchone()[0] == "launch"

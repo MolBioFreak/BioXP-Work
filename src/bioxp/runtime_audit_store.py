@@ -1697,6 +1697,8 @@ class RuntimeAuditDatabase:
             ).fetchone()
             if existing_operation is not None:
                 return str(existing_operation["pipette_operation_id"])
+            if payload["control_class"] not in {"physical_interrupt", "safety_interrupt"}:
+                _normal_claim_eligibility(connection, binding=binding, resources=("pipette",))
             operation_id = str(payload.get("pipette_operation_id") or f"pipette.{row['command_id']}")
             connection.execute(
                 """
@@ -1949,6 +1951,8 @@ class RuntimeAuditDatabase:
                 result["pipette_operation_id"] = str(existing["pipette_operation_id"])
                 connection.execute("COMMIT")
                 return result, False
+            if payload.get("control_class") not in {"physical_interrupt", "safety_interrupt"}:
+                _normal_claim_eligibility(connection, binding=workflow_claim_context(), resources=("pipette",))
             now = time.time()
             operation_id = str(payload.get("pipette_operation_id") or f"pipette.{command_id}")
             connection.execute(

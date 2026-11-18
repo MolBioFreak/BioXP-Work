@@ -10918,10 +10918,14 @@ def _protocol_bindings(bundle, *, source_executor=None):
     metadata = bundle["protocol"]["document"].get("metadata", {})
     native = {}
     lifecycle = {}
-    if metadata.get("input_mode") != "oem_prepared":
+    from .protocols.executor import new_saved_method
+    plain = metadata.get("input_mode") != "oem_prepared"
+    def plain_handlers():
         from .calibration_workflow import calibration_handler
         return {**_protocol_live_handlers(), **_protocol_mechanism_handlers(source_executor),
-                ProtocolActionKind.CALIBRATION: calibration_handler(_calibration_settings_service)}, {}, {}
+                ProtocolActionKind.CALIBRATION: calibration_handler(_calibration_settings_service)}
+    if plain and not new_saved_method(metadata):
+        return plain_handlers(), {}, {}
     capabilities = set()
     if callable(getattr(FourPipetteTransport, "dispense_air_for_oem_script", None)):
         capabilities.add("dispense_air_for_oem_script")
@@ -11028,10 +11032,12 @@ def _protocol_bindings(bundle, *, source_executor=None):
     if provider is not None and canonical_plan is not None:
         # checkTips shares the same camera/illumination owner as inspection.
         # Binding callbacks does not acquire the camera or command any motion.
-        _bind_deck_cover_inspection(provider)
+        if not plain:
+            _bind_deck_cover_inspection(provider)
         callbacks = provider.build_oem_pipette_source_callbacks(
             execute_plan=pipette_plan, start_child=start_child,
             stopped=lambda: executor().source_stopped(), settings=settings,
+            **({"bind_load_tips_runtime": False} if plain else {}),
             rgb_writer=lambda r, g, b: _get_tester().strip_set_rgb(r, g, b, reconnect_first=False, activate_first=False),
         )
         callbacks.pop("settings")  # The same captured mapping is passed below.
@@ -11040,12 +11046,29 @@ def _protocol_bindings(bundle, *, source_executor=None):
         callbacks["move_z_home"] = lambda action, state: callbacks["source_bindings"].home(None, action, state)
         callbacks["source_bindings"] = replace(callbacks["source_bindings"],
             source_capabilities=callbacks["source_bindings"].source_capabilities.intersection(capabilities))
+        if plain:
+            from .runtime_audit_store import TIP_PREFLIGHT_ACTION
+            if _pipette_receipts is None:
+                raise ProtocolLiveContractError("Saved-method pipette claim owner unavailable")
+            # Read the collection booleans just updated by ?31, not Park's
+            # lazy constructor. Launch must never initialize the pumps.
+            launch_bindings = replace(callbacks["source_bindings"], tip_exists=lambda *_: any(
+                row["tip_loaded"] for row in _get_pipette_transport().collection_source_snapshot()["channels"]))
+            prefix = build_oem_pipette_lifecycle_helpers(before_native_entry=before_entry,
+                pipette_call=_protocol_source_pipette_call, source_bindings=launch_bindings,
+                settings=settings, move_to_waste=callbacks["move_to_waste"], sweep_handler=None)["run_job_tip_prefix"]
+            def launch(state):
+                with store.saved_method_tip_preflight(state.job_id):
+                    return prefix(state, source_occurrence_id=TIP_PREFLIGHT_ACTION)
+            return plain_handlers(), {}, {"saved_method_tip_preflight": launch}
         native = provider.build_oem_native_handlers(
             settings=settings, execute_plan=execute_plan,
             execute_thermal=execute_thermal if callable(canonical_control) else None,
             execute_mov=_protocol_source_mov if callable(getattr(app.state, "oem_mov_execution_admitter", None)) else None,
             rgb_writer=lambda r, g, b: _get_tester().strip_set_rgb(r, g, b, reconnect_first=False, activate_first=False),
         )
+    if plain:
+        raise ProtocolLiveContractError("Saved-method tip preflight provider unavailable")
     def publish_tip_transition(tray_id, well_ids, action, state):
         if not well_ids:
             # Source ReTip only writes selected empty Reuse wells.

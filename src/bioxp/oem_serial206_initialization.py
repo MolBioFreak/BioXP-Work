@@ -12681,7 +12681,7 @@ class Serial206OemInitializationProvider:
     def build_oem_pipette_source_callbacks(
         self, *, execute_plan: Callable, start_child: Callable, stopped: Callable,
         rgb_writer: Callable | None = None, source_error_event: Callable | None = None,
-        settings: Mapping[str, Any] | None = None,
+        settings: Mapping[str, Any] | None = None, bind_load_tips_runtime: bool = True,
     ) -> dict[str, Any]:
         """Bind D's finite source bodies to canonical WP8 execution, not RAM prep.
 
@@ -12695,10 +12695,11 @@ class Serial206OemInitializationProvider:
         from .oem_deck_movement import _pierced
 
         captured = copy.deepcopy(dict(settings or {}))
-        self._oem_pipette_load_tips_settings = captured
-        self._oem_pipette_source_error_event = source_error_event
-        if rgb_writer is not None:
-            self._oem_pipette_rgb_writer = rgb_writer
+        if bind_load_tips_runtime:
+            self._oem_pipette_load_tips_settings = captured
+            self._oem_pipette_source_error_event = source_error_event
+            if rgb_writer is not None:
+                self._oem_pipette_rgb_writer = rgb_writer
 
         def run(operation, action, state, **inputs):
             plan = compile_finite_plate_operation(operation, source_leaf_available=True, **inputs)

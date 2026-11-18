@@ -2832,7 +2832,8 @@ class OperatorCommandStore(CommandReceiptReader):
                     "SELECT 1 FROM operator_commands c LEFT JOIN serial206_movement_commands m USING(command_id) "
                     "WHERE c.command_id<>? AND COALESCE(m.state,c.status) IN "
                     "('reserved','admitted','executing','running','dispatched','acknowledged','issued_pending','interrupting') "
-                    "AND (c.command_kind='pipette' OR c.action_id=? OR EXISTS (SELECT 1 FROM "
+                    "AND (c.command_kind='pipette' OR EXISTS (SELECT 1 FROM pipette_operations po WHERE po.command_id=c.command_id) "
+                    "OR c.action_id=? OR EXISTS (SELECT 1 FROM "
                     f"serial206_command_resources r WHERE r.command_id=c.command_id AND r.resource_key IN ({placeholders}))) LIMIT 1",
                     (parent, TIP_PREFLIGHT_ACTION, *TIP_PREFLIGHT_RESOURCES)).fetchone():
                     raise ValueError("method_tip_preflight_resource_busy")

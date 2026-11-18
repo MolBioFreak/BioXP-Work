@@ -15,6 +15,15 @@ from .validators import validate_protocol_document, validate_protocol_support
 ActionHandler = Callable[[ProtocolAction, ProtocolRuntimeState], Mapping[str, Any] | Future]
 
 
+def new_saved_method(metadata):
+    run = metadata.get("bms_method_run")
+    if not isinstance(run, Mapping) or run.get("schema") != "bms.bioxp-method-run.v1" or run.get("recovery") is not None:
+        return False
+    saved = run.get("saved")
+    return (isinstance(saved, Mapping) and bool(saved.get("id")) and
+            type(saved.get("revision")) is int and saved["revision"] >= 1)
+
+
 def source_default_return(action: ProtocolAction, state: ProtocolRuntimeState) -> Mapping[str, Any]:
     """Retained dispatcher default: source line return only, no locks or IO."""
     if action.oem_opcode not in OEM_SOURCE_DEFAULT_NOOPS:
@@ -137,7 +146,7 @@ class ProtocolExecutor:
         self._lifecycle_handlers = dict(lifecycle_handlers or {})
         if set(self._oem_handlers) - set(SOURCE_DOMAINS):
             raise ValueError("Unknown OEM operation binding")
-        if set(self._lifecycle_handlers) - LIFECYCLE_HOOKS:
+        if set(self._lifecycle_handlers) - LIFECYCLE_HOOKS - {"saved_method_tip_preflight"}:
             raise ValueError("Unknown lifecycle binding")
         self._on_state_change = on_state_change
         self._before_native_entry = before_native_entry
@@ -336,7 +345,7 @@ class ProtocolExecutor:
             a.kind.value == "oem_operation" for s in document.stages for a in s.actions
         )
         if not oem:
-            return ()
+            return ("saved_method_tip_preflight",) if new_saved_method(document.metadata) else ()
         # Control/termination exits belong to the selected job even before a
         # control is requested. Physical leaves are supplied by the canonical factory.
         required = LIFECYCLE_HOOKS - {"prepare", "preparation_abort", "ordinary_pause_restore"}
@@ -350,7 +359,7 @@ class ProtocolExecutor:
         validate_protocol_document(document)
         required = self.required_lifecycle(document)
         missing = ["lifecycle:" + key for key in required if key not in self._lifecycle_handlers]
-        if required and not self.dry_run and self._source_script_begin is None:
+        if "run_job" in required and not self.dry_run and self._source_script_begin is None:
             missing.extend(("source_script_begin", "source_script_returned"))
         for stage in document.stages:
             for action in stage.actions:
@@ -707,7 +716,7 @@ class ProtocolExecutor:
     def _hook(self, name: str, domains: tuple[str, ...] = (), *, once: bool = False) -> dict[str, Any] | None:
         if once and name in self._hooks_done:
             return
-        if self._termination and name in {"prepare", "run_job", "script_prologue", "ordinary_pause_prepare", "deferred_pause_enter", "wake"}:
+        if self._termination and name in {"saved_method_tip_preflight", "prepare", "run_job", "script_prologue", "ordinary_pause_prepare", "deferred_pause_enter", "wake"}:
             raise _Diversion()
         self.wait_for_domains(domains)
         if name == "source_error" and self._termination != "source_error":
@@ -1085,7 +1094,7 @@ class ProtocolExecutor:
         state.workflow = state.workflow or ProtocolWorkflowState(command_id=self.job_id)
         self._state, self._active = state, True
         self._pool = ThreadPoolExecutor(max_workers=len(ALL_DOMAINS) + 1, thread_name_prefix="protocol-source")
-        self._oem = bool(report["required_lifecycle"])
+        self._oem = "run_job" in report["required_lifecycle"]
         self._ensure_stage_states(document, state)
         try:
             self._publish("preparing" if document.metadata.get("oem_prepare") else "starting")
@@ -1136,6 +1145,11 @@ class ProtocolExecutor:
                     self._source_workflow = state.workflow
                     self._source_entered = True
                 self._hook("script_prologue", once=True)
+            elif "saved_method_tip_preflight" in report["required_lifecycle"]:
+                result = self._hook("saved_method_tip_preflight", once=True)
+                if not result or result.get("source_pause_scripts"):
+                    self._failed = True
+                    raise _Diversion()
             self._publish("executing")
             for stage in document.stages:
                 state.current_stage_id = stage.stage_id
