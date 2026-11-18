@@ -11,12 +11,12 @@ FAST = "thermo-4483485-enduraplate-fast"
 def test_enduraplate_fast_default_on_magnet_block(tmp_path, monkeypatch):
     monkeypatch.setenv("BIOXP_OEM_RUNTIME_STATE_ROOT", str(tmp_path))
     assert _plate_gripper_offset(1, 25) == -10236          # 143882 - 10236 = 133646
-    P.set_loaded(movable_object="OUTPUT_PLATE", plate_id="4483354")  # catalog number resolves to id
-    assert P.loaded()["OUTPUT_PLATE"] == "thermo-4483354-enduraplate"
+    P.set_loaded(movable_object="OUTPUT_PLATE", plate_id="other-plate")
+    assert P.loaded()["OUTPUT_PLATE"] == "other-plate"
     assert _plate_gripper_offset(1, 25) == -30236          # no entry: OEM height
-    P.save_gripper(plate_id="thermo-4483354-enduraplate", location="LOC_P_MS", z_low_offset_steps=-5000)
+    P.save_gripper(plate_id="other-plate", location="LOC_P_MS", z_low_offset_steps=-5000)
     assert _plate_gripper_offset(1, 25) == -5000
-    P.save_gripper(plate_id="thermo-4483354-enduraplate", location="LOC_P_MS", z_low_offset_steps=None)
+    P.save_gripper(plate_id="other-plate", location="LOC_P_MS", z_low_offset_steps=None)
     assert _plate_gripper_offset(1, 25) == -30236
 
 
@@ -40,5 +40,5 @@ def test_plate_move_records_station_plate_for_depth(tmp_path, monkeypatch):
     assert P.plate_at("LOC_MS") == FAST
     P.record_plate_move(movable_object="OUTPUT_PLATE", plate_id=FAST, destination="LOC_P_OC")
     assert P.plate_at("LOC_MS") is None and P.plate_at("LOC_OC") == FAST
-    P.set_station(location="LOC_RC", plate_id="4483354")
-    assert P.plate_at("LOC_RC") == "thermo-4483354-enduraplate"
+    P.set_station(location="LOC_RC", plate_id="4483485")
+    assert P.plate_at("LOC_RC") == FAST

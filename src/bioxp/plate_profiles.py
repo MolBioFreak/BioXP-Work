@@ -38,11 +38,6 @@ PLATES: dict[str, dict[str, Any]] = {
         },
         "depth_offsets": [],
     },
-    "thermo-4483354-enduraplate": {
-        "name": "MicroAmp EnduraPlate Optical 96-Well (4483354)",
-        "gripper": {},
-        "depth_offsets": [],
-    },
 }
 LOADED = {"OUTPUT_PLATE": "thermo-4483485-enduraplate-fast"}
 
