@@ -4061,9 +4061,10 @@ class Serial206ProductionPrimitiveAdapter:
     def _depth_offset(self, location_name: str, plate_type: str | None = None) -> dict[str, Any]:
         """Saved extra depth for the loaded tip at this station (and plate type, when known)."""
         from .pipette.depth_offsets import resolve
+        from .plate_profiles import plate_at
         transport = getattr(self, "pipette_transport", None)
         tip_type = getattr(transport, "_tip_type", None) if _transport_tip_loaded(transport) else None
-        return resolve(tip_type=tip_type, location=location_name, plate_type=plate_type)
+        return resolve(tip_type=tip_type, location=location_name, plate_type=plate_type or plate_at(location_name))
 
     def _loaded_tip_z_offset(self) -> dict[str, Any]:
         from .pipette.tip_length import tip_z_offset
@@ -13300,7 +13301,9 @@ class Serial206OemInitializationProvider:
             depth = {"offset_steps": 0}
             if operation == "sourceLowerTo" and holder_row is None:
                 from .pipette.depth_offsets import resolve
-                depth = resolve(tip_type=loaded_type if loaded else None, location=LOCATION_ID_TO_NAME[arguments["location"]])
+                from .plate_profiles import plate_at
+                station = LOCATION_ID_TO_NAME[arguments["location"]]
+                depth = resolve(tip_type=loaded_type if loaded else None, location=station, plate_type=plate_at(station))
                 target += int(depth["offset_steps"])
             return {**self.moveZ(target), "source_return": target if operation == "sourceLowerTo" else 0,
                     "tip_z_offset": tip_offset, "depth_offset": depth}

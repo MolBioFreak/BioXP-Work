@@ -10417,11 +10417,14 @@ def _protocol_live_plate_move_handler(action, state):
     intent = translate_oem_plate_move(
         str(plate_token), str(params.get("target_location")), params.get("move_mode"),
     )
-    if params.get("plate_type") and intent["plate"] == 1:
-        # The workflow names the labware: record it as the loaded output plate so its
-        # saved plate profile (gripper heights) applies to this and later moves.
-        from .plate_profiles import set_loaded
-        set_loaded(movable_object="OUTPUT_PLATE", plate_id=str(params["plate_type"]))
+    if params.get("plate_type"):
+        # The workflow names the labware: record it as loaded and at its destination, so
+        # its plate profile (gripper heights, depth offsets) applies there.
+        from .oem_compat.pathing import LOCATION_ID_TO_NAME
+        from .plate_profiles import record_plate_move
+        record_plate_move(movable_object="OUTPUT_PLATE" if intent["plate"] == 1 else str(plate_token),
+                          plate_id=str(params["plate_type"]),
+                          destination=LOCATION_ID_TO_NAME.get(int(intent["destination"]), str(intent["destination"])))
     position_table_provider = getattr(app.state, "oem_deck_position_table_provider", None)
     if not callable(position_table_provider):
         raise HTTPException(status_code=503, detail={"error": "serial206_position_table_unavailable"})
@@ -11341,8 +11344,14 @@ class PlateGripperSave(BaseModel):
     model_config = ConfigDict(extra="forbid")
     plate_id: str = Field(min_length=1, max_length=80)
     location: str = Field(min_length=1, max_length=40)
-    z_low_offset_steps: int
+    z_low_offset_steps: int | None
     source: str | None = Field(default=None, max_length=300)
+
+
+class PlateStationSave(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    location: str = Field(min_length=1, max_length=40)
+    plate_id: str | None = Field(default=None, max_length=80)
 
 
 class PlateLoadedSave(BaseModel):
@@ -11363,6 +11372,16 @@ async def deck_plate_profiles_gripper_save(req: PlateGripperSave):
     from .plate_profiles import save_gripper
     try:
         return await run_in_threadpool(lambda: save_gripper(**req.model_dump()))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.put("/deck/plate-profiles/station")
+async def deck_plate_profiles_station_save(req: PlateStationSave):
+    """Record-only: which plate type sits at a pipetting station (its depth offsets apply). No motion."""
+    from .plate_profiles import set_station
+    try:
+        return await run_in_threadpool(lambda: set_station(**req.model_dump()))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
