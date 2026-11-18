@@ -164,6 +164,7 @@ class ProtocolExecutor:
         self._recording_failed = False
         self._failed = False
         self._unknown = False
+        self._native_entries = 0
         self._pause: tuple[str, str] | None = None
         self._wake_control: str | None = None
         self._wake_complete = False
@@ -398,10 +399,18 @@ class ProtocolExecutor:
         try:
             self._before_native_entry(identity, self._state)
         except Exception as exc:
-            self._unknown = True
-            self._state.record_event("native_entry_refused", detail={"identity": identity, "error_type": type(exc).__name__})
-            self._publish("reconciling", held_reason="native_authority_unavailable")
+            # Refused before anything in this run was entered: nothing was sent,
+            # so the run failed with a known reason. After that it stays unknown.
+            if self._native_entries:
+                self._unknown = True
+            else:
+                self._failed = True
+            self._state.record_event("native_entry_refused", detail={
+                "identity": identity, "error_type": type(exc).__name__, "error": str(exc)[:300],
+                "native_entries_before": self._native_entries})
+            self._publish("reconciling" if self._unknown else None, held_reason="native_authority_unavailable")
             raise _Diversion() from exc
+        self._native_entries += 1
 
     def request_control(self, action: str, *, control_id: str, mode: str | None = None,
                         gate: str | None = None, gate_id: str | None = None) -> dict[str, Any]:

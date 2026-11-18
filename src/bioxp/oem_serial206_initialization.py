@@ -7058,6 +7058,12 @@ class Serial206OemInitializationProvider:
             else:
                 active_receipt = {"command_id": command_id, "intent": selected, "idempotency_key": idempotency_key, "generation": generation, "inputs": safe_inputs, "status": "executing", "result": None}
                 lifecycle.update({"state": "executing", "generation": generation, "active_receipt": active_receipt, "pending_ticket": None})
+                if (selected in home_intents and type(lifecycle.get("board_lifecycle_generation")) is not int
+                        and type(current_board_generation) is int):
+                    # A board off/on cleared this record. The home runs in the
+                    # current board session; left blank, the next status read
+                    # takes "missing" for "changed" and discards the home.
+                    lifecycle["board_lifecycle_generation"] = current_board_generation
                 if selected == "enable_xyz_current":
                     z_active_receipt = {
                         **copy.deepcopy(active_receipt),
@@ -10338,6 +10344,18 @@ class Serial206OemInitializationProvider:
             receipt["status"] = "executing"
             z["active_receipt"] = copy.deepcopy(receipt)
             z["state"] = "executing"
+            if (intent in {"manual_home", "move_z_home", "diagnostic_home_axis"}
+                    and type(z.get("board_lifecycle_generation")) is not int):
+                # Same as X: a home on a record cleared by a board off/on runs in
+                # the current board session and must not read as a changed one.
+                home_board_generation_provider = getattr(
+                    self.preparation_provider, "current_board_lifecycle_generation", None
+                )
+                home_board_generation = (
+                    home_board_generation_provider() if callable(home_board_generation_provider) else None
+                )
+                if type(home_board_generation) is int:
+                    z.update({"generation": observed_generation, "board_lifecycle_generation": home_board_generation})
             if intent == "home_gz":
                 x_lifecycle = state["x_lifecycle"]
                 home_gz_prior_x_state = str(x_lifecycle.get("state") or "unprepared")

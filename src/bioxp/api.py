@@ -9178,6 +9178,22 @@ async def set_chiller_fan(req: ChillerFanRequest):
 @app.post("/chiller/pwm")
 async def set_chiller_pwm(req: ChillerPwmRequest):
     tester = _get_tester()
+    if req.pwm == 0:
+        # OEM btnRCOff/btnOCOff: ClassChillerBoard.setChillerPWM(chiller, 0) alone,
+        # no board activation. It also resets the target the cool-down check
+        # compares against, so the next setpoint is not refused as "too long".
+        bank = _CHILLER_BANK_MAP[req.bank]
+
+        def off():
+            source = dict(tester.oem_set_chiller_pwm(req.bank.value, 0))
+            readback = verified = None
+            if source.get("ok") is True:
+                time.sleep(tester.CHILLER_VERIFY_SETTLE_S)
+                readback = tester.chiller_gp_read(23, bank)
+                verified = bool(readback.get("ok") and readback.get("value") is not None and int(readback["value"]) == 0)
+            return {**source, "bank": bank, "axis": tester.CHILLER_SET_AXIS[bank], "pwm": 0,
+                    "readback": readback, "verified": verified}
+        return await _run_blocking("Chiller PWM", off, timeout_s=25.0)
     return await _run_blocking(
         "Chiller PWM",
         lambda: (

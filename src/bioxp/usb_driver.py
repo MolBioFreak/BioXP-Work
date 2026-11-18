@@ -5577,7 +5577,19 @@ class BioXpTester:
             ):
                 mismatches.append({"param": param, "expected": wanted, "observed": observed})
         if mismatches:
-            self._invalidate_oem_no_motion_profiles(reason=f"{key}_profile_readback_mismatch")
+            # Only this axis's profile is in question. A register that differs is
+            # not a board off/on: keep the board session and the other axes.
+            for name in ("_oem_no_motion_profile_generations", "_oem_no_motion_profile_fingerprints"):
+                rows = getattr(self, name, None)
+                if isinstance(rows, dict):
+                    rows.pop(key, None)
+            ready = getattr(self, "_oem_no_motion_profiles_ready", None)
+            if isinstance(ready, set):
+                ready.discard(key)
+            self._oem_no_motion_profile_ready = False
+            self._oem_no_motion_profile_invalidation = {
+                "reason": f"{key}_profile_readback_mismatch", "invalidated_at": time.time(),
+            }
             raise RuntimeError(
                 f"OEM no-motion profile readback mismatch for {axis_key}: {mismatches}; "
                 "run /motion/oem/prepare_without_motion again"
