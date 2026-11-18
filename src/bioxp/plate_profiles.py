@@ -125,12 +125,40 @@ def loaded() -> dict[str, str]:
     return {**LOADED, **_saved()["loaded"]}
 
 
+_LOCATION_READER = None
+# Deck-record locations (catch/release positions) and the pipetting station they serve.
+_DECK_TO_STATION = {**GRIP_TO_STATION, "LOC_MS": "LOC_MS", "LOC_TC": "LOC_TC", "LOC_OC": "LOC_OC", "LOC_RC": "LOC_RC"}
+
+
+def set_location_reader(reader) -> None:
+    """Register the deck record reader: returns {movable object: location name}."""
+    global _LOCATION_READER
+    _LOCATION_READER = reader
+
+
+def object_locations() -> dict[str, str]:
+    try:
+        rows = _LOCATION_READER() if callable(_LOCATION_READER) else None
+    except Exception:  # an unreadable record only means no derived station
+        rows = None
+    return {str(k): str(v) for k, v in dict(rows or {}).items() if isinstance(v, str)}
+
+
 def stations() -> dict[str, str]:
-    return dict(_saved()["stations"])
+    """Manually recorded plates per station, plus each loaded object's plate at its deck-record station."""
+    out = dict(_saved()["stations"])
+    where = object_locations()
+    for obj, plate in loaded().items():
+        station = _DECK_TO_STATION.get(where.get(obj, ""))
+        if station:
+            out = {k: v for k, v in out.items() if not (v == plate and k != station and k in _DECK_TO_STATION.values())}
+            out[station] = plate
+    return out
 
 
 def table() -> dict[str, Any]:
     return {"schema_version": SCHEMA, "plates": plates(), "loaded": loaded(), "stations": stations(),
+            "object_locations": object_locations(),
             "station_depth_offsets": _saved()["station_depth_offsets"],
             "gripper_stations": sorted(GRIP_TO_STATION),
             "oem_magnet_block_output_plate_z_offset": OEM_MAGNET_BLOCK_OUTPUT_PLATE_Z_OFFSET,
@@ -203,13 +231,7 @@ def record_plate_move(*, movable_object: str, plate_id: str, destination: str) -
     data = _saved()
     plate = _plate_id(plate_id)
     data["loaded"][movable_object] = plate
-    previous = data["object_stations"].get(movable_object)
-    if previous and data["stations"].get(previous) == plate:
-        data["stations"].pop(previous, None)
-    station = GRIP_TO_STATION.get(destination, destination)
-    data["object_stations"][movable_object] = station
-    data["stations"][station] = plate
-    _write(data)
+    _write(data)  # its station follows the deck record (stations())
 
 
 def plate_at(location: Any) -> str | None:

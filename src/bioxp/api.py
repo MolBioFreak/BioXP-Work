@@ -11360,6 +11360,21 @@ class PlateLoadedSave(BaseModel):
     plate_id: str = Field(min_length=1, max_length=80)
 
 
+def _plate_object_locations():
+    plane = getattr(app.state, "operator_command_plane", None)
+    store = getattr(plane, "store", None)
+    reader = getattr(store, "deck_semantic_state", None)
+    return dict((reader() or {}).get("movable_plate_locations") or {}) if callable(reader) else {}
+
+
+def _register_plate_location_reader():
+    from .plate_profiles import set_location_reader
+    set_location_reader(_plate_object_locations)
+
+
+_register_plate_location_reader()
+
+
 @app.get("/deck/plate-profiles")
 async def deck_plate_profiles_read():
     from .plate_profiles import table

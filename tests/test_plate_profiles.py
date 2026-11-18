@@ -34,11 +34,17 @@ def test_depth_offsets_nest_under_plates_and_fold_in_legacy(tmp_path, monkeypatc
     assert D.resolve(tip_type=10, location="LOC_RC", plate_type="other")["offset_mm"] == 5.4
 
 
-def test_plate_move_records_station_plate_for_depth(tmp_path, monkeypatch):
+def test_station_follows_the_deck_record_for_manual_and_workflow_moves(tmp_path, monkeypatch):
     monkeypatch.setenv("BIOXP_OEM_RUNTIME_STATE_ROOT", str(tmp_path))
-    P.record_plate_move(movable_object="OUTPUT_PLATE", plate_id=FAST, destination="LOC_P_MS")
-    assert P.plate_at("LOC_MS") == FAST
-    P.record_plate_move(movable_object="OUTPUT_PLATE", plate_id=FAST, destination="LOC_P_OC")
+    where = {"OUTPUT_PLATE": "LOC_P_MS"}
+    P.set_location_reader(lambda: where)
+    assert P.plate_at("LOC_MS") == FAST           # manual catch/release only updates the deck record
+    where["OUTPUT_PLATE"] = "LOC_P_OC"
     assert P.plate_at("LOC_MS") is None and P.plate_at("LOC_OC") == FAST
+    where["OUTPUT_PLATE"] = "LOC_GANTRY"
+    assert P.plate_at("LOC_OC") is None
+    P.record_plate_move(movable_object="OUTPUT_PLATE", plate_id=FAST, destination="LOC_P_MS")
+    assert P.loaded()["OUTPUT_PLATE"] == FAST
     P.set_station(location="LOC_RC", plate_id="4483485")
     assert P.plate_at("LOC_RC") == FAST
+    P.set_location_reader(None)
