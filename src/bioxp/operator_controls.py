@@ -1702,7 +1702,12 @@ def _dashboard_payload(machine_state: Mapping[str, Any]) -> dict[str, Any]:
         "schema_version": "bioxp.operator_dashboard.v1",
         "ownership_generation": int(machine_state.get("ownership_generation") or 0),
         "connection": {"live": connection_live, "ownership": dict(ownership)},
-        "motion": {"enabled": motion_readiness["enabled"], "reason": motion_readiness["disabled_reason"]},
+        "motion": {
+            "enabled": motion_readiness["enabled"], "reason": motion_readiness["disabled_reason"],
+            "state": ("off" if maintenance.get("motion_blocked") is True and maintenance.get("block_reason") == "operator_motion_off"
+                      else "unknown" if ownership.get("CAN_READY") is None
+                      else "on" if motion_readiness["enabled"] else "blocked"),
+        },
         "operation": {"state": lifecycle.get("operation_state"), "reason": lifecycle.get("operation_reason")},
         "enclosure": {
             "door_closed": (latch.get("door_sensor") == 1) if isinstance(latch, Mapping) else None,
@@ -3007,8 +3012,10 @@ class _OperatorPollCache:
     made that poll. No worker backlog or autonomous refresh loop is created.
     """
 
-    def __init__(self, ownership_generation_provider=None):
-        self._generation = ownership_generation_provider or (lambda: None)
+    def __init__(self, ownership_generation_provider=None, readiness_revision_provider=None):
+        epoch = ownership_generation_provider or (lambda: None)
+        readiness = readiness_revision_provider or (lambda: None)
+        self._generation = lambda: (epoch(), readiness())
         self._observed_generation = self._generation()
         self._waiting = {}
         self._failures = {}
@@ -3098,7 +3105,7 @@ class _OperatorPollCache:
                 if cached is not None:
                     body = cached[0]
                     cached_generation = body.get("ownership_generation", (body.get("dashboard") or {}).get("ownership_generation"))
-                    if generation is not None and cached_generation != generation:
+                    if generation[0] is not None and cached_generation != generation[0]:
                         self._cache.pop(key, None)
                         cached = None
                 idle = self._pending is None or self._pending.done()
@@ -3228,7 +3235,12 @@ def install_operator_control_plane(
     for metadata in (catalog_metadata, canonical_metadata):
         metadata.update(catalog_view="metadata", metadata_revision=_catalog_revision(metadata["actions"]))
 
-    poll_cache = _OperatorPollCache(lambda: int(hardware_state.ownership_epoch))
+    def readiness_revision():
+        latch = maintenance_state_provider() if maintenance_state_provider else {}
+        return (lifecycle_state.revision, latch.get("motion_blocked"),
+                latch.get("recovery_required"), latch.get("block_reason"))
+
+    poll_cache = _OperatorPollCache(lambda: int(hardware_state.ownership_epoch), readiness_revision)
     app.state.operator_poll_cache = poll_cache
     from contextlib import AsyncExitStack, asynccontextmanager
     previous_lifespan = app.router.lifespan_context

@@ -77,6 +77,11 @@ class CanonicalLifecycleOwner:
             self._check_camera = bool(check_camera)
             self._touch()
 
+    @property
+    def revision(self) -> int:
+        with self._lock:
+            return self._revision
+
     def _touch(self) -> None:
         self._revision += 1
         self._updated_at = _utc_now()
