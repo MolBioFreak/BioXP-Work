@@ -212,11 +212,13 @@ def test_refused_launch_is_stored_failed_with_reason(retained_rig):
     claimed = store.claim_next()
     assert claimed['command_id'] == 'refused-parent'
     assert store._renew_owner(lease_seconds=120)
+    store.assert_workflow_current(claimed["command_id"])  # Stale board numbers are not a refusal.
+    store._priority_fence.set()  # An actual Stop still refuses entry.
     store._workflow_dispatcher(claimed)
     final = store.get_workflow('refused-parent')
     assert calls == []  # nothing was sent
     assert final['status'] == 'failed', final['status']
     runtime = final['execution']['runtime_state']
     refused = [e for e in runtime['events'] if e['event'] == 'native_entry_refused']
-    assert refused and refused[0]['detail']['error'] == 'workflow_board_epoch_changed', json.dumps(runtime['events'])[:600]
+    assert refused and refused[0]['detail']['error'] == 'workflow_interrupted', json.dumps(runtime['events'])[:600]
     assert runtime['workflow']['held_reason'] == 'native_authority_unavailable'

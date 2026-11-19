@@ -10662,16 +10662,8 @@ def _protocol_command_store():
     return plane.store
 
 
-def _protocol_authority(document):
-    from .operator_command_plane import _active_board_epochs
-    from .services.protocol_service import _workflow_resources
-    resources = _workflow_resources(document)
-    epochs = {}
-    if any(resource.startswith("axis:") for resource in resources):
-        epochs = _active_board_epochs(app.state.operator_command_plane._state(), "oem.deck._finite_operation")
-        if set(epochs) != {"4", "5"}:
-            raise ProtocolLiveContractError("Selected workflow board epochs are unavailable.")
-    return int(hardware_state.ownership_epoch), epochs
+def _protocol_authority(_document):
+    return int(hardware_state.ownership_epoch), {}
 
 
 def _protocol_source_pipette_call(operation_name, operation, action, state, step_id):

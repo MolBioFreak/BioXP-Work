@@ -135,8 +135,7 @@ def _deliver_workflow_wake_prepare(command_store, provider, state, *, child_id, 
     counter = getattr(tester, "_oem_board_lifecycle_generation", None)
     transport = getattr(tester, "_oem_transport_generation", None)
     abort = getattr(tester, "_oem_abort_generation", None)
-    if (type(before) is not int or type(counter) is not int or type(transport) is not int
-            or before != fence["footprint"]["board_epochs"].get("5")):
+    if type(before) is not int or type(counter) is not int or type(transport) is not int:
         raise ValueError("workflow_wake_native_generation_unavailable")
     transitions = []
     generation_called = False
