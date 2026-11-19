@@ -1245,7 +1245,8 @@ class BioXpTester:
         for (board, axis), service in sorted(self._oem_fan_services().items()):
             rows.append({k: service.get(k) for k in (
                 "running", "tc_on", "target_c", "current_c", "pedestal_c", "fan_speed", "error", "last_error", "last_tick_at")}
-                | {"board": board, "axis": axis})
+                | {"board": board, "axis": axis}
+                | ({k: service.get(k) for k in ("fan_write_acknowledged", "cutoff_acknowledged", "source_board_error_event", "block_read_error")} if board == self.BOARD_CHILLER else {}))
         return {"services": rows}
 
     def _oem_fan_services(self):
@@ -1274,6 +1275,10 @@ class BioXpTester:
     def _oem_fan_read(self, board, command, cmd_type, motor, fallback):
         ack = self.send_tmcl_retry(int(board), int(command), int(cmd_type), int(motor), 0,
             attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
+        if board == self.BOARD_CHILLER and motor == 0 and self._tmcl_success(ack) and ack.get("value") is not None:
+            # The OC service reads channel 1, not the OC block (channel 3).
+            service = self._oem_thermal_fan(board, 0)
+            service["block_read_error"] = self._oem_chiller_block_sample(0, int(ack["value"]) / 1000.0)
         return (float(ack.get("value", int(round(float(fallback) * 1000.0)))) / 1000.0) if self._tmcl_success(ack) else float(fallback)
 
     def _oem_fan_schedule(self, key):
@@ -1332,15 +1337,15 @@ class BioXpTester:
                 speed = self._oem_fan_speed(current, service["target_c"], averaged, bool(service["going_down"]), bool(service["accelerate"])) if service["going_down"] else self._oem_fan_speed(current, service["target_c"], averaged, False)
             else:
                 speed = self._oem_fan_speed(current, service["target_c"], averaged, False)
-            service["fan_speed"] = speed
             service["last_tick_at"] = time.time()
+            if board == self.BOARD_CHILLER:
+                self._oem_chiller_fan_output(service, axis, speed, averaged)
+                return
+            service["fan_speed"] = speed
             self.send_tmcl_retry(board, 141, 0, axis, speed, attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
             if not service["error"] and averaged > 50.0:
-                if board == self.BOARD_THERMAL:
-                    self.send_tmcl_retry(board, 144, 0, 0, 0, attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
-                    self.send_tmcl_retry(board, 144, 0, 1, 0, attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
-                else:
-                    self.send_tmcl_retry(board, 144, 0, axis, 0, attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
+                self.send_tmcl_retry(board, 144, 0, 0, 0, attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
+                self.send_tmcl_retry(board, 144, 0, 1, 0, attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
                 service.update({"tc_on": False, "target_c": 30.0, "error": True})
             service["last_error"] = None
         except Exception as exc:
@@ -1348,6 +1353,31 @@ class BioXpTester:
         finally:
             service["ticking"] = False
             self._oem_fan_schedule(key)
+
+    def _oem_chiller_fan_output(self, service, axis, speed, averaged):
+        result = self._oem_thermal_result()
+        service["fan_write_acknowledged"] = False
+        try:
+            ack = self._oem_thermal_tx(result, self.BOARD_CHILLER, 141, 0, axis, speed)
+            service["fan_write_acknowledged"] = self._tmcl_success(ack)
+            if service["fan_write_acknowledged"]:
+                service["fan_speed"] = speed
+                service["last_error"] = None
+            else:
+                service["last_error"] = f"Fan write not acknowledged: {ack}"
+        except Exception as exc:
+            service["last_error"] = f"Fan write failed: {exc}"
+        # Fan delivery and cooling-time diagnostics must not skip the cutoff.
+        if not service["error"] and averaged > 50.0:
+            message = "TC Chiller Pedestal Temp is too high"
+            service.update(source_board_error_event=message, cutoff_acknowledged=False)
+            try:
+                cutoff = self._oem_thermal_result()
+                self._oem_thermal_pwm(cutoff, self.BOARD_CHILLER, axis, 0)
+                service["cutoff_acknowledged"] = cutoff['controller_command_acknowledged']
+                service.update(tc_on=False, target_c=30.0, error=True)
+            finally:
+                self._oem_thermal_error(result, message)
 
     def _oem_fan_set_target(self, board, axis, target_c):
         service = self._oem_fan_services().setdefault((int(board), int(axis)), {"pedestal_samples": [0.0] * 5, "target_c": 30.0, "current_c": 30.0, "tc_on": False, "going_down": False, "accelerate": False, "error": False, "running": False, "ticking": False})
@@ -8305,6 +8335,16 @@ class BioXpTester:
             fw_hex = "-".join(f"{b:02X}" for b in ack["raw"][9:13])
         return {"ack": ack, "ok": self._tmcl_success(ack), "fw_hex": fw_hex}
 
+    def _oem_chiller_block_sample(self, bank, actual):
+        state = self._oem_thermal_state(self.BOARD_CHILLER, bank)
+        state['chiller_current'] = actual
+        if actual < state['target'] and not state['reached']:
+            state['reached'] = True
+            self._oem_thermal_stop_clock(state)
+        if not state['reached'] and actual - state['target'] > 2 and self._oem_thermal_elapsed(state) > (state['needed'] + 300) * 1000:
+            return 'It took too long to cool the ' + ('Reagent Chiller' if bank == 0 else 'Output Nest')
+        return None
+
     def chiller_read_temp_axis(self, axis):
         ack = self._send_chiller(
             143,
@@ -8319,7 +8359,12 @@ class BioXpTester:
             strict_match=True,
         )
         temp_c = (float(ack["value"]) / 1000.0) if self._tmcl_success(ack) else None
-        return {"axis": int(axis), "ack": ack, "temp_c": temp_c, "ok": self._tmcl_success(ack)}
+        row = {"axis": int(axis), "ack": ack, "temp_c": temp_c, "ok": self._tmcl_success(ack)}
+        if temp_c is not None and int(axis) in (0, 3):
+            error = self._oem_chiller_block_sample(0 if int(axis) == 0 else 1, temp_c)
+            if error:
+                row["source_exception"] = error
+        return row
 
     def chiller_read_temps(self):
         out = {}
@@ -9194,12 +9239,9 @@ class BioXpTester:
             ack = self._oem_thermal_tx(result, self.BOARD_CHILLER, 143, 0, 0 if bank == 0 else 3)
             actual = state['chiller_current'] if ack is None else int(ack['value']) / 1000 if self._tmcl_success(ack) else 0.0
             if ack is not None and self._tmcl_success(ack):
-                state['chiller_current'] = actual
-                if actual < state['target'] and not state['reached']:
-                    state['reached'] = True
-                    self._oem_thermal_stop_clock(state)
-                if not state['reached'] and actual - state['target'] > 2 and self._oem_thermal_elapsed(state) > (state['needed'] + 300) * 1000:
-                    raise RuntimeError('It took too long to cool the ' + ('Reagent Chiller' if bank == 0 else 'Output Nest'))
+                error = self._oem_chiller_block_sample(bank, actual)
+                if error:
+                    raise RuntimeError(error)
             needed = self._oem_thermal_needed(temp_c - actual, self._oem_thermal_gp(result, self.BOARD_CHILLER, 8, bank) / 1000.0) if temp_c < actual else 0.0
             state['needed'] = 10.0 if needed < 10 else needed
             state['target'] = float(temp_c)
