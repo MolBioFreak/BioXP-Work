@@ -1407,6 +1407,11 @@ def _assess_action(action: Mapping[str, Any], machine_state: Mapping[str, Any], 
         else:
             readiness = _motion_readiness(machine_state, required_axes)
         existing_keys = {str(row.get("key")) for row in dependencies}
+        # Panel Home and HomeXY read their controllers live; a missing CAN observation is not an interlock.
+        if ownership.get("CAN_READY") is None and action_id in {
+            "oem.x.manual_panel_home", "oem.z.manual_home", "oem.xy.home", "oem.xy.home_xy",
+        }:
+            existing_keys.add("can_ready")
         dependencies.extend(
             row for row in readiness["dependencies"] if str(row.get("key")) not in existing_keys
         )
