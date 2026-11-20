@@ -6,6 +6,10 @@ import threading
 import time
 from typing import Any, Callable, Mapping, Protocol
 
+# OEM pipetteTipType.UNKNOWN is 201. Shown as "unknown"; never a 200 uL tip, never "no tips".
+UNKNOWN_TIP_TYPE = 201
+KNOWN_TIP_TYPES = (10, 50, 200)
+
 from .. import BioXpCanDriver
 try:
     from ..novo_usb_can import BioXpNovoUsbDriver
@@ -1015,7 +1019,9 @@ class FourPipetteTransport:
         self._transaction_lock = threading.RLock()
         self._interrupt_epoch = 0
         self._last_group_transaction: dict[str, Any] | None = None
-        self._tip_type = 201  # OEM enum value UNKNOWN
+        self._tip_type = UNKNOWN_TIP_TYPE
+        # True once the loaded tip touched liquid or went into a well (a used tip).
+        self._tip_contacted = False
         self._tip_location = -1
         self._allow_to_stop = True
         self._forceabort = forceabort or (lambda: False)
@@ -1099,6 +1105,8 @@ class FourPipetteTransport:
             "live_query_performed": False,
             "last_group_transaction": self._last_group_transaction,
             "tip_type": self._tip_type,
+            "tip_type_known": self._tip_type in KNOWN_TIP_TYPES,
+            "tip_used": bool(getattr(self, "_tip_contacted", False)),
             "tip_location": self._tip_location,
             "allow_to_stop": self._allow_to_stop,
             "fluid_detection_timestamps": dict(self._fluid_detection_timestamps),
@@ -1550,7 +1558,7 @@ class FourPipetteTransport:
                 and all(code == 32 for code in process_status_codes)
                 and all(code == 0 for code in error_codes)
             )
-            self._tip_type = 201
+            self._tip_type = UNKNOWN_TIP_TYPE
             self._last_group_transaction = {
                 "ok": ok,
                 "outcome": "reinitialized" if ok else "reinitialize_status_not_all_0",
@@ -2016,6 +2024,17 @@ class FourPipetteTransport:
                         "command_effects", "program", "buffer_action", "effects_deferred", "response_descriptors")})
         return result
 
+    _LIQUID_CONTACT_OPERATIONS = frozenset({"aspirate", "dispense", "mix", "fluid detection", "cavro_reaspirate"})
+
+    def _require_known_tip_type(self, operation: str, channels: Any) -> None:
+        """Unknown tips (after a restart or re-init) are ejected to waste, never pipetted with."""
+        if self._tip_type in KNOWN_TIP_TYPES:
+            return
+        raise PipetteTipStateError(
+            "Tip type unknown: eject the tips to waste, then pick up from a rack with a recorded size.",
+            details={"operation": operation, "channels": list(channels or []), "tip_type": "unknown",
+                     "recovery": "eject_to_waste"})
+
     def _run_group_liquid_operation(
         self,
         operation: str,
@@ -2031,6 +2050,9 @@ class FourPipetteTransport:
         after_sends: Callable[[], None] | None = None,
         set_allow_to_stop: bool = True,
     ) -> dict[str, Any]:
+        if operation in self._LIQUID_CONTACT_OPERATIONS:
+            self._require_known_tip_type(operation, channels)
+            self._tip_contacted = True
         if set_allow_to_stop:
             self._allow_to_stop = False
         rows: list[dict[str, Any]] = []
@@ -2488,6 +2510,8 @@ class FourPipetteTransport:
         # Finite private sharing for the two source overloads only. Existing
         # generic/manual guards and group completion semantics remain untouched.
         aspirating = operation == "aspirate"
+        self._require_known_tip_type(operation, list(self.CHANNELS))
+        self._tip_contacted = True
         volume = float(volume_ul)
         rows: list[dict[str, Any]] = []
         queries: list[dict[str, Any]] = []
@@ -2605,6 +2629,8 @@ class FourPipetteTransport:
         if vigor < 0 or vigor > 100:
             raise ValueError("vigorous must be between 0 and 100")
         selected = self._selected_channels()
+        self._require_known_tip_type("mix", selected)
+        self._tip_contacted = True
         effective_volume = float(self._tip_type)
         with self._transaction_lock:
             self._allow_to_stop = False
@@ -2671,6 +2697,7 @@ class FourPipetteTransport:
     def loadTip(self, tip_type: int, tip_location: int = -1) -> dict[str, Any]:  # noqa: N802
         self._tip_type = int(tip_type)
         self._tip_location = int(tip_location)
+        self._tip_contacted = False  # set at pickup: a fresh tip is clean
         return {
             "ok": True,
             "outcome": "host_state_only",
@@ -2683,7 +2710,7 @@ class FourPipetteTransport:
     def set_tip(self, command: PipetteTipCommand) -> dict[str, Any]:
         if command.action is PipetteTipAction.LOAD:
             metadata = dict(command.metadata)
-            return self.loadTip(int(metadata.get("tip_type", 201)), int(metadata.get("tip_location", -1)))
+            return self.loadTip(int(metadata.get("tip_type", UNKNOWN_TIP_TYPE)), int(metadata.get("tip_location", -1)))
         metadata = dict(command.metadata)
         channels = self._selected_channels(metadata.get("channels")) if metadata.get("channels") is not None else None
         return self.eject_all_tips(
@@ -2804,7 +2831,8 @@ class FourPipetteTransport:
                     },
                 )
             self._tip_location = -1
-            self._tip_type = 201
+            self._tip_type = UNKNOWN_TIP_TYPE
+            self._tip_contacted = False
             return {
                 "ok": True,
                 "outcome": "verified_empty_after_retry" if retried else "verified_empty",

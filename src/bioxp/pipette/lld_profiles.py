@@ -52,9 +52,9 @@ def profiles() -> dict[str, Any]:
 
 
 def profile_for(tip_type: Any) -> dict[str, Any] | None:
-    """Settings for the loaded tip type, or None when the type is unknown (e.g. 201 after restart)."""
+    """Settings for the loaded tip type, or None when the type is unknown: pumps keep their settings."""
     data = profiles()
-    key = "200" if tip_type == 201 else str(tip_type)
+    key = str(tip_type)
     rows = data["profiles"].get(key)
     if rows is None:
         return None

@@ -4100,6 +4100,8 @@ class Serial206ProductionPrimitiveAdapter:
                 return {"ok": False, "failure": "position_table_z_low_missing"}
             tip_offset = {"offset_steps": 0, "reason": "tip_rack"} if at_tip_rack else self._loaded_tip_z_offset()
             depth = {"offset_steps": 0, "reason": "tip_rack"} if at_tip_rack else self._depth_offset(str(location_id))
+            if not at_tip_rack:
+                _mark_tip_used(getattr(self, "pipette_transport", None))
             target = (int(target_row.z_low) + (4030 if bool(overpress) else 0) + int(tip_offset["offset_steps"])
                       + int(depth["offset_steps"]))
             source_anchor = "ClassControlInterface.cs:4401-4421"
@@ -4418,6 +4420,12 @@ def tip_tray_location(machine_status: Mapping[str, Any], index: int) -> int:
     if isinstance(trays, list) and len(trays) == len(TIP_TRAY_LOCATIONS):
         return int(trays[index]["location"])
     return TIP_TRAY_LOCATIONS[index]
+
+def _mark_tip_used(transport: Any) -> None:
+    """A loaded tip lowered into a well counts as used (dirty)."""
+    if _transport_tip_loaded(transport) and hasattr(transport, "_tip_contacted"):
+        transport._tip_contacted = True
+
 
 def _transport_tip_loaded(transport: Any) -> bool:
     """Tips on: the four-channel group carries the flag on its channel transports."""
@@ -11998,6 +12006,15 @@ class Serial206OemInitializationProvider:
             raise ValueError(f"unexpected scriptmoveTo provider arguments: {sorted(row)}")
         return destination, column, well, line, position_flag, run_parallel, expected_digest, source_plan
 
+    def _tip_dirty_for_path(self, state: Mapping[str, Any]) -> bool:
+        """Used or unknown-type tips take the OEM wet-tip route; a clean pickup goes straight to waste."""
+        if not state.get("tip_loaded"):
+            return bool(state.get("tip_dirty"))
+        from .pipette.transport import KNOWN_TIP_TYPES
+        transport = getattr(self.primitives, "pipette_transport", None)
+        return (bool(state.get("tip_dirty")) or getattr(transport, "_tip_contacted", False) is True
+                or getattr(transport, "_tip_type", None) not in KNOWN_TIP_TYPES)
+
     def preview_scriptmove_to(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         destination, column, well, row, position_flag, run_parallel, _expected, _source = self._scriptmove_argument_names(arguments)
         state = self.mov_execution_machine_state()
@@ -12005,7 +12022,7 @@ class Serial206OemInitializationProvider:
             current_location=int(state["current_location"]), target_location=destination,
             column=column, row=row, well=well, position_flag=position_flag,
             run_in_parallel=run_parallel, tip_loaded=bool(state["tip_loaded"]),
-            tip_dirty=bool(state["tip_dirty"]), tip_location=int(state["tip_location"]),
+            tip_dirty=self._tip_dirty_for_path(state), tip_location=int(state["tip_location"]),
             clean_path=bool(state["clean_path"]), pseudo_home_steps=int(state["pseudo_z_home"]),
             plate_on_gantry=state.get("plate_on_gantry"),
             location19_y=int(load_bound_oem_position_table().resolve(
@@ -12020,7 +12037,7 @@ class Serial206OemInitializationProvider:
             current_location=int(state["current_location"]), target_location=destination,
             column=column, row=row, well=well, position_flag=position_flag,
             run_in_parallel=run_parallel, tip_loaded=bool(state["tip_loaded"]),
-            tip_dirty=bool(state["tip_dirty"]), tip_location=int(state["tip_location"]),
+            tip_dirty=self._tip_dirty_for_path(state), tip_location=int(state["tip_location"]),
             clean_path=bool(state["clean_path"]), pseudo_home_steps=int(state["pseudo_z_home"]),
             plate_on_gantry=state.get("plate_on_gantry"),
             location19_y=int(load_bound_oem_position_table().resolve(
@@ -13325,6 +13342,8 @@ class Serial206OemInitializationProvider:
             loaded = _transport_tip_loaded(transport)
             tip_offset = tip_z_offset(loaded_type if loaded and isinstance(loaded_type, int) else None)
             target += int(tip_offset["offset_steps"])
+            if operation == "sourceLowerTo":
+                _mark_tip_used(transport)
             depth = {"offset_steps": 0}
             if operation == "sourceLowerTo" and holder_row is None:
                 from .pipette.depth_offsets import resolve
@@ -15988,7 +16007,7 @@ class Serial206OemInitializationProvider:
                 target_well=0,
                 position_flag=0,
                 tip_loaded=True,
-                tip_dirty=bool(machine.get("tip_dirty")) if isinstance(machine, Mapping) else False,
+                tip_dirty=True,  # tips found at startup: type unknown, keep the wet-tip route
                 timeout_s=min(bounded, 60.0),
                 pseudo_home_steps=int(machine.get("psudo_z_home_steps", 65000)) if isinstance(machine, Mapping) else 65000,
                 plate_on_gantry=machine.get("plate_on_gantry") if isinstance(machine, Mapping) else None,

@@ -167,7 +167,17 @@ class OemPathPlanner:
             if z > pseudo:
                 steps.append(_step("moveZ", z=pseudo, reason="current_z_above_pseudo_home", source_lines="ClassControlInterface.cs:3864-3867"))
             mid = self.get_midpoints(current_x=x2, current_y=y2, target_x=x, target_y=y)
-            if current_id in TECAN_RACK_OR_STRIP4_IDS and (loc_id != 20 or loc_id != 18) and loc_id != WASTE_BIN_ID:
+            if loc_id == WASTE_BIN_ID and not state.tip_dirty:
+                # Clean tip (picked up, never in liquid or a well): straight to the bin.
+                # Used or unknown tips keep the OEM legs around open plates below.
+                branch = "clean_tip_direct_to_waste"
+                steps.append(_step("moveXY", x=82450, y=y, reason="clean_tip_direct_to_waste"))
+                if str(state.device_type).upper() == "DBC":
+                    steps.append(_step("moveZ", z=75000))
+                else:
+                    steps += [_step("moveZ", z=145000), _step("moveX", x=self.x_high_limit - 500),
+                              _step("moveSteps", axis="x", delta=-1000), _step("moveZ", z=pseudo)]
+            elif current_id in TECAN_RACK_OR_STRIP4_IDS and (loc_id != 20 or loc_id != 18) and loc_id != WASTE_BIN_ID:
                 branch = "tip_loaded_from_rack_or_strip4_direct_xy_then_z"
                 steps += [_step("moveXY", x=x, y=y, source_lines="ClassControlInterface.cs:3869-3872"), _step("sleep", milliseconds=50), _step("moveZ", z=num, source_lines="ClassControlInterface.cs:3871-3873")]
             elif len(mid) != 0 and loc_id != WASTE_BIN_ID:

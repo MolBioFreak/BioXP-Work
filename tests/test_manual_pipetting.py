@@ -197,6 +197,7 @@ def test_ordered_transfer_reaches_real_liquid_owner_and_stops_on_failure(rig, mo
         t._initialized = t._tip_loaded = True
         transports.append(t)
     group = FourPipetteTransport(transports, sleep=lambda seconds: None)
+    group.loadTip(10)  # picked up from a rack with a recorded size
     monkeypatch.setattr(api, "_get_pipette_transport", lambda: group)
     monkeypatch.setattr(api, "_pipette_receipts", None)
     monkeypatch.setattr(api, "_liquid_reference_preflight", lambda *a: None)

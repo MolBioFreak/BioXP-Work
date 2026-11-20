@@ -19,6 +19,7 @@ from typing import Any
 Z_STEPS_PER_MM = 2015.748
 from ..plate_profiles import SAVED_NAME  # stored in the one plate profile file
 MAX_MM = 15.0
+PLATE_STATIONS = ("LOC_MS", "LOC_TC", "LOC_OC", "LOC_RC")
 # Values found experimentally on this robot; offered as quick picks, never applied unless saved.
 STANDARD_MM = [
     {"offset_mm": 0.0, "label": "None (calibrated height)", "source": "OEM station height + tip length"},
@@ -44,9 +45,19 @@ def _norm_plate(value: Any) -> str | None:
 
 
 def resolve(*, tip_type: Any, location: Any, plate_type: Any = None) -> dict[str, Any]:
-    """Offset in force for this move; zero with no matching entry."""
-    tip = 200 if tip_type == 201 else tip_type
+    """Offset in force for this move; zero with no matching entry.
+
+    Needs tip type, station and plate/tube. An unknown tip type or station uses
+    the managed default (no offset); an unknown plate uses the station default.
+    Either way the move proceeds and the result carries a flag.
+    """
+    tip = tip_type if tip_type in (10, 50, 200) else None
     plate = _norm_plate(plate_type)
+    flags = [name for name, missing in (("tip_type_unknown", tip is None), ("station_unknown", not location),
+             ("plate_type_unknown", plate is None and location in PLATE_STATIONS)) if missing]
+    if tip is None or not location:
+        return {"offset_steps": 0, "offset_mm": 0.0, "matched": None, "flags": flags,
+                "applied": "managed default: no offset"}
     best, best_rank = None, -1
     for entry in entries():
         fields = ((entry.get("tip_type"), tip, 1), (entry.get("location"), location, 2),
@@ -57,9 +68,9 @@ def resolve(*, tip_type: Any, location: Any, plate_type: Any = None) -> dict[str
         if rank > best_rank:
             best, best_rank = entry, rank
     if best is None:
-        return {"offset_steps": 0, "offset_mm": 0.0, "matched": None}
+        return {"offset_steps": 0, "offset_mm": 0.0, "matched": None, "flags": flags}
     return {"offset_steps": round(float(best["offset_mm"]) * Z_STEPS_PER_MM), "offset_mm": float(best["offset_mm"]),
-            "matched": {k: best.get(k) for k in ("tip_type", "location", "plate_type", "source", "saved_at")}}
+            "matched": {k: best.get(k) for k in ("tip_type", "location", "plate_type", "source", "saved_at")}, "flags": flags}
 
 
 def table() -> dict[str, Any]:

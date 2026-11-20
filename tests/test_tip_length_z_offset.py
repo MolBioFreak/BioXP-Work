@@ -50,7 +50,9 @@ def test_offset_applies_to_calibrated_heights_only_with_a_tip():
 
 
 def test_shipped_offsets_match_datasheet_lengths_at_oem_z_scale():
-    for tip, steps in ((10, 45757), (50, 0), (200, -1008), (201, -1008)):
+    unknown = tip_z_offset(201)
+    assert unknown["offset_steps"] == 0 and unknown["tip_type"] == "unknown"
+    for tip, steps in ((10, 45757), (50, 0), (200, -1008)):
         info = tip_z_offset(tip)
         assert info["measured"] is True and info["offset_steps"] == steps == info["datasheet_delta_steps"]
 

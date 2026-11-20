@@ -11321,7 +11321,7 @@ async def pipette_tip_tray_set(req: ManualTipTraySet):
 
 class TipOffsetConfirm(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    tip_type: Literal[10, 50, 200, 201]
+    tip_type: Literal[10, 50, 200]
     offset_steps: int
     source: str = Field(min_length=1, max_length=300)
 
