@@ -8448,20 +8448,47 @@ async def motion_gripper_clear():
     )
 
 
+def _record_gripper_home_reference(result, *, tester, ownership_epoch, board_epoch):
+    """Publish the gripper reference row when the controller itself proves home.
+
+    Same rule as the thermal door: only a controller-verified home (switch read
+    back at home) writes the row. A source short-circuit (already zero in OEM
+    memory, nothing moved) leaves the row as it was.
+    """
+    home = ((result or {}).get("home") or {}).get("home") if isinstance(result, dict) else None
+    if (isinstance(result, dict) and result.get("ok") is True and isinstance(home, dict)
+            and home.get("controller_home_proof_verified") is True
+            and hardware_state.ownership_epoch == ownership_epoch
+            and tester.oem_current_board_lifecycle_generation() == board_epoch):
+        reference = _reference_state_store.mark_referenced(MarkAxisReferencedCommand(
+            axis="g", position_steps=0, source="ClassControlInterface.btnGripperHome_Click",
+            motion_kind="manual_gripper_home",
+        ))
+        result["reference_state"] = reference
+        if reference.get("ok") is not True or reference.get("durable_clean") is not True:
+            result.update(ok=False, failure="gripper_home_reference_persistence_failed")
+    return result
+
+
 @app.post("/motion/gripper/home")
 async def motion_gripper_home():
     _require_motion_route_ready()
     tester = _get_tester()
-    return await _run_blocking(
-        "OEM gripper home",
-        lambda: _with_live_interlock(tester, lambda: gripper_home(
+
+    def execute():
+        ownership_epoch = hardware_state.ownership_epoch
+        board_epoch = tester.oem_current_board_lifecycle_generation()
+        result = _with_live_interlock(tester, lambda: gripper_home(
             tester,
             operator_ack="GRIPPER_HOME",
             reason="oem_manual_gripper_home",
             timeout_s=15.0,
-        )),
-        timeout_s=None,  # Native OEM source owns all waits; ordinary custody is retained.
-    )
+        ))
+        return _gripper_success_or_409(_record_gripper_home_reference(
+            result, tester=tester, ownership_epoch=ownership_epoch, board_epoch=board_epoch))
+
+    # Native OEM source owns all waits; ordinary custody is retained.
+    return await _run_blocking("OEM gripper home", execute, timeout_s=None)
 
 
 def _gripper_success_or_409(result: dict) -> dict:
