@@ -2757,9 +2757,13 @@ class PipetteTipRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 class PipetteTipTypeRequest(BaseModel):
-    """OEM combo selection: software type only, never physical pickup."""
+    """Operator sets the type of the tips already on the guns: software only, never a pickup.
+
+    Clears the unknown-type flag. ``used`` (default true: history unknown) keeps the wet-tip
+    route to waste; false records fresh, unused tips."""
     model_config = ConfigDict(extra="forbid")
-    tip_type: Literal[10, 50, 200, 201]
+    tip_type: Literal[10, 50, 200]
+    used: StrictBool = True
 
 
 class PipetteEjectAllRequest(BaseModel):
@@ -9643,7 +9647,7 @@ async def liquid_tip(req: PipetteTipRequest):
 async def liquid_pipette_tip_type(req: PipetteTipTypeRequest):
     result = await run_pipette_operation(
         "select_tip_type",
-        lambda transport: transport.loadTip(req.tip_type),
+        lambda transport: transport.set_loaded_tip_type(req.tip_type, used=req.used),
         get_transport=_get_pipette_transport,
         run_blocking=_run_blocking,
         timeout_s=10.0,

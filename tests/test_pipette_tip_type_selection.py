@@ -32,13 +32,13 @@ def test_typed_tip_selection_uses_existing_software_owner(monkeypatch):
             assert client.post(PATH, json=invalid,
                 headers={"Idempotency-Key": f"invalid-tip-type-{index}"}).status_code == 422
         assert transport._tip_type == 201
-        for kind in (10, 50, 200, 201):
+        for kind in (10, 50, 200):
             response = client.post(PATH, json={"tip_type": kind},
                                    headers={"Idempotency-Key": f"tip-type-{kind}"})
             assert response.status_code == 200, response.text
             body = response.json()
             assert body["tip_type"] == kind
-            assert body["tip_location"] == -1
+            assert body["tip_location"] == -1 and body["tip_used"] is True
             assert body["outcome"] == "host_state_only"
             assert body["hardware_commanded"] is False
             assert body["physical_effect_verified"] is False
@@ -57,7 +57,7 @@ def test_tip_type_is_typed_catalog_service_action():
     assert not _motor_motion_action(matching[0])
     assert _safety("POST", PATH) == "service"
     field = api.PipetteTipTypeRequest.model_json_schema()["properties"]["tip_type"]
-    assert field["enum"] == [10, 50, 200, 201]
+    assert field["enum"] == [10, 50, 200]
 
 
 def test_tip_type_receipt_is_completed_not_failed(tmp_path, monkeypatch):

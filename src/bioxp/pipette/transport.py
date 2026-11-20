@@ -2694,6 +2694,14 @@ class FourPipetteTransport:
 
 
 
+    def set_loaded_tip_type(self, tip_type: int, *, used: bool = True) -> dict[str, Any]:
+        """Operator states which tips are on the guns. Host state only."""
+        if int(tip_type) not in KNOWN_TIP_TYPES:
+            raise ValueError("tip_type must be 10, 50 or 200")
+        result = self.loadTip(int(tip_type), self._tip_location)
+        self._tip_contacted = bool(used)
+        return {**result, "tip_used": bool(used), "set_by": "operator"}
+
     def loadTip(self, tip_type: int, tip_location: int = -1) -> dict[str, Any]:  # noqa: N802
         self._tip_type = int(tip_type)
         self._tip_location = int(tip_location)
