@@ -1,8 +1,9 @@
-"""Passive, host-receive-time evidence for finite, completion-waited strokes.
+"""Bounded, host-receive-time evidence for finite, completion-waited strokes.
 
-No pressure stream enable, query, sleep or extra completion wait. The executor
+Unmarked workflows remain passive; explicit opt-in scopes transient stream control. The executor
 owns attribution, the service owns retention, and the router owns ingress.
 """
+from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
@@ -16,12 +17,22 @@ STROKES = {'aspirate', 'dispense', 'dispense_all', 'aspirate air', 'cavro_reaspi
 
 
 @contextmanager
-def attempt_scope(job, result, entered_id):
+def attempt_scope(job, result, entered_id, document, fence):
     refs, pending = [], []
     identity = dict(job_id=job, source_occurrence_id=result['source_occurrence_id'],
                     native_action_id=result['action_id'], native_attempt_id=entered_id,
                     attempt=result.get('attempt'))
-    token = _attempt.set((identity, refs, pending) if job and identity['attempt'] else None)
+    method = document.metadata.get('bms_method')
+    marker = method.get('workflow_pressure_streaming') if isinstance(method, Mapping) else None
+    active = marker is True
+    authored = False
+    if active:
+        from .workflow_stream import authored_control
+        authored = any(authored_control(a.params) for stage in document.stages for a in stage.actions)
+    if active and not identity['attempt']:
+        identity['attempt'] = 1
+    token = _attempt.set((identity, refs, pending, active, authored, fence)
+                         if job and marker is not False and identity['attempt'] else None)
     try:
         yield
     finally:
@@ -54,7 +65,7 @@ def observe_stroke(run):
         owner = _claim.get()
         if owner is None or operation not in STROKES or not kwargs.get('defer_completion', True):
             return run(group, operation, channels, callback, **kwargs)
-        (identity, refs, pending), store, claim, generation = owner
+        (identity, refs, pending, active, authored, fence), store, claim, generation = owner
         if len(refs) >= MAX_STROKES:
             if len(refs) == MAX_STROKES:
                 refs.append({**identity, 'observation_error': 'attempt stroke capture limit reached'})
@@ -62,8 +73,9 @@ def observe_stroke(run):
         ref = {**identity, 'stroke': operation, 'channels': list(channels)}
         capture = router = None
         epoch = group._interrupt_epoch
+        control = None
         def send(channel, transport, defer):
-            nonlocal capture, router
+            nonlocal capture, router, control
             if channel == channels[0]:
                 refs.append(ref)
                 try:
@@ -73,9 +85,25 @@ def observe_stroke(run):
                         raise ValueError('selected channels do not share an active pressure reader')
                     capture = router.begin_scientific_pressure_capture(dict(channels=list(channels),
                         max_frames=MAX_FRAMES, duration_ms=MAX_MS))
+                    if active:
+                        from .workflow_stream import StreamControl
+                        control = StreamControl(group, channels, router, epoch, authored, fence, ref)
+                        control.enable()
+                        # Exclude frames from queries and setup, including frames queued
+                        # on the receiver before this exact host-time boundary.
+                        with capture.lock:
+                            capture.started_at = router._clock()
+                            capture.deadline = capture.started_at + MAX_MS / 1000
+                            capture.frames.clear()
+                            capture.lost_frames = 0
                 except Exception as exc:
                     ref['observation_error'] = str(exc)[:256]
-            return callback(channel, transport, defer)
+            if control is not None:
+                control.check_authority()
+            value = callback(channel, transport, defer)
+            if control is not None:
+                control.stroke_revisions[channel] = getattr(transport._driver, '_pipette_buffer_revision', None)
+            return value
         outcome = None
         try:
             outcome = run(group, operation, channels, send, **kwargs)
@@ -91,7 +119,7 @@ def observe_stroke(run):
                         from .receipts import PipetteReceiptStore
                         raw = capture.finish()
                         raw.update(finished_at=finished, stroke_identity=dict(ref),
-                            acquisition='passive_group_send_through_wait', duration_limit_reached=finished >= capture.deadline,
+                            acquisition='scoped_group_send_through_wait' if control else 'passive_group_send_through_wait', duration_limit_reached=finished >= capture.deadline,
                             interrupted=interrupted, ok=state=='completed', source_return_completed=returned)
                         writer = PipetteReceiptStore(store.root)
                         try:
@@ -108,4 +136,6 @@ def observe_stroke(run):
                     pending.append((retain, ref))
                 except Exception as exc:
                     ref['observation_error'] = str(exc)[:256]
+            if control is not None:
+                control.restore(outcome)
     return wrapped

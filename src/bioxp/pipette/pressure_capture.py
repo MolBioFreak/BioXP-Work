@@ -49,7 +49,7 @@ class ScientificPressureCapture:
             self.lost_frames += 1
             return
         try:
-            if self.closed:
+            if self.closed or frame.received_at < self.started_at:
                 return
             if len(self.frames) >= self.request.max_frames:
                 self.lost_frames += 1

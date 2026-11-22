@@ -910,6 +910,11 @@ class NovoRouter:
                 self._typed_receive_context.descriptors = prior
         return scoped()
 
+    def pipette_completion_pending(self, channel: int) -> bool:
+        """Read-only: optional stream instrumentation must never displace an owner."""
+        with self._completion_lock:
+            return channel in self._pipette_completions
+
     def prepare_pipette_completion(
         self,
         channel: int,

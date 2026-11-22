@@ -1189,7 +1189,11 @@ class ProtocolExecutor:
                 if control_id and self._termination:
                     raise _Diversion()
                 from ..pipette.stroke_pressure import attempt_scope
-                with attempt_scope(self.job_id, result, entered_action.action_id):
+                def pressure_fence():
+                    if self._termination or self._interrupted or self._recording_failed or self._unknown:
+                        raise RuntimeError('workflow no longer current')
+                    self._before_native_entry(identity, state)
+                with attempt_scope(self.job_id, result, entered_action.action_id, document, pressure_fence):
                     value = handler(entered_action, state)
                     return value.result() if isinstance(value, Future) else value
             value = self._pool.submit(copy_context().run, entered)
