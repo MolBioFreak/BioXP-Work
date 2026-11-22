@@ -149,6 +149,7 @@ class NovoRouter:
             )
         }
         self._diagnostics: deque[dict[str, Any]] = deque(maxlen=int(queue_size))
+        self._capture_registration_lock = threading.Lock()
         self._pressure_epoch = 0
         self._pressure_epoch_started_at: float | None = None
         self._reader_generation = 0
@@ -838,17 +839,24 @@ class NovoRouter:
 
     def begin_scientific_pressure_capture(self, request):
         from .pipette.pressure_capture import ScientificPressureCapture
-        prior = getattr(self, "_scientific_pressure_capture", None)
-        if prior is not None and not prior.closed:
-            raise ValueError("an explicit scientific pressure capture is already active")
-        capture = ScientificPressureCapture(request, reader_generation=self.reader_generation, clock=self._clock)
-        self._scientific_pressure_capture = capture
-        return capture
+        with self._capture_registration_lock:
+            prior = getattr(self, "_scientific_pressure_capture", None)
+            if prior is not None and not prior.closed:
+                raise ValueError("an explicit scientific pressure capture is already active")
+            capture = ScientificPressureCapture(request, reader_generation=self.reader_generation, clock=self._clock)
+            self._scientific_pressure_capture = capture
+            return capture
+
+    def detach_scientific_pressure_capture(self, capture):
+        # Stop ingress now; decoding may be deferred past motion cleanup.
+        with self._capture_registration_lock, capture.lock:
+            capture.closed = True
+            if getattr(self, "_scientific_pressure_capture", None) is capture:
+                self._scientific_pressure_capture = None
+            return self._clock()
 
     def finish_scientific_pressure_capture(self, capture):
-        # Detach first; finishing/persistence belongs to the caller, not reader.
-        if getattr(self, "_scientific_pressure_capture", None) is capture:
-            self._scientific_pressure_capture = None
+        self.detach_scientific_pressure_capture(capture)
         return capture.finish()
 
     def calculate_pressure_offset_evidence(self) -> dict[int, dict[str, Any]]:

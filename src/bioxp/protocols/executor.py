@@ -88,7 +88,7 @@ def _utc_now() -> str:
 # OEM executeScript keeps progress and outcome per instruction, never a copy of
 # its evidence. Full evidence lives once on the child command (command_id).
 _STEP_FIELDS = ("stage_id", "action_id", "parent_action_id", "kind", "source_occurrence_id",
-                "status", "ok", "started_at", "finished_at", "command_id")
+                "status", "ok", "started_at", "finished_at", "command_id", "pressure_traces")
 
 
 def _step_record(result) -> None:
@@ -1188,8 +1188,10 @@ class ProtocolExecutor:
                 self._entry(identity)
                 if control_id and self._termination:
                     raise _Diversion()
-                value = handler(entered_action, state)
-                return value.result() if isinstance(value, Future) else value
+                from ..pipette.stroke_pressure import attempt_scope
+                with attempt_scope(self.job_id, result, entered_action.action_id):
+                    value = handler(entered_action, state)
+                    return value.result() if isinstance(value, Future) else value
             value = self._pool.submit(copy_context().run, entered)
         if isinstance(value, Future):
             result["pending"] = True

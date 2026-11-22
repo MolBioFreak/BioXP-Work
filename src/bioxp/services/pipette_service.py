@@ -455,7 +455,9 @@ async def _run_transport_call(
         transport = get_transport()
         stage = "dispatch"
         def execute():
-            result = operation(transport)
+            from ..pipette.stroke_pressure import receipt_scope
+            result = receipt_scope(receipt_store, failure_claim_record,
+                effective_runtime_binding.get("connection_generation"), lambda: operation(transport))
             if observe_result is not None:
                 # Observe a new physical return while its real receipt is active;
                 # retained-key replay above never republishes current tip state.

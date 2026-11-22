@@ -15,6 +15,7 @@ try:
     from ..novo_usb_can import BioXpNovoUsbDriver
 except Exception:  # pragma: no cover - surfaced lazily in status payloads
     BioXpNovoUsbDriver = None  # type: ignore[assignment]
+from .stroke_pressure import observe_stroke
 from .models import (
     PipetteAspirateCommand,
     PipetteCommandError,
@@ -2035,6 +2036,7 @@ class FourPipetteTransport:
             details={"operation": operation, "channels": list(channels or []), "tip_type": "unknown",
                      "recovery": "eject_to_waste"})
 
+    @observe_stroke
     def _run_group_liquid_operation(
         self,
         operation: str,
