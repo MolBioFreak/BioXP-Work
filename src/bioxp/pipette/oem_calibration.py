@@ -29,8 +29,8 @@ class ManualTipLoadRequest:
     well: str  # tipLocation: A1,B1,...,A12,B12 (four-channel pickup)
     overpress: bool = False
     lift_z: bool = False
-    # Channels (0-3) that keep their tips. The others are ejected back into
-    # their rack wells right after pickup, after a short lift. None keeps all four.
+    # Channels (0-3) that keep their tips. Other observed mounted tips are
+    # returned to the rack after a short lift. None skips selective release.
     keep_channels: tuple[int, ...] | None = None
     release_lift_mm: float = RELEASE_LIFT_MM
 
@@ -190,7 +190,10 @@ def manual_load_tip(request: ManualTipLoadRequest, bindings: CalibrationBindings
                 and r["result"].get("hardware_truth_level") == "hardware_query"]
 
     seq.step("queryTipStatus", lambda: b.pipette("query_tip_status_all", observe_pickup))
-    drop = [c for c in range(4) if request.keep_channels is not None and c not in request.keep_channels]
+    # A shared descent can encounter empty rack sockets. Only eject tips
+    # the successful hardware query actually observed, never the whole mask complement.
+    drop = [c for c in seq.result["picked_up_channels"]
+            if request.keep_channels is not None and c not in request.keep_channels]
     if drop:
         # Intended releases are not evidence of completion. Retain the unresolved
         # set even if the transport/receipt publisher unwinds partway through.
