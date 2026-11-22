@@ -771,7 +771,11 @@ class ProtocolExecutor:
                 result['unresolved_attempt'] = True
             else:
                 self._failed = True
-            if not attempt_hold and (event_control == "pause_for_operator" or result.get("on_error") == "pause_for_operator") and not self._termination:
+            # An inferred method default only requests the recoverable attempt gate;
+            # it must not hold an owner-lost, ambiguous or terminal action in the legacy gate.
+            inferred_hold = (not self._oem and (result.get('metadata') or {}).get('bms_method', {}).get('default_error_hold') is True)
+            if (not attempt_hold and not self._termination and (event_control == 'pause_for_operator'
+                    or (not inferred_hold and result.get('on_error') == 'pause_for_operator'))):
                 self._state.workflow.held_reason = "source_error_hold"
                 self._state.workflow.source_occurrence_id = result.get("source_occurrence_id") or result.get("action_id")
         if result.get("stage_id") in self._state.stage_states:

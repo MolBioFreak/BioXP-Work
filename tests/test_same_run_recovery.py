@@ -54,6 +54,25 @@ class RecoveryTest(unittest.TestCase):
             ex.interrupt(control_id='teardown')
             worker.join(3)
 
+    def test_implicit_error_policy_does_not_convert_ambiguous_failure_to_operator_hold(self):
+        gates = []
+        action = ProtocolAction('first', 'stage', K.PIPETTE_ASPIRATE, on_error='pause_for_operator',
+                                metadata={'bms_method': {'default_error_hold': True}})
+        doc = ProtocolDocument('fixture', stages=(ProtocolStage('stage', actions=(action,)),))
+        ex = ProtocolExecutor(dry_run=False, job_id='inert', before_native_entry=lambda *_: None,
+                              handlers={K.PIPETTE_ASPIRATE: lambda *_: {'ok': False, 'uncertain': True}},
+                              on_state_change=lambda state: gates.append(state.workflow.gate))
+        worker = Thread(target=ex.execute, args=(doc,), daemon=True)
+        worker.start()
+        try:
+            worker.join(2)
+            self.assertFalse(worker.is_alive(), 'an implicit default trapped a terminal outcome in an operator hold')
+            self.assertNotIn('error_hold', gates)
+            self.assertNotEqual(ex.outcome, 'completed')
+        finally:
+            if worker.is_alive():
+                ex.interrupt(control_id='teardown'); worker.join(3)
+
     def test_sqlite_retry_reopen_and_replay(self):
         import tempfile
         import time
