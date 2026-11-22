@@ -1,4 +1,4 @@
-"""Optional, attempt-owned ADP stream control. No acquisition controls for pLLD."""
+"""Optional, attempt-owned ADP stream control."""
 from collections.abc import Mapping
 
 from .cavro_commands import compile_device_command
@@ -98,7 +98,7 @@ class StreamControl:
             except Exception as exc:
                 row['setup_error'] = str(exc)[:256]
 
-    def restore(self, outcome):
+    def restore(self, outcome, *, require_success=False):
         for row in reversed(self.rows):
             if row.get('enable') not in ('unresolved','completion_returned'): continue
             row['restore'] = 'unresolved'
@@ -108,7 +108,7 @@ class StreamControl:
                 ch = row['channel']
                 end = next((r.get('completion') or {} for r in (outcome or {}).get('channels', [])
                             if r['channel']==ch), {})
-                if not end.get('ok') and end.get('outcome')!='device_error':
+                if not end.get('ok') and (require_success or end.get('outcome')!='device_error'):
                     raise ValueError('stroke completion unresolved')
                 with self.group._transaction_lock:
                     if self.stroke_revisions.get(ch) != self.driver(ch)._pipette_buffer_revision:

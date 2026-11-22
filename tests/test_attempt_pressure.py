@@ -17,7 +17,7 @@ from bioxp.protocols.models import ProtocolAction, ProtocolActionKind as K, Prot
 from bioxp.services.pipette_service import run_pipette_operation
 
 
-@pytest.mark.parametrize('mode', ['ordinary', 'interrupted', 'empty', 'overflow', 'writer_error', 'reader_busy'])
+@pytest.mark.parametrize('mode', ['ordinary', 'interrupted', 'empty', 'overflow', 'writer_error', 'reader_busy', 'search_timeout'])
 def test_failed_stroke_retry_cold_read(tmp_path, monkeypatch, mode):
     monkeypatch.setattr("bioxp.pipette.receipts._current_replay_identity", lambda: {})
     monkeypatch.setattr(PipetteReceiptStore, "_source_identity", staticmethod(lambda: {}))
@@ -54,7 +54,8 @@ def test_failed_stroke_retry_cold_read(tmp_path, monkeypatch, mode):
         frame(77)
         try:
             return asyncio.run(run_pipette_operation('aspirate',
-                lambda t:_send_wire(t, [1], 'P1,1R', 500, effect='aspirate'),
+                lambda t:_send_wire(t, [1], 'BR' if mode=='search_timeout' else 'P1,1R',
+                    500, effect='fluid detection' if mode=='search_timeout' else 'aspirate'),
                 get_transport=lambda:group, run_blocking=inline, receipt_store=store,
                 runtime_binding={'idempotency_key':action.action_id}))
         finally:
@@ -72,7 +73,7 @@ def test_failed_stroke_retry_cold_read(tmp_path, monkeypatch, mode):
             decision='retry', source_occurrence_id='occ', native_action_id='a',expected_attempt=1,overrides={})
         worker.join(5)
         assert ex.outcome=='completed', ex._state.action_results
-        assert calls == ['P1,1R']*2
+        assert calls == (['BR'] if mode=='search_timeout' else ['P1,1R'])*2
         rows = ex._state.to_payload()["action_results"]
         refs = [r['pressure_traces'][0] for r in rows]
         if mode in ('reader_busy', 'writer_error'):

@@ -819,8 +819,10 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                     body["source_timeout_termination"] = {"error": str(exc), "exception_type": type(exc).__name__}
             # A channel without contact is a per-channel result, not a failed search.
             return {"ok": True, "search_complete": body.get("ok") is True, "detection": body}
+        from .stroke_pressure import defer_search_pressure_restore
         try:
-            detected = record("liquid_search", detect, inputs=op, pipette=True)
+            with defer_search_pressure_restore() as pressure_restores:
+                detected = record("liquid_search", detect, inputs=op, pipette=True)
             stopped = detected.get("z_stopped_at") or {"monotonic": time.monotonic(), "wall": time.time()}
             record("liquid_search_z_stop", lambda: provider.primitives.z_stop(), inputs={})
         except BaseException:
@@ -841,9 +843,13 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
             # OEM scrFluidDetection: liftTo, then DispenseAll, so the air drawn while
             # searching never stays in the tip and later pipetting starts from zero.
             z_move(start, 1791)
-            record("liquid_search_dispense_all", lambda t: _send_wire(t, op["channels"], "A0,0R", op["timeout_ms"],
-                   effect="dispense_all"), inputs={"ascii": "A0,0R", "source": "ControlLib.scrFluidDetection DispenseAll"},
-                   pipette=True)
+            def clear_search_tip(t):
+                termination = detected.get("detection", {}).get("source_timeout_termination")
+                for restore in pressure_restores:
+                    restore(termination)
+                return _send_wire(t, op["channels"], "A0,0R", op["timeout_ms"], effect="dispense_all")
+            record("liquid_search_dispense_all", clear_search_tip,
+                   inputs={"ascii": "A0,0R", "source": "ControlLib.scrFluidDetection DispenseAll"}, pipette=True)
         channels = {}
         for row_ in detected.get("detection", {}).get("channels", []):
             completion = row_.get("completion") or {}

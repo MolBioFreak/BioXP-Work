@@ -10,10 +10,21 @@ from functools import wraps
 
 _attempt = ContextVar('stroke_attempt', default=None)
 _claim = ContextVar('stroke_claim', default=None)
+_search_restores = ContextVar('search_pressure_restores', default=None)
+
+
+@contextmanager
+def defer_search_pressure_restore():
+    restores = []
+    token = _search_restores.set(restores)
+    try:
+        yield restores
+    finally:
+        _search_restores.reset(token)
 MAX_STROKES = 32
 MAX_FRAMES = 256
 MAX_MS = 10000
-STROKES = {'aspirate', 'dispense', 'dispense_all', 'aspirate air', 'cavro_reaspirate'}
+STROKES = {'aspirate', 'dispense', 'dispense_all', 'aspirate air', 'cavro_reaspirate', 'fluid detection'}
 
 
 @contextmanager
@@ -74,6 +85,9 @@ def observe_stroke(run):
         capture = router = None
         epoch = group._interrupt_epoch
         control = None
+        is_search = operation == 'fluid detection'
+        restores = _search_restores.get() if is_search else None
+        duration_ms = min(30000, max(MAX_MS, kwargs.get('timeout_ms', MAX_MS))) if is_search else MAX_MS
         def send(channel, transport, defer):
             nonlocal capture, router, control
             if channel == channels[0]:
@@ -84,8 +98,8 @@ def observe_stroke(run):
                     if not all(group._transports[c]._driver.bus.router is router for c in channels):
                         raise ValueError('selected channels do not share an active pressure reader')
                     capture = router.begin_scientific_pressure_capture(dict(channels=list(channels),
-                        max_frames=MAX_FRAMES, duration_ms=MAX_MS))
-                    if active:
+                        max_frames=2048 if is_search else MAX_FRAMES, duration_ms=duration_ms))
+                    if active and (not is_search or restores is not None):
                         from .workflow_stream import StreamControl
                         control = StreamControl(group, channels, router, epoch, authored, fence, ref)
                         control.enable()
@@ -93,7 +107,7 @@ def observe_stroke(run):
                         # on the receiver before this exact host-time boundary.
                         with capture.lock:
                             capture.started_at = router._clock()
-                            capture.deadline = capture.started_at + MAX_MS / 1000
+                            capture.deadline = capture.started_at + duration_ms / 1000
                             capture.frames.clear()
                             capture.lost_frames = 0
                 except Exception as exc:
@@ -137,5 +151,22 @@ def observe_stroke(run):
                 except Exception as exc:
                     ref['observation_error'] = str(exc)[:256]
             if control is not None:
-                control.restore(outcome)
+                if restores is None:
+                    control.restore(outcome)
+                else:
+                    def restore(termination=None):
+                        if termination is not None:
+                            # Only the application's own completed timeout cleanup can
+                            # replace the unresolved search completions for restoration.
+                            with group._transaction_lock:
+                                if termination.get('interrupt_epoch') == epoch + 1 == group._interrupt_epoch:
+                                    control.epoch = group._interrupt_epoch
+                                    for row in termination.get('channels', []):
+                                        ch = row['channel']
+                                        if ch in control.drivers and row.get('completion', {}).get('ok') is True:
+                                            control.stroke_revisions[ch] = getattr(control.drivers[ch], '_pipette_buffer_revision', None)
+                                    control.restore(termination, require_success=True)
+                                    return
+                        control.restore(outcome)
+                    restores.append(restore)
     return wrapped

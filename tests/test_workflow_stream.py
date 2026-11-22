@@ -52,12 +52,13 @@ class Pumps(HardwareEndpoints):
             if self.fault=='stop' and wire.startswith('P') and ch==3: self.group._interrupt_epoch += 1
             if self.fault=='restore' and wire=='o0,0R': error=True
             if (self.fault,wire) in [('enable_ack','o0,1R'),('restore_ack','o0,0R')]: return len(frame)
+            if self.fault == 'search_timeout' and wire.startswith('B'): return len(frame)
             rx(1,bytes([35 if error else 32,96]))
         return len(frame)
 
 
 @pytest.mark.parametrize('marker,fault', [(True,'ok'),(False,'ok'),(None,'ok'),(True,'unknown'),
-    (True,'stop'),(True,'failure'),(True,'restore'),(True,'authored'),(True,'buffered'),(True,'enable_ack'),(True,'restore_ack'),(True,'lost_owner')])
+    (True,'stop'),(True,'failure'),(True,'restore'),(True,'authored'),(True,'buffered'),(True,'enable_ack'),(True,'restore_ack'),(True,'lost_owner'),(True,'search_timeout')])
 def test_workflow_recipe_stream(tmp_path, monkeypatch, marker, fault):
     monkeypatch.setattr('bioxp.pipette.receipts._current_replay_identity', lambda:{})
     monkeypatch.setattr(PipetteReceiptStore,'_source_identity',staticmethod(lambda:{}))
@@ -74,6 +75,8 @@ def test_workflow_recipe_stream(tmp_path, monkeypatch, marker, fault):
         with gzip.open(Path(__file__).parents[1]/'testdata/contracts/attempt_transfer_forms.json.gz','rt') as f:
             params=json.load(f)['single'][0]
         recipe=params['recipe']; recipe['channels']=[1,3]
+        if fault=='search_timeout':
+            recipe.update(channels=[1], timeout_ms=500, liquid_detection={'location_id':3, 'mode':'by_level'})
         if fault=='authored': recipe['phase_settings']={'leading_air':{'pressure_streaming':False}}
         action=ProtocolAction('a','s',K.PIPETTE_MANUAL_PHYSICAL,params,source_occurrence_id='occ',on_error='stop')
         metadata={'bms_method':{} if marker is None else {'workflow_pressure_streaming':marker}}
@@ -86,6 +89,23 @@ def test_workflow_recipe_stream(tmp_path, monkeypatch, marker, fault):
             finally: store.connection.close()
         provider=NS(primitives=NS(pipette_transport=group),_wp8_execution_fence_checker=lambda *a,**k:None,
             _wp8_execute_nested_plan=lambda **kw:{'ok':True},_manual_pipette_receipt_runner=receipt)
+        if fault == 'search_timeout':
+            # The USB fixture does not emulate TR's cancellation protocol. Give
+            # the application the same correlated receipt as an owned cleanup.
+            def terminate():
+                group._interrupt_epoch += 1
+                ep.wires.append((-1, 'TERMINATED'))
+                return {'ok':True, 'interrupt_epoch':group._interrupt_epoch,
+                        'channels':[{'channel':1,'completion':{'ok':True}}]}
+            group.terminate = terminate
+            monkeypatch.setattr('bioxp.oem_compat.position_table.load_bound_oem_position_table',
+                lambda: NS(resolve=lambda **_: NS(z_high=60000,z_low=80000)))
+            provider.moveZ = lambda _: {'ok':True}
+            provider._offset_deck_semantic_state = lambda **_: {'pseudo_z_home':500}
+            provider.primitives.z_set_max_speed = lambda _: {'ok':True}
+            provider.primitives.oem_move_z = lambda *a,**kw: {'ok':True}
+            provider.primitives._read_axis_position = lambda _: 77984
+            provider.primitives.z_stop = lambda: (ep.wires.append((-1,'Z_STOP')), {'ok':True})[1]
         def leaf(a,state):
             app=compile_liquid_recipe(a.to_payload()['params']['recipe'])['application']
             return run_application_inline(provider,app,command_id='job',owner_identity={'source_identity':'a'})
@@ -94,6 +114,24 @@ def test_workflow_recipe_stream(tmp_path, monkeypatch, marker, fault):
         provider._wp8_execution_fence_checker = lambda *a,**kw: fence()
         ex=ProtocolExecutor(dry_run=False,job_id='job',before_native_entry=fence,handlers={action.kind:leaf})
         row=ex.execute(doc).to_payload()['action_results'][0]
+        if fault == 'search_timeout':
+            assert row['status'] == 'failed', (row,ep.wires)
+            refs = [r for r in row['pressure_traces'] if r['stroke']=='fluid detection']
+            ref, = refs
+            assert ref['channels']==[1]
+            assert ep.wires.index((1,'o0,1R')) < ep.wires.index((1,'BR')) < ep.wires.index((-1,'Z_STOP'))
+            assert (1,'o0,0R') in ep.wires, json.dumps([ref, ep.wires, row.get('error'), row.get('detail'), str(row.get('pipette_result',{}))[-1500:]])
+            assert ep.wires.index((-1,'Z_STOP')) < ep.wires.index((1,'o0,0R'))
+            assert ep.channels[1] is False
+            cold=PipetteReceiptStore(tmp_path)
+            try:
+                cap=cold.scientific_pressure_capture(ref['stream_session_id'])
+                assert cap['stream']['terminal_state']=='failed'
+                chunk,=cap['chunks']
+                assert chunk['channel']==1
+                assert [s['raw_pressure'] for s in chunk['scientific_result']['samples']]==[32]
+            finally: cold.connection.close()
+            return
         assert (row['status']=='completed') == (fault not in ('failure','stop','lost_owner')), (row,ep.wires)
         strokes=[(ch,w) for ch,w in ep.wires if w[0] in 'PDA']
         expected=[(c,w) for w in ('P20,1R','P22.5,1R','P1.25,1R','D22.5,1R','A0R') for c in [1,3]]
