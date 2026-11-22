@@ -4,7 +4,9 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import copy_context
 from time import monotonic
 from datetime import datetime, timezone
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from uuid import uuid4
+from . import recovery
 from threading import Condition
 from typing import Any, Callable, Mapping
 
@@ -168,6 +170,9 @@ class ProtocolExecutor:
         self._state: ProtocolRuntimeState | None = None
         self._owned: list[tuple[OwnedOperation, dict[str, Any]]] = []
         self._controls: dict[str, dict[str, Any]] = {}
+        self._attempts = {}  # native action id -> (effective frozen action, latest result)
+        self._pending_decision = None
+        self._recovery_gate = None
         self._termination: str | None = None
         self._interrupted = False
         self._recording_failed = False
@@ -422,10 +427,12 @@ class ProtocolExecutor:
         self._native_entries += 1
 
     def request_control(self, action: str, *, control_id: str, mode: str | None = None,
-                        gate: str | None = None, gate_id: str | None = None) -> dict[str, Any]:
+                        gate: str | None = None, gate_id: str | None = None, **selection) -> dict[str, Any]:
         """F/C first validate durable identity/generation; no native IO here."""
         request = {"action": action, **({"mode": mode} if mode else {}),
-                   **({"gate": gate} if gate else {}), **({"gate_id": gate_id} if gate_id else {})}
+                   **({"gate": gate} if gate else {}), **({"gate_id": gate_id} if gate_id else {}), **selection}
+        if selection and action != "recover":
+            raise ValueError("Unexpected recovery fields")
         with self._condition:
             if control_id in self._controls:
                 if self._controls[control_id] != request:
@@ -446,7 +453,36 @@ class ProtocolExecutor:
                 if self._termination or workflow.phase != "waiting" or workflow.gate != "deferred_pause" or gate_id != workflow.gate_id or self._wake_complete or self._wake_control:
                     raise ValueError("Wake requires the reached deferred gate")
                 self._wake_control = control_id
+            elif action == "recover":
+                if (self._oem or self._termination or self._unknown or self._failed or self._owned
+                        or self._release_gate or self._recovery_gate != gate_id or not gate_id
+                        or workflow.gate_id != gate_id or workflow.phase != 'waiting'):
+                    raise ValueError('Recovery requires the reached live authored hold')
+                native_id = selection.get('native_action_id')
+                entry = self._attempts.get(native_id)
+                decision = selection.get('decision')
+                if not entry:
+                    raise ValueError('No reached pipetting attempt')
+                selected, row = entry
+                if (row['source_occurrence_id'] != selection.get('source_occurrence_id')
+                        or type(selection.get('expected_attempt')) is not int
+                        or row['attempt'] != selection['expected_attempt']):
+                    raise ValueError('Attempt identity mismatch')
+                if decision == 'repeat':
+                    if row.get('ok') is not True:
+                        raise ValueError('Repeat requires a completed action')
+                elif (decision not in ('retry', 'skip', 'manual_complete') or workflow.gate != 'error_hold'
+                      or row.get('hold_id') != gate_id):
+                    raise ValueError('Decision requires the current failed attempt')
+                overrides = selection.get('overrides', {})
+                if overrides and decision in ('skip', 'manual_complete'):
+                    raise ValueError('No parameters for non-executing decisions')
+                proposed = recovery.adjusted(selected, overrides)
+                self._pending_decision = (control_id, decision, proposed, row)
+                self._release_gate = control_id
             elif action == "continue":
+                if self._pending_decision:
+                    raise ValueError('Gate decision already accepted')
                 if self._termination or gate not in {"ordinary_pause", "deferred_pause", "delaypoint"} or gate != workflow.gate or gate_id != workflow.gate_id:
                     raise ValueError("Continue requires the matching gate occurrence")
                 if gate == "deferred_pause" and not self._wake_complete:
@@ -461,7 +497,7 @@ class ProtocolExecutor:
                 raise ValueError("Unknown workflow control")
             self._controls[control_id] = request
             workflow.last_control_id = control_id
-            workflow.requested_control = dict(request)
+            workflow.requested_control = ({"action": action, "gate_id": gate_id} if action == "recover" else dict(request))
             self._condition.notify_all()
             return self._control_result(control_id)
 
@@ -650,10 +686,19 @@ class ProtocolExecutor:
         if payload.get("uncertain") or payload.get("status") == "ambiguous":
             self._unknown = True
         if payload.get("ok") is not True and not (payload.get("interrupted") and (self._termination or self._interrupted)):
-            self._failed = True
             application = payload.get("pipette_result") or {}
             event_control = application.get("requested_control") if application.get("kind") == "cavro_application" else None
-            if (event_control == "pause_for_operator" or result.get("on_error") == "pause_for_operator") and not self._termination:
+            attempt_hold = (not self._oem and result.get('action_id') in self._attempts
+                            and self._attempts[result['action_id']][1] is result
+                            and not self._unknown and not self._failed and not self._termination
+                            and not self._interrupted and not payload.get('interrupted')
+                            and not payload.get('source_error_hold') and payload.get('error') != 'source_child_failed'
+                            and (event_control == 'pause_for_operator' or result.get('on_error') == 'pause_for_operator'))
+            if attempt_hold:
+                result['unresolved_attempt'] = True
+            else:
+                self._failed = True
+            if not attempt_hold and (event_control == "pause_for_operator" or result.get("on_error") == "pause_for_operator") and not self._termination:
                 self._state.workflow.held_reason = "source_error_hold"
                 self._state.workflow.source_occurrence_id = result.get("source_occurrence_id") or result.get("action_id")
         if result.get("stage_id") in self._state.stage_states:
@@ -1010,7 +1055,7 @@ class ProtocolExecutor:
                     return {"ok": True, "host_exit": "timer"}
                 self._condition.wait(remaining)
 
-    def _dispatch(self, action: ProtocolAction, document: ProtocolDocument) -> None:
+    def _dispatch(self, action: ProtocolAction, document: ProtocolDocument, *, control_id=None):
         state = self._state
         opcode = action.oem_opcode if action.kind.value == "oem_operation" else None
         domains = SOURCE_DOMAINS[opcode] if opcode else ALL_DOMAINS
@@ -1022,7 +1067,26 @@ class ProtocolExecutor:
                   "kind": action.kind.value, "source_occurrence_id": identity,
                   "metadata": action.to_payload()["metadata"], "on_error": action.on_error,
                   "status": "running", "started_at": _utc_now()}
+        entered_action = action
+        if not self._oem and recovery.supported(action):
+            prior = self._attempts.get(action.action_id)
+            number = prior[1]['attempt'] + 1 if prior else 1
+            result['attempt'] = number
+            state.workflow.native_action_id, state.workflow.attempt = action.action_id, number
+            if control_id:
+                # Handler-side claim keys derive from action_id. Never reuse a prior delivery key.
+                entered_action = replace(action, action_id='recovery-' + uuid4().hex,
+                                         source_occurrence_id=identity)
+                result['intent_at'] = result.pop('started_at')
+                result.update(status='accepted', prior_attempt=number-1, control_command_id=control_id,
+                              native_attempt_id=entered_action.action_id,
+                              overrides=self._controls[control_id].get('overrides', {}))
+            self._attempts[action.action_id] = (action, result)
         state.action_results.append(result)
+        if control_id:
+            self._publish()  # persist the new attempt identity before any handler entry
+            if self._termination or self._interrupted or self._recording_failed:
+                raise _Diversion()
         if action.kind in {ProtocolActionKind.NOTE, ProtocolActionKind.PAUSE_REVIEW}:
             value = {"ok": True, "host_only": True}
         elif opcode in OEM_SOURCE_DEFAULT_NOOPS:
@@ -1036,9 +1100,16 @@ class ProtocolExecutor:
             # Source Task.Run belongs to this executor, not to synchronous
             # provider wrappers. Preserve canonical thread-forwarded context.
             def entered():
+                if control_id:
+                    if self._termination or self._interrupted or self._recording_failed:
+                        raise _Diversion()
+                    result.update(status='running', started_at=_utc_now())
+                    self._publish()
                 self._entry(identity)
-                result = handler(action, state)
-                return result.result() if isinstance(result, Future) else result
+                if control_id and self._termination:
+                    raise _Diversion()
+                value = handler(entered_action, state)
+                return value.result() if isinstance(value, Future) else value
             value = self._pool.submit(copy_context().run, entered)
         if isinstance(value, Future):
             result["pending"] = True
@@ -1051,11 +1122,10 @@ class ProtocolExecutor:
         if not self._oem:
             # Native authored actions are serial boundaries. Publish the exact
             # entered child before advancing the cursor to the next child.
-            self._publish()
+            if not control_id:
+                self._publish()
             self.wait_for_domains(ALL_DOMAINS)
-            if self._pause and not self._termination:
-                self._gate("ordinary_pause", self._pause[1])
-            return
+            return result
         if result.get("source_error_hold"):
             self._gate("error_hold", identity)
         if self._failed or self._unknown:
@@ -1073,6 +1143,56 @@ class ProtocolExecutor:
                     self._hook("ordinary_pause_prepare")
             if not self._termination:
                 self._gate("ordinary_pause", self._pause[1])
+
+    def _authored_holds(self, row, document):
+        # Suspended holds are local to this live executor. A successful out-of-cursor
+        # repeat pops back to the same logical pause, with a fresh decision token.
+        holds = []
+        if self._pause and not self._termination:
+            holds.append(('ordinary_pause', row, self._pause))
+        if row.get('unresolved_attempt'):
+            holds.append(('error_hold', row, None))
+        workflow = self._state.workflow
+        while holds:
+            gate, current, pause = holds[-1]
+            gate_id = (pause[1] if gate == 'ordinary_pause' and not current.get('hold_id')
+                       else 'hold-' + uuid4().hex)
+            current['hold_id'] = gate_id
+            self._pause = pause
+            workflow.source_occurrence_id = current['source_occurrence_id']
+            workflow.native_action_id, workflow.attempt = current['action_id'], current.get('attempt')
+            workflow.held_reason = 'source_error_hold' if gate == 'error_hold' else None
+            self._recovery_gate = gate_id
+            try:
+                self._gate(gate, gate_id)
+            except _Diversion:
+                if any(g == 'error_hold' for g, _, _ in holds):
+                    self._failed = True
+                raise
+            finally:
+                self._recovery_gate = None
+            workflow.held_reason = None
+            choice, self._pending_decision = self._pending_decision, None
+            if not choice:
+                holds.pop()
+                continue
+            control, decision, action, prior = choice
+            self._state.record_event('recovery_decision', detail={**self._controls[control], 'control_command_id': control})
+            self._publish()
+            self._boundary()
+            if decision != 'repeat':
+                holds.pop()
+                prior.pop('unresolved_attempt', None)
+            if decision in ('skip', 'manual_complete'):
+                prior['resolution'] = 'skipped' if decision == 'skip' else 'operator_completed'
+                prior['resolution_control_id'] = control
+                self._publish()
+                continue
+            workflow.source_occurrence_id = prior['source_occurrence_id']
+            attempt = self._dispatch(action, document, control_id=control)
+            if attempt.get('unresolved_attempt'):
+                holds.append(('error_hold', attempt, None))
+        workflow.source_occurrence_id = row['source_occurrence_id']
 
     def _execute_workflow(self, document: ProtocolDocument, *, state: ProtocolRuntimeState | None) -> ProtocolRuntimeState:
         report = self.preflight(document)
@@ -1158,9 +1278,13 @@ class ProtocolExecutor:
                 for action in stage.actions:
                     stage_state.current_action_id = action.action_id
                     state.workflow.source_occurrence_id = action.source_occurrence_id or action.action_id
+                    if not self._oem:
+                        state.workflow.native_action_id = state.workflow.attempt = None
                     self._boundary()
                     self._publish()
-                    self._dispatch(action, document)
+                    row = self._dispatch(action, document)
+                    if not self._oem:
+                        self._authored_holds(row, document)
                     if action.review_required or action.kind == ProtocolActionKind.PAUSE_REVIEW:
                         self.wait_for_domains(ALL_DOMAINS)
                         from ..calibration_measurements import pending_measurement
@@ -1232,9 +1356,12 @@ class ProtocolExecutor:
         for stage in document.stages:
             stage_state = state.stage_states[stage.stage_id]
             rows = [r for r in state.action_results if r.get("stage_id") == stage.stage_id]
+            if not self._oem and any(r.get('attempt') for r in rows):
+                rows = list({r['action_id']: r for r in rows}.values())
             stage_state.completed_actions = [r["action_id"] for r in rows if r.get("ok") is True]
-            stage_state.current_action_id = next((r["action_id"] for r in rows if r.get("ok") is not True), None)
-            if len(stage_state.completed_actions) == len(stage.actions):
+            stage_state.current_action_id = next((r["action_id"] for r in rows if r.get("ok") is not True and not r.get("resolution")), None)
+            resolved = sum(r.get("resolution") in ("skipped", "operator_completed") for r in rows) if not self._oem else 0
+            if len(stage_state.completed_actions) + resolved == len(stage.actions):
                 stage_state.status = StageExecutionStatus.COMPLETED
             elif rows:
                 stage_state.status = StageExecutionStatus.FAILED
@@ -1242,6 +1369,7 @@ class ProtocolExecutor:
                 stage_state.status = StageExecutionStatus.PENDING
         state.workflow.gate = state.workflow.gate_id = None
         state.workflow.source_occurrence_id = None
+        state.workflow.native_action_id = state.workflow.attempt = None
         state.current_stage_id = None
         state.record_event("workflow_settled", detail={"outcome": self.outcome})
         self._publish("reconciling" if self.outcome == "ambiguous" else "terminal")

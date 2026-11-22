@@ -2751,7 +2751,9 @@ class OperatorCommandStore(CommandReceiptReader):
                              - {"ambiguous", "outcome_unknown", "reconciliation_required"})
             pending = conn.execute(
                 "SELECT 1 FROM operator_commands c LEFT JOIN serial206_movement_commands m USING(command_id) "
-                "WHERE c.parent_command_id=? AND COALESCE(m.state,c.status) NOT IN ("
+                "WHERE c.parent_command_id=? "
+                "AND NOT (c.command_kind='protocol_control' AND json_extract(c.requested_inputs_json,'$.action') IS 'recover') "
+                "AND COALESCE(m.state,c.status) NOT IN ("
                 + ",".join("?" for _ in settled) + ") LIMIT 1", (command_id, *settled)).fetchone()
             independent_unknown = status == "ambiguous"
             if pending or not lifecycle_settled:
@@ -2923,6 +2925,18 @@ class OperatorCommandStore(CommandReceiptReader):
             row = self._workflow_current(conn, command_id)
             if request["command_id"] != command_id or request["expected_ownership_generation"] != row["ownership_generation"]:
                 raise ValueError("workflow_generation_mismatch")
+            if request['action'] == 'recover':
+                # A settled handler future alone is not proof its native claims settled.
+                # HOST controls carry no physical custody (and may be recording their receipt).
+                from .runtime_audit_store import TERMINAL_COMMAND_STATES
+                settled = sorted((TERMINAL_COMMAND_STATES | COMMAND_TERMINAL) - UNKNOWN_OUTCOME_STATES)
+                pending = conn.execute(
+                    "SELECT 1 FROM operator_commands c LEFT JOIN serial206_movement_commands m USING(command_id) "
+                    "WHERE c.parent_command_id=? AND c.command_kind!='protocol_control' "
+                    "AND COALESCE(m.state,c.status) NOT IN (" + ','.join('?' for _ in settled) + ") LIMIT 1",
+                    (command_id, *settled)).fetchone()
+                if pending or row['status'] != 'dispatched':
+                    raise ValueError('workflow_recovery_not_settled')
             callback = self._workflow_controls.get(command_id)
             if callback is None:
                 raise ValueError("workflow_task_unavailable")

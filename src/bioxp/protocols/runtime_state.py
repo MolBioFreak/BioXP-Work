@@ -95,6 +95,8 @@ class ProtocolWorkflowState:
     gate: str | None = None
     gate_id: str | None = None
     source_occurrence_id: str | None = None
+    native_action_id: str | None = None
+    attempt: int | None = None
     requested_control: dict[str, str] | None = None
     last_control_id: str | None = None
     reached_control_id: str | None = None
@@ -115,11 +117,15 @@ class ProtocolWorkflowState:
         for name in ("gate_id", "source_occurrence_id", "last_control_id", "reached_control_id", "held_reason"):
             if payload.get(name) is not None and not isinstance(payload[name], str):
                 raise ValueError(f"Workflow {name} must be a string or null")
+        if payload.get("attempt") is not None and (type(payload["attempt"]) is not int or payload["attempt"] < 1):
+            raise ValueError("Invalid workflow attempt")
+        if payload.get("native_action_id") is not None and not isinstance(payload["native_action_id"], str):
+            raise ValueError("Invalid workflow native action identity")
         control = payload.get("requested_control")
         if control is not None:
             if not isinstance(control, dict) or set(control) - {"action", "mode", "gate", "gate_id"}:
                 raise ValueError("Invalid workflow requested_control")
-            if control.get("action") not in {"pause", "wake", "continue", "safe_stop", "abort", "review"}:
+            if control.get("action") not in {"pause", "wake", "continue", "safe_stop", "abort", "review", "recover"}:
                 raise ValueError("Unknown workflow requested control")
             if control.get("action") == "pause" and control.get("mode") not in {"ordinary", "deferred"}:
                 raise ValueError("Invalid workflow pause mode")
@@ -136,6 +142,7 @@ class ProtocolWorkflowState:
             "command_id": self.command_id, "phase": self.phase,
             "gate": self.gate, "gate_id": self.gate_id,
             "source_occurrence_id": self.source_occurrence_id,
+            **({"native_action_id": self.native_action_id, "attempt": self.attempt} if self.attempt is not None else {}),
             "requested_control": None if self.requested_control is None else dict(self.requested_control),
             "last_control_id": self.last_control_id,
             "reached_control_id": self.reached_control_id,

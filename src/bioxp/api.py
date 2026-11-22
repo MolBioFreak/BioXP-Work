@@ -3070,6 +3070,16 @@ class ProtocolContinueRequest(ProtocolControlTarget):
     gate_id: StrictStr = Field(..., min_length=1)
 
 
+class ProtocolRecoveryRequest(ProtocolControlTarget):
+    action: Literal["recover"]
+    decision: Literal["retry", "repeat", "skip", "manual_complete"]
+    gate_id: StrictStr = Field(min_length=1)
+    source_occurrence_id: StrictStr = Field(min_length=1)
+    native_action_id: StrictStr = Field(min_length=1)
+    expected_attempt: StrictInt = Field(ge=1)
+    overrides: dict[Literal["aspiration_delay_ms", "on_contact_delay_ms", "submerge_steps"], StrictInt] = Field(default_factory=dict)
+
+
 class ProtocolSafeStopRequest(ProtocolControlTarget):
     action: Literal["safe_stop"]
 
@@ -3079,7 +3089,7 @@ class ProtocolAbortRequest(ProtocolControlTarget):
 
 
 ProtocolControlRequest = Annotated[
-    ProtocolPauseRequest | ProtocolWakeRequest | ProtocolContinueRequest | ProtocolSafeStopRequest | ProtocolAbortRequest,
+    ProtocolPauseRequest | ProtocolWakeRequest | ProtocolContinueRequest | ProtocolSafeStopRequest | ProtocolAbortRequest | ProtocolRecoveryRequest,
     Field(discriminator="action"),
 ]
 
