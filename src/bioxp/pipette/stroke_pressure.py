@@ -59,6 +59,19 @@ def attempt_scope(job, result, entered_id, document, fence):
             result['pressure_traces'] = refs
 
 
+def current_attempt():
+    return _attempt.get()
+
+
+@contextmanager
+def bind_child_attempt(attempt):
+    token = _attempt.set(attempt)
+    try:
+        yield
+    finally:
+        _attempt.reset(token)
+
+
 def receipt_scope(store, claim, generation, call):
     attempt = _attempt.get()
     if attempt is None or not claim:

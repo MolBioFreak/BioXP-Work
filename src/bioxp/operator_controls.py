@@ -3587,39 +3587,39 @@ def install_operator_control_plane(
             if binding is None:
                 raise ValueError("prepared_plan_requires_workflow_context")
             identity = f"{binding['parent_command_id']}:{binding['source_occurrence_id']}:{plan['plan_digest']}"
-            admitted = command_plane.store.admit_internal_wp8_operation(
+            with command_plane.store.workflow_child_pressure(lambda: command_plane.store.admit_internal_wp8_operation(
                 str(plan["operation"]), inputs={}, state=command_plane._state(),
                 idempotency_key="workflow-leaf-" + hashlib.sha256(identity.encode()).hexdigest(),
                 prepared_plan=plan,
-            )
-            command_id = admitted["command_id"]
-            workflow = state.workflow
-            if workflow is not None and command_id not in workflow.child_command_ids:
-                workflow.child_command_ids.append(command_id)
-            from concurrent.futures import TimeoutError as FutureTimeoutError
-            wake = command_plane.store.workflow_child_completion(command_id, include_issued_pending=True)
-            while True:
-                try:
-                    receipt = wake.result(timeout=0.25)["receipt"]
-                except FutureTimeoutError:
-                    # Bounded only to observe owner stop; no receipt polling.
-                    if command_plane.store._stop.is_set():
-                        raise RuntimeError("workflow_child_owner_lost")
-                    continue
-                if receipt is None:
-                    raise RuntimeError("workflow_child_receipt_missing")
-                status = receipt["status"]
-                if status == "issued_pending":
-                    from .protocols.executor import OwnedOperation
-                    evidence = receipt.get("terminal_evidence") or {}
-                    response = dict(evidence.get("response") or {})
-                    return {**response, "command_id": command_id, "status": status,
-                            "owned_children": (OwnedOperation(
-                                command_plane.store.workflow_child_completion(command_id),
-                                domains=("Gripper",), command_id=command_id),)}
-                if status in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"}:
-                    return _workflow_terminal_result(receipt)
-                raise RuntimeError(f"workflow_child_unexpected_status:{status}")
+            )) as admitted:
+                command_id = admitted["command_id"]
+                workflow = state.workflow
+                if workflow is not None and command_id not in workflow.child_command_ids:
+                    workflow.child_command_ids.append(command_id)
+                from concurrent.futures import TimeoutError as FutureTimeoutError
+                wake = command_plane.store.workflow_child_completion(command_id, include_issued_pending=True)
+                while True:
+                    try:
+                        receipt = wake.result(timeout=0.25)["receipt"]
+                    except FutureTimeoutError:
+                        # Bounded only to observe owner stop; no receipt polling.
+                        if command_plane.store._stop.is_set():
+                            raise RuntimeError("workflow_child_owner_lost")
+                        continue
+                    if receipt is None:
+                        raise RuntimeError("workflow_child_receipt_missing")
+                    status = receipt["status"]
+                    if status == "issued_pending":
+                        from .protocols.executor import OwnedOperation
+                        evidence = receipt.get("terminal_evidence") or {}
+                        response = dict(evidence.get("response") or {})
+                        return {**response, "command_id": command_id, "status": status,
+                                "owned_children": (OwnedOperation(
+                                    command_plane.store.workflow_child_completion(command_id),
+                                    domains=("Gripper",), command_id=command_id),)}
+                    if status in {"completed", "failed", "interrupted", "ambiguous", "cleared", "rejected"}:
+                        return _workflow_terminal_result(receipt)
+                    raise RuntimeError(f"workflow_child_unexpected_status:{status}")
 
         def workflow_initial_check(state: Any, *, validate_current: Callable[[str], bool]) -> Mapping[str, Any]:
             callback = getattr(app.state, "oem_workflow_initial_check", None)

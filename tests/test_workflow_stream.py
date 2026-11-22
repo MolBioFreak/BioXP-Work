@@ -52,13 +52,13 @@ class Pumps(HardwareEndpoints):
             if self.fault=='stop' and wire.startswith('P') and ch==3: self.group._interrupt_epoch += 1
             if self.fault=='restore' and wire=='o0,0R': error=True
             if (self.fault,wire) in [('enable_ack','o0,1R'),('restore_ack','o0,0R')]: return len(frame)
-            if self.fault == 'search_timeout' and wire.startswith('B'): return len(frame)
+            if self.fault in ('search_timeout','dispatched_search_timeout') and wire.startswith('B'): return len(frame)
             rx(1,bytes([35 if error else 32,96]))
         return len(frame)
 
 
 @pytest.mark.parametrize('marker,fault', [(True,'ok'),(False,'ok'),(None,'ok'),(True,'unknown'),
-    (True,'stop'),(True,'failure'),(True,'restore'),(True,'authored'),(True,'buffered'),(True,'enable_ack'),(True,'restore_ack'),(True,'lost_owner'),(True,'search_timeout')])
+    (True,'stop'),(True,'failure'),(True,'restore'),(True,'authored'),(True,'buffered'),(True,'enable_ack'),(True,'restore_ack'),(True,'lost_owner'),(True,'search_timeout'),(True,'dispatched_search_timeout')])
 def test_workflow_recipe_stream(tmp_path, monkeypatch, marker, fault):
     monkeypatch.setattr('bioxp.pipette.receipts._current_replay_identity', lambda:{})
     monkeypatch.setattr(PipetteReceiptStore,'_source_identity',staticmethod(lambda:{}))
@@ -75,7 +75,7 @@ def test_workflow_recipe_stream(tmp_path, monkeypatch, marker, fault):
         with gzip.open(Path(__file__).parents[1]/'testdata/contracts/attempt_transfer_forms.json.gz','rt') as f:
             params=json.load(f)['single'][0]
         recipe=params['recipe']; recipe['channels']=[1,3]
-        if fault=='search_timeout':
+        if fault in ('search_timeout','dispatched_search_timeout'):
             recipe.update(channels=[1], timeout_ms=500, liquid_detection={'location_id':3, 'mode':'by_level'})
         if fault=='authored': recipe['phase_settings']={'leading_air':{'pressure_streaming':False}}
         action=ProtocolAction('a','s',K.PIPETTE_MANUAL_PHYSICAL,params,source_occurrence_id='occ',on_error='stop')
@@ -89,7 +89,7 @@ def test_workflow_recipe_stream(tmp_path, monkeypatch, marker, fault):
             finally: store.connection.close()
         provider=NS(primitives=NS(pipette_transport=group),_wp8_execution_fence_checker=lambda *a,**k:None,
             _wp8_execute_nested_plan=lambda **kw:{'ok':True},_manual_pipette_receipt_runner=receipt)
-        if fault == 'search_timeout':
+        if fault in ('search_timeout','dispatched_search_timeout'):
             # The USB fixture does not emulate TR's cancellation protocol. Give
             # the application the same correlated receipt as an owned cleanup.
             def terminate():
@@ -108,13 +108,38 @@ def test_workflow_recipe_stream(tmp_path, monkeypatch, marker, fault):
             provider.primitives.z_stop = lambda: (ep.wires.append((-1,'Z_STOP')), {'ok':True})[1]
         def leaf(a,state):
             app=compile_liquid_recipe(a.to_payload()['params']['recipe'])['application']
-            return run_application_inline(provider,app,command_id='job',owner_identity={'source_identity':'a'})
+            def application():
+                return run_application_inline(provider,app,command_id='job',owner_identity={'source_identity':'a'})
+            if fault != 'dispatched_search_timeout':
+                return application()
+            from concurrent.futures import ThreadPoolExecutor
+            from contextlib import nullcontext
+            from threading import Event, Lock, RLock
+            from bioxp.operator_command_plane import OperatorCommandStore
+            import sqlite3
+            store = object.__new__(OperatorCommandStore)
+            store._worker_lock, store._workers, store._worker_commands = Lock(), set(), {}
+            store._wake, store._lock = Event(), RLock()
+            store._child_pressure_attempts = {}
+            store.workflow_context = lambda *a, **kw: nullcontext()
+            store.connection = sqlite3.connect(':memory:', check_same_thread=False)
+            store.connection.row_factory = sqlite3.Row
+            store.connection.execute('CREATE TABLE operator_commands (command_id, parent_command_id, requested_inputs_json)')
+            store.connection.execute('INSERT INTO operator_commands VALUES (?, ?, ?)',
+                ('child', 'job', json.dumps({'workflow_binding': {'source_occurrence_id': 'manual:a'}})))
+            evidence = []
+            try:
+                with store.workflow_child_pressure(lambda: {'command_id': 'child'}), ThreadPoolExecutor(max_workers=1) as pool:
+                    pool.submit(store._dispatch_worker, lambda _: evidence.append(application()), {'command_id': 'child'}).result()
+                return evidence[0]
+            finally:
+                store.connection.close()
         def fence(*_):
             if fault=='lost_owner' and (3,'P20,1R') in ep.wires: raise RuntimeError('lease lost')
         provider._wp8_execution_fence_checker = lambda *a,**kw: fence()
         ex=ProtocolExecutor(dry_run=False,job_id='job',before_native_entry=fence,handlers={action.kind:leaf})
         row=ex.execute(doc).to_payload()['action_results'][0]
-        if fault == 'search_timeout':
+        if fault in ('search_timeout','dispatched_search_timeout'):
             assert row['status'] == 'failed', (row,ep.wires)
             refs = [r for r in row['pressure_traces'] if r['stroke']=='fluid detection']
             ref, = refs

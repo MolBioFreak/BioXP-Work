@@ -947,6 +947,7 @@ class OperatorCommandStore(CommandReceiptReader):
         self._worker_lock = threading.Lock()
         self._workers: set[threading.Thread] = set()
         self._worker_commands: dict[threading.Thread, str] = {}
+        self._child_pressure_attempts: dict[str, Any] = {}
         self._shutdown_guard_thread: threading.Thread | None = None
         self._shutdown_guard_finalize = threading.Event()
         self._shutdown_guard_recover = False
@@ -4839,6 +4840,25 @@ class OperatorCommandStore(CommandReceiptReader):
         finally:
             self._internal_admission.depth = depth
 
+    @contextmanager
+    def workflow_child_pressure(self, admit: Callable[[], dict[str, Any]]):
+        from .pipette.stroke_pressure import current_attempt
+        attempt = current_attempt()
+        if attempt is None:
+            yield admit()
+            return
+        # Admission wakes the dispatcher. Publish before it can claim the child.
+        with self._lock:
+            admitted = admit()
+            command_id = admitted["command_id"]
+            self._child_pressure_attempts[command_id] = attempt
+        try:
+            yield admitted
+        finally:
+            with self._lock:
+                if self._child_pressure_attempts.get(command_id) is attempt:
+                    self._child_pressure_attempts.pop(command_id)
+
     def admit_internal_wp8_operation(
         self,
         operation: str,
@@ -6750,7 +6770,10 @@ class OperatorCommandStore(CommandReceiptReader):
                                              (claimed["command_id"],)).fetchone()
             if parent and parent["parent_command_id"]:
                 occurrence = _json_load(parent["requested_inputs_json"], {})["workflow_binding"]["source_occurrence_id"]
-                with self.workflow_context(parent["parent_command_id"], source_occurrence_id=occurrence):
+                from .pipette.stroke_pressure import bind_child_attempt
+                with self._lock:
+                    attempt = self._child_pressure_attempts.pop(claimed["command_id"], None)
+                with self.workflow_context(parent["parent_command_id"], source_occurrence_id=occurrence), bind_child_attempt(attempt):
                     dispatch_one(claimed)
             else:
                 dispatch_one(claimed)
