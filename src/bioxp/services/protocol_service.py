@@ -700,7 +700,7 @@ def bind_protocol_dispatcher(command_store, *, binding_factory, artifact_store=N
             else:
                 executor.request_control(request["action"], control_id=control_id,
                                          **{key: request[key] for key in ("mode", "gate", "gate_id", "decision", "source_occurrence_id",
-                                                                          "native_action_id", "expected_attempt", "overrides") if key in request})
+                                                                          "native_action_id", "expected_attempt", "overrides", "scope") if key in request})
             return state.workflow.to_payload()
 
         command_store.bind_workflow_controls(job_id, control)
@@ -728,7 +728,7 @@ def bind_protocol_dispatcher(command_store, *, binding_factory, artifact_store=N
 
 def control_protocol_job(job_id: str, request: Mapping[str, Any], *, command_store) -> dict[str, Any]:
     variants = {"pause": {"mode"}, "wake": {"gate_id"}, "continue": {"gate", "gate_id"},
-                "recover": {"gate_id", "decision", "source_occurrence_id", "native_action_id", "expected_attempt", "overrides"},
+                "recover": {"gate_id", "decision", "source_occurrence_id", "native_action_id", "expected_attempt", "overrides", "scope"},
                 "safe_stop": set(), "abort": set(), "review": {"reviewer", "note", "stage_id", "action_id", "decision", "measurements", "source_occurrence_id"}}
     action = request.get("action")
     common = {"action", "idempotency_key", "command_id", "expected_ownership_generation"}

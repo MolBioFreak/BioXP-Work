@@ -3072,6 +3072,7 @@ class ProtocolContinueRequest(ProtocolControlTarget):
 
 class ProtocolRecoveryRequest(ProtocolControlTarget):
     action: Literal["recover"]
+    scope: Literal["action", "occurrence"] | None = None
     decision: Literal["retry", "repeat", "skip", "manual_complete"]
     gate_id: StrictStr = Field(min_length=1)
     source_occurrence_id: StrictStr = Field(min_length=1)

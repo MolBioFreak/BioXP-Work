@@ -96,6 +96,8 @@ def _step_record(result) -> None:
     # outcome flags (setpoint accepted, wait complete, run id). Nested
     # evidence stays on the child command.
     kept = {k: v for k, v in result.items() if k in _STEP_FIELDS or not isinstance(v, (dict, list))}
+    if result.get('control_command_id') and 'overrides' in result:
+        kept['overrides'] = result['overrides']
     artifact = result.get("artifact")
     if isinstance(artifact, Mapping):
         # A saved image is the step's own output: keep where it is, once.
@@ -426,6 +428,77 @@ class ProtocolExecutor:
             raise _Diversion() from exc
         self._native_entries += 1
 
+    def _redo_plan(self, selection, selected, row, decision):
+        scope = selection.get('scope', 'action')
+        if scope not in ('action', 'occurrence'):
+            raise ValueError('Unknown recovery scope')
+        occurrence = selection.get('source_occurrence_id')
+        original = self._original_actions[selected.action_id]
+        sequence = original.metadata.get('bms_method', {}).get('sequence')
+        if sequence is not None and (
+                not isinstance(sequence, tuple) or not sequence or
+                any(not isinstance(m, Mapping) or not isinstance(m.get('occurrence_id'), str)
+                    or not m['occurrence_id'] or type(m.get('target_index')) is not int
+                    or m['target_index'] != i for i, m in enumerate(sequence)) or
+                sequence[0]['occurrence_id'] != original.source_occurrence_id or
+                len(sequence) != len(original.params.get('targets', ()))):
+            raise ValueError('Incomplete frozen sequence provenance')
+        if sequence and len(sequence) > 1:
+            if scope != 'occurrence' or decision not in ('retry', 'repeat'):
+                raise ValueError('Shared native action requires a single occurrence projection')
+            # A failed original batch cannot certify which suffix is safe to omit.
+            if decision == 'retry' and row.get('projected_target_index') is None:
+                raise ValueError('Cannot resume an indivisible failed sequence')
+            params = original.to_payload()['params']
+            targets = params.get('targets', [])
+            members = [m.get('occurrence_id') for m in sequence]
+            if (original.kind != ProtocolActionKind.PIPETTE_POSITION or params.get('operation') != 'move_sequence'
+                    or len(sequence) != len(targets) or len(set(members)) != len(sequence)
+                    or self._occurrences.get(occurrence, []) not in ([], [original])
+                    or occurrence not in members
+                    or (decision == 'retry' and row['source_occurrence_id'] != occurrence)):
+                raise ValueError('No unambiguous single-target projection')
+            index = members.index(occurrence)
+            projected = replace(original, source_occurrence_id=occurrence, params={**params, 'targets':[targets[index]]})
+            return (recovery.adjusted(projected, selection.get('overrides', {})),), index
+        if row['source_occurrence_id'] != occurrence:
+            raise ValueError('Attempt occurrence mismatch')
+        proposed = recovery.adjusted(selected, selection.get('overrides', {}))
+        if scope == 'action':
+            if not self._standalone_redo(selected) and decision in ('retry', 'repeat'):
+                raise ValueError('Action is not an eligible standalone pipetting attempt')
+            return (proposed,), None
+        if decision not in ('retry', 'repeat'):
+            raise ValueError('Occurrence scope requires retry or repeat')
+        members = self._occurrences[occurrence]
+        stage = members[0].stage_id
+        if (any(a.stage_id != stage or not self._redo_member(a)
+                    or len(a.metadata.get('bms_method', {}).get('sequence', ())) > 1 for a in members)
+                or members != self._stage_slice(members)):
+            raise ValueError('Occurrence is not an unambiguous consecutive authored step')
+        if decision == 'repeat' and not all(self._attempts.get(a.action_id, (None, {}))[1].get('ok') is True for a in members):
+            raise ValueError('Repeat requires the whole completed occurrence')
+        # Retry only re-enters the prefix through the held child. The suspended
+        # iterator already owns its unentered suffix (including a nested redo).
+        end = len(members) if decision == 'repeat' else members.index(original) + 1
+        return tuple(proposed if a.action_id == selected.action_id else self._attempts[a.action_id][0]
+                     for a in members[:end]), None
+
+    @staticmethod
+    def _standalone_redo(action):
+        return action.kind in (ProtocolActionKind.PIPETTE_MANUAL_PHYSICAL, ProtocolActionKind.PIPETTE_POSITION,
+                               ProtocolActionKind.PIPETTE_TIP) or recovery.supported(action)
+
+    @classmethod
+    def _redo_member(cls, action):
+        return (action.kind != ProtocolActionKind.OEM_OPERATION and
+                (action.source_occurrence_id or cls._standalone_redo(action)))
+
+    def _stage_slice(self, members):
+        stage_actions = self._stage_actions[members[0].stage_id]
+        start = stage_actions.index(members[0])
+        return list(stage_actions[start:start + len(members)])
+
     def request_control(self, action: str, *, control_id: str, mode: str | None = None,
                         gate: str | None = None, gate_id: str | None = None, **selection) -> dict[str, Any]:
         """F/C first validate durable identity/generation; no native IO here."""
@@ -464,8 +537,7 @@ class ProtocolExecutor:
                 if not entry:
                     raise ValueError('No reached pipetting attempt')
                 selected, row = entry
-                if (row['source_occurrence_id'] != selection.get('source_occurrence_id')
-                        or type(selection.get('expected_attempt')) is not int
+                if (type(selection.get('expected_attempt')) is not int
                         or row['attempt'] != selection['expected_attempt']):
                     raise ValueError('Attempt identity mismatch')
                 if decision == 'repeat':
@@ -477,8 +549,8 @@ class ProtocolExecutor:
                 overrides = selection.get('overrides', {})
                 if overrides and decision in ('skip', 'manual_complete'):
                     raise ValueError('No parameters for non-executing decisions')
-                proposed = recovery.adjusted(selected, overrides)
-                self._pending_decision = (control_id, decision, proposed, row)
+                plan, projection = self._redo_plan(selection, selected, row, decision)
+                self._pending_decision = (control_id, decision, plan, row, projection)
                 self._release_gate = control_id
             elif action == "continue":
                 if self._pending_decision:
@@ -693,7 +765,8 @@ class ProtocolExecutor:
                             and not self._unknown and not self._failed and not self._termination
                             and not self._interrupted and not payload.get('interrupted')
                             and not payload.get('source_error_hold') and payload.get('error') != 'source_child_failed'
-                            and (event_control == 'pause_for_operator' or result.get('on_error') == 'pause_for_operator'))
+                            and (result.get('control_command_id') or event_control == 'pause_for_operator'
+                                 or result.get('on_error') == 'pause_for_operator'))
             if attempt_hold:
                 result['unresolved_attempt'] = True
             else:
@@ -1055,7 +1128,7 @@ class ProtocolExecutor:
                     return {"ok": True, "host_exit": "timer"}
                 self._condition.wait(remaining)
 
-    def _dispatch(self, action: ProtocolAction, document: ProtocolDocument, *, control_id=None):
+    def _dispatch(self, action: ProtocolAction, document: ProtocolDocument, *, control_id=None, projection=None):
         state = self._state
         opcode = action.oem_opcode if action.kind.value == "oem_operation" else None
         domains = SOURCE_DOMAINS[opcode] if opcode else ALL_DOMAINS
@@ -1068,7 +1141,7 @@ class ProtocolExecutor:
                   "metadata": action.to_payload()["metadata"], "on_error": action.on_error,
                   "status": "running", "started_at": _utc_now()}
         entered_action = action
-        if not self._oem and recovery.supported(action):
+        if not self._oem and self._redo_member(action):
             prior = self._attempts.get(action.action_id)
             number = prior[1]['attempt'] + 1 if prior else 1
             result['attempt'] = number
@@ -1080,7 +1153,10 @@ class ProtocolExecutor:
                 result['intent_at'] = result.pop('started_at')
                 result.update(status='accepted', prior_attempt=number-1, control_command_id=control_id,
                               native_attempt_id=entered_action.action_id,
-                              overrides=self._controls[control_id].get('overrides', {}))
+                              overrides=(self._controls[control_id].get('overrides', {}) if action.action_id ==
+                                         self._controls[control_id]['native_action_id'] else {}))
+                if projection is not None:
+                    result['projected_target_index'] = projection
             self._attempts[action.action_id] = (action, result)
         state.action_results.append(result)
         if control_id:
@@ -1152,11 +1228,38 @@ class ProtocolExecutor:
             holds.append(('ordinary_pause', row, self._pause))
         if row.get('unresolved_attempt'):
             holds.append(('error_hold', row, None))
+        if not holds:
+            return
         workflow = self._state.workflow
+        saved_cursors = {}
+        def cursor(stage, action):
+            state = self._state
+            saved_cursors.setdefault(stage, state.stage_states[stage].current_action_id)
+            state.current_stage_id = stage
+            state.stage_states[stage].current_action_id = action
         while holds:
             gate, current, pause = holds[-1]
+            if gate in ('dispatch', 'review'):
+                holds.pop()
+                cursor(current.stage_id, current.action_id)
+                if gate == 'review':
+                    workflow.source_occurrence_id = current.source_occurrence_id or current.action_id
+                    from ..calibration_measurements import pending_measurement
+                    self._state.pending_measurement = pending_measurement(current)
+                    self._gate('review', 'review-' + uuid4().hex)
+                    self._boundary()
+                    continue
+                control, projection = pause
+                workflow.source_occurrence_id = current.source_occurrence_id or current.action_id
+                attempt = self._dispatch(current, document, control_id=control, projection=projection)
+                if self._pause:
+                    holds.append(('ordinary_pause', attempt, self._pause))
+                if attempt.get('unresolved_attempt'):
+                    holds.append(('error_hold', attempt, None))
+                continue
             gate_id = (pause[1] if gate == 'ordinary_pause' and not current.get('hold_id')
                        else 'hold-' + uuid4().hex)
+            cursor(current['stage_id'], current['action_id'])
             current['hold_id'] = gate_id
             self._pause = pause
             workflow.source_occurrence_id = current['source_occurrence_id']
@@ -1176,8 +1279,21 @@ class ProtocolExecutor:
             if not choice:
                 holds.pop()
                 continue
-            control, decision, action, prior = choice
-            self._state.record_event('recovery_decision', detail={**self._controls[control], 'control_command_id': control})
+            control, decision, plan, prior, projection = choice
+            request = self._controls[control]
+            # This is planned scope, not evidence of delivery. Retry's unreached
+            # suffix remains on the normal cursor and is never double-dispatched.
+            included = (self._occurrences[prior['source_occurrence_id']] if
+                        request.get('scope') == 'occurrence' and projection is None else plan)
+            children = []
+            for child in included:
+                provenance = child.to_payload()['metadata'].get('bms_method', {})
+                children.append({'native_action_id': child.action_id, 'kind': child.kind.value,
+                    **{key:provenance[key] for key in ('planned_liquid_effects','planned_recipe_phase_effects') if key in provenance}})
+            self._state.record_event('recovery_decision', detail={**request, 'control_command_id': control,
+                'planned_children': children if decision in ('repeat','retry') else [],
+                'reentry_action_ids': [a.action_id for a in plan] if decision in ('repeat','retry') else [],
+                'projected_target_index': projection})
             self._publish()
             self._boundary()
             if decision != 'repeat':
@@ -1188,11 +1304,18 @@ class ProtocolExecutor:
                 prior['resolution_control_id'] = control
                 self._publish()
                 continue
-            workflow.source_occurrence_id = prior['source_occurrence_id']
-            attempt = self._dispatch(action, document, control_id=control)
-            if attempt.get('unresolved_attempt'):
-                holds.append(('error_hold', attempt, None))
+            for action in reversed(plan):
+                # The suspended cursor already owns the retry anchor's review.
+                if (decision == 'repeat' or action.action_id != prior['action_id']) and (
+                        action.review_required or action.kind == ProtocolActionKind.PAUSE_REVIEW):
+                    holds.append(('review', action, None))
+                holds.append(('dispatch', action, (control, projection)))
+        for stage, saved in saved_cursors.items():
+            self._state.stage_states[stage].current_action_id = saved
+        self._state.current_stage_id = row['stage_id']
         workflow.source_occurrence_id = row['source_occurrence_id']
+        workflow.native_action_id = row['action_id']
+        workflow.attempt = self._attempts.get(row['action_id'], (None, row))[1].get('attempt')
 
     def _execute_workflow(self, document: ProtocolDocument, *, state: ProtocolRuntimeState | None) -> ProtocolRuntimeState:
         report = self.preflight(document)
@@ -1216,6 +1339,12 @@ class ProtocolExecutor:
         self._pool = ThreadPoolExecutor(max_workers=len(ALL_DOMAINS) + 1, thread_name_prefix="protocol-source")
         self._oem = "run_job" in report["required_lifecycle"]
         self._ensure_stage_states(document, state)
+        if not self._oem:
+            self._stage_actions = {s.stage_id:s.actions for s in document.stages}
+            self._original_actions = {a.action_id:a for s in document.stages for a in s.actions}
+            self._occurrences = {}
+            for a in self._original_actions.values():
+                self._occurrences.setdefault(a.source_occurrence_id or a.action_id, []).append(a)
         try:
             self._publish("preparing" if document.metadata.get("oem_prepare") else "starting")
             if self._oem:

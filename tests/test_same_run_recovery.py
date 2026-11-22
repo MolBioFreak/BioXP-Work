@@ -66,9 +66,17 @@ class RecoveryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             OEMRuntimeStore(root).close()
             store = OperatorCommandStore(root)
-            first = ProtocolAction('first', 'stage', K.PIPETTE_ASPIRATE, on_error='pause_for_operator')
+            prefix = ProtocolAction('prefix','stage',K.PIPETTE_MANUAL_PHYSICAL,
+                {'operation':'load_tip', 'tray':1, 'well':'A1'}, source_occurrence_id='first')
+            recipe = dict(mode='single',channels=[0],timeout_ms=1000,target_liquid_ul=1,
+                commanded_aspiration_ul=1,aspiration_speed_ul_s=1,aspiration_delay_ms=10,
+                leading_air=None,trailing_air=None,before_leading_air=[],before_liquid=[],after_liquid=[],
+                before_dispense=[],after_dispense=[],dispense_segments=[{'volume_ul':1,'speed_ul_s':1}],
+                final_empty_before=[],final_empty_speed_ul_s=None,multi=None)
+            first = ProtocolAction('first','stage',K.PIPETTE_MANUAL_PHYSICAL,
+                {'operation':'cavro_liquid_recipe','recipe':recipe}, source_occurrence_id='first',on_error='pause_for_operator')
             second = ProtocolAction('second', 'stage', K.LED, {'red':0,'green':0,'blue':0})
-            doc = ProtocolDocument('fixture', stages=(ProtocolStage('stage', actions=(first, second)),))
+            doc = ProtocolDocument('fixture', stages=(ProtocolStage('stage', actions=(prefix, first, second)),))
             job = 'sqlite-witness'
             state = ProtocolRuntimeState.from_document(doc, dry_run=False, job_id=job)
             bundle = {'protocol':{'document':doc.to_payload()}, 'execution':{'runtime_state':state.to_payload()},
@@ -76,8 +84,8 @@ class RecoveryTest(unittest.TestCase):
             calls = []
             def leaf(action, state):
                 calls.append(action.action_id)
-                return {'ok':len(calls) >= 3, 'partial':{'amount':None}}
-            bind_protocol_dispatcher(store, binding_factory=lambda *a, **kw: ({K.PIPETTE_ASPIRATE:leaf, K.LED:leaf},{},{}),
+                return {'ok':action.params.get('operation') != 'cavro_liquid_recipe' or len(calls) >= 6, 'partial':{'amount':None}}
+            bind_protocol_dispatcher(store, binding_factory=lambda *a, **kw: ({K.PIPETTE_MANUAL_PHYSICAL:leaf, K.LED:leaf},{},{}),
                                      artifact_store=SimpleNamespace(save=lambda _:None))
             store.admit_workflow(command_id=job, idempotency_key='root', plan_fingerprint='inert',
                                  requested_inputs={'bundle':bundle}, ownership_generation=7, resources=(), board_epochs={})
@@ -101,7 +109,7 @@ class RecoveryTest(unittest.TestCase):
                 gate = held(1)
                 body = dict(command_id=job, expected_ownership_generation=7, idempotency_key='choose', action='recover',
                             native_action_id='first', source_occurrence_id='first', expected_attempt=1,
-                            gate_id=gate, decision='retry', overrides={})
+                            gate_id=gate, decision='retry', scope='occurrence', overrides={'aspiration_delay_ms':5})
                 receipt = send(body)
                 next_gate = held(2)
                 self.assertNotEqual(next_gate, gate)
@@ -126,9 +134,11 @@ class RecoveryTest(unittest.TestCase):
             cold = OperatorCommandStore(root)
             try:
                 rows = cold.get_workflow(job)['execution']['runtime_state']['action_results']
-                self.assertEqual([r['action_id'] for r in rows], ['first','first','first','second'])
-                self.assertEqual(len(set(calls)), 4)
-                self.assertEqual([r['partial'] for r in rows[:2]], [{'amount':None}]*2)
+                self.assertEqual([r['action_id'] for r in rows], ['prefix','first','prefix','first','prefix','first','second'])
+                self.assertEqual(len(set(calls)), 7)
+                self.assertEqual(rows[5]['overrides'], {'aspiration_delay_ms':5})
+                self.assertEqual(rows[4]['overrides'], {})
+                self.assertEqual([r['partial'] for r in (rows[1],rows[3])], [{'amount':None}]*2)
                 self.assertEqual(control_protocol_job(job, body, command_store=cold), receipt)
             finally:
                 cold.stop()
@@ -227,3 +237,77 @@ class RecoveryTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             ex.request_control('recover',control_id='new',decision='retry',gate_id='gone',
                                native_action_id='a',source_occurrence_id='a',expected_attempt=2)
+
+    def test_whole_occurrence_repeat_and_retry(self):
+        from queue import Queue
+        holds = Queue()
+        trace = []
+        def leaf(action, state):
+            name = action.params['name']
+            trace.append(name)
+            return {'ok': not (name == 'y' and trace.count('y') == 1)}
+        actions = tuple(ProtocolAction(n, 's', kind, {'name': n}, source_occurrence_id=occ,
+                                 on_error='pause_for_operator') for n, kind, occ in (
+            ('a', K.PIPETTE_MANUAL_PHYSICAL, 'loop/0'), ('b', K.PIPETTE_POSITION, 'loop/0'),
+            ('x', K.PIPETTE_POSITION, 'loop/1'), ('y', K.PIPETTE_DISPENSE, 'loop/1'),
+            ('z', K.PIPETTE_ASPIRATE, 'loop/1')))
+        ex = ProtocolExecutor(job_id='owner', dry_run=False, handlers={a.kind:leaf for a in actions},
+            before_native_entry=lambda *_:None, on_state_change=lambda s: holds.put(s.workflow.gate_id)
+            if s.workflow.phase == 'waiting' else None)
+        worker = Thread(target=ex.execute, args=(ProtocolDocument('fixture', stages=(ProtocolStage('s',actions=actions),)),), daemon=True)
+        worker.start()
+        try:
+            gate = holds.get(timeout=3)
+            def choose(decision, key, occ, gate, cid):
+                ex.request_control('recover', control_id=cid, decision=decision, native_action_id=key,
+                    source_occurrence_id=occ, expected_attempt=1, scope='occurrence', gate_id=gate)
+            with self.assertRaises(ValueError):
+                choose('repeat', 'x', 'loop/1', gate, 'partial')
+            choose('repeat', 'b', 'loop/0', gate, 'repeat')
+            returned = holds.get(timeout=3)
+            self.assertNotEqual(returned, gate)
+            self.assertEqual(trace, list('abxyab'))
+            choose('retry', 'y', 'loop/1', returned, 'retry')
+            worker.join(3)
+            self.assertEqual(trace, list('abxyabxyz'))
+            self.assertEqual(ex.outcome, 'completed')
+        finally:
+            ex.interrupt(control_id='stop'); worker.join(3)
+
+    def test_shared_move_repeats_only_selected_target_and_returns(self):
+        from queue import Queue
+        holds, targets = Queue(), []
+        members = [{'occurrence_id':o, 'target_index':i} for i,o in enumerate(('outer/0','outer/1'))]
+        batch = ProtocolAction('shared','s',K.PIPETTE_POSITION,
+            {'operation':'move_sequence', 'targets':[{'location_id':3}, {'location_id':4}]},
+            metadata={'bms_method':{'sequence':members}}, source_occurrence_id='outer/0')
+        stop = ProtocolAction('stop','s',K.LED, {'red':0,'green':0,'blue':0}, source_occurrence_id='stop')
+        def move(a, state):
+            targets.append(tuple(t['location_id'] for t in a.params['targets']))
+            return {'ok':len(targets) != 2}
+        def pause(a, state):
+            ex.request_control('pause', control_id='pause', mode='ordinary')
+            return {'ok':True}
+        ex = ProtocolExecutor(job_id='owner', dry_run=False, handlers={K.PIPETTE_POSITION:move,K.LED:pause},
+            before_native_entry=lambda *_:None, on_state_change=lambda s:holds.put(s.workflow.to_payload())
+            if s.workflow.phase == 'waiting' else None)
+        worker = Thread(target=ex.execute, args=(ProtocolDocument('fixture',stages=(ProtocolStage('s',actions=(batch,stop)),)),), daemon=True)
+        worker.start()
+        try:
+            gate = holds.get(timeout=3)['gate_id']
+            choice = dict(gate_id=gate, decision='repeat', source_occurrence_id='outer/1',native_action_id='shared',expected_attempt=1)
+            with self.assertRaises(ValueError):
+                ex.request_control('recover',control_id='ambiguous',**choice)
+            ex.request_control('recover',control_id='repeat',scope='occurrence',**choice)
+            nested = holds.get(timeout=3)
+            self.assertEqual((nested['gate'],nested['source_occurrence_id']),('error_hold','outer/1'))
+            ex.request_control('recover',control_id='retry',scope='occurrence',**{**choice,'gate_id':nested['gate_id'],'decision':'retry','expected_attempt':2})
+            returned = holds.get(timeout=3)
+            self.assertEqual((returned['gate'],returned['source_occurrence_id']),('ordinary_pause','stop'))
+            ex.request_control('continue',control_id='resume',gate='ordinary_pause',gate_id=returned['gate_id'])
+            worker.join(3)
+            self.assertEqual(ex.outcome,'completed')
+            self.assertEqual(targets,[(3,4),(4,),(4,)])
+            self.assertEqual(len(batch.params['targets']),2)
+        finally:
+            ex.interrupt(control_id='teardown'); worker.join(3)
