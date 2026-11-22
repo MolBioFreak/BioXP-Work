@@ -114,6 +114,7 @@ class _HolderLocation(_Location):
 
 
 class ManualLower(_HolderLocation):
+    offset_steps: int | None = None
     operation: Literal["lower"]
 
 
@@ -296,7 +297,7 @@ def compile_manual_pipetting(request: ManualPipettingRequest | Mapping[str, Any]
 
     for index, step in enumerate(req.steps):
         if isinstance(step, (ManualMove, ManualMoveSequence, ManualLower, ManualLift)):
-            dumped = step.model_dump()
+            dumped = step.model_dump(exclude_unset=True) if isinstance(step, ManualLower) else step.model_dump()
             if "holder_row" in dumped and dumped["holder_row"] is None:
                 del dumped["holder_row"]
             add(ProtocolActionKind.PIPETTE_POSITION, dumped, index)
@@ -335,6 +336,8 @@ def manual_position_plan(params: Mapping[str, Any]) -> dict[str, Any]:
         inputs.update(well=well_id_from_label(step.well), position_flag=step.position_flag)
     elif isinstance(step, ManualLower):
         operation = "pipette_lower"
+        if step.offset_steps is not None:
+            inputs["offset_steps"] = step.offset_steps
     else:
         operation = "pipette_lift"
         inputs["height"] = step.height_steps

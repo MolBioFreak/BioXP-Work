@@ -102,6 +102,7 @@ class LiquidDetection(_Input):
     search_speed_native: int = Field(default=300, gt=0)
     search_timeout_ms: int = Field(default=15000, gt=0)   # OEM detectFluidLevel wait
     detection_id: str = Field(default="source", min_length=1)
+    pressure_settings: dict[str, int] = Field(default_factory=dict)
     sensing: Literal["pressure", "capacitive", "hybrid"] = "pressure"  # capacitive/hybrid need an external cLLD board
     # Source plate type (BMS labware profile name), so a saved plate-type depth offset applies.
     plate_type: str | None = Field(default=None, max_length=80)
@@ -123,6 +124,7 @@ class Recipe(_Input):
     aspiration_intent: StrokeIntent | None = None
     aspiration_speed_ul_s: float = Field(gt=0)
     aspiration_delay_ms: int = Field(ge=0)
+    dispense_delay_ms: int | None = Field(default=None, ge=0)
     leading_air: Air | None
     trailing_air: Air | None
     before_leading_air: list[Instruction]
@@ -241,6 +243,7 @@ def compile_liquid_recipe(request: dict[str, Any]) -> dict[str, Any]:
                           "target_liquid_ul": r.target_liquid_ul,
                           **({"accounting_intent": r.aspiration_intent.model_dump()} if r.aspiration_intent else {})}
             operations.append({"operation": "liquid_search", "channels": r.channels, "timeout_ms": d.search_timeout_ms,
+                **({"pressure_settings": d.pressure_settings} if d.pressure_settings else {}),
                 **({"on_contact": on_contact} if d.mode == "on_contact" else {}),
                 **({"volume_check": d.volume_check} if d.volume_check else {}),
                 "location_id": d.location_id, "detection_id": d.detection_id, "start_mode": d.start_mode, "sensing": d.sensing,
@@ -272,6 +275,8 @@ def compile_liquid_recipe(request: dict[str, Any]) -> dict[str, Any]:
         if r.multi is None:
             append_motion(r.before_dispense)
             dispense(r.dispense_segments)
+            if r.dispense_delay_ms is not None:
+                operations.append({"operation": "delay", "duration_ms": r.dispense_delay_ms})
             append_motion(r.after_dispense)
         else:
             m = r.multi
@@ -290,6 +295,8 @@ def compile_liquid_recipe(request: dict[str, Any]) -> dict[str, Any]:
             for aliquot in m.aliquots:
                 append_motion(aliquot.before)
                 dispense(aliquot.segments)
+                if r.dispense_delay_ms is not None:
+                    operations.append({"operation": "delay", "duration_ms": r.dispense_delay_ms})
                 if m.reaspiration is not None:
                     operations.append({"operation": "delay", "duration_ms": m.dispense_to_reaspiration_delay_ms})
                     stroke("reaspirate", m.reaspiration.volume_ul, m.reaspiration.speed_ul_s)

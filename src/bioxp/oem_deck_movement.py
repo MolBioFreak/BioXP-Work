@@ -1322,6 +1322,7 @@ WP8_COMPILED_CHILD_OPERATIONS = frozenset({
 
 FINITE_PLATE_OPERATIONS |= frozenset(OEM_PIPETTE_LEAVES) | {"pipette_shift_camera", "pipette_script_waste", "pipette_unlock"}
 WP8_OPERATION_INTENT_KEYS.update({name: frozenset(keys) for name, (_, keys) in OEM_PIPETTE_LEAVES.items()})
+WP8_OPERATION_INTENT_KEYS["pipette_lower"] |= {"offset_steps"}
 for _name in ("pipette_lower", "pipette_lift"):
     WP8_OPERATION_INTENT_KEYS[_name] = WP8_OPERATION_INTENT_KEYS[_name] | {"holder_row"}
 WP8_OPERATION_INTENT_KEYS.update({name: frozenset() for name in ("pipette_shift_camera", "pipette_script_waste", "pipette_unlock")})
@@ -1373,6 +1374,11 @@ def _compile_finite_plate_operation_unchecked(
         arguments = {key: inputs[key] for key in keys}
         if operation in {"pipette_lower", "pipette_lift"} and inputs.get("holder_row") is not None:
             arguments["holder_row"] = str(inputs["holder_row"])
+        if operation == "pipette_lower" and "offset_steps" in inputs:
+            from .oem_compat.pathing import TIP_TRAY_LOCATIONS
+            if type(inputs["offset_steps"]) is not int or inputs["location"] in TIP_TRAY_LOCATIONS:
+                raise ValueError("offset requires a calibrated liquid endpoint")
+            arguments["offset_steps"] = inputs["offset_steps"]
         if operation == "manual_load_tip" and inputs.get("keep_channels") is not None:
             # Partial pickup: keep these channels, release the rest back into the rack.
             arguments.update(keep_channels=[int(c) for c in inputs["keep_channels"]],

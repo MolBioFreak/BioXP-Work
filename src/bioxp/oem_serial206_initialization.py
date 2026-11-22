@@ -13351,7 +13351,9 @@ class Serial206OemInitializationProvider:
                 station = LOCATION_ID_TO_NAME[arguments["location"]]
                 depth = resolve(tip_type=loaded_type if loaded else None, location=station, plate_type=plate_at(station))
                 target += int(depth["offset_steps"])
-            return {**self.moveZ(target), "source_return": target if operation == "sourceLowerTo" else 0,
+            target += arguments.get("offset_steps", 0)
+            return {**self.moveZ(target), **({"offset_steps": arguments["offset_steps"]} if "offset_steps" in arguments else {}),
+                    "source_return": target if operation == "sourceLowerTo" else 0,
                     "tip_z_offset": tip_offset, "depth_offset": depth}
         if operation == "sourceNamedMoveTo":
             from .oem_deck_catalog import DeckCatalog

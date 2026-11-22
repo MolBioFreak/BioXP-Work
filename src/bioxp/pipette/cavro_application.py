@@ -137,6 +137,7 @@ class LiquidSearch(_Selected):
     z_motor_current: int = 25                                 # OEM Z_MOTOR_MAX_CURRENT_DOWN
     # ADP LLD mode (M 30053815-C U70/U71/U72). pLLD is onboard; cLLD/hybrid need an external cLLD board.
     sensing: Literal["pressure", "capacitive", "hybrid"] = "pressure"
+    pressure_settings: dict[str, int] = Field(default_factory=dict)
     # Channels whose wells are listed as holding liquid. A miss here holds the run.
     expected_channels: list[Annotated[int, Field(ge=0, le=3)]] | None = None
     # Optional: aspirate on each channel as it touches while Z keeps descending.
@@ -374,6 +375,10 @@ def compile_application(request: Mapping[str, Any]) -> dict[str, Any]:
                     raise ValueError("after_detection_steps and after_detection_speed_native must be specified together")
                 op["wire_commands"] = [{"field": "plld", "ascii": "B1R" if instruction.start_mode == 1 else "BR"}]
             elif isinstance(instruction, LiquidSearch):
+                for field in instruction.pressure_settings:
+                    if field not in PRESSURE_PARAMETERS or instruction.sensing == "capacitive":
+                        raise ValueError(f"Unsupported pressure override for {instruction.sensing}: {field}")
+                setting_commands(instruction.pressure_settings)
                 op.update(instruction.model_dump())  # defaults are part of the executed search
                 op["wire_commands"] = [{"field": "plld", "ascii": "B1R" if instruction.start_mode == 1 else "BR"},
                     {"field": "sensing", "ascii": {"pressure": "U70R", "capacitive": "U71R", "hybrid": "U72R"}[instruction.sensing]}]
@@ -572,6 +577,72 @@ def _send_one(transport, wire, command_name):
     return {"ok": raw.get("ok") is True, "driver_result": raw, **transport._driver_evidence(raw)}
 
 
+# Reports are not ordered like setters: samples/CAN is ?27, hybrid interval ?39.
+_PRESSURE_REPORTS = (32, 33, 34, 35, 36, 37, 38, 27, 39)
+
+
+def _pressure_scope(op, record, evidence, search):
+    """Capture before profile writes, apply after them, unwind even a partial send."""
+    saved = []
+    attempted = set()
+    channels, timeout = op['channels'], op['timeout_ms']
+    def write(label, selected, wire):
+        reply = record(label, lambda t: _send_wire(t, selected, wire, timeout),
+               inputs={'ascii':wire, 'channels':selected}, pipette=True)
+        rows = reply.get('channels') or []
+        if (reply.get('ok') is not True or reply.get('interrupted_by_terminate')
+                or [r.get('channel') for r in rows] != selected
+                or not all((r.get('completion') or {}).get('ok') is True for r in rows)):
+            raise PipetteCommandError(f'{label} outcome unresolved')
+
+    for field in op['pressure_settings']:
+        selector, low, high, *_ = PRESSURE_PARAMETERS[field]
+        query = compile_device_command({'command':'report', 'selector':_PRESSURE_REPORTS[selector]})
+        reply = record('device_command', lambda t: t.run_cavro_command(query, channels=channels, timeout_ms=timeout),
+                       inputs={'ascii':query['ascii'], 'channels':channels, 'field':field}, pipette=True)
+        observed = {}
+        for row in reply.get('channels', []):
+            result = row.get('result') or {}
+            report = result.get('report') or {}
+            text = report.get('raw_ascii')
+            ch = row.get('channel')
+            if (type(ch) is not int or ch in observed or result.get('semantic_query_response_verified') is not True
+                    or report.get('report_kind') != query['report_kind'] or report.get('parsed') is not True
+                    or not isinstance(text,str) or not text.isascii() or not text.isdecimal()
+                    or not low <= int(text) <= high):
+                raise PipetteCommandError(f'Cannot capture {field} for restoration')
+            observed[ch] = int(text)
+        if set(observed) != set(channels):
+            raise PipetteCommandError(f'Incomplete channel capture for {field}')
+        saved.extend((ch, field, old) for ch,old in observed.items())
+
+    def apply():
+        for field, wire in setting_commands(op['pressure_settings']):
+            attempted.add(field)
+            write('pressure_override', channels, wire)
+
+    primary = None
+    try:
+        return search(apply)
+    except Exception as exc:
+        primary = exc
+        raise
+    finally:
+        for ch, field, old in reversed(saved):
+            if field not in attempted:
+                continue
+            wire = setting_commands({field:old})[0][1]
+            row = {'channel':ch, 'field':field, 'prior_value':old}
+            evidence.append(row)
+            try:
+                write('pressure_restore', [ch], wire)
+                row['status'] = 'restore_returned'
+            except Exception as exc:
+                row.update(status='unresolved', error=str(exc))
+        if primary is None and any(r['status']=='unresolved' for r in evidence):
+            raise PipetteCommandError('Pressure restoration unresolved')
+
+
 def run_application_inline(provider, request: Mapping[str, Any], *, command_id: str,
                            owner_identity: Mapping[str, Any]) -> dict[str, Any]:
     from .effect_accounting import accounting_occurrence
@@ -660,7 +731,10 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
         result.setdefault("lld_profiles", []).append(profile)
         if profile is None:
             return  # unknown tip type: leave the pumps' current settings unchanged
+        overridden = {PRESSURE_PARAMETERS[f][0] for f in op.get("pressure_settings", {})}
         for wire in wires(profile):
+            if int(wire[1:wire.index(",")]) in overridden:
+                continue
             record("lld_profile", lambda t, w=wire: _send_wire(t, op["channels"], w, op["timeout_ms"]),
                    inputs={"ascii": wire, "profile": profile}, pipette=True)
 
@@ -692,7 +766,7 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
         transform = move["reference"].get("transform") if move["reference"]["kind"] == "rack" else last_rack
         return trajectory_evidence(geometry, {**head_targets, "z": geometry["target_steps"]}, transform, channels)
 
-    def liquid_search(op):
+    def liquid_search(op, apply_override=None):
         from ..oem_compat.pathing import LOCATION_ID_TO_NAME
         from ..oem_compat.position_table import load_bound_oem_position_table
         from .liquid_detection import contact_from_timestamps, height_above_floor_mm, search_window
@@ -708,6 +782,8 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
         if type(row.z_low) is not int or type(row.z_high) is not int:
             raise PipetteCommandError("liquid search needs calibrated high and low heights for this station")
         apply_lld_profile(op)
+        if apply_override is not None:
+            apply_override()
         offset = int(tip_offset()["offset_steps"])
         reader = getattr(provider.primitives, "_depth_offset", None)
         depth = (reader(LOCATION_ID_TO_NAME[op["location_id"]], op.get("plate_type"))
@@ -984,7 +1060,11 @@ def _run_application_inline(provider, plan, *, command_id, owner_identity):
                 if op.get("after_detection_steps") is not None:
                     z_move(op["after_detection_steps"] + plld_offset, op["after_detection_speed_native"])
             elif kind == "liquid_search":
-                liquid_search(op)
+                if op.get("pressure_settings"):
+                    _pressure_scope(op, record, result.setdefault("pressure_restoration", []),
+                                    lambda apply: liquid_search(op, apply))
+                else:
+                    liquid_search(op)
             elif kind == "surface_aspirate":
                 surface_aspirate(op)
             else:
