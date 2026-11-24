@@ -84,6 +84,52 @@ def _segment_intersects_box(
     return t0 <= t1
 
 
+def _leg_rect_overlaps_box(
+    x1: int, y1: int, x2: int, y2: int, *, x_min: int, x_max: int, y_min: int, y_max: int
+) -> bool:
+    """True when the leg's bounding rectangle touches the box.
+
+    X and Y run on independent motors, so the head does not follow the straight
+    line between two points; it stays somewhere inside their bounding rectangle.
+    """
+    return not (max(x1, x2) < x_min or min(x1, x2) > x_max or max(y1, y2) < y_min or min(y1, y2) > y_max)
+
+
+def xy_travel_legs(start_x: int, start_y: int, steps: list[dict[str, Any]]) -> list[tuple[int, int, int, int]]:
+    """Expand planned steps into XY legs (start and end of each horizontal travel)."""
+    legs: list[tuple[int, int, int, int]] = []
+    cx, cy = int(start_x), int(start_y)
+
+    def go(nx: int, ny: int) -> None:
+        nonlocal cx, cy
+        if (nx, ny) != (cx, cy):
+            legs.append((cx, cy, nx, ny))
+        cx, cy = nx, ny
+
+    for step in steps:
+        op = step.get("op")
+        if op in ("moveXY", "moveTo"):
+            go(int(step.get("x", cx)), int(step.get("y", cy)))
+        elif op == "moveX":
+            go(int(step["x"]), cy)
+        elif op == "moveY":
+            go(cx, int(step["y"]))
+        elif op == "moveSteps":
+            if step.get("axis") == "x":
+                go(cx + int(step["delta"]), cy)
+            elif step.get("axis") == "y":
+                go(cx, cy + int(step["delta"]))
+        elif op == "parallel":
+            nx, ny = cx, cy
+            for sub in step.get("steps") or ():
+                if sub.get("op") == "moveX":
+                    nx = int(sub["x"])
+                elif sub.get("op") == "moveY":
+                    ny = int(sub["y"])
+            go(nx, ny)
+    return legs
+
+
 def workflow_thermal_door_policy(document: Any) -> dict[str, Any]:
     """Decide whether a pipetting workflow should open the thermal door at launch.
 
@@ -227,7 +273,7 @@ class OemPathPlanner:
     def get_closed_door_waypoints(
         self, *, current_x: int, current_y: int, target_x: int, target_y: int
     ) -> list[dict[str, int]]:
-        """Return chiller-corridor waypoints if segment crosses the closed thermal door box."""
+        """Chiller-corridor waypoints when a direct move would cross the closed thermal door box."""
         x1, y1, x2, y2 = int(current_x), int(current_y), int(target_x), int(target_y)
         if x1 == x2 and y1 == y2:
             return []
@@ -235,14 +281,41 @@ class OemPathPlanner:
         bounds = {k: box[k] for k in ("x_min", "x_max", "y_min", "y_max")}
         if _point_in_box(x1, y1, **bounds) or _point_in_box(x2, y2, **bounds):
             return []
-        if not _segment_intersects_box(x1, y1, x2, y2, **bounds):
+        if not _leg_rect_overlaps_box(x1, y1, x2, y2, **bounds):
             return []
-        bypass_y = box["bypass_y"]
-        if y1 < bypass_y and y2 < bypass_y:
-            return [{"x": x1, "y": bypass_y}, {"x": x2, "y": bypass_y}, {"x": x2, "y": y2}]
+        return self.closed_door_corridor_route(current_x=x1, current_y=y1, target_x=x2, target_y=y2)
+
+    def closed_door_corridor_route(
+        self, *, current_x: int, current_y: int, target_x: int, target_y: int
+    ) -> list[dict[str, int]]:
+        """Up to the chiller corridor (Y = bypass), across, then to the target.
+
+        Legs below the corridor are single-axis, so for endpoints outside the box
+        none of them can enter it.
+        """
+        x1, y1, x2, y2 = int(current_x), int(current_y), int(target_x), int(target_y)
+        bypass_y = self.closed_thermal_door_no_go_box()["bypass_y"]
+        points: list[dict[str, int]] = []
         if y1 < bypass_y:
-            return [{"x": x1, "y": bypass_y}, {"x": x2, "y": y2}]
-        return [{"x": x2, "y": bypass_y}, {"x": x2, "y": y2}]
+            points.append({"x": x1, "y": bypass_y})
+        if y2 < bypass_y:
+            points.append({"x": x2, "y": bypass_y})
+        points.append({"x": x2, "y": y2})
+        out: list[dict[str, int]] = []
+        prev = (x1, y1)
+        for pt in points:
+            if (pt["x"], pt["y"]) != prev:
+                out.append(pt)
+                prev = (pt["x"], pt["y"])
+        return out
+
+    def closed_door_route_check(self, *, start_x: int, start_y: int, steps: list[dict[str, Any]]) -> dict[str, Any]:
+        """Check every planned XY leg against the closed-door box."""
+        box = self.closed_thermal_door_no_go_box()
+        bounds = {k: box[k] for k in ("x_min", "x_max", "y_min", "y_max")}
+        legs = xy_travel_legs(start_x, start_y, steps)
+        crossing = [list(leg) for leg in legs if _leg_rect_overlaps_box(*leg, **bounds)]
+        return {"box": box, "legs": [list(leg) for leg in legs], "crossing_legs": crossing, "clear": not crossing}
 
     @staticmethod
     def _move_to_authority(state: OemMachineState) -> dict[str, Any]:
@@ -379,6 +452,37 @@ class OemPathPlanner:
             branch = "dirty_tip_default_moveTo"
             steps.append(_step("moveTo", x=x, y=y, z=num, run_in_parallel=bool(run_in_parallel), move_to_authority=self._move_to_authority(state), source_lines="ClassControlInterface.cs:4009-4011"))
 
+        closed_door_route: dict[str, Any] | None = None
+        if state.tip_loaded and state.needs_closed_door_avoidance():
+            box = self.closed_thermal_door_no_go_box()
+            bounds = {k: box[k] for k in ("x_min", "x_max", "y_min", "y_max")}
+            travel_x = 82450 if loc_id == WASTE_BIN_ID else x
+            endpoint_in_box = _point_in_box(x2, y2, **bounds) or _point_in_box(travel_x, y, **bounds)
+            check = self.closed_door_route_check(start_x=x2, start_y=y2, steps=steps)
+            closed_door_route = {"oem_branch": branch, "endpoint_in_box": endpoint_in_box,
+                                 "oem_route_check": check, "rerouted": False}
+            if not check["clear"] and not endpoint_in_box:
+                xy_ops = ("moveXY", "moveTo", "moveX", "moveY", "parallel", "moveSteps")
+                first_xy = next((i for i, st in enumerate(steps) if st["op"] in xy_ops), len(steps))
+                rebuilt = list(steps[:first_xy])
+                rebuilt += [_step("moveXY", **pt, reason="closed_thermal_door_bypass")
+                            for pt in self.closed_door_corridor_route(
+                                current_x=x2, current_y=y2, target_x=travel_x, target_y=y)]
+                if loc_id == WASTE_BIN_ID:
+                    if str(state.device_type).upper() == "DBC":
+                        rebuilt.append(_step("moveZ", z=75000))
+                    else:
+                        rebuilt += [_step("moveZ", z=145000), _step("moveX", x=self.x_high_limit - 500),
+                                    _step("moveSteps", axis="x", delta=-1000), _step("moveZ", z=pseudo)]
+                    branch = "tip_loaded_closed_door_avoidance_waste_bin"
+                else:
+                    rebuilt.append(_step("moveZ", z=num))
+                    branch = "tip_loaded_closed_door_avoidance"
+                steps = rebuilt
+                closed_door_route.update(
+                    rerouted=True,
+                    final_route_check=self.closed_door_route_check(start_x=x2, start_y=y2, steps=steps))
+
         plan = {
             "ok": True,
             "schema_version": "bioxp.oem_scriptmove_path_plan.v1",
@@ -398,6 +502,7 @@ class OemPathPlanner:
             "target_coordinates": target_xyz,
             "state": state.to_payload(),
             "steps": steps,
+            "closed_door_route": closed_door_route,
             "step_count": len(steps),
             "source_hazards": (
                 ["confirmed_oem_cover_storage_tautology"]
