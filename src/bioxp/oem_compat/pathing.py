@@ -459,8 +459,10 @@ class OemPathPlanner:
             travel_x = 82450 if loc_id == WASTE_BIN_ID else x
             endpoint_in_box = _point_in_box(x2, y2, **bounds) or _point_in_box(travel_x, y, **bounds)
             check = self.closed_door_route_check(start_x=x2, start_y=y2, steps=steps)
+            # Keep this summary small: the executed plan passes through a bounded
+            # JSON projection, and bulky fields here would truncate its steps.
             closed_door_route = {"oem_branch": branch, "endpoint_in_box": endpoint_in_box,
-                                 "oem_route_check": check, "rerouted": False}
+                                 "oem_route_clear": check["clear"], "rerouted": False}
             if not check["clear"] and not endpoint_in_box:
                 xy_ops = ("moveXY", "moveTo", "moveX", "moveY", "parallel", "moveSteps")
                 first_xy = next((i for i, st in enumerate(steps) if st["op"] in xy_ops), len(steps))
@@ -481,7 +483,7 @@ class OemPathPlanner:
                 steps = rebuilt
                 closed_door_route.update(
                     rerouted=True,
-                    final_route_check=self.closed_door_route_check(start_x=x2, start_y=y2, steps=steps))
+                    final_route_clear=self.closed_door_route_check(start_x=x2, start_y=y2, steps=steps)["clear"])
 
         plan = {
             "ok": True,

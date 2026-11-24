@@ -71,7 +71,26 @@ def test_strip4_to_magsep_now_goes_over_chillers(planner):
     plan = planner.plan_script_move_to(current_loc=14, location_id=0, positionflag=0,
                                        state=_state(14, locs[14], tip_type=50, door_open=False))
     assert plan["branch"] == "tip_loaded_closed_door_avoidance"
-    assert plan["closed_door_route"]["oem_route_check"]["clear"] is True
+    assert plan["closed_door_route"]["oem_route_clear"] is True
     bypass_y = planner.closed_thermal_door_no_go_box()["bypass_y"]
     xy = [(s["x"], s["y"]) for s in plan["steps"] if s["op"] == "moveXY"]
     assert xy == [(locs[0][0], bypass_y), locs[0]]
+
+
+@pytest.mark.parametrize("tip_type", [10, 50, 200, None])
+@pytest.mark.parametrize("dirty", [False, True])
+def test_executed_plan_projection_keeps_every_step(planner, tip_type, dirty):
+    """The plan is stored and executed through _json_safe; nothing may be cut."""
+    from bioxp.oem_serial206_initialization import _json_safe
+    locs, _bounds, pairs = _pairs(planner)
+    cut = []
+    for a, b in pairs:
+        state = OemMachineState.from_query(
+            current_location_id=str(a), current_x=locs[a][0], current_y=locs[a][1], current_z=500,
+            tip_loaded=True, tip_dirty=dirty, tip_type=tip_type, thermal_door_open=False,
+            pseudo_z_home=500, device_type="BIOXP",
+        )
+        plan = planner.plan_script_move_to(current_loc=a, location_id=b, positionflag=0, state=state)
+        if _json_safe(plan)["steps"] != plan["steps"]:
+            cut.append((_loc_name(a), _loc_name(b), plan["branch"]))
+    assert cut == []
