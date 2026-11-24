@@ -11093,7 +11093,34 @@ def _protocol_bindings(bundle, *, source_executor=None):
                 settings=settings, move_to_waste=callbacks["move_to_waste"], sweep_handler=None)["run_job_tip_prefix"]
             def launch(state):
                 with store.saved_method_tip_preflight(state.job_id):
-                    return prefix(state, source_occurrence_id=TIP_PREFLIGHT_ACTION)
+                    tip_result = prefix(state, source_occurrence_id=TIP_PREFLIGHT_ACTION)
+                if not isinstance(tip_result, Mapping) or tip_result.get("source_pause_scripts") or tip_result.get("ok") is False:
+                    return tip_result
+                from .oem_compat.pathing import workflow_thermal_door_policy
+                from .oem_deck_movement import compile_finite_plate_operation
+                door_policy = workflow_thermal_door_policy(bundle["protocol"]["document"])
+                if not door_policy.get("should_open"):
+                    return {**dict(tip_result), "thermal_door_preflight": {"policy": door_policy, "action": "skipped"}}
+                door_state = provider.wp8_operation_machine_state("thermal_door", {})
+                door_is_open = door_state.get("door_is_open")
+                if door_is_open is True:
+                    return {**dict(tip_result), "thermal_door_preflight": {"policy": door_policy, "action": "already_open"}}
+                if door_is_open is not False:
+                    return {**dict(tip_result), "thermal_door_preflight": {"policy": door_policy, "action": "skipped_door_state_unknown"}}
+                door_plan = compile_finite_plate_operation(
+                    "thermal_door",
+                    source_leaf_available=True,
+                    open=True,
+                    door_is_open=False,
+                    board_test_mode=bool(door_state.get("board_test_mode", False)),
+                )
+                door_result = execute_plan(door_plan, "lifecycle:saved_method_thermal_door", state)
+                ok = tip_result.get("ok", True) is not False and door_result.get("ok") is True
+                return {
+                    **dict(tip_result),
+                    "ok": ok,
+                    "thermal_door_preflight": {"policy": door_policy, "action": "opened", "result": door_result},
+                }
             return plain_handlers(), {}, {"saved_method_tip_preflight": launch}
         native = provider.build_oem_native_handlers(
             settings=settings, execute_plan=execute_plan,

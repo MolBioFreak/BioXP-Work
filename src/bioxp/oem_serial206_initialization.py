@@ -4074,13 +4074,17 @@ class Serial206ProductionPrimitiveAdapter:
         tip_type = getattr(transport, "_tip_type", None) if _transport_tip_loaded(transport) else None
         return resolve(tip_type=tip_type, location=location_name, plate_type=plate_type or plate_at(location_name))
 
-    def _loaded_tip_z_offset(self) -> dict[str, Any]:
-        from .pipette.tip_length import tip_z_offset
+    def _loaded_tip_type(self) -> int | None:
         transport = getattr(self, "pipette_transport", None)
         tip_type = getattr(transport, "_tip_type", None)
-        # No tip on the gun means no tip length to correct.
         loaded = _transport_tip_loaded(transport)
-        return tip_z_offset(int(tip_type) if loaded and isinstance(tip_type, int) else None)
+        if loaded and isinstance(tip_type, int) and not isinstance(tip_type, bool):
+            return int(tip_type)
+        return None
+
+    def _loaded_tip_z_offset(self) -> dict[str, Any]:
+        from .pipette.tip_length import tip_z_offset
+        return tip_z_offset(self._loaded_tip_type())
 
     def z_pipette_position(
         self,
@@ -4331,6 +4335,8 @@ class Serial206ProductionPrimitiveAdapter:
         plate_on_gantry: int | str | None,
         gripper_confirmed: bool | None = None,
         location19_y: int | None = None,
+        tip_type: int | None = None,
+        thermal_door_open: bool | None = None,
     ) -> dict[str, Any]:
         observed_gripper = Serial206OemInitializationProvider._observed_gripper_confirmation(self.tester)
         if gripper_confirmed is not None and gripper_confirmed is not observed_gripper:
@@ -4349,7 +4355,9 @@ class Serial206ProductionPrimitiveAdapter:
             tip_loaded=bool(tip_loaded),
             tip_dirty=bool(tip_dirty),
             tip_location=int(tip_location),
+            tip_type=tip_type if tip_type is not None else (self._loaded_tip_type() if bool(tip_loaded) else None),
             tip_z_offset_steps=self._loaded_tip_z_offset()["offset_steps"] if bool(tip_loaded) else 0,
+            thermal_door_open=thermal_door_open,
             clean_path=bool(clean_path),
             device_type="BIOXP",
             gripper_confirmed=gripper_confirmed,
@@ -8157,16 +8165,57 @@ class Serial206OemInitializationProvider:
                 if z_raise is not None and z_raise.get("ok") is not True:
                     return {"ok": False, "failure": "xy_sequence_z_raise_failed", "z_raise": _json_safe(z_raise),
                             "children": [], "completed_targets": 0}
+            closed_door_planner = None
+            cur_xy: tuple[int, int] | None = None
+            try:
+                semantic = self._canonical_deck_semantic_state(require_latch_observation=False)
+                machine_status = dict(self._load_state().get("machine_status") or {})
+                tip_loaded_now = bool(semantic.get("tip_loaded"))
+                door_open_now = machine_status.get("thermal_door_open")
+                tip_type_now = self.primitives._loaded_tip_type() if hasattr(self.primitives, "_loaded_tip_type") else None
+                if tip_loaded_now and tip_type_now != 10 and door_open_now is False:
+                    from .oem_compat.pathing import OemPathPlanner
+                    closed_door_planner = OemPathPlanner(load_bound_oem_position_table())
+                    cur_xy = (int(self.primitives._read_axis_position("x")), int(self.primitives._read_axis_position("y")))
+            except Exception:
+                closed_door_planner = None
             for index, (target, xy) in enumerate(zip(targets, resolved)):
                 if interrupted():
                     return {"ok": False, "failure": "xy_sequence_interrupted", "interrupted": True,
                             "next_target_index": index, "children": children, "z_raise": _json_safe(z_raise),
                             "completed_targets": sum(child["ok"] for child in children)}
                 child_id = f"{values['command_id']}:xy:{index}"
+                bypass_waypoints: list[dict[str, int]] = []
+                if closed_door_planner is not None and cur_xy is not None:
+                    full_pts = closed_door_planner.get_closed_door_waypoints(
+                        current_x=cur_xy[0], current_y=cur_xy[1], target_x=xy["x"], target_y=xy["y"])
+                    bypass_waypoints = full_pts[:-1] if len(full_pts) > 1 else []
+                    if bypass_waypoints and z_raise is None:
+                        z_raise = self._raise_to_travel_height()
+                        if z_raise is not None and z_raise.get("ok") is not True:
+                            return {"ok": False, "failure": "xy_sequence_z_raise_failed", "z_raise": _json_safe(z_raise),
+                                    "children": children, "completed_targets": index}
+                    for wp_idx, wp in enumerate(bypass_waypoints):
+                        if interrupted():
+                            return {"ok": False, "failure": "xy_sequence_interrupted", "interrupted": True,
+                                    "next_target_index": index, "children": children, "z_raise": _json_safe(z_raise),
+                                    "completed_targets": sum(child["ok"] for child in children)}
+                        wp_id = f"{child_id}:bypass:{wp_idx}"
+                        wp_res = self.execute_xy_intent(wp["x"], wp["y"], {
+                            **values, "command_id": wp_id, "parent_command_id": values["command_id"],
+                            "idempotency_key": f"{values['idempotency_key']}:xy:{index}:bypass:{wp_idx}",
+                        }, source_context="ControlLib.MotionThread", interrupt_check=interrupted)
+                        if wp_res.get("ok") is not True:
+                            return {"ok": False, "failure": "xy_sequence_child_failed", "failed_target_index": index,
+                                    "children": children, "completed_targets": index, "failed_child": wp_res,
+                                    "z_raise": _json_safe(z_raise), "closed_door_bypass_waypoints": bypass_waypoints}
+                        cur_xy = (wp["x"], wp["y"])
                 result = self.execute_xy_intent(xy["x"], xy["y"], {
                     **values, "command_id": child_id, "parent_command_id": values["command_id"],
                     "idempotency_key": f"{values['idempotency_key']}:xy:{index}",
                 }, source_context="ControlLib.MotionThread", interrupt_check=interrupted)
+                if result.get("ok") is True and cur_xy is not None:
+                    cur_xy = (xy["x"], xy["y"])
                 primitive = result.get("result")
                 primitive = primitive if isinstance(primitive, Mapping) else {}
                 # Preserve the existing source/provider outcome. Missing target
@@ -8179,7 +8228,8 @@ class Serial206OemInitializationProvider:
                          "branch": primitive.get("branch"),
                          "controller_command_acknowledged": primitive.get("controller_command_acknowledged") is True,
                          "controller_terminal_state_verified": primitive.get("controller_terminal_state_verified") is True,
-                         "source_noop": primitive.get("source_noop") is True}
+                         "source_noop": primitive.get("source_noop") is True,
+                         **({"closed_door_bypass_waypoints": bypass_waypoints} if bypass_waypoints else {})}
                 children.append(child)
                 if not child["ok"]:
                     return {"ok": False, "failure": "xy_sequence_child_failed", "failed_target_index": index,
@@ -12028,6 +12078,8 @@ class Serial206OemInitializationProvider:
             location19_y=int(load_bound_oem_position_table().resolve(
                 location_id="LOC_RC_COVER").base_coordinates["y"]),
             gripper_confirmed=self._deck_gripper_confirmed(),
+            tip_type=self.primitives._loaded_tip_type() if bool(state["tip_loaded"]) and hasattr(self.primitives, "_loaded_tip_type") else None,
+            thermal_door_open=state.get("thermal_door_open"),
         )
 
     def scriptmoveTo(self, **arguments: Any) -> dict[str, Any]:
@@ -12043,6 +12095,8 @@ class Serial206OemInitializationProvider:
             location19_y=int(load_bound_oem_position_table().resolve(
                 location_id="LOC_RC_COVER").base_coordinates["y"]),
             gripper_confirmed=self._deck_gripper_confirmed(),
+            tip_type=self.primitives._loaded_tip_type() if bool(state["tip_loaded"]) and hasattr(self.primitives, "_loaded_tip_type") else None,
+            thermal_door_open=state.get("thermal_door_open"),
             expected_plan_digest=None if expected_digest is None else str(expected_digest),
             source_plan=source_plan if isinstance(source_plan, Mapping) else None,
         )

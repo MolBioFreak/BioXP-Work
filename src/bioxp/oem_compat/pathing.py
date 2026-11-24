@@ -26,6 +26,10 @@ MIDPOINT_LINES = "ClassControlInterface.cs:5254-5366"
 SCRIPTMOVE_TO_METHOD_TOKEN = "0x06000120"
 SCRIPTMOVE_TO_IL_SHA256 = "3e94ea68ac09edbbeb021907285e9e47206c07d118e5f3a9f5611cd03c491ce3"
 XY_MM_TO_STEPS = 236.94
+CLOSED_DOOR_EXEMPT_TIP_TYPES = frozenset({10})
+# Closed thermal door bezel clearance around LOC_TC wells (matches approved deck map: ~21 mm X, ~19 mm Y).
+CLOSED_DOOR_MARGIN_X_STEPS = int(round(21.0 * XY_MM_TO_STEPS))
+CLOSED_DOOR_MARGIN_Y_STEPS = int(round(19.0 * XY_MM_TO_STEPS))
 
 
 def _loc_name(value: str | int | None) -> str:
@@ -48,6 +52,82 @@ def _step(kind: str, **kwargs: Any) -> dict[str, Any]:
     payload = {"op": kind, "motion_commanded": False, "opened_usb": False, "physical_motion": False}
     payload.update(kwargs)
     return payload
+
+
+def _point_in_box(x: int, y: int, *, x_min: int, x_max: int, y_min: int, y_max: int) -> bool:
+    return x_min <= x <= x_max and y_min <= y <= y_max
+
+
+def _segment_intersects_box(
+    x1: int, y1: int, x2: int, y2: int, *, x_min: int, x_max: int, y_min: int, y_max: int
+) -> bool:
+    """Exact Liang-Barsky segment vs axis-aligned box intersection."""
+    dx = x2 - x1
+    dy = y2 - y1
+    t0, t1 = 0.0, 1.0
+    for p_val, q_val in ((-dx, x1 - x_min), (dx, x_max - x1), (-dy, y1 - y_min), (dy, y_max - y1)):
+        if p_val == 0:
+            if q_val < 0:
+                return False
+        else:
+            r = q_val / p_val
+            if p_val < 0:
+                if r > t1:
+                    return False
+                if r > t0:
+                    t0 = r
+            else:
+                if r < t0:
+                    return False
+                if r < t1:
+                    t1 = r
+    return t0 <= t1
+
+
+def workflow_thermal_door_policy(document: Any) -> dict[str, Any]:
+    """Decide whether a pipetting workflow should open the thermal door at launch.
+
+    Matches OEM default (open door before pipetting) unless:
+    - The workflow explicitly opts to keep the thermal door closed, or
+    - The workflow only uses 10 uL tips (which clear the closed door at Z=500), or
+    - The workflow contains no pipetting actions.
+    """
+    doc = document if isinstance(document, dict) else {}
+    metadata = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
+    bms_meta = metadata.get("bms_method") if isinstance(metadata.get("bms_method"), dict) else {}
+    bms_method = bms_meta.get("method") if isinstance(bms_meta.get("method"), dict) else {}
+    for container in (metadata, bms_meta, bms_method):
+        if container.get("keep_thermal_door_closed") is True or container.get("thermal_door_policy") == "keep_closed":
+            return {"should_open": False, "reason": "explicit_keep_closed", "tip_types": []}
+    has_pipetting = False
+    tip_types: set[int] = set()
+    untyped_tip_load = False
+    pipette_kinds = {
+        "pipette_manual_physical", "pipette_tip", "pipette_aspirate",
+        "pipette_dispense", "pipette_mix", "pipette_position",
+    }
+    for stage in doc.get("stages") or ():
+        if not isinstance(stage, dict):
+            continue
+        for action in stage.get("actions") or ():
+            if not isinstance(action, dict):
+                continue
+            kind = str(action.get("kind") or "")
+            params = action.get("params") if isinstance(action.get("params"), dict) else {}
+            if kind in pipette_kinds:
+                has_pipetting = True
+            op = str(params.get("operation") or "")
+            if (kind == "pipette_manual_physical" and op in {"load_tip", "source_load_tips"}) or kind == "pipette_tip":
+                raw_tip = params.get("tip_type")
+                if isinstance(raw_tip, int) and not isinstance(raw_tip, bool):
+                    tip_types.add(raw_tip)
+                elif op in {"load_tip", "source_load_tips"}:
+                    untyped_tip_load = True
+    if not has_pipetting:
+        return {"should_open": False, "reason": "no_pipetting_actions", "tip_types": []}
+    if tip_types and not untyped_tip_load and tip_types.issubset(CLOSED_DOOR_EXEMPT_TIP_TYPES):
+        return {"should_open": False, "reason": "exempt_10ul_only", "tip_types": sorted(tip_types)}
+    return {"should_open": True, "reason": "default_open_for_non_10ul_pipetting", "tip_types": sorted(tip_types)}
 
 
 @dataclass(frozen=True)
@@ -121,6 +201,49 @@ class OemPathPlanner:
                 points += [{"x": num, "y": num2}, {"x": x, "y": y}]
         return points
 
+    def closed_thermal_door_no_go_box(self) -> dict[str, int]:
+        """No-go box over LOC_TC when the thermal door is closed, plus chiller bypass Y."""
+        p1 = self._target(1)   # LOC_OC
+        p2 = self._target(2)   # LOC_TC
+        p3 = self._target(3)   # LOC_RC
+        inc = int(p2.inc_factor) or 1
+        tc_a1_x = int(p2.base_coordinates["x"])
+        tc_a1_y = int(p2.base_coordinates["y"])
+        tc_h12_x = tc_a1_x + inc * OEM_X_INCREMENT * 11
+        tc_h12_y = tc_a1_y + inc * OEM_Y_INCREMENT * 7
+        x_min = min(tc_a1_x, tc_h12_x) - CLOSED_DOOR_MARGIN_X_STEPS
+        x_max = max(tc_a1_x, tc_h12_x) + CLOSED_DOOR_MARGIN_X_STEPS
+        y_min = 0
+        y_max = max(tc_a1_y, tc_h12_y) + CLOSED_DOOR_MARGIN_Y_STEPS
+        bypass_y = max(int(p1.base_coordinates["y"]), int(p3.base_coordinates["y"]), y_max + 2000)
+        return {
+            "x_min": x_min,
+            "x_max": x_max,
+            "y_min": y_min,
+            "y_max": y_max,
+            "bypass_y": bypass_y,
+        }
+
+    def get_closed_door_waypoints(
+        self, *, current_x: int, current_y: int, target_x: int, target_y: int
+    ) -> list[dict[str, int]]:
+        """Return chiller-corridor waypoints if segment crosses the closed thermal door box."""
+        x1, y1, x2, y2 = int(current_x), int(current_y), int(target_x), int(target_y)
+        if x1 == x2 and y1 == y2:
+            return []
+        box = self.closed_thermal_door_no_go_box()
+        bounds = {k: box[k] for k in ("x_min", "x_max", "y_min", "y_max")}
+        if _point_in_box(x1, y1, **bounds) or _point_in_box(x2, y2, **bounds):
+            return []
+        if not _segment_intersects_box(x1, y1, x2, y2, **bounds):
+            return []
+        bypass_y = box["bypass_y"]
+        if y1 < bypass_y and y2 < bypass_y:
+            return [{"x": x1, "y": bypass_y}, {"x": x2, "y": bypass_y}, {"x": x2, "y": y2}]
+        if y1 < bypass_y:
+            return [{"x": x1, "y": bypass_y}, {"x": x2, "y": y2}]
+        return [{"x": x2, "y": bypass_y}, {"x": x2, "y": y2}]
+
     @staticmethod
     def _move_to_authority(state: OemMachineState) -> dict[str, Any]:
         """Carry the exact dynamic predicates required by the OEM moveTo branch."""
@@ -166,8 +289,24 @@ class OemPathPlanner:
             branch = "tip_loaded"
             if z > pseudo:
                 steps.append(_step("moveZ", z=pseudo, reason="current_z_above_pseudo_home", source_lines="ClassControlInterface.cs:3864-3867"))
+            closed_mid: list[dict[str, int]] = []
+            if state.needs_closed_door_avoidance():
+                tx = 82450 if loc_id == WASTE_BIN_ID else x
+                closed_mid = self.get_closed_door_waypoints(current_x=x2, current_y=y2, target_x=tx, target_y=y)
             mid = self.get_midpoints(current_x=x2, current_y=y2, target_x=x, target_y=y)
-            if loc_id == WASTE_BIN_ID and not state.tip_dirty:
+            if closed_mid and loc_id == WASTE_BIN_ID:
+                branch = "tip_loaded_closed_door_avoidance_waste_bin"
+                steps += [_step("moveXY", **pt, reason="closed_thermal_door_bypass") for pt in closed_mid]
+                if str(state.device_type).upper() == "DBC":
+                    steps.append(_step("moveZ", z=75000))
+                else:
+                    steps += [_step("moveZ", z=145000), _step("moveX", x=self.x_high_limit - 500),
+                              _step("moveSteps", axis="x", delta=-1000), _step("moveZ", z=pseudo)]
+            elif closed_mid:
+                branch = "tip_loaded_closed_door_avoidance"
+                steps += [_step("moveXY", **pt, reason="closed_thermal_door_bypass") for pt in closed_mid]
+                steps.append(_step("moveZ", z=num))
+            elif loc_id == WASTE_BIN_ID and not state.tip_dirty:
                 # Clean tip (picked up, never in liquid or a well): straight to the bin.
                 # Used or unknown tips keep the OEM legs around open plates below.
                 branch = "clean_tip_direct_to_waste"
