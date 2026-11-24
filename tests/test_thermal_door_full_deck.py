@@ -42,13 +42,14 @@ def _pairs(planner):
     return locs, bounds, list(itertools.permutations(outside, 2))
 
 
+@pytest.mark.parametrize("door_open", [False, None])
 @pytest.mark.parametrize("tip_type", [50, 200, None])
-def test_no_leg_enters_closed_door_box_for_long_tips(planner, tip_type):
+def test_no_leg_enters_closed_door_box_for_long_tips(planner, tip_type, door_open):
     locs, bounds, pairs = _pairs(planner)
     crossings = []
     for a, b in pairs:
         plan = planner.plan_script_move_to(current_loc=a, location_id=b, positionflag=0,
-                                           state=_state(a, locs[a], tip_type=tip_type, door_open=False))
+                                           state=_state(a, locs[a], tip_type=tip_type, door_open=door_open))
         for leg in xy_travel_legs(*locs[a], plan["steps"]):
             if _leg_rect_overlaps_box(*leg, **bounds):
                 crossings.append((_loc_name(a), _loc_name(b), plan["branch"], leg))
@@ -59,7 +60,7 @@ def test_no_leg_enters_closed_door_box_for_long_tips(planner, tip_type):
 def test_ten_ul_and_open_door_keep_exact_oem_plans(planner):
     locs, _bounds, pairs = _pairs(planner)
     for a, b in pairs:
-        for tip_type, door in ((10, False), (50, True), (50, None)):
+        for tip_type, door in ((10, False), (10, None), (50, True)):
             plan = planner.plan_script_move_to(current_loc=a, location_id=b, positionflag=0,
                                                state=_state(a, locs[a], tip_type=tip_type, door_open=door))
             assert plan["closed_door_route"] is None

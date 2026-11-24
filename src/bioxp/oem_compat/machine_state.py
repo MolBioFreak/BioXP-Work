@@ -84,8 +84,8 @@ class OemMachineState:
         return bool(dict(self.axis_confirmed).get(self._norm_axis(axis), False))
 
     def needs_closed_door_avoidance(self) -> bool:
-        """True when a non-10 uL tip is loaded and the thermal door is closed."""
-        return bool(self.tip_loaded) and self.tip_type != 10 and self.thermal_door_open is False
+        """True when a non-10 uL tip is loaded and the door is not known open."""
+        return bool(self.tip_loaded) and self.tip_type != 10 and self.thermal_door_open is not True
 
 
 

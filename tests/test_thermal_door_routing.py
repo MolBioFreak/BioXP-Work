@@ -121,9 +121,19 @@ def test_10ul_tip_is_exempt_from_closed_door_avoidance():
     assert plan["branch"] != "tip_loaded_closed_door_avoidance"
 
 
-def test_door_open_or_unknown_or_no_tip_keeps_oem_behavior():
+def test_unknown_door_state_is_avoided_like_closed():
     planner = _planner()
-    for loaded, door in ((False, False), (True, True), (True, None)):
+    state = OemMachineState.from_query(
+        current_location_id="0", current_x=26213, current_y=9241, current_z=500,
+        tip_loaded=True, tip_dirty=True, tip_type=50, thermal_door_open=None,
+        pseudo_z_home=500,
+    )
+    assert state.needs_closed_door_avoidance() is True
+
+
+def test_door_open_or_no_tip_keeps_oem_behavior():
+    planner = _planner()
+    for loaded, door in ((False, False), (True, True)):
         state = OemMachineState.from_query(
             current_location_id="0", current_x=26213, current_y=9241, current_z=500,
             tip_loaded=loaded, tip_dirty=True, tip_type=50, thermal_door_open=door,

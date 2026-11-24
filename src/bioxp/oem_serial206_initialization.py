@@ -2706,6 +2706,11 @@ class Serial206ProductionPrimitiveAdapter:
             context = current_operator_dispatch_context() or {}
             parent = context.get("operator_command_id")
             if not isinstance(parent, str) or not parent:
+                # Park's tip cleanup inside a WP8 finite operation (the door
+                # open/close Park child) runs on the operator-plane worker
+                # without a dispatch context; that operation is the parent.
+                parent = getattr(self, "_wp8_parent_command_id", None)
+            if not isinstance(parent, str) or not parent:
                 raise RuntimeError("lifecycle_pipette_attempt_identity_not_bound")
             child = f"{parent}:{lifecycle_stage_id}"
             attempt = {"command_id": child, "idempotency_key": child}
@@ -3278,6 +3283,16 @@ class Serial206ProductionPrimitiveAdapter:
                 if interruption is not None:
                     return interruption
                 z_home = self.z_move_z_home(timeout_s=float(wait_timeout_s))
+                home_bypass = self._closed_door_bypass_for_xy(
+                    0, 0, tip_loaded=tip_loaded if type(tip_loaded) is bool else None)
+                for point in home_bypass["waypoints"] if z_home.get("ok") is True else []:
+                    leg = self._move_xy_direct(point["x"], point["y"], wait_timeout_s=float(wait_timeout_s),
+                                               source_context="ControlLib.MotionThread")
+                    if not (isinstance(leg, Mapping) and leg.get("ok") is True):
+                        return {"ok": False, "source_return_code": 1, "branch": "all_zero_home",
+                                "target": target, "z_home": _json_safe(z_home), "operations": [leg],
+                                "failure": "closed_door_bypass_leg_failed", "closed_door_bypass": home_bypass,
+                                "source_anchor": "ClassControlInterface.moveTo:4463-4506"}
                 xy_results: dict[str, Any] = {}
                 xy_errors: list[str] = []
 
@@ -3358,6 +3373,22 @@ class Serial206ProductionPrimitiveAdapter:
                 if interruption is not None:
                     return interruption
                 results.append(self.oem_move_z(pseudo, pseudo_home_steps=pseudo, motor_current=31, wait_for_stop=True))
+            door_bypass = self._closed_door_bypass_for_xy(
+                target["x"], target["y"], tip_loaded=bool(tip_loaded), current_xy=(current["x"], current["y"]))
+            for point in door_bypass["waypoints"]:
+                interruption = interrupted("closed_door_bypass")
+                if interruption is not None:
+                    return interruption
+                leg = self._move_xy_direct(point["x"], point["y"], wait_timeout_s=5.0,
+                                           source_context="ControlLib.MotionThread")
+                results.append(leg)
+                if not (isinstance(leg, Mapping) and leg.get("ok") is True):
+                    return {"ok": False, "source_return_code": 1, "branch": "closed_door_bypass",
+                            "target": target, "pseudo_z_home": pseudo, "operations": list(results),
+                            "failure": "closed_door_bypass_leg_failed", "closed_door_bypass": door_bypass,
+                            "source_anchor": "ClassControlInterface.moveTo:4463-4620"}
+            if door_bypass["waypoints"]:
+                current = {axis: self._read_axis_position(axis) for axis in ("x", "y", "z")}
             x_acc = 400 if abs(target["x"] - current["x"]) > 10000 else 350
             y_acc = 750 if abs(target["y"] - current["y"]) > 10000 else 400
 
@@ -3474,6 +3505,7 @@ class Serial206ProductionPrimitiveAdapter:
                 "ok": all(isinstance(row, Mapping) and row.get("ok") is True for row in results),
                 "source_return_code": 0,
                 "branch": branch,
+                **({"closed_door_bypass": door_bypass} if door_bypass.get("checked") else {}),
                 "target": target,
                 "before": current,
                 "pseudo_z_home": pseudo,
@@ -3544,7 +3576,102 @@ class Serial206ProductionPrimitiveAdapter:
             steps=steps, timeout_s=float(wait_timeout_s),
         )
 
+    def thermal_door_open_from_sensors(self) -> bool | None:
+        """Door state from tcDoorOpened/tcDoorClosed; None when unreadable or mid-travel."""
+        reader = getattr(self.tester, "motor_thermal_door_status", None)
+        if not callable(reader):
+            return None
+        try:
+            raw = reader()
+        except Exception:
+            return None
+        if not isinstance(raw, Mapping):
+            return None
+        opened, closed = raw.get("opened"), raw.get("closed")
+        if type(opened) is not bool or type(closed) is not bool:
+            return None
+        if opened and not closed:
+            return True
+        if closed and not opened:
+            return False
+        return None
+
+    def _closed_door_bypass_for_xy(
+        self,
+        x: int,
+        y: int,
+        *,
+        tip_loaded: bool | None = None,
+        current_xy: tuple[int, int] | None = None,
+    ) -> dict[str, Any]:
+        """Chiller-corridor waypoints when a long tip would cross the closed door.
+
+        Only a loaded non-10 uL tip whose XY leg overlaps the cycler box reads
+        the door sensors. Open door: no detour. Closed or unreadable: detour.
+        """
+        loaded = (_transport_tip_loaded(getattr(self, "pipette_transport", None))
+                  if tip_loaded is None else bool(tip_loaded))
+        if not loaded:
+            return {"checked": False, "waypoints": []}
+        tip_type = self._loaded_tip_type()
+        if tip_type == 10:
+            return {"checked": False, "waypoints": []}
+        try:
+            if current_xy is None:
+                current_xy = (self._read_axis_position("x"), self._read_axis_position("y"))
+            route = OemPathPlanner(load_bound_oem_position_table()).get_closed_door_waypoints(
+                current_x=int(current_xy[0]), current_y=int(current_xy[1]),
+                target_x=int(x), target_y=int(y))
+        except Exception as exc:
+            return {"checked": False, "waypoints": [], "unavailable": type(exc).__name__}
+        if not route:
+            return {"checked": True, "crosses": False, "waypoints": []}
+        door_open = self.thermal_door_open_from_sensors()
+        evidence = {"checked": True, "crosses": True, "tip_type": tip_type,
+                    "door_open": door_open, "door_source": "sensors"}
+        if door_open is True:
+            return {**evidence, "waypoints": []}
+        return {**evidence, "waypoints": [{"x": int(p["x"]), "y": int(p["y"])} for p in route[:-1]]}
+
     def move_xy(
+        self,
+        x: int,
+        y: int,
+        *,
+        speed: int | None = None,
+        acc: int | None = None,
+        wait_timeout_s: float,
+        source_context: str | None = None,
+    ) -> dict[str, Any]:
+        """moveXY; a long tip goes around the closed thermal door."""
+        bypass = self._closed_door_bypass_for_xy(int(x), int(y))
+        legs: list[dict[str, Any]] = []
+        if bypass["waypoints"]:
+            from .oem_compat.machine_state import PSEUDO_Z_HOME_HIGH
+            if int(self._read_axis_position("z")) > PSEUDO_Z_HOME_HIGH:
+                raised = self.oem_move_z(PSEUDO_Z_HOME_HIGH, pseudo_home_steps=PSEUDO_Z_HOME_HIGH,
+                                         motor_current=31, wait_for_stop=True)
+                if not (isinstance(raised, Mapping) and raised.get("ok") is True):
+                    return {"ok": False, "failure": "closed_door_bypass_z_raise_failed",
+                            "requested": {"x": int(x), "y": int(y)}, "closed_door_bypass": bypass,
+                            "z_raise": _json_safe(raised)}
+            for point in bypass["waypoints"]:
+                leg = self._move_xy_direct(point["x"], point["y"], speed=speed, acc=acc,
+                                           wait_timeout_s=wait_timeout_s,
+                                           source_context="ControlLib.MotionThread")
+                legs.append({**point, "ok": isinstance(leg, Mapping) and leg.get("ok") is True})
+                if not legs[-1]["ok"]:
+                    failed = dict(leg) if isinstance(leg, Mapping) else {}
+                    return {**failed, "ok": False,
+                            "failure": failed.get("failure") or "closed_door_bypass_leg_failed",
+                            "closed_door_bypass": {**bypass, "legs": legs}}
+        result = self._move_xy_direct(int(x), int(y), speed=speed, acc=acc,
+                                      wait_timeout_s=wait_timeout_s, source_context=source_context)
+        if bypass.get("checked") and isinstance(result, Mapping):
+            result = {**dict(result), "closed_door_bypass": {**bypass, **({"legs": legs} if legs else {})}}
+        return result
+
+    def _move_xy_direct(
         self,
         x: int,
         y: int,
@@ -8171,9 +8298,8 @@ class Serial206OemInitializationProvider:
                 semantic = self._canonical_deck_semantic_state(require_latch_observation=False)
                 machine_status = dict(self._load_state().get("machine_status") or {})
                 tip_loaded_now = bool(semantic.get("tip_loaded"))
-                door_open_now = machine_status.get("thermal_door_open")
-                tip_type_now = self.primitives._loaded_tip_type() if hasattr(self.primitives, "_loaded_tip_type") else None
-                if tip_loaded_now and tip_type_now != 10 and door_open_now is False:
+                routing = self._routing_tip_and_door({**machine_status, "tip_loaded": tip_loaded_now})
+                if tip_loaded_now and routing["tip_type"] != 10 and routing["thermal_door_open"] is not True:
                     from .oem_compat.pathing import OemPathPlanner
                     closed_door_planner = OemPathPlanner(load_bound_oem_position_table())
                     cur_xy = (int(self.primitives._read_axis_position("x")), int(self.primitives._read_axis_position("y")))
@@ -8229,6 +8355,8 @@ class Serial206OemInitializationProvider:
                          "controller_command_acknowledged": primitive.get("controller_command_acknowledged") is True,
                          "controller_terminal_state_verified": primitive.get("controller_terminal_state_verified") is True,
                          "source_noop": primitive.get("source_noop") is True,
+                         **({"closed_door_bypass": primitive["closed_door_bypass"]}
+                            if isinstance(primitive.get("closed_door_bypass"), Mapping) else {}),
                          **({"closed_door_bypass_waypoints": bypass_waypoints} if bypass_waypoints else {})}
                 children.append(child)
                 if not child["ok"]:
@@ -11972,8 +12100,13 @@ class Serial206OemInitializationProvider:
             # Its Park child performs its own scoped custody/collection reads.
             with self._lock:
                 machine = dict(self._load_state().get("machine_status") or {})
+            door = machine.get("thermal_door_open")
+            if type(door) is not bool:
+                reader = getattr(self.primitives, "thermal_door_open_from_sensors", None)
+                sensed = reader() if callable(reader) else None
+                door = sensed if type(sensed) is bool else None
             return {
-                "door_is_open": machine.get("thermal_door_open"),
+                "door_is_open": door,
                 "board_test_mode": bool(machine.get("BoardTestMode", machine.get("board_test_mode", False))),
             }
         state = dict(self.mov_execution_machine_state())
@@ -12065,6 +12198,19 @@ class Serial206OemInitializationProvider:
         return (bool(state.get("tip_dirty")) or getattr(transport, "_tip_contacted", False) is True
                 or getattr(transport, "_tip_type", None) not in KNOWN_TIP_TYPES)
 
+    def _routing_tip_and_door(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        """Tip type and door state for routing; a long tip reads the door sensors."""
+        loaded = bool(state.get("tip_loaded"))
+        tip_type = (self.primitives._loaded_tip_type()
+                    if loaded and hasattr(self.primitives, "_loaded_tip_type") else None)
+        stored = state.get("thermal_door_open")
+        door = stored if type(stored) is bool else None
+        reader = getattr(self.primitives, "thermal_door_open_from_sensors", None)
+        if loaded and tip_type != 10 and callable(reader):
+            sensed = reader()
+            door = sensed if type(sensed) is bool else None
+        return {"tip_type": tip_type, "thermal_door_open": door}
+
     def preview_scriptmove_to(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         destination, column, well, row, position_flag, run_parallel, _expected, _source = self._scriptmove_argument_names(arguments)
         state = self.mov_execution_machine_state()
@@ -12078,8 +12224,7 @@ class Serial206OemInitializationProvider:
             location19_y=int(load_bound_oem_position_table().resolve(
                 location_id="LOC_RC_COVER").base_coordinates["y"]),
             gripper_confirmed=self._deck_gripper_confirmed(),
-            tip_type=self.primitives._loaded_tip_type() if bool(state["tip_loaded"]) and hasattr(self.primitives, "_loaded_tip_type") else None,
-            thermal_door_open=state.get("thermal_door_open"),
+            **self._routing_tip_and_door(state),
         )
 
     def scriptmoveTo(self, **arguments: Any) -> dict[str, Any]:
@@ -12095,8 +12240,7 @@ class Serial206OemInitializationProvider:
             location19_y=int(load_bound_oem_position_table().resolve(
                 location_id="LOC_RC_COVER").base_coordinates["y"]),
             gripper_confirmed=self._deck_gripper_confirmed(),
-            tip_type=self.primitives._loaded_tip_type() if bool(state["tip_loaded"]) and hasattr(self.primitives, "_loaded_tip_type") else None,
-            thermal_door_open=state.get("thermal_door_open"),
+            **self._routing_tip_and_door(state),
             expected_plan_digest=None if expected_digest is None else str(expected_digest),
             source_plan=source_plan if isinstance(source_plan, Mapping) else None,
         )
@@ -12343,6 +12487,15 @@ class Serial206OemInitializationProvider:
 
     def wp8_park_gantry(self, operation: str, arguments: Mapping[str, Any], **context: Any) -> Any:
         del operation
+        parent = context.get("command_id")
+        previous = getattr(self.primitives, "_wp8_parent_command_id", None)
+        self.primitives._wp8_parent_command_id = parent if isinstance(parent, str) and parent else previous
+        try:
+            return self._wp8_park_gantry_body(arguments, **context)
+        finally:
+            self.primitives._wp8_parent_command_id = previous
+
+    def _wp8_park_gantry_body(self, arguments: Mapping[str, Any], **context: Any) -> Any:
         rehome = bool(arguments.get("rehome", False))
         checker = None
         if rehome:
