@@ -1455,9 +1455,11 @@ class BioXpTester:
                 attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
         if board == self.BOARD_CHILLER and motor == 0 and self._tmcl_success(ack) and ack.get("value") is not None:
             # The OC service reads channel 1, not the OC block (channel 3).
-            block_err = self._oem_chiller_block_sample(0, int(ack["value"]) / 1000.0)
+            # Identity check and the in-memory chiller sample share the fan
+            # lock, so a tick retired by reconnect cannot publish stale state.
             with self._fan_state_lock():
                 if tick_guard is None or self._oem_fan_is_active_locked(*tick_guard):
+                    block_err = self._oem_chiller_block_sample(0, int(ack["value"]) / 1000.0)
                     service = self._oem_thermal_fan(board, 0)
                     service["block_read_error"] = block_err
         return (float(ack.get("value", int(round(float(fallback) * 1000.0)))) / 1000.0) if self._tmcl_success(ack) else float(fallback)

@@ -1263,6 +1263,7 @@ async def lifespan(app: FastAPI):
         # waiter, but it cannot publish an owner after this shutdown completes.
         failed_owner = None
         audit_buffers = ()
+        preserve_worker_dependencies = False
         try:
             async with _tester_lock:
                 async with _tester_transition_lock:
@@ -1270,12 +1271,9 @@ async def lifespan(app: FastAPI):
                         await _stop_owned_camera_session(reason="lifespan shutdown")
                     except Exception as exc:
                         shutdown_errors.append(f"camera shutdown: {exc}")
-                    history_reader = getattr(app.state, "operator_history_reader", None)
-                    if history_reader is not None:
-                        try:
-                            history_reader.close()
-                        except Exception as exc:
-                            shutdown_errors.append(f"operator history reader shutdown: {exc}")
+                    # Stop command workers before closing anything they use. If a
+                    # worker is still active, refuse here and leave the history
+                    # reader, operator resources, calibration store and USB open.
                     command_plane = getattr(app.state, "operator_command_plane", None)
                     command_plane_failure: Exception | None = None
                     if command_plane is not None:
@@ -1284,12 +1282,8 @@ async def lifespan(app: FastAPI):
                         except Exception as exc:
                             command_plane_failure = exc
                             shutdown_errors.append(f"operator command plane shutdown: {exc}")
-                    if operator_lifecycle is not None:
-                        try:
-                            operator_lifecycle.close()
-                        except Exception as exc:
-                            shutdown_errors.append(f"operator control plane close: {exc}")
                     if command_plane_failure is not None:
+                        preserve_worker_dependencies = True
                         _receiver_audit_shutdown = {"state": "skipped", "reason": "command_workers_active",
                                                     "durable_ownership_claimed": False}
                         app.state.receiver_audit_shutdown = _receiver_audit_shutdown
@@ -1298,6 +1292,17 @@ async def lifespan(app: FastAPI):
                             f"command workers remain active: {command_plane_failure}"
                         )
                         raise RuntimeError(_startup_error) from command_plane_failure
+                    history_reader = getattr(app.state, "operator_history_reader", None)
+                    if history_reader is not None:
+                        try:
+                            history_reader.close()
+                        except Exception as exc:
+                            shutdown_errors.append(f"operator history reader shutdown: {exc}")
+                    if operator_lifecycle is not None:
+                        try:
+                            operator_lifecycle.close()
+                        except Exception as exc:
+                            shutdown_errors.append(f"operator control plane close: {exc}")
                     cleanup_errors = list(shutdown_errors)
                     close_camera = getattr(_camera_provider, "close", None)
                     if callable(close_camera):
@@ -1350,7 +1355,7 @@ async def lifespan(app: FastAPI):
                         if cleanup_errors:
                             _startup_error = "BioXP lifespan shutdown completed with warnings: " + "; ".join(cleanup_errors)
         finally:
-            if calibration_runtime_store is not None:
+            if calibration_runtime_store is not None and not preserve_worker_dependencies:
                 try:
                     await asyncio.to_thread(calibration_runtime_store.close)
                 except Exception as exc:
@@ -5489,6 +5494,10 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
         "lease_acquired": False, "lease_released": False,
         "delivery_attempted": False, "delivery_finished": False,
         "delivery_succeeded": False, "delivery_result": None,
+        # True only when a Stop frame was observed on the wire and the
+        # delivery step did not report failure. A no-op or a failure before
+        # the first write is never reported as delivered.
+        "delivered": False,
     }
     admitted: asyncio.Future = loop.create_future()
 
@@ -5502,7 +5511,7 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
                 if isinstance(delivery_result, Mapping)
                 else {"ok": True, "axis_delivery_lease_released": True}
             ),
-            "delivered": True,
+            "delivered": bool(state["delivered"]),
             "delivery_completed": True,
             "reconciliation_pending": True,
             "reconciliation_required": True,
@@ -5593,7 +5602,28 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
             state["delivery_succeeded"] = True
             if callable(value):
                 state["delivery_result"] = getattr(value, "delivery_result", None)
-            _journal_interrupt_phase("delivered", surface=surface_key)
+            outcome = state["delivery_result"] if callable(value) else value
+            delivery_ok = not (isinstance(outcome, Mapping) and outcome.get("ok") is False)
+            wire = progress.snapshot()
+            wire_write_observed = bool(wire["wire_write_observed"])
+            state["delivered"] = bool(wire_write_observed and delivery_ok)
+            if state["delivered"]:
+                _journal_interrupt_phase("delivered", surface=surface_key)
+            elif not delivery_ok:
+                _journal_interrupt_phase(
+                    "failed", surface=surface_key,
+                    reason=("interrupt_delivery_failed_after_wire_write" if wire_write_observed
+                            else "interrupt_delivery_failed_before_wire_write"),
+                    wire_write_observed=wire_write_observed,
+                    controller_ack_observed=bool(wire["controller_ack_observed"]),
+                )
+            else:
+                _journal_interrupt_phase(
+                    "delivery_attempted", surface=surface_key,
+                    reason="interrupt_returned_without_wire_write",
+                    wire_write_observed=False,
+                    controller_ack_observed=bool(wire["controller_ack_observed"]),
+                )
         finally:
             # Delivery boundary: free the connection lease and this surface's
             # lane immediately so no other Stop is queued behind this one.
