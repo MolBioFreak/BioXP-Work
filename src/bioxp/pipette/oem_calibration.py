@@ -221,10 +221,17 @@ def manual_load_tip(request: ManualTipLoadRequest, bindings: CalibrationBindings
                 completed(getattr(exc, "details", {}).get("sends", []))
                 raise
             completed(sends)
-            # Preserve the existing source setters on a normal transport return.
-            for ch in drop:
-                t._transports[ch]._tip_loaded = False
-            return {"ok": True, "channels": drop, "sends": sends}
+            # Released guns no longer carry tips; the kept ones stay tracked.
+            note = getattr(t, "_note_tips_released", None)
+            if callable(note):
+                note(drop)
+            else:
+                for ch in drop:
+                    t._transports[ch]._tip_loaded = False
+            # Re-read so Park/deck state see the head as it is after release.
+            query = getattr(t, "query_tip_status_all", None)
+            after = query() if callable(note) and callable(query) else None
+            return {"ok": True, "channels": drop, "sends": sends, **({"after": after} if after else {})}
         seq.step("releaseUnneededTips", lambda: b.pipette("release_unneeded_tips", release))
         seq.result.update(kept_channels=list(request.keep_channels), release_lift_steps=lift)
     if request.lift_z:
@@ -286,7 +293,7 @@ def aspirate_calibration_air(transport: FourPipetteTransport) -> Result:
     a lost completion observation into a new source exception.
     """
     selected = transport._tip_location_channels()
-    speed_channel = transport._tip_location if transport._tip_location != -1 else 0
+    speed_channel = transport._primary_tip_channel()
     timeout = 5 * int(15 / transport._transports[speed_channel]._top_speed * 1000) + 4000
     result = transport._run_group_liquid_operation(
         "aspirate air", selected,

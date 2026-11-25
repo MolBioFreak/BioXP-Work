@@ -15451,7 +15451,19 @@ class Serial206OemInitializationProvider:
                 discarded_return=True,
             )
             controller_rows.append(moved)
-            record("ejectAllTips(true,true)", eject(), discarded_return=False)
+            try:
+                record("ejectAllTips(true,true)", eject(), discarded_return=False)
+            except Exception as exc:
+                # Only a tip-state outcome is handed to the query below; a Stop
+                # or transport fault still unwinds Park.
+                from .pipette.transport import PipetteTipStateError
+                if not (isinstance(exc, PipetteTipStateError) or (
+                        getattr(exc, "status_code", None) == 409 and "tip_state" in str(exc))):
+                    raise
+                # The tip query below decides: empty head continues to Park,
+                # tips still on pause for manual removal (ControlLib:7084-7090).
+                source_children.append({"operation": "ejectAllTips(true,true)",
+                    "discarded_return": False, "error": f"{type(exc).__name__}: {exc}"[:500]})
             assert callable(query)
             queried = record(
                 "queryTipStatus(-1)",

@@ -1024,6 +1024,9 @@ class FourPipetteTransport:
         # True once the loaded tip touched liquid or went into a well (a used tip).
         self._tip_contacted = False
         self._tip_location = -1
+        # Guns that should hold tips (any subset). None: no tips expected.
+        # Grows when a tip query sees new tips; shrinks only on eject/release.
+        self._expected_tip_channels: list[int] | None = None
         self._allow_to_stop = True
         self._forceabort = forceabort or (lambda: False)
         self._fluid_detection_timestamps: dict[int, float | None] = {channel: None for channel in self.CHANNELS}
@@ -1109,6 +1112,7 @@ class FourPipetteTransport:
             "tip_type_known": self._tip_type in KNOWN_TIP_TYPES,
             "tip_used": bool(getattr(self, "_tip_contacted", False)),
             "tip_location": self._tip_location,
+            "tip_channels": list(self._expected_tip_channels or []),
             "allow_to_stop": self._allow_to_stop,
             "fluid_detection_timestamps": dict(self._fluid_detection_timestamps),
             "last_error": self._last_error,
@@ -2193,7 +2197,29 @@ class FourPipetteTransport:
         return 5 * int(float(volume_ul) / float(speed) * 1000.0) + 4_000
 
     def _tip_location_channels(self) -> list[int]:
-        return list(self.CHANNELS) if self._tip_location == -1 else [self._tip_location]
+        """Guns that carry tips: TipLocation, else the tracked subset, else all four."""
+        if self._tip_location != -1:
+            return [self._tip_location]
+        expected = getattr(self, "_expected_tip_channels", None)
+        return sorted(expected) if expected else list(self.CHANNELS)
+
+    def _primary_tip_channel(self) -> int:
+        return self._tip_location_channels()[0]
+
+    def _note_tips_released(self, channels) -> None:
+        """Host state after tips left these guns (eject or release)."""
+        gone = {int(ch) for ch in channels}
+        for ch in gone:
+            self._transports[ch]._tip_loaded = False
+        remaining = [ch for ch in (getattr(self, "_expected_tip_channels", None) or []) if ch not in gone]
+        self._expected_tip_channels = remaining or None
+        if not any(t._tip_loaded is True for t in self._transports):
+            self._tip_location = -1
+            self._tip_type = UNKNOWN_TIP_TYPE
+            self._tip_contacted = False
+            self._expected_tip_channels = None
+        elif self._tip_location in gone:
+            self._tip_location = -1
 
     def _verify_standard_tip_selection(self, selected: list[int]) -> dict[str, Any]:
         before = self.query_tip_status_all()
@@ -2262,7 +2288,7 @@ class FourPipetteTransport:
         if channels is None:
             selected = self._tip_location_channels()
             before = self._verify_standard_tip_selection(selected)
-            speed_channel = self._tip_location if self._tip_location != -1 else 0
+            speed_channel = self._primary_tip_channel()
             level_channel = speed_channel
         else:
             selected = self._selected_channels(channels)
@@ -2355,7 +2381,7 @@ class FourPipetteTransport:
                     if lost is not None and self._error_callback is not None:
                         self._record_pipette_error(lost, 42)
                         raise PipetteTipStateError("Lost tip", details={"channel": lost})
-                speed_channel = self._tip_location if self._tip_location != -1 else 0
+                speed_channel = self._primary_tip_channel()
                 timeout_ms = self._oem_timeout_ms(
                     volume, self._transports[speed_channel]._top_speed, 4_000,
                 )
@@ -2534,7 +2560,7 @@ class FourPipetteTransport:
                     if lost is not None and self._error_callback is not None:
                         self._record_pipette_error(lost, 42)
                         raise PipetteTipStateError("Lost tip", details={"channel": lost})
-                speed = self._transports[self._tip_location if self._tip_location != -1 else 0]._top_speed
+                speed = self._transports[self._primary_tip_channel()]._top_speed
                 timeout_ms = (self._oem_timeout_ms(volume, speed, 4_000) if aspirating
                               else self._oem_standard_dispense_timeout_ms(volume, speed))
                 if aspirating:
@@ -2630,7 +2656,7 @@ class FourPipetteTransport:
         vigor = int(vigorous)
         if vigor < 0 or vigor > 100:
             raise ValueError("vigorous must be between 0 and 100")
-        selected = self._selected_channels()
+        selected = self._tip_location_channels()
         self._require_known_tip_type("mix", selected)
         self._tip_contacted = True
         effective_volume = float(self._tip_type)
@@ -2797,11 +2823,11 @@ class FourPipetteTransport:
             before = self.query_tip_status_all()
             loaded = set(before["channels_with_tips"])
             missing = [channel for channel in selected if channel not in loaded]
-            if check_missing_tip and missing:
-                raise PipetteTipStateError(
-                    "OEM ejectAllTips detected a missing tip on a selected channel.",
-                    details={"selected_channels": selected, "missing_channels": missing, "before": before},
-                )
+            # Empty guns are skipped, never a refusal (OEM ejectAllTips also
+            # ejects the loaded ones first). A gun that was expected to hold a
+            # tip but is empty is reported as a lost tip, as evidence only.
+            expected = set(self._expected_tip_channels or ())
+            lost = [channel for channel in missing if channel in expected]
 
             targeted = (selected if oem_verify_all and self._tip_location != -1 and loaded
                         else [channel for channel in selected if channel in loaded])
@@ -2840,13 +2866,15 @@ class FourPipetteTransport:
                         "retry_performed": retried,
                     },
                 )
-            self._tip_location = -1
-            self._tip_type = UNKNOWN_TIP_TYPE
-            self._tip_contacted = False
+            self._note_tips_released(
+                [ch for ch in selected if ch not in set(after["channels_with_tips"])])
             return {
                 "ok": True,
                 "outcome": "verified_empty_after_retry" if retried else "verified_empty",
                 "channels_targeted": selected,
+                "channels_ejected": sorted(set(targeted)),
+                "missing_channels": missing,
+                "lost_tip_channels": lost if check_missing_tip else [],
                 "before": before,
                 "sends": sends,
                 "after": after,
@@ -2884,6 +2912,7 @@ class FourPipetteTransport:
                     details={"keep": keep, "after": after, "ejection": result},
                 )
             self._tip_location = keep
+            self._expected_tip_channels = [keep]
             return {"ok": True, "outcome": "kept_one_tip", "tip": keep, "ejection": result, "after": after, "physical_effect_verified": False}
 
     def verifyEjectTip(self, tip: int = -1) -> dict[str, Any]:  # noqa: N802
@@ -2969,6 +2998,9 @@ class FourPipetteTransport:
                         **source_result},
                 )
             loaded_channels = [row["channel"] for row in channels if row["tip_loaded"]]
+            if loaded_channels:
+                self._expected_tip_channels = sorted(
+                    set(self._expected_tip_channels or ()) | set(loaded_channels))
             return {
                 **source_result,
                 "ok": True,
@@ -3073,7 +3105,7 @@ class FourPipetteTransport:
         if command.speed is None:
             selected = self._tip_location_channels()
             before = self._verify_standard_tip_selection(selected)
-            speed_channel = self._tip_location if self._tip_location != -1 else 0
+            speed_channel = self._primary_tip_channel()
             speed = float(self._transports[speed_channel]._top_speed)
         else:
             selected, speed_phase = self._prepare_explicit_speed_overload(
@@ -3109,7 +3141,7 @@ class FourPipetteTransport:
         if command.speed is None:
             selected = self._tip_location_channels()
             before = self._verify_standard_tip_selection(selected)
-            speed_channel = self._tip_location if self._tip_location != -1 else 0
+            speed_channel = self._primary_tip_channel()
             speed = float(self._transports[speed_channel]._top_speed)
             timeout_ms = self._oem_standard_dispense_timeout_ms(command.volume_ul, speed)
         else:

@@ -153,3 +153,41 @@ def test_workflow_keeps_tip_cleanup_and_manual_removal_pause(named,monkeypatch,s
         assert (4,4,0,1,80000) in frames
         assert (5,4,0,0,79000) in frames
     assert calls==["eject","query"]
+
+
+@pytest.mark.parametrize("head_after", ["empty", "tip_still_on"])
+def test_park_continues_past_a_tip_state_eject_error(named, monkeypatch, head_after):
+    """Stale TipExist or a missing gun must never fail Park by itself."""
+    from bioxp.oem_deck_movement import DeckExecutionFailure
+    from bioxp.pipette.transport import PipetteTipStateError
+    _, p, s, _, frames, _ = named
+    tips = {"tip_exists": True}
+    p.bind_pipette_collection_state_reader(lambda: dict(tips))
+    def eject():
+        raise PipetteTipStateError("OEM ejectAllTips detected a missing tip on a selected channel.")
+    def query(**kw):
+        tips["tip_exists"] = head_after == "tip_still_on"
+        return {"ok": True}
+    monkeypatch.setattr(p.primitives, "eject_all_tips_for_oem_park", eject)
+    monkeypatch.setattr(p.primitives, "query_all_pipette_tip_states", query)
+    if head_after == "empty":
+        result, _ = workflow(named, monkeypatch, {})
+        assert result["ok"] is True
+        assert s.deck_semantic_state()["current_location"] == "LOC_PARK"
+    else:
+        with pytest.raises(DeckExecutionFailure) as error:
+            workflow(named, monkeypatch, {})
+        assert error.value.provider_results[0]["governance_outcome"] == "manual_tip_removal_required"
+
+
+def test_park_still_stops_on_a_non_tip_eject_fault(named, monkeypatch):
+    _, p, s, _, frames, _ = named
+    p.bind_pipette_collection_state_reader(lambda: {"tip_exists": True})
+    def eject():
+        raise RuntimeError("controller stop")
+    monkeypatch.setattr(p.primitives, "eject_all_tips_for_oem_park", eject)
+    monkeypatch.setattr(p.primitives, "query_all_pipette_tip_states", lambda **kw: {"ok": True})
+    with pytest.raises(Exception):
+        workflow(named, monkeypatch, {})
+    assert s.deck_semantic_state()["current_location"] != "LOC_PARK"
+

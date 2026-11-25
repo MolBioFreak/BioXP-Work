@@ -170,7 +170,11 @@ def run_collection_diagnostic(group, request, record, result=None, *, publish_ti
                     t._eject_tip_channels_once([ch], wait_for_completion=True)})
                 result["ejected_channels"].append(channel)
                 # Retain each completed release even if a later channel fails.
-                group._transports[channel]._tip_loaded = False
+                group._note_tips_released([channel])
+        if result["ejected_channels"]:
+            # verifyEjectTip: re-read the guns so Park and the deck record see
+            # the head as it is now, not the pre-eject query.
+            record("verify_eject_tip_states", lambda t: t.query_tip_status_all())
         if publish_tip_state is not None:
             try:
                 published = publish_tip_state(bool(_cached(group)))
