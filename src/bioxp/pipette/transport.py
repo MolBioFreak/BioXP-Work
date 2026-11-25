@@ -2855,6 +2855,11 @@ class FourPipetteTransport:
                 sends.extend(retry_sends)
                 after = self.query_tip_status_all()
                 remaining = [channel for channel in verify if channel in set(after["channels_with_tips"])]
+            affected = verify if (retried and oem_verify_all) else selected
+            after_loaded = set(after["channels_with_tips"])
+            verified_empty = [ch for ch in affected if ch not in after_loaded]
+            if verified_empty:
+                self._note_tips_released(verified_empty)
             if remaining:
                 raise PipetteTipStateError(
                     "OEM ejectAllTips verification still reports loaded tips after one retry.",
@@ -2866,8 +2871,6 @@ class FourPipetteTransport:
                         "retry_performed": retried,
                     },
                 )
-            self._note_tips_released(
-                [ch for ch in selected if ch not in set(after["channels_with_tips"])])
             return {
                 "ok": True,
                 "outcome": "verified_empty_after_retry" if retried else "verified_empty",
@@ -2914,6 +2917,47 @@ class FourPipetteTransport:
             self._tip_location = keep
             self._expected_tip_channels = [keep]
             return {"ok": True, "outcome": "kept_one_tip", "tip": keep, "ejection": result, "after": after, "physical_effect_verified": False}
+
+    def reconcile_intentional_tip_removal(
+        self,
+        channels: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """Reconcile host tip state after operator-completed manual tip removal.
+
+        Queries hardware readback first; invalid or failed readback raises
+        PipetteCommandError without clearing any tracked tip expectations.
+        Only requested channels positively confirmed empty by valid hardware
+        readback are cleared from host state.
+        """
+        selected = self._selected_channels(channels)
+        with self._transaction_lock:
+            prior_tip_loaded = [transport._tip_loaded for transport in self._transports]
+            try:
+                after = self.query_tip_status_all()
+            except Exception:
+                for transport, prior in zip(self._transports, prior_tip_loaded):
+                    transport._tip_loaded = prior
+                raise
+            loaded = set(after["channels_with_tips"])
+            reconciled_empty = [ch for ch in selected if ch not in loaded]
+            still_loaded = [ch for ch in selected if ch in loaded]
+            if reconciled_empty:
+                self._note_tips_released(reconciled_empty)
+            return {
+                "ok": True,
+                "channels_requested": selected,
+                "reconciled_empty_channels": reconciled_empty,
+                "still_loaded_channels": still_loaded,
+                "channels_with_tips": list(after["channels_with_tips"]),
+                "expected_tip_channels": (
+                    list(self._expected_tip_channels)
+                    if self._expected_tip_channels is not None
+                    else []
+                ),
+                "after": after,
+                "hardware_query_verified": True,
+                "physical_effect_verified": False,
+            }
 
     def verifyEjectTip(self, tip: int = -1) -> dict[str, Any]:  # noqa: N802
         before = self.query_tip_status_all()
@@ -3064,6 +3108,16 @@ class FourPipetteTransport:
                     post_attempt_readback = self.query_tip_status_all()
                 except PipetteCommandError as exc:
                     post_attempt_error = exc.to_payload()
+                if (
+                    isinstance(post_attempt_readback, Mapping)
+                    and post_attempt_readback.get("ok") is True
+                    and post_attempt_readback.get("hardware_query_verified") is True
+                ):
+                    attempted_channels = [int(row["channel"]) for row in sends] + [int(channel)]
+                    readback_loaded = set(post_attempt_readback.get("channels_with_tips") or ())
+                    verified_empty = [ch for ch in attempted_channels if ch not in readback_loaded]
+                    if verified_empty:
+                        self._note_tips_released(verified_empty)
                 raise PipetteCommandError(
                     "Pipette eject did not receive an exact immediate acknowledgement.",
                     details={
@@ -3077,6 +3131,10 @@ class FourPipetteTransport:
                 )
             sends.append({"channel": channel, "result": result})
         after = self.query_tip_status_all()
+        after_loaded = set(after["channels_with_tips"])
+        verified_empty = [ch for ch in expected if ch not in after_loaded]
+        if verified_empty:
+            self._note_tips_released(verified_empty)
         if after["tip_count"] != 0:
             raise PipetteCommandError(
                 "Post-eject hardware readback still reports loaded tips.",

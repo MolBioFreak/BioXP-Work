@@ -6574,6 +6574,11 @@ class OperatorCommandStore(CommandReceiptReader):
     def start(self, dispatch_one: Callable[[dict[str, Any]], None]) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
+        self._stop.clear()
+        self._priority_fence.clear()
+        for fence in self._axis_priority_fences.values():
+            fence.clear()
+        self._wake.clear()
         deadline = time.monotonic() + 6.0
         while not self._owner_acquired:
             if self._acquire_owner():

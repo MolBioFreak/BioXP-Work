@@ -462,10 +462,11 @@ class PipetteReceiptStore:
                 )
                 if replay.get("retry_forbidden") is True:
                     raise PipetteReceiptError("pipette receipt is in progress or requires reconciliation")
-                row = self.connection.execute(
-                    "SELECT receipt_json FROM pipette_operations WHERE command_id=? AND pipette_operation_id=?",
-                    (claim["command_id"], claim["pipette_operation_id"]),
-                ).fetchone()
+                with self._lock:
+                    row = self.connection.execute(
+                        "SELECT receipt_json FROM pipette_operations WHERE command_id=? AND pipette_operation_id=?",
+                        (claim["command_id"], claim["pipette_operation_id"]),
+                    ).fetchone()
                 receipt = json.loads(row["receipt_json"])
                 if receipt.get("schema") != "bioxp.pipette.receipt.v1":
                     raise PipetteReceiptError("durable pipette replay receipt is unavailable")
@@ -1903,15 +1904,16 @@ class PipetteReceiptStore:
 
     def read(self, limit: int = 50) -> list[dict[str, Any]]:
         selected_limit = max(1, min(int(limit), 200))
-        rows = self.connection.execute(
-            "SELECT receipt_json FROM pipette_operations WHERE receipt_json IS NOT NULL AND receipt_json <> '{}' ORDER BY updated_at DESC LIMIT ?",
-            (selected_limit,),
-        ).fetchall()
-        if rows:
-            return [json.loads(row["receipt_json"]) for row in rows]
-        if self._legacy_path.exists():
-            raise PipetteReceiptError("active pipette JSONL requires JSONL migration")
-        return []
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT receipt_json FROM pipette_operations WHERE receipt_json IS NOT NULL AND receipt_json <> '{}' ORDER BY updated_at DESC LIMIT ?",
+                (selected_limit,),
+            ).fetchall()
+            if rows:
+                return [json.loads(row["receipt_json"]) for row in rows]
+            if self._legacy_path.exists():
+                raise PipetteReceiptError("active pipette JSONL requires JSONL migration")
+            return []
 
     def latest(self) -> dict[str, Any] | None:
         rows = self.read(1)

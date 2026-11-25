@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import errno
 import threading
 import time
 import uuid
 from collections import deque
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -66,6 +69,58 @@ class MatchResult:
     outcome: str | None = None
 
 
+class NovoTransactionProgress:
+    """Thread-safe per-attempt wire-write and controller-ack progress tracker."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._wire_write_started = False
+        self._wire_write_observed = False
+        self._wire_write_count = 0
+        self._controller_ack_observed = False
+        self._controller_ack_count = 0
+
+    def note_wire_write_started(self) -> None:
+        with self._lock:
+            self._wire_write_started = True
+
+    def note_wire_write_completed(self) -> None:
+        with self._lock:
+            self._wire_write_started = True
+            self._wire_write_observed = True
+            self._wire_write_count += 1
+
+    def note_controller_ack(self) -> None:
+        with self._lock:
+            self._controller_ack_observed = True
+            self._controller_ack_count += 1
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "wire_write_started": self._wire_write_started,
+                "wire_write_observed": self._wire_write_observed,
+                "wire_write_count": self._wire_write_count,
+                "controller_ack_observed": self._controller_ack_observed,
+                "controller_ack_count": self._controller_ack_count,
+            }
+
+
+_TRANSACTION_PROGRESS_TRACKER: ContextVar[NovoTransactionProgress | None] = ContextVar(
+    "novo_transaction_progress_tracker",
+    default=None,
+)
+
+
+@contextmanager
+def track_novo_transaction_progress(progress: NovoTransactionProgress):
+    token = _TRANSACTION_PROGRESS_TRACKER.set(progress)
+    try:
+        yield progress
+    finally:
+        _TRANSACTION_PROGRESS_TRACKER.reset(token)
+
+
 @dataclass
 class _PendingTransaction:
     transaction_id: str
@@ -73,6 +128,7 @@ class _PendingTransaction:
     matcher: Callable[[NovoFrame], MatchResult]
     registered_at: float
     owner_generation: int
+    progress: NovoTransactionProgress | None = None
     event: threading.Event = field(default_factory=threading.Event)
     frames: list[NovoFrame] = field(default_factory=list)
     skipped: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=64))
@@ -120,6 +176,9 @@ class NovoRouter:
         queue_size: int = 256,
         clock: Callable[[], float] = time.monotonic,
         audit_buffer: Any = None,
+        error_backoff_initial_s: float = 0.01,
+        error_backoff_max_s: float = 0.25,
+        stop_wait: Callable[[float], bool] | None = None,
     ) -> None:
         if ep_in is None or ep_out is None:
             raise NovoRouterError("Novo router requires connected IN and OUT endpoints")
@@ -131,6 +190,9 @@ class NovoRouter:
         self.read_size = int(read_size)
         self.read_timeout_ms = int(read_timeout_ms)
         self._clock = clock
+        self._error_backoff_initial_s = max(0.0, float(error_backoff_initial_s))
+        self._error_backoff_max_s = max(self._error_backoff_initial_s, float(error_backoff_max_s))
+        self._stop_wait_override = stop_wait
         self.transaction_lock = threading.Lock()
         self._pending_lock = threading.Lock()
         self._pending: _PendingTransaction | None = None
@@ -350,7 +412,22 @@ class NovoRouter:
             classification = "unknown"
         return NovoFrame(arbitration_id, dlc, data, raw, received_at, classification)
 
+    @staticmethod
+    def _classify_reader_error(exc: Exception) -> tuple[str, bool]:
+        err_no = getattr(exc, "errno", None)
+        backend_code = getattr(exc, "backend_error_code", None)
+        if err_no == errno.ENODEV or backend_code == -4:
+            return "device_disconnected", True
+        return "io_error", False
+
+    def _wait_error_backoff(self, delay_s: float) -> bool:
+        if delay_s <= 0.0:
+            return self._stop.is_set()
+        wait_fn = self._stop_wait_override if self._stop_wait_override is not None else self._stop.wait
+        return bool(wait_fn(delay_s)) or self._stop.is_set()
+
     def _receive_loop(self) -> None:
+        consecutive_errors = 0
         while not self._stop.is_set():
             try:
                 raw = bytes(self.ep_in.read(self.read_size, timeout=self.read_timeout_ms))
@@ -359,9 +436,34 @@ class NovoRouter:
                     break
                 if exc.__class__.__name__ == "USBTimeoutError" or isinstance(exc, TimeoutError):
                     continue
-                self._diagnostics.append({"classification": "reader_error", "error": repr(exc), "at": self._clock()})
-                self._audit("reader_error", {"error": repr(exc)[:512], "at": self._clock()})
+                consecutive_errors += 1
+                error_kind, device_lost = self._classify_reader_error(exc)
+                delay_s = min(
+                    self._error_backoff_max_s,
+                    self._error_backoff_initial_s * (2 ** min(consecutive_errors - 1, 20)),
+                )
+                now = self._clock()
+                self._diagnostics.append({
+                    "classification": "reader_error",
+                    "error": repr(exc),
+                    "error_kind": error_kind,
+                    "device_lost": device_lost,
+                    "consecutive_errors": consecutive_errors,
+                    "backoff_s": delay_s,
+                    "at": now,
+                })
+                self._audit("reader_error", {
+                    "error": repr(exc)[:512],
+                    "error_kind": error_kind,
+                    "device_lost": device_lost,
+                    "consecutive_errors": consecutive_errors,
+                    "backoff_s": delay_s,
+                    "at": now,
+                })
+                if self._wait_error_backoff(delay_s):
+                    break
                 continue
+            consecutive_errors = 0
             received_at = self._clock()
             try:
                 frame = self._decode_record(self._decode(raw), raw, received_at)
@@ -414,6 +516,11 @@ class NovoRouter:
                     if decision.terminal:
                         pending.outcome = decision.outcome or "completion"
                         pending.received_at = frame.received_at
+                        if (
+                            pending.progress is not None
+                            and pending.outcome not in {"malformed", "shutdown", "transport_rebound"}
+                        ):
+                            pending.progress.note_controller_ack()
                         if self._pending is pending:
                             self._pending = None
                         pending.event.set()
@@ -565,6 +672,7 @@ class NovoRouter:
             raise NovoRouterError("Novo multi-frame transaction requires at least one frame")
         if not self.running:
             raise NovoRouterError("Novo router is not running")
+        progress = _TRANSACTION_PROGRESS_TRACKER.get()
         with self.transaction_lock:
             cleared_pipette_replies = self._clear_oem_pipette_receive_queue(provenance)
             transaction_id = uuid.uuid4().hex
@@ -577,6 +685,7 @@ class NovoRouter:
                     matcher,
                     registered_at,
                     self._reader_generation,
+                    progress=progress,
                 )
                 with self._pending_lock:
                     self._pending = pending
@@ -592,7 +701,11 @@ class NovoRouter:
                 # CAN frame.  Keep one transaction/pending owner, but never
                 # concatenate framed USB records into one bulk write.
                 for raw_tx in frames:
+                    if progress is not None:
+                        progress.note_wire_write_started()
                     self.ep_out.write(raw_tx, timeout=int(write_timeout_ms))
+                    if progress is not None:
+                        progress.note_wire_write_completed()
                     write_timestamps.append(self._clock())
             except Exception:
                 with self._pending_lock:
@@ -678,6 +791,7 @@ class NovoRouter:
     ) -> dict[str, Any]:
         if not self.running:
             raise NovoRouterError("Novo router is not running")
+        progress = _TRANSACTION_PROGRESS_TRACKER.get()
         with self.transaction_lock:
             cleared_pipette_replies = self._clear_oem_pipette_receive_queue(provenance)
             transaction_id = uuid.uuid4().hex
@@ -690,6 +804,7 @@ class NovoRouter:
                     matcher,
                     registered_at,
                     self._reader_generation,
+                    progress=progress,
                 )
                 with self._pending_lock:
                     self._pending = pending
@@ -742,9 +857,15 @@ class NovoRouter:
                             if not valid_owner:
                                 outcome = "transport_rebound" if self._reader_generation != pending.owner_generation else "shutdown"
                                 break
+                            if progress is not None:
+                                progress.note_wire_write_started()
                             self.ep_out.write(raw_tx, timeout=int(write_timeout_ms))
                     else:
+                        if progress is not None:
+                            progress.note_wire_write_started()
                         self.ep_out.write(raw_tx, timeout=int(write_timeout_ms))
+                    if progress is not None:
+                        progress.note_wire_write_completed()
                     attempt["tx_write_completed_at"] = self._clock()
                 except Exception as exc:
                     with self._pending_lock:
@@ -828,6 +949,9 @@ class NovoRouter:
         if name not in self._queues:
             raise KeyError(name)
         return list(self._queues[name])
+
+    def diagnostics_snapshot(self) -> list[dict[str, Any]]:
+        return list(self._diagnostics)
 
     def queue_clear(self, name: str) -> int:
         if name not in self._queues:

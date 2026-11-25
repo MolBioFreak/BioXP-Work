@@ -1564,14 +1564,20 @@ class OperatorHistoryReader:
         self.path = self.root / "bioxp_runtime.db"
         self.lock = threading.RLock()
         self.connection: sqlite3.Connection | None = None
-        if self.path.is_file():
-            connection = sqlite3.connect(
-                f"{self.path.as_uri()}?mode=ro", uri=True, timeout=2.0,
-                isolation_level=None, check_same_thread=False,
-            )
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA query_only=ON")
-            self.connection = connection
+        self.open()
+
+    def open(self) -> None:
+        with self.lock:
+            if self.connection is not None:
+                return
+            if self.path.is_file():
+                connection = sqlite3.connect(
+                    f"{self.path.as_uri()}?mode=ro", uri=True, timeout=2.0,
+                    isolation_level=None, check_same_thread=False,
+                )
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only=ON")
+                self.connection = connection
 
     def _table_columns(self, table: str) -> set[str] | None:
         if self.connection is None:
@@ -1621,6 +1627,9 @@ class OperatorHistoryReader:
         ).fetchone()
 
     def _command_projection(self, row: sqlite3.Row) -> dict[str, Any]:
+        connection = self.connection
+        if connection is None:
+            raise RuntimeError("operator history reader is closed")
         command_id = str(row["command_id"])
         canonical = self._canonical_command(command_id)
         stored_status = str(canonical["state"]) if canonical is not None else str(row["status"])
@@ -1631,7 +1640,7 @@ class OperatorHistoryReader:
         if transition_columns is not None:
             if not {"transition_sequence", "command_id"}.issubset(transition_columns):
                 raise RuntimeError("unsupported legacy operator history schema: operator_plane_transitions")
-            selected = self.connection.execute(
+            selected = connection.execute(
                 "SELECT MAX(transition_sequence) FROM operator_plane_transitions WHERE command_id=?",
                 (command_id,),
             ).fetchone()
@@ -1672,11 +1681,12 @@ class OperatorHistoryReader:
         }
         if response["requested_inputs"].get("workflow_input_evidence_id") is not None:
             from .operator_command_receipts import CommandReceiptReader
-            native = CommandReceiptReader(self.connection, self.lock).get_command(command_id)
-            response.update(requested_inputs=native["requested_inputs"], terminal_evidence=native["terminal_evidence"])
+            native = CommandReceiptReader(connection, self.lock).get_command(command_id)
+            if native is not None:
+                response.update(requested_inputs=native["requested_inputs"], terminal_evidence=native["terminal_evidence"])
         if self._table_columns("runtime_retired_records") is not None:
             from .runtime_method_retirement_v15 import command_history
-            history = command_history(self.connection, command_id)
+            history = command_history(connection, command_id)
             if history is not None:
                 response["retired_method_history"] = history
                 response["method_id"] = history["original_command"]["method_id"]

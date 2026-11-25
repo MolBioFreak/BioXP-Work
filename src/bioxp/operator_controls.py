@@ -2893,10 +2893,21 @@ class _OperatorStateReader:
         self._lock = threading.Lock()
         self._closed = False
 
+    def reopen(self):
+        with self._lock:
+            if not self._closed:
+                return
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="operator-state")
+            self._pending = None
+            self._closed = False
+
     def close(self):
         with self._lock:
+            if self._closed:
+                return
             self._closed = True
-        self._executor.shutdown(wait=False, cancel_futures=True)
+            executor = self._executor
+        executor.shutdown(wait=False, cancel_futures=True)
 
     async def read(self):
         with self._lock:
@@ -3078,11 +3089,28 @@ class _OperatorPollCache:
             return self.assessment_wire(await fn(*args, **kwargs), requested_base)
         return served
 
+    def reopen(self):
+        with self._lock:
+            if not self._closed:
+                return
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="operator-poll")
+            self._waiting.clear()
+            self._failures.clear()
+            self._cache.clear()
+            self._assessment_bases.clear()
+            self._pending = None
+            self._pending_key = None
+            self._observed_generation = self._generation()
+            self._closed = False
+
     def close(self):
         with self._lock:
+            if self._closed:
+                return
             self._closed = True
+            executor = self._executor
         # Running provider work cannot safely be killed or relinquished.
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        executor.shutdown(wait=False, cancel_futures=True)
 
     def wrap(self, fn):
         @wraps(fn)
@@ -3246,31 +3274,21 @@ def install_operator_control_plane(
 
     poll_cache = _OperatorPollCache(lambda: int(hardware_state.ownership_epoch), readiness_revision)
     app.state.operator_poll_cache = poll_cache
-    from contextlib import AsyncExitStack, asynccontextmanager
-    previous_lifespan = app.router.lifespan_context
+    from contextlib import AsyncExitStack
+    reconciliation_executor_box: list[ThreadPoolExecutor | None] = [
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="operator-reconcile")
+    ]
+    reconciliation_executor_lock = threading.Lock()
+    shutting_down = False
 
-    @asynccontextmanager
-    async def polling_lifespan(application):
-        try:
-            async with previous_lifespan(application) as state:
-                try:
-                    yield state
-                finally:
-                    # Finish retained owners before the underlying lifespan
-                    # releases USB. HTTP disconnect never cancels their work.
-                    pending = [item[2] for item in direct_requests.values()]
-                    if pending:
-                        await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
-        finally:
-            poll_cache.close()
-            admission_state_reader.close()
-            preview_state_reader.close()
-            invoke_state_reader.close()
-            deck_display_reader.close()
-            reconciliation_executor.shutdown(wait=False, cancel_futures=True)
+    def _get_reconciliation_executor() -> ThreadPoolExecutor:
+        with reconciliation_executor_lock:
+            executor = reconciliation_executor_box[0]
+            if executor is None:
+                executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="operator-reconcile")
+                reconciliation_executor_box[0] = executor
+            return executor
 
-    app.router.lifespan_context = polling_lifespan
-    reconciliation_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="operator-reconcile")
     invoke_lock = asyncio.Lock()
     interrupt_lock = asyncio.Lock()
     # RCA F2: delivery admission is bounded where delivery happens -- one lane
@@ -4043,15 +4061,25 @@ def install_operator_control_plane(
             value = source.get(name)
             return value if type(value) is bool else None
 
+        controller_stop_ack = evidence_bool("controller_command_acknowledged")
+        if controller_stop_ack is None:
+            controller_stop_ack = evidence_bool("controller_stop_acknowledged")
         return {
             "source_call_completed": evidence_bool("source_call_completed"),
             "source_return_ok": evidence_bool("source_return_ok"),
             "first_stop_acknowledged": evidence_bool("first_stop_acknowledged"),
             "second_stop_acknowledged": evidence_bool("second_stop_acknowledged"),
-            "controller_stop_acknowledged": evidence_bool("controller_command_acknowledged"),
+            "controller_stop_acknowledged": controller_stop_ack,
             "controller_terminal_state_verified": evidence_bool("controller_terminal_state_verified"),
             "physical_effect_verified": False,
             "persistence_state": "unknown",
+            **({"delivered": evidence_bool("delivered")} if evidence_bool("delivered") is not None else {}),
+            **({"reconciliation_pending": evidence_bool("reconciliation_pending")} if evidence_bool("reconciliation_pending") is not None else {}),
+            **({"physical_delivery_started": evidence_bool("physical_delivery_started")} if evidence_bool("physical_delivery_started") is not None else {}),
+            **({"wire_write_observed": evidence_bool("wire_write_observed")} if evidence_bool("wire_write_observed") is not None else {}),
+            **({"controller_ack_observed": evidence_bool("controller_ack_observed")} if evidence_bool("controller_ack_observed") is not None else {}),
+            **({"connection_lease_held": evidence_bool("connection_lease_held")} if evidence_bool("connection_lease_held") is not None else {}),
+            **({"connection_transition_blocked_until_worker_exit": evidence_bool("connection_transition_blocked_until_worker_exit")} if evidence_bool("connection_transition_blocked_until_worker_exit") is not None else {}),
             "details": {
                 "request": _bounded_json(observation, _MAX_INPUT_BYTES),
                 "response": _bounded_json(response, _MAX_RESPONSE_BYTES),
@@ -4125,6 +4153,8 @@ def install_operator_control_plane(
             "transport_exchanges": [],
             "transport_retention_errors": list(row.get("transport_retention_errors") or []),
             "interrupt_evidence": row.get("interrupt_evidence"),
+            **({"reconciliation_pending": bool(row["reconciliation_pending"])}
+               if "reconciliation_pending" in row else {}),
             "z_move": row.get("z_move"),
             "xy_failure": row.get("xy_failure"),
             **({"plate_operation": dict(row["plate_operation"])}
@@ -4271,6 +4301,10 @@ def install_operator_control_plane(
             if retained[0] != binding:
                 raise HTTPException(409, detail="idempotency_key already bound to different action request")
             return await asyncio.shield(retained[1])
+        if shutting_down:
+            raise HTTPException(503, detail={"error": "operator_control_plane_shutting_down",
+                "message": "Operator control plane is shutting down; no new actions may be admitted.",
+                "physical_motion_commanded": False, "automatic_retry": False})
         if direct_requests or invoke_lock.locked() or command_plane.store.live_command_worker_ids():
             raise HTTPException(409, detail={"error": "operator_action_busy",
                 "message": "A normal action is active; observe its receipt before submitting another.",
@@ -5261,7 +5295,7 @@ def install_operator_control_plane(
                                 controller_delivery=(int(delivered.get("http_status") or 503), delivered.get("body")),
                                 interrupt_attempt_id=interrupt_attempt_id,
                             ))
-                        pending_reconciliation = asyncio.wrap_future(reconciliation_executor.submit(reconcile))
+                        pending_reconciliation = asyncio.wrap_future(_get_reconciliation_executor().submit(reconcile))
                         cancellation_requested = False
                         while True:
                             try:
@@ -5365,6 +5399,55 @@ def install_operator_control_plane(
             receipt["retry_forbidden"] = True
             return receipt
 
+    class _OperatorControlPlaneLifecycle:
+        def __init__(self) -> None:
+            self.direct_requests = direct_requests
+            self._closed = False
+
+        def start(self) -> None:
+            nonlocal shutting_down
+            shutting_down = False
+            self._closed = False
+            poll_cache.reopen()
+            admission_state_reader.reopen()
+            preview_state_reader.reopen()
+            invoke_state_reader.reopen()
+            deck_display_reader.reopen()
+            legacy_command_store.open()
+            with reconciliation_executor_lock:
+                if reconciliation_executor_box[0] is None:
+                    reconciliation_executor_box[0] = ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="operator-reconcile"
+                    )
+            command_plane.start()
+
+        async def drain_direct_requests(self) -> None:
+            nonlocal shutting_down
+            shutting_down = True
+            while True:
+                pending = [item[2] for item in list(direct_requests.values()) if not item[2].done()]
+                if not pending:
+                    break
+                await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
+
+        def close(self) -> None:
+            nonlocal shutting_down
+            shutting_down = True
+            if self._closed:
+                return
+            self._closed = True
+            poll_cache.close()
+            admission_state_reader.close()
+            preview_state_reader.close()
+            invoke_state_reader.close()
+            deck_display_reader.close()
+            with reconciliation_executor_lock:
+                executor = reconciliation_executor_box[0]
+                reconciliation_executor_box[0] = None
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
+
+    app.state.operator_control_plane_lifecycle = _OperatorControlPlaneLifecycle()
     app.state.invoke_operator_action_v2 = invoke_action_v2
     app.include_router(router)
     app.openapi_schema = None

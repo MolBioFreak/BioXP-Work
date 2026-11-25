@@ -8,6 +8,7 @@ import subprocess
 import shutil
 import re
 import signal
+import stat
 import json
 import concurrent.futures
 import threading
@@ -392,6 +393,10 @@ class BioXpTester:
         # different motors, so one owner must retain the endpoints for the complete
         # drain/write/reply transaction and for endpoint replacement.
         self._transport_lock = threading.RLock()
+        self._oem_fan_lock = threading.RLock()
+        self._oem_transport_generation = 0
+        self._oem_fan_token_seq = 0
+        self._oem_fan_active_keys = []
         self.dev = None
         self.ep_out = None
         self.ep_in = None
@@ -455,6 +460,9 @@ class BioXpTester:
             ) from exc
 
 
+    class _StaleFanTickError(Exception):
+        """Internal signal that a fan tick belongs to a retired connection."""
+
     def _transport_guard(self):
         """Return the per-device reentrant endpoint-ownership lock.
 
@@ -465,6 +473,19 @@ class BioXpTester:
         if lock is None:
             lock = threading.RLock()
             self._transport_lock = lock
+        return lock
+
+    def _fan_state_lock(self):
+        """Dedicated lock for fan service state, timers, and snapshots.
+
+        Lock order invariant: always acquire ``_transport_guard()`` before
+        ``_fan_state_lock()`` whenever both are needed; never hold
+        ``_fan_state_lock()`` across USB/TMCL I/O.
+        """
+        lock = getattr(self, "_oem_fan_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._oem_fan_lock = lock
         return lock
 
     @classmethod
@@ -547,6 +568,10 @@ class BioXpTester:
 
     def _disconnect(self, dev=None, *, hard_reset=False, return_device=False):
         with self._transport_guard():
+            # Retire host fan timers before releasing USB without sending any
+            # cooling-off command or joining an in-flight tick under this lock.
+            self._oem_transport_generation = int(getattr(self, "_oem_transport_generation", 0)) + 1
+            fan_retire = self._oem_retire_fan_services(remember_active=True)
             router = getattr(self, "novo_router", None)
             if dev is None:
                 dev = self.dev
@@ -559,6 +584,7 @@ class BioXpTester:
                 "release_interface_ok": None,
                 "dispose_resources_ok": None,
                 "hard_reset_ok": None,
+                "fan_services_retired": fan_retire,
             }
             if router is not None:
                 try:
@@ -658,7 +684,12 @@ class BioXpTester:
                 self._connect()
                 recovery_dev = self.dev
                 self._reset_transport_recovery_state()
-                attempt.update({"ok": True, "connected_device": self._device_label(self.dev)})
+                rearmed_fans = self._oem_rearm_fan_services()
+                attempt.update({
+                    "ok": True,
+                    "connected_device": self._device_label(self.dev),
+                    "fan_services_rearmed": rearmed_fans,
+                })
                 provenance = self._build_reset_provenance(
                     subsystem="usb_runtime",
                     source="BioXpTester.reconnect",
@@ -996,33 +1027,23 @@ class BioXpTester:
         }
 
 
-    def collect_bus_events(self, duration_s=0.50, timeout_ms=20, max_events=96):
-        """Capture asynchronous TMCL frames without competing for endpoint ownership."""
-        with self._transport_guard():
-            return self._collect_bus_events_locked(
-                duration_s=duration_s,
-                timeout_ms=timeout_ms,
-                max_events=max_events,
-            )
-
-    def _collect_bus_events_locked(self, duration_s=0.50, timeout_ms=20, max_events=96):
-        """Actively retain and decode asynchronous TMCL frames for one window."""
-        router = getattr(self, "novo_router", None)
-        if router is None:
-            return []
-        deadline = time.monotonic() + max(0.0, float(duration_s))
-        sleep_s = max(0.001, min(0.02, float(timeout_ms) / 1000.0))
-        while time.monotonic() < deadline:
-            time.sleep(min(sleep_s, max(0.0, deadline - time.monotonic())))
+    def _decode_bus_event_snapshot(self, router, *, max_events=96, expected_reader_generation=None):
         frames = router.queue_snapshot("valid_async") + router.queue_snapshot("unknown_async")
         decoded = []
         for frame in frames[-int(max_events):]:
             provenance = frame.provenance() if hasattr(frame, "provenance") else dict(frame)
+            frame_gen = provenance.get("owner_generation")
+            if (
+                expected_reader_generation is not None
+                and frame_gen is not None
+                and frame_gen != expected_reader_generation
+            ):
+                continue
             event = self._decode_bus_event_frame(provenance.get("raw") or [], source="novo_router_async")
             if event is not None:
                 event["event_sequence"] = provenance.get("receive_sequence")
                 event["receive_owner"] = provenance.get("receive_owner")
-                event["owner_generation"] = provenance.get("owner_generation")
+                event["owner_generation"] = frame_gen
                 event["command_correlation"] = "unavailable_on_wire"
                 disposition = getattr(router, "motor_event_disposition", None)
                 if callable(disposition):
@@ -1033,6 +1054,53 @@ class BioXpTester:
             else:
                 decoded.append({**provenance, "status": None, "source": "novo_router_async_unclassified"})
         return decoded
+
+    def collect_bus_events(self, duration_s=0.50, timeout_ms=20, max_events=96):
+        """Capture asynchronous TMCL frames without holding endpoint ownership across passive waits."""
+        with self._transport_guard():
+            router = getattr(self, "novo_router", None)
+            if router is None:
+                return []
+            start_transport_gen = int(getattr(self, "_oem_transport_generation", 0))
+            start_reader_gen = getattr(router, "reader_generation", None)
+        deadline = time.monotonic() + max(0.0, float(duration_s))
+        sleep_s = max(0.001, min(0.02, float(timeout_ms) / 1000.0))
+        while time.monotonic() < deadline:
+            if (
+                getattr(self, "novo_router", None) is not router
+                or int(getattr(self, "_oem_transport_generation", 0)) != start_transport_gen
+            ):
+                return []
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            time.sleep(min(sleep_s, remaining))
+        with self._transport_guard():
+            current_router = getattr(self, "novo_router", None)
+            current_transport_gen = int(getattr(self, "_oem_transport_generation", 0))
+            current_reader_gen = getattr(current_router, "reader_generation", None) if current_router is not None else None
+            if (
+                current_router is not router
+                or current_transport_gen != start_transport_gen
+                or current_reader_gen != start_reader_gen
+            ):
+                return []
+            return self._decode_bus_event_snapshot(
+                router,
+                max_events=max_events,
+                expected_reader_generation=start_reader_gen,
+            )
+
+    def _collect_bus_events_locked(self, duration_s=0.50, timeout_ms=20, max_events=96):
+        """Decode already-captured asynchronous TMCL frames under the current transport guard."""
+        router = getattr(self, "novo_router", None)
+        if router is None:
+            return []
+        return self._decode_bus_event_snapshot(
+            router,
+            max_events=max_events,
+            expected_reader_generation=getattr(router, "reader_generation", None),
+        )
 
     def send_tmcl_retry(self, board_id, command, cmd_type, motor, value, attempts=3, **kwargs):
         for _ in range(max(1, attempts)):
@@ -1216,6 +1284,99 @@ class BioXpTester:
         profile = self._motion_oem_axis_profile(str(axis).strip().lower(), startup=True)
         return bool(isinstance(profile, Mapping) and self._oem_board_present(int(profile["board"])) and self._oem_board_state().get(int(profile["board"]), False))
 
+    def _oem_fan_default_state(self):
+        return {
+            "pedestal_samples": [0.0] * 5,
+            "target_c": 30.0,
+            "current_c": 30.0,
+            "tc_on": False,
+            "going_down": False,
+            "accelerate": False,
+            "error": False,
+            "running": False,
+            "ticking": False,
+            "interval_s": 5.0,
+            "lid_target_c": -99.0,
+            "generation": None,
+            "token": None,
+            "timer": None,
+        }
+
+    def _oem_fan_generation(self):
+        return int(getattr(self, "_oem_transport_generation", 0))
+
+    def _oem_fan_is_active_locked(self, key, expected_generation, expected_token):
+        if self._oem_fan_generation() != expected_generation or getattr(self, "dev", None) is None:
+            return False
+        service = self._oem_fan_services().get(key)
+        return (
+            isinstance(service, dict)
+            and service.get("running") is True
+            and service.get("generation") == expected_generation
+            and service.get("token") == expected_token
+        )
+
+    def _oem_fan_assert_active(self, tick_guard):
+        if tick_guard is None:
+            return
+        key, expected_generation, expected_token = tick_guard
+        with self._fan_state_lock():
+            if not self._oem_fan_is_active_locked(key, expected_generation, expected_token):
+                raise self._StaleFanTickError("fan service retired or replaced")
+
+    def _oem_retire_fan_services(self, *, remember_active=True):
+        """Cancel host fan timers on disconnect without sending hardware cooling-off commands."""
+        retired_keys = []
+        timers_to_cancel = []
+        with self._fan_state_lock():
+            services = self._oem_fan_services()
+            active_now = []
+            for key, service in list(services.items()):
+                if not isinstance(service, dict):
+                    continue
+                was_running = bool(service.get("running"))
+                if was_running:
+                    active_now.append(key)
+                    retired_keys.append(key)
+                timer = service.get("timer")
+                if timer is not None:
+                    timers_to_cancel.append(timer)
+                service["timer"] = None
+                service["running"] = False
+                service["ticking"] = False
+                service["generation"] = None
+                service["token"] = None
+            if remember_active and active_now:
+                self._oem_fan_active_keys = list(active_now)
+            remembered = list(getattr(self, "_oem_fan_active_keys", []))
+        for timer in timers_to_cancel:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        return {
+            "retired_keys": [list(k) for k in retired_keys],
+            "remembered_keys": [list(k) for k in remembered],
+            "generation": self._oem_fan_generation(),
+        }
+
+    def _oem_rearm_fan_services(self):
+        """Re-arm previously active fan services on the replacement USB connection."""
+        with self._fan_state_lock():
+            keys = list(getattr(self, "_oem_fan_active_keys", []))
+        rearmed = []
+        for board, axis in keys:
+            try:
+                rearmed.append(self._oem_fan_service_start(board, axis))
+            except Exception as exc:
+                rearmed.append({
+                    "board": int(board),
+                    "axis": int(axis),
+                    "started": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+        return rearmed
+
     def _oem_start_fan_service(self, board_id):
         """Literal Class{Thermal,Chiller}Board.startFanService dispatch."""
         bid = int(board_id)
@@ -1235,6 +1396,18 @@ class BioXpTester:
         bid = int(board_id)
         if bid not in (self.BOARD_THERMAL, self.BOARD_CHILLER):
             return {"board": bid, "service": "base_noop"}
+        axes = (0,) if bid == self.BOARD_THERMAL else (0, 1)
+        with self._fan_state_lock():
+            gen = self._oem_fan_generation()
+            services = self._oem_fan_services()
+            already_running = all(
+                isinstance(services.get((bid, ax)), dict)
+                and services[(bid, ax)].get("running") is True
+                and services[(bid, ax)].get("generation") == gen
+                for ax in axes
+            )
+        if already_running:
+            return {"board": bid, "started": True, "already_running": True}
         try:
             return self._oem_start_fan_service(bid)
         except Exception as exc:  # report, never block the caller
@@ -1242,7 +1415,9 @@ class BioXpTester:
 
     def oem_fan_service_status(self):
         rows = []
-        for (board, axis), service in sorted(self._oem_fan_services().items()):
+        with self._fan_state_lock():
+            items = [(key, dict(service)) for key, service in sorted(self._oem_fan_services().items())]
+        for (board, axis), service in items:
             rows.append({k: service.get(k) for k in (
                 "running", "tc_on", "target_c", "current_c", "pedestal_c", "fan_speed", "error", "last_error", "last_tick_at")}
                 | {"board": board, "axis": axis}
@@ -1250,11 +1425,12 @@ class BioXpTester:
         return {"services": rows}
 
     def _oem_fan_services(self):
-        services = getattr(self, "_oem_fan_service_state", None)
-        if not isinstance(services, dict):
-            services = {}
-            self._oem_fan_service_state = services
-        return services
+        with self._fan_state_lock():
+            services = getattr(self, "_oem_fan_service_state", None)
+            if not isinstance(services, dict):
+                services = {}
+                self._oem_fan_service_state = services
+            return services
 
     @staticmethod
     def _oem_fan_speed(current, target, pedestal, control_on, accelerate=False):
@@ -1272,125 +1448,256 @@ class BioXpTester:
             return 255 if pedestal > 37.0 else 220 if pedestal > 35.0 else 200 if pedestal > 32.0 else 150
         return 255 if pedestal > 37.0 else 200 if pedestal > 35.0 else 150 if pedestal > 32.0 else 100 if pedestal > 30.0 else 50 if pedestal > 28.0 else 0
 
-    def _oem_fan_read(self, board, command, cmd_type, motor, fallback):
-        ack = self.send_tmcl_retry(int(board), int(command), int(cmd_type), int(motor), 0,
-            attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
+    def _oem_fan_read(self, board, command, cmd_type, motor, fallback, *, tick_guard=None):
+        with self._transport_guard():
+            self._oem_fan_assert_active(tick_guard)
+            ack = self.send_tmcl_retry(int(board), int(command), int(cmd_type), int(motor), 0,
+                attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
         if board == self.BOARD_CHILLER and motor == 0 and self._tmcl_success(ack) and ack.get("value") is not None:
             # The OC service reads channel 1, not the OC block (channel 3).
-            service = self._oem_thermal_fan(board, 0)
-            service["block_read_error"] = self._oem_chiller_block_sample(0, int(ack["value"]) / 1000.0)
+            block_err = self._oem_chiller_block_sample(0, int(ack["value"]) / 1000.0)
+            with self._fan_state_lock():
+                if tick_guard is None or self._oem_fan_is_active_locked(*tick_guard):
+                    service = self._oem_thermal_fan(board, 0)
+                    service["block_read_error"] = block_err
         return (float(ack.get("value", int(round(float(fallback) * 1000.0)))) / 1000.0) if self._tmcl_success(ack) else float(fallback)
 
-    def _oem_fan_schedule(self, key):
-        service = self._oem_fan_services()[key]
-        if not service.get("running"):
-            return
-        timer = threading.Timer(service.get("interval_s", 5.0), self._oem_fan_tick, args=(key,))
-        timer.daemon = True
-        service["timer"] = timer
-        timer.start()
+    def _oem_fan_schedule(self, key, expected_generation=None, expected_token=None):
+        with self._fan_state_lock():
+            service = self._oem_fan_services().get(key)
+            if not isinstance(service, dict) or not service.get("running"):
+                return
+            gen = service.get("generation")
+            token = service.get("token")
+            if expected_generation is not None and (gen != expected_generation or self._oem_fan_generation() != expected_generation):
+                return
+            if expected_token is not None and token != expected_token:
+                return
+            prev_timer = service.get("timer")
+            if prev_timer is not None:
+                try:
+                    prev_timer.cancel()
+                except Exception:
+                    pass
+            timer = threading.Timer(
+                service.get("interval_s", 5.0),
+                self._oem_fan_tick,
+                args=(key, gen, token),
+            )
+            timer.daemon = True
+            service["timer"] = timer
+            timer.start()
 
     def _oem_fan_service_start(self, board, axis):
         key = (int(board), int(axis))
-        services = self._oem_fan_services()
-        service = services.setdefault(key, {"pedestal_samples": [0.0] * 5, "target_c": 30.0, "current_c": 30.0, "tc_on": False, "going_down": False, "accelerate": False, "error": False, "running": False, "ticking": False})
+        with self._fan_state_lock():
+            services = self._oem_fan_services()
+            service = services.setdefault(key, self._oem_fan_default_state())
+            fallback_current = float(service.get("current_c", 30.0))
         # ClassThermalFanControl.startservice(): read current, then enable 5000ms timer.
         if int(board) == self.BOARD_THERMAL:
-            service["current_c"] = self._oem_fan_read(board, 10, 4, 0, service["current_c"])
+            read_current = self._oem_fan_read(board, 10, 4, 0, fallback_current)
         else:
-            service["current_c"] = self._oem_fan_read(board, 143, 0, axis, service["current_c"])
-        if not service.get("running"):
-            service["running"] = True
-            self._oem_fan_schedule(key)
-        return {"board": int(board), "axis": int(axis), "interval_ms": 5000, "current_c": service["current_c"], "started": True}
+            read_current = self._oem_fan_read(board, 143, 0, axis, fallback_current)
+        with self._fan_state_lock():
+            services = self._oem_fan_services()
+            service = services.setdefault(key, self._oem_fan_default_state())
+            service["current_c"] = read_current
+            gen = self._oem_fan_generation()
+            if not service.get("running") or service.get("generation") != gen:
+                token = int(getattr(self, "_oem_fan_token_seq", 0)) + 1
+                self._oem_fan_token_seq = token
+                service["pedestal_samples"] = [0.0] * 5
+                service["error"] = False
+                service["last_error"] = None
+                service["ticking"] = False
+                service["generation"] = gen
+                service["token"] = token
+                service["running"] = True
+                self._oem_fan_schedule(key, gen, token)
+            current_out = service["current_c"]
+        return {"board": int(board), "axis": int(axis), "interval_ms": 5000, "current_c": current_out, "started": True}
 
-    def _oem_fan_tick(self, key):
-        service = self._oem_fan_services().get(key)
-        if not isinstance(service, dict) or not service.get("running") or service.get("ticking"):
-            return
-        service["ticking"] = True
+    def _oem_fan_tick(self, key, expected_generation=None, expected_token=None):
+        with self._fan_state_lock():
+            service = self._oem_fan_services().get(key)
+            if not isinstance(service, dict) or not service.get("running"):
+                return
+            gen = service.get("generation")
+            token = service.get("token")
+            if expected_generation is None and expected_token is None:
+                expected_generation = gen
+                expected_token = token
+            if not self._oem_fan_is_active_locked(key, expected_generation, expected_token):
+                return
+            if service.get("ticking"):
+                return
+            service["ticking"] = True
+            samples = list(service["pedestal_samples"])
+            current_fallback = service["current_c"]
+            going_down = bool(service["going_down"])
+            tc_on = bool(service["tc_on"])
+            target_c = float(service["target_c"])
+            accelerate = bool(service["accelerate"])
+            had_error = bool(service["error"])
+        tick_guard = (key, expected_generation, expected_token)
         board, axis = key
+        stale = False
         try:
             # Exact source sampling order and special going-down pedestal override.
-            samples = list(service["pedestal_samples"])
             samples[:-1] = samples[1:]
             if board == self.BOARD_THERMAL:
-                pedestal = self._oem_fan_read(board, 143, 0, 2, samples[-1])
-                current = self._oem_fan_read(board, 10, 4, 0, service["current_c"])
+                pedestal = self._oem_fan_read(board, 143, 0, 2, samples[-1], tick_guard=tick_guard)
+                current = self._oem_fan_read(board, 10, 4, 0, current_fallback, tick_guard=tick_guard)
             else:
                 pedestal_axis = 1 if axis == 0 else 4
-                pedestal = self._oem_fan_read(board, 143, 0, pedestal_axis, samples[-1])
-                current = self._oem_fan_read(board, 143, 0, axis, service["current_c"])
+                pedestal = self._oem_fan_read(board, 143, 0, pedestal_axis, samples[-1], tick_guard=tick_guard)
+                current = self._oem_fan_read(board, 143, 0, axis, current_fallback, tick_guard=tick_guard)
             samples[-1] = pedestal
-            service["pedestal_samples"] = samples
             averaged = sum(samples) / len(samples)
-            if service["going_down"] and samples[-1] > samples[-2] + 0.5:
-                averaged = samples[-1]
-            service["pedestal_c"] = averaged
-            service["current_c"] = current
-            if service["tc_on"]:
-                # OEM deliberately reads current a second time in the active branch.
-                current = self._oem_fan_read(board, 10, 4, 0, current) if board == self.BOARD_THERMAL else self._oem_fan_read(board, 143, 0, axis, current)
+            with self._fan_state_lock():
+                if not self._oem_fan_is_active_locked(*tick_guard):
+                    raise self._StaleFanTickError()
+                going_down = bool(service["going_down"])
+                tc_on = bool(service["tc_on"])
+                target_c = float(service["target_c"])
+                accelerate = bool(service["accelerate"])
+                had_error = bool(service["error"])
+                if going_down and samples[-1] > samples[-2] + 0.5:
+                    averaged = samples[-1]
+                service["pedestal_samples"] = list(samples)
+                service["pedestal_c"] = averaged
                 service["current_c"] = current
-                if current <= float(service["target_c"]) - 1.0:
-                    service["going_down"] = False
-                speed = self._oem_fan_speed(current, service["target_c"], averaged, bool(service["going_down"]), bool(service["accelerate"])) if service["going_down"] else self._oem_fan_speed(current, service["target_c"], averaged, False)
+            if tc_on:
+                # OEM deliberately reads current a second time in the active branch.
+                current = (
+                    self._oem_fan_read(board, 10, 4, 0, current, tick_guard=tick_guard)
+                    if board == self.BOARD_THERMAL
+                    else self._oem_fan_read(board, 143, 0, axis, current, tick_guard=tick_guard)
+                )
+                with self._fan_state_lock():
+                    if not self._oem_fan_is_active_locked(*tick_guard):
+                        raise self._StaleFanTickError()
+                    service["current_c"] = current
+                    target_c = float(service["target_c"])
+                    if current <= target_c - 1.0:
+                        service["going_down"] = False
+                    going_down = bool(service["going_down"])
+                    accelerate = bool(service["accelerate"])
+                speed = (
+                    self._oem_fan_speed(current, target_c, averaged, going_down, accelerate)
+                    if going_down
+                    else self._oem_fan_speed(current, target_c, averaged, False)
+                )
             else:
-                speed = self._oem_fan_speed(current, service["target_c"], averaged, False)
-            service["last_tick_at"] = time.time()
+                speed = self._oem_fan_speed(current, target_c, averaged, False)
+            tick_ts = time.time()
             if board == self.BOARD_CHILLER:
-                self._oem_chiller_fan_output(service, axis, speed, averaged)
+                with self._fan_state_lock():
+                    if not self._oem_fan_is_active_locked(*tick_guard):
+                        raise self._StaleFanTickError()
+                    service["last_tick_at"] = tick_ts
+                self._oem_chiller_fan_output(service, axis, speed, averaged, tick_guard=tick_guard)
                 return
-            service["fan_speed"] = speed
-            self.send_tmcl_retry(board, 141, 0, axis, speed, attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
-            if not service["error"] and averaged > 50.0:
-                self.send_tmcl_retry(board, 144, 0, 0, 0, attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
-                self.send_tmcl_retry(board, 144, 0, 1, 0, attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
-                service.update({"tc_on": False, "target_c": 30.0, "error": True})
-            service["last_error"] = None
-        except Exception as exc:
-            service["last_error"] = f"{type(exc).__name__}: {exc}"
-        finally:
-            service["ticking"] = False
-            self._oem_fan_schedule(key)
-
-    def _oem_chiller_fan_output(self, service, axis, speed, averaged):
-        result = self._oem_thermal_result()
-        service["fan_write_acknowledged"] = False
-        try:
-            ack = self._oem_thermal_tx(result, self.BOARD_CHILLER, 141, 0, axis, speed)
-            service["fan_write_acknowledged"] = self._tmcl_success(ack)
-            if service["fan_write_acknowledged"]:
+            with self._transport_guard():
+                self._oem_fan_assert_active(tick_guard)
+                self.send_tmcl_retry(board, 141, 0, axis, speed, attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
+            with self._fan_state_lock():
+                if not self._oem_fan_is_active_locked(*tick_guard):
+                    raise self._StaleFanTickError()
+                service["last_tick_at"] = tick_ts
                 service["fan_speed"] = speed
-                service["last_error"] = None
-            else:
-                service["last_error"] = f"Fan write not acknowledged: {ack}"
+                had_error = bool(service["error"])
+            if not had_error and averaged > 50.0:
+                with self._transport_guard():
+                    self._oem_fan_assert_active(tick_guard)
+                    self.send_tmcl_retry(board, 144, 0, 0, 0, attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
+                    self._oem_fan_assert_active(tick_guard)
+                    self.send_tmcl_retry(board, 144, 0, 1, 0, attempts=1, wait_reply=True, write_timeout_ms=80, read_timeout_ms=100, max_reads=10, strict_match=True)
+                with self._fan_state_lock():
+                    if not self._oem_fan_is_active_locked(*tick_guard):
+                        raise self._StaleFanTickError()
+                    service.update({"tc_on": False, "target_c": 30.0, "error": True})
+            with self._fan_state_lock():
+                if self._oem_fan_is_active_locked(*tick_guard):
+                    service["last_error"] = None
+        except self._StaleFanTickError:
+            stale = True
         except Exception as exc:
-            service["last_error"] = f"Fan write failed: {exc}"
+            with self._fan_state_lock():
+                if self._oem_fan_is_active_locked(*tick_guard):
+                    service["last_error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            with self._fan_state_lock():
+                if self._oem_fan_is_active_locked(*tick_guard):
+                    service["ticking"] = False
+                    if not stale:
+                        self._oem_fan_schedule(key, expected_generation, expected_token)
+
+    def _oem_chiller_fan_output(self, service, axis, speed, averaged, *, tick_guard=None):
+        result = self._oem_thermal_result()
+        with self._fan_state_lock():
+            if tick_guard is not None and not self._oem_fan_is_active_locked(*tick_guard):
+                raise self._StaleFanTickError()
+            service["fan_write_acknowledged"] = False
+        try:
+            with self._transport_guard():
+                self._oem_fan_assert_active(tick_guard)
+                ack = self._oem_thermal_tx(result, self.BOARD_CHILLER, 141, 0, axis, speed)
+            acked = self._tmcl_success(ack)
+            with self._fan_state_lock():
+                if tick_guard is not None and not self._oem_fan_is_active_locked(*tick_guard):
+                    raise self._StaleFanTickError()
+                service["fan_write_acknowledged"] = acked
+                if acked:
+                    service["fan_speed"] = speed
+                    service["last_error"] = None
+                else:
+                    service["last_error"] = f"Fan write not acknowledged: {ack}"
+        except self._StaleFanTickError:
+            raise
+        except Exception as exc:
+            with self._fan_state_lock():
+                if tick_guard is None or self._oem_fan_is_active_locked(*tick_guard):
+                    service["last_error"] = f"Fan write failed: {exc}"
         # Fan delivery and cooling-time diagnostics must not skip the cutoff.
-        if not service["error"] and averaged > 50.0:
+        with self._fan_state_lock():
+            if tick_guard is not None and not self._oem_fan_is_active_locked(*tick_guard):
+                raise self._StaleFanTickError()
+            needs_cutoff = (not service["error"]) and averaged > 50.0
+        if needs_cutoff:
             message = "TC Chiller Pedestal Temp is too high"
-            service.update(source_board_error_event=message, cutoff_acknowledged=False)
+            with self._fan_state_lock():
+                if tick_guard is not None and not self._oem_fan_is_active_locked(*tick_guard):
+                    raise self._StaleFanTickError()
+                service.update(source_board_error_event=message, cutoff_acknowledged=False)
             try:
                 cutoff = self._oem_thermal_result()
-                self._oem_thermal_pwm(cutoff, self.BOARD_CHILLER, axis, 0)
-                service["cutoff_acknowledged"] = cutoff['controller_command_acknowledged']
-                service.update(tc_on=False, target_c=30.0, error=True)
+                with self._transport_guard():
+                    self._oem_fan_assert_active(tick_guard)
+                    self._oem_thermal_pwm(cutoff, self.BOARD_CHILLER, axis, 0)
+                with self._fan_state_lock():
+                    if tick_guard is not None and not self._oem_fan_is_active_locked(*tick_guard):
+                        raise self._StaleFanTickError()
+                    service["cutoff_acknowledged"] = cutoff['controller_command_acknowledged']
+                    service.update(tc_on=False, target_c=30.0, error=True)
             finally:
                 self._oem_thermal_error(result, message)
 
     def _oem_fan_set_target(self, board, axis, target_c):
-        service = self._oem_fan_services().setdefault((int(board), int(axis)), {"pedestal_samples": [0.0] * 5, "target_c": 30.0, "current_c": 30.0, "tc_on": False, "going_down": False, "accelerate": False, "error": False, "running": False, "ticking": False})
-        service["target_c"] = float(target_c)
-        service["tc_on"] = True
-        service["going_down"] = float(service["current_c"]) > float(target_c)
-        service["accelerate"] = float(service["current_c"]) > float(target_c) + 25.0
-        service["error"] = False
+        with self._fan_state_lock():
+            service = self._oem_fan_services().setdefault((int(board), int(axis)), self._oem_fan_default_state())
+            service["target_c"] = float(target_c)
+            service["tc_on"] = True
+            service["going_down"] = float(service["current_c"]) > float(target_c)
+            service["accelerate"] = float(service["current_c"]) > float(target_c) + 25.0
+            service["error"] = False
 
     def _oem_fan_turn_off(self, board, axis):
-        service = self._oem_fan_services().get((int(board), int(axis)))
-        if isinstance(service, dict):
-            service.update({"tc_on": False, "target_c": 30.0})
+        with self._fan_state_lock():
+            service = self._oem_fan_services().get((int(board), int(axis)))
+            if isinstance(service, dict):
+                service.update({"tc_on": False, "target_c": 30.0})
 
     def _oem_activate_board(self, board_id):
         """Literal Class{Head,Deck,Thermal,Chiller}Board.activateBoard()."""
@@ -3617,17 +3924,21 @@ class BioXpTester:
             return {f"{board}:{motor}": event for (board, motor), event in available.items()}
 
     def _collect_fallback_motor_signals(self, duration_s):
-        # Use the existing sole endpoint lock for receive, Set, Reset and take.
-        # Do not hold it across the complete timeout: Abort must be able to Set.
+        # Do not hold _transport_guard() across the passive observation wait:
+        # Stop and Abort must never queue behind passive polling sleeps.
         with self._transport_guard():
             generation = int(getattr(self, "_oem_abort_generation", 0))
-            window = self.collect_bus_events(duration_s=duration_s, timeout_ms=8, max_events=32)
-            if generation != int(getattr(self, "_oem_abort_generation", 0)):
-                return window  # Do not restamp pre-Abort wire events into its generation.
+            transport_generation = int(getattr(self, "_oem_transport_generation", 0))
+        window = self.collect_bus_events(duration_s=duration_s, timeout_ms=8, max_events=32)
+        with self._transport_guard():
+            if (
+                generation != int(getattr(self, "_oem_abort_generation", 0))
+                or transport_generation != int(getattr(self, "_oem_transport_generation", 0))
+            ):
+                return []  # Do not restamp pre-Abort or pre-reconnect wire events.
             wires = getattr(self, "_oem_fallback_motor_signals", None)
             if wires is None:
                 wires = self._oem_fallback_motor_signals = {}
-            generation = int(getattr(self, "_oem_abort_generation", 0))
             for event in window:
                 if not isinstance(event, dict) or event.get("status") != 128:
                     continue
@@ -9161,19 +9472,15 @@ class BioXpTester:
         return self._oem_thermal_merge(result, child)
 
     def _oem_thermal_fan_interval(self, seconds):
-        fan = self._oem_thermal_fan(self.BOARD_THERMAL, 0)
-        fan['interval_s'] = seconds
-        if fan.get('running'):
-            timer = fan.get('timer')
-            if timer is not None:
-                timer.cancel()
-            self._oem_fan_schedule((self.BOARD_THERMAL, 0))
+        with self._fan_state_lock():
+            fan = self._oem_thermal_fan(self.BOARD_THERMAL, 0)
+            fan['interval_s'] = seconds
+            if fan.get('running'):
+                self._oem_fan_schedule((self.BOARD_THERMAL, 0), fan.get('generation'), fan.get('token'))
 
     def _oem_thermal_fan(self, board, bank):
-        return self._oem_fan_services().setdefault((board, bank), {
-            'pedestal_samples': [0.0] * 5, 'target_c': 30.0, 'current_c': 30.0,
-            'tc_on': False, 'going_down': False, 'accelerate': False, 'error': False,
-            'running': False, 'ticking': False, 'lid_target_c': -99.0})
+        with self._fan_state_lock():
+            return self._oem_fan_services().setdefault((board, bank), self._oem_fan_default_state())
 
     def _oem_thermal_pwm(self, result, board, bank, pwm):
         pwm = max(0, min(100, int(pwm)))
@@ -9185,13 +9492,15 @@ class BioXpTester:
             state = self._oem_thermal_state(board, bank if board == self.BOARD_CHILLER else 0)
             state['target'] = 100 if board == self.BOARD_CHILLER else 30
             if pwm == 0:
-                self._oem_thermal_fan(board, bank if board == self.BOARD_CHILLER else 0).update(tc_on=False, target_c=30.0)
+                with self._fan_state_lock():
+                    self._oem_thermal_fan(board, bank if board == self.BOARD_CHILLER else 0).update(tc_on=False, target_c=30.0)
         if board == self.BOARD_THERMAL:
-            fan = self._oem_thermal_fan(board, 0)
-            if bank == 0:
-                fan.update(tc_on=False, target_c=30.0)
-            else:
-                fan['lid_target_c'] = -99.0
+            with self._fan_state_lock():
+                fan = self._oem_thermal_fan(board, 0)
+                if bank == 0:
+                    fan.update(tc_on=False, target_c=30.0)
+                else:
+                    fan['lid_target_c'] = -99.0
 
     def oem_turn_off_heater(self):
         result = self._oem_thermal_result()
@@ -9268,21 +9577,27 @@ class BioXpTester:
     def oem_resume_temperature(self):
         result = self._oem_thermal_result()
         if self._oem_board_present(self.BOARD_THERMAL):
-            fan = self._oem_thermal_fan(self.BOARD_THERMAL, 0)
-            if fan['tc_on']:
-                child = self.oem_thermal_set_temperature(fan['target_c'], 0, False)
+            with self._fan_state_lock():
+                fan = self._oem_thermal_fan(self.BOARD_THERMAL, 0)
+                tc_on = bool(fan.get('tc_on'))
+                tc_target = fan.get('target_c', 30.0)
+                lid_target = fan.get('lid_target_c', -99.0)
+            if tc_on:
+                child = self.oem_thermal_set_temperature(tc_target, 0, False)
                 self._oem_thermal_merge(result, child)
                 if not child.get('source_body_returned'):
                     return result
-            if fan.get('lid_target_c', -99.0) != -99.0:
-                child = self.oem_thermal_set_lid_temperature(fan['lid_target_c'], 0, False)
+            if lid_target != -99.0:
+                child = self.oem_thermal_set_lid_temperature(lid_target, 0, False)
                 self._oem_thermal_merge(result, child)
                 if not child.get('source_body_returned'):
                     return result
         if self._oem_board_present(self.BOARD_CHILLER):
             for bank in (0, 1):
-                if self._oem_thermal_fan(self.BOARD_CHILLER, bank)['tc_on']:
-                    target = self._oem_thermal_fan(self.BOARD_CHILLER, 0)['target_c']
+                with self._fan_state_lock():
+                    bank_tc_on = bool(self._oem_thermal_fan(self.BOARD_CHILLER, bank).get('tc_on'))
+                    target = self._oem_thermal_fan(self.BOARD_CHILLER, 0).get('target_c', 30.0)
+                if bank_tc_on:
                     child = self.oem_chiller_set_temperature(bank, target)
                     self._oem_thermal_merge(result, child)
                     if not child.get('source_body_returned'):
@@ -10072,9 +10387,47 @@ class BioXpTester:
             return False
 
     @staticmethod
+    def _proc_starttime(pid):
+        try:
+            with open(f"/proc/{int(pid)}/stat", "r", encoding="ascii", errors="replace") as f:
+                raw = f.read()
+        except OSError:
+            return None
+        rparen = raw.rfind(")")
+        if rparen < 0:
+            return None
+        tail = raw[rparen + 1:].split()
+        if len(tail) <= 19:
+            return None
+        return tail[19]
+
+    @staticmethod
+    def _proc_owns_device(pid, target_dev):
+        fd_dir = f"/proc/{int(pid)}/fd"
+        try:
+            entries = os.listdir(fd_dir)
+        except OSError:
+            return False
+        for fd_name in entries:
+            try:
+                st = os.stat(f"{fd_dir}/{fd_name}")
+            except OSError:
+                continue
+            if (stat.S_ISCHR(st.st_mode) or stat.S_ISBLK(st.st_mode)) and (st.st_dev, st.st_rdev) == target_dev:
+                return True
+        return False
+
+    @staticmethod
     def camera_release_busy_owners(device="/dev/video0"):
         if shutil.which("fuser") is None:
-            return {"ok": False, "error": "fuser not found", "pids": [], "killed": []}
+            return {"ok": False, "error": "fuser not found", "pids": [], "killed": [], "alive": []}
+        try:
+            dev_stat = os.stat(device)
+        except OSError as e:
+            return {"ok": False, "error": f"cannot stat device {device}: {e}", "pids": [], "killed": [], "alive": []}
+        if not (stat.S_ISCHR(dev_stat.st_mode) or stat.S_ISBLK(dev_stat.st_mode)):
+            return {"ok": False, "error": f"{device} is not a device node", "pids": [], "killed": [], "alive": []}
+        target_dev = (dev_stat.st_dev, dev_stat.st_rdev)
         try:
             p = subprocess.run(
                 ["fuser", device],
@@ -10085,27 +10438,79 @@ class BioXpTester:
                 check=False,
             )
         except Exception as e:
-            return {"ok": False, "error": str(e), "pids": [], "killed": []}
+            return {"ok": False, "error": str(e), "pids": [], "killed": [], "alive": []}
 
-        text = f"{p.stdout}\n{p.stderr}"
-        pids = sorted({int(x) for x in re.findall(r"\b\d+\b", text)})
+        stdout_text = p.stdout or ""
+        stderr_text = p.stderr or ""
+        if p.returncode == 1:
+            if stdout_text.strip() == "" and stderr_text.strip() == "":
+                return {"ok": True, "pids": [], "killed": [], "alive": []}
+            return {
+                "ok": False,
+                "error": f"fuser exited 1 with output: {(stderr_text.strip() or stdout_text.strip())[:300]}",
+                "pids": [],
+                "killed": [],
+                "alive": [],
+            }
+        if p.returncode != 0:
+            return {
+                "ok": False,
+                "error": f"fuser exited {p.returncode}: {stderr_text.strip()[:300]}",
+                "pids": [],
+                "killed": [],
+                "alive": [],
+            }
+
+        tokens = stdout_text.split()
+        if any(re.fullmatch(r"\d+", tok) is None for tok in tokens):
+            return {
+                "ok": False,
+                "error": f"malformed fuser stdout: {stdout_text.strip()[:300]}",
+                "pids": [],
+                "killed": [],
+                "alive": [],
+            }
         this_pid = os.getpid()
-        pids = [pid for pid in pids if pid != this_pid]
-        killed = []
-        for pid in pids:
+        candidates = sorted({int(tok) for tok in tokens if int(tok) > 1 and int(tok) != this_pid})
+        verified = []
+        for pid in candidates:
+            starttime_before = BioXpTester._proc_starttime(pid)
+            if starttime_before is None:
+                continue
+            if not BioXpTester._proc_owns_device(pid, target_dev):
+                continue
+            starttime_after = BioXpTester._proc_starttime(pid)
+            if starttime_after != starttime_before:
+                continue
+            verified.append((pid, starttime_before))
+
+        killed_identities = []
+        for pid, orig_starttime in verified:
+            if BioXpTester._proc_starttime(pid) != orig_starttime or not BioXpTester._proc_owns_device(pid, target_dev):
+                continue
             try:
                 os.kill(pid, signal.SIGTERM)
-                killed.append(pid)
+                killed_identities.append((pid, orig_starttime))
             except OSError:
                 pass
-        time.sleep(0.25)
-        for pid in list(killed):
-            if BioXpTester._pid_alive(pid):
+        if killed_identities:
+            time.sleep(0.25)
+        for pid, orig_starttime in list(killed_identities):
+            if (
+                BioXpTester._pid_alive(pid)
+                and BioXpTester._proc_starttime(pid) == orig_starttime
+                and BioXpTester._proc_owns_device(pid, target_dev)
+            ):
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except OSError:
                     pass
-        alive = [pid for pid in pids if BioXpTester._pid_alive(pid)]
+        pids = [pid for pid, _ in verified]
+        killed = [pid for pid, _ in killed_identities]
+        alive = [
+            pid for pid, orig_starttime in verified
+            if BioXpTester._pid_alive(pid) and BioXpTester._proc_starttime(pid) == orig_starttime
+        ]
         return {
             "ok": True,
             "pids": pids,

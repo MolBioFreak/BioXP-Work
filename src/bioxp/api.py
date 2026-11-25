@@ -23,6 +23,7 @@ from typing import Annotated, Any, Callable, Literal, Mapping, Optional, Protoco
 from fastapi import FastAPI, HTTPException, Query, Request
 
 from .camera_provider import CameraError, CameraFrame, CameraProvider
+from .novo_router import NovoTransactionProgress, track_novo_transaction_progress
 from .oem_config import harmonized_motion_config
 from .hardware_status import CANONICAL_DOMAINS, CollectionContext, hardware_state
 from .reference_recovery import ReferenceRecoveryMonitor
@@ -1119,13 +1120,14 @@ async def lifespan(app: FastAPI):
         _pipette_receipts = PipetteReceiptStore(root=runtime_root)
     elif _pipette_receipts.root != runtime_root:
         raise RuntimeError("pipette receipt store is already bound to a different canonical runtime root")
-    if not _operator_reports_installed:
+    if not getattr(app.state, "_operator_reports_installed", False):
         app.include_router(
             create_operator_reports_router(
                 _pipette_receipts,
                 writer_health_provider=runtime_write_coordinator(_pipette_receipts.root).snapshot,
             )
         )
+        app.state._operator_reports_installed = True
         _operator_reports_installed = True
     app.state.report_export_reconciliation = reconcile_operator_report_exports(_pipette_receipts)
     calibration_runtime_store = None
@@ -1175,22 +1177,12 @@ async def lifespan(app: FastAPI):
             detail = getattr(exc, "detail", None) or str(exc)
             _startup_error = f"OEM automatic USB startup failed: {detail}"
             print(f"[WARN] {_startup_error}")
-        else:
-            # OEM program start runs activateBoard(); startFanService() for every
-            # board.  Boards may already be active here, so start the thermal and
-            # chiller fan/pedestal services directly.  Reads and fan writes only.
-            tester_now = _tester
-            if tester_now is not None and hasattr(tester_now, "_oem_ensure_fan_service"):
-                for board in (tester_now.BOARD_THERMAL, tester_now.BOARD_CHILLER):
-                    try:
-                        started = await asyncio.to_thread(tester_now._oem_ensure_fan_service, board)
-                        print(f"[INFO] fan service board {board}: {started}")
-                    except Exception as exc:
-                        print(f"[WARN] fan service board {board} failed to start: {exc}")
     def start_operator_control_plane() -> None:
         global _operator_control_plane_installed
-        command_plane_to_start = None
-        if not _operator_control_plane_installed and app.state.release_start_error is None:
+        if app.state.release_start_error is not None:
+            return
+        lifecycle = getattr(app.state, "operator_control_plane_lifecycle", None)
+        if lifecycle is None:
             app.state.oem_preparation_camera = _protocol_preparation_camera()
             install_operator_control_plane(
                 app,
@@ -1203,12 +1195,12 @@ async def lifespan(app: FastAPI):
                 oem_deck_position_table_provider=load_bound_oem_position_table,
                 motion_snapshot_collector=_collect_motion_admission_snapshot,
             )
-            operator_store = app.state.operator_receipt_store
-            command_plane_to_start = app.state.operator_command_plane
+            lifecycle = app.state.operator_control_plane_lifecycle
+        operator_store = getattr(app.state, "operator_receipt_store", None)
+        if operator_store is not None:
             operator_store.converge_startup_state()
-        if command_plane_to_start is not None and app.state.release_start_error is None:
-            command_plane_to_start.start()
-            _operator_control_plane_installed = True
+        lifecycle.start()
+        _operator_control_plane_installed = True
 
     release_start_task = None
     if app.state.release_identity.get("verified") is True:
@@ -1251,103 +1243,118 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        calibration_close_error = None
-        if calibration_runtime_store is not None:
-            try:
-                await asyncio.to_thread(calibration_runtime_store.close)
-            except Exception as exc:
-                calibration_close_error = f"calibration store close: {exc}"
+        shutdown_errors = []
         if reference_recovery_task is not None and not reference_recovery_task.done():
             reference_recovery_task.cancel()
             await asyncio.gather(reference_recovery_task, return_exceptions=True)
         if release_start_task is not None and not release_start_task.done():
             release_start_task.cancel()
             await asyncio.gather(release_start_task, return_exceptions=True)
+        # Stop admitting new direct requests and drain retained in-flight direct
+        # work BEFORE acquiring tester locks or stopping USB / SQLite stores.
+        operator_lifecycle = getattr(app.state, "operator_control_plane_lifecycle", None)
+        if operator_lifecycle is not None:
+            try:
+                await operator_lifecycle.drain_direct_requests()
+            except Exception as exc:
+                shutdown_errors.append(f"operator direct request drain: {exc}")
         # Close admission immediately, then drain the same ownership leases used
         # by reconnect. A shielded constructor may outlive its cancelled HTTP
         # waiter, but it cannot publish an owner after this shutdown completes.
-        async with _tester_lock:
-            async with _tester_transition_lock:
-                shutdown_errors = [calibration_close_error] if calibration_close_error else []
+        failed_owner = None
+        audit_buffers = ()
+        try:
+            async with _tester_lock:
+                async with _tester_transition_lock:
+                    try:
+                        await _stop_owned_camera_session(reason="lifespan shutdown")
+                    except Exception as exc:
+                        shutdown_errors.append(f"camera shutdown: {exc}")
+                    history_reader = getattr(app.state, "operator_history_reader", None)
+                    if history_reader is not None:
+                        try:
+                            history_reader.close()
+                        except Exception as exc:
+                            shutdown_errors.append(f"operator history reader shutdown: {exc}")
+                    command_plane = getattr(app.state, "operator_command_plane", None)
+                    command_plane_failure: Exception | None = None
+                    if command_plane is not None:
+                        try:
+                            command_plane.stop()
+                        except Exception as exc:
+                            command_plane_failure = exc
+                            shutdown_errors.append(f"operator command plane shutdown: {exc}")
+                    if operator_lifecycle is not None:
+                        try:
+                            operator_lifecycle.close()
+                        except Exception as exc:
+                            shutdown_errors.append(f"operator control plane close: {exc}")
+                    if command_plane_failure is not None:
+                        _receiver_audit_shutdown = {"state": "skipped", "reason": "command_workers_active",
+                                                    "durable_ownership_claimed": False}
+                        app.state.receiver_audit_shutdown = _receiver_audit_shutdown
+                        _startup_error = (
+                            "BioXP lifespan shutdown blocked transport teardown because operator "
+                            f"command workers remain active: {command_plane_failure}"
+                        )
+                        raise RuntimeError(_startup_error) from command_plane_failure
+                    cleanup_errors = list(shutdown_errors)
+                    close_camera = getattr(_camera_provider, "close", None)
+                    if callable(close_camera):
+                        try:
+                            close_camera()
+                        except Exception as exc:
+                            cleanup_errors.append(f"camera control owner close: {exc}")
+                    close_fn = getattr(_pipette_transport, "close", None)
+                    if callable(close_fn):
+                        try:
+                            close_fn()
+                        except Exception as exc:
+                            cleanup_errors.append(f"pipette transport close: {exc}")
+                    owners = (_tester,) if _tester_quarantine is _tester else (_tester, _tester_quarantine)
+                    audit_buffers = _receiver_audit_buffers(owners)
+                    for owner in owners:
+                        if owner is None:
+                            continue
+                        try:
+                            disconnect = getattr(owner, "_disconnect", None)
+                            if not callable(disconnect):
+                                raise RuntimeError("USB owner has no authoritative disconnect operation")
+                            _require_complete_disconnect_report(disconnect())
+                        except Exception as exc:
+                            if failed_owner is None:
+                                failed_owner = owner
+                            cleanup_errors.append(f"USB owner disconnect: {exc}")
+                    if failed_owner is not None:
+                        _tester = None
+                        _tester_quarantine = failed_owner
+                        _pipette_transport = None
+                        _startup_error = (
+                            "BioXP lifespan shutdown cleanup incomplete; owner quarantined: "
+                            + "; ".join(cleanup_errors)
+                        )
+                        _publish_quarantined_owner(
+                            source="generic_lifespan_shutdown_incomplete",
+                            reason=_startup_error,
+                        )
+                    else:
+                        _tester = None
+                        _tester_quarantine = None
+                        _pipette_transport = None
+                        _ownership_changed(
+                            reason="generic_lifespan_shutdown",
+                            transport="unbound",
+                            usb="unbound",
+                            router="stopped",
+                        )
+                        if cleanup_errors:
+                            _startup_error = "BioXP lifespan shutdown completed with warnings: " + "; ".join(cleanup_errors)
+        finally:
+            if calibration_runtime_store is not None:
                 try:
-                    await _stop_owned_camera_session(reason="lifespan shutdown")
+                    await asyncio.to_thread(calibration_runtime_store.close)
                 except Exception as exc:
-                    shutdown_errors.append(f"camera shutdown: {exc}")
-                history_reader = getattr(app.state, "operator_history_reader", None)
-                if history_reader is not None:
-                    try:
-                        history_reader.close()
-                    except Exception as exc:
-                        shutdown_errors.append(f"operator history reader shutdown: {exc}")
-                command_plane = getattr(app.state, "operator_command_plane", None)
-                command_plane_failure: Exception | None = None
-                if command_plane is not None:
-                    try:
-                        command_plane.stop()
-                    except Exception as exc:
-                        command_plane_failure = exc
-                        shutdown_errors.append(f"operator command plane shutdown: {exc}")
-                if command_plane_failure is not None:
-                    _receiver_audit_shutdown = {"state": "skipped", "reason": "command_workers_active",
-                                                "durable_ownership_claimed": False}
-                    app.state.receiver_audit_shutdown = _receiver_audit_shutdown
-                    _startup_error = (
-                        "BioXP lifespan shutdown blocked transport teardown because operator "
-                        f"command workers remain active: {command_plane_failure}"
-                    )
-                    raise RuntimeError(_startup_error) from command_plane_failure
-                cleanup_errors = list(shutdown_errors)
-                close_camera = getattr(_camera_provider, "close", None)
-                if callable(close_camera):
-                    try:
-                        close_camera()
-                    except Exception as exc:
-                        cleanup_errors.append(f"camera control owner close: {exc}")
-                failed_owner = None
-                close_fn = getattr(_pipette_transport, "close", None)
-                if callable(close_fn):
-                    try:
-                        close_fn()
-                    except Exception as exc:
-                        cleanup_errors.append(f"pipette transport close: {exc}")
-                owners = (_tester,) if _tester_quarantine is _tester else (_tester, _tester_quarantine)
-                audit_buffers = _receiver_audit_buffers(owners)
-                for owner in owners:
-                    if owner is None:
-                        continue
-                    try:
-                        disconnect = getattr(owner, "_disconnect", None)
-                        if not callable(disconnect):
-                            raise RuntimeError("USB owner has no authoritative disconnect operation")
-                        _require_complete_disconnect_report(disconnect())
-                    except Exception as exc:
-                        if failed_owner is None:
-                            failed_owner = owner
-                        cleanup_errors.append(f"USB owner disconnect: {exc}")
-                if failed_owner is not None:
-                    _tester = None
-                    _tester_quarantine = failed_owner
-                    _pipette_transport = None
-                    _startup_error = (
-                        "BioXP lifespan shutdown cleanup incomplete; owner quarantined: "
-                        + "; ".join(cleanup_errors)
-                    )
-                    _publish_quarantined_owner(
-                        source="generic_lifespan_shutdown_incomplete",
-                        reason=_startup_error,
-                    )
-                else:
-                    _tester = None
-                    _tester_quarantine = None
-                    _pipette_transport = None
-                    _ownership_changed(
-                        reason="generic_lifespan_shutdown",
-                        transport="unbound",
-                        usb="unbound",
-                        router="stopped",
-                    )
-                    if cleanup_errors:
-                        _startup_error = "BioXP lifespan shutdown completed with warnings: " + "; ".join(cleanup_errors)
+                    shutdown_errors.append(f"calibration store close: {exc}")
         # No transport/controller ownership lock may cover this storage wait.
         # If teardown could not prove producer shutdown, do not close its audit
         # admission. USB quarantine truth remains independent of logging truth.
@@ -1469,6 +1476,8 @@ def _execute_provider_z_intent(intent: str, inputs: Mapping[str, Any] | None = N
                 if not isinstance(result, dict) or result.get("ok") is not True:
                     raise HTTPException(status_code=409, detail=result)
                 return result
+            if hasattr(reconcile, "delivery_result"):
+                setattr(finish_stop, "delivery_result", getattr(reconcile, "delivery_result"))
             return finish_stop
         else:
             result = execute(
@@ -2070,10 +2079,15 @@ async def oem_switch_audit(req: OemSwitchAuditRequest):
     payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
     mode = payload.get("mode", "status")
     artifact_root = payload.get("artifact_root") or os.environ.get("BIOXP_OEM_STARTUP_ARTIFACT_BASE")
-    if _tester is None:
-        raise HTTPException(status_code=503, detail=_startup_error or "BioXP USB runtime not available for live switch audit.")
-    hardware = _BioXpSwitchAuditHardware(_get_tester())
-    result = run_switch_audit(hardware, axes=payload.get("axes") or ["x", "y", "z", "g", "door"], mode=mode, artifact_root=artifact_root)
+    axes = payload.get("axes") or ["x", "y", "z", "g", "door"]
+
+    def _run_audit():
+        if _tester is None:
+            raise HTTPException(status_code=503, detail=_startup_error or "BioXP USB runtime not available for live switch audit.")
+        hardware = _BioXpSwitchAuditHardware(_get_tester())
+        return run_switch_audit(hardware, axes=axes, mode=mode, artifact_root=artifact_root)
+
+    result = await _run_blocking("OEM switch audit", _run_audit, timeout_s=60.0, run_motion_precheck=False)
     if not result.get("ok"):
         raise HTTPException(status_code=409, detail=result.get("error"))
     return result
@@ -5286,13 +5300,14 @@ def _protocol_mutation_scope(label):
         yield
 
 
-async def _run_blocking(label: str, func, timeout_s: float | None = 30.0, *, on_finished=None):
+async def _run_blocking(label: str, func, timeout_s: float | None = 30.0, *, on_finished=None, run_motion_precheck: bool = True):
     def invoke():
-        from bioxp.operator_controls import current_operator_dispatch_context
-        context = current_operator_dispatch_context() or {}
-        precheck = context.get("motion_snapshot_precheck")
-        if callable(precheck):
-            precheck()
+        if run_motion_precheck:
+            from bioxp.operator_controls import current_operator_dispatch_context
+            context = current_operator_dispatch_context() or {}
+            precheck = context.get("motion_snapshot_precheck")
+            if callable(precheck):
+                precheck()
         return func()
 
     async def leased_operation():
@@ -5469,11 +5484,38 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
     lane = _safety_interrupt_lane(surface_key)
     loop = asyncio.get_running_loop()
     interrupt_context = copy_context()
+    progress = NovoTransactionProgress()
     state = {
         "lease_acquired": False, "lease_released": False,
         "delivery_attempted": False, "delivery_finished": False,
+        "delivery_succeeded": False, "delivery_result": None,
     }
     admitted: asyncio.Future = loop.create_future()
+
+    def _reconciliation_pending_payload(deadline_s: float) -> dict[str, Any]:
+        tx_progress = progress.snapshot()
+        lease_currently_held = bool(state["lease_acquired"] and not state["lease_released"])
+        delivery_result = state["delivery_result"]
+        return {
+            **(
+                dict(delivery_result)
+                if isinstance(delivery_result, Mapping)
+                else {"ok": True, "axis_delivery_lease_released": True}
+            ),
+            "delivered": True,
+            "delivery_completed": True,
+            "reconciliation_pending": True,
+            "reconciliation_required": True,
+            "reconciliation_deadline_s": float(deadline_s),
+            "completion_ambiguous": False,
+            "physical_effect_verified": False,
+            "wire_write_observed": bool(tx_progress["wire_write_observed"]),
+            "controller_ack_observed": bool(tx_progress["controller_ack_observed"]),
+            "connection_lease_held": lease_currently_held,
+            "connection_transition_blocked_until_worker_exit": lease_currently_held,
+            "error": "interrupt_reconciliation_pending",
+            "recorded": True,
+        }
 
     def _admit(outcome: HTTPException | None) -> None:
         if not admitted.done():
@@ -5525,7 +5567,10 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
             tester = _get_tester()
 
             def invoke_interrupt():
-                return interrupt_context.run(func, tester)
+                def _run_with_progress():
+                    with track_novo_transaction_progress(progress):
+                        return func(tester)
+                return interrupt_context.run(_run_with_progress)
 
             _admit(None)
             state["delivery_attempted"] = True
@@ -5545,6 +5590,9 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
                     "failed", surface=surface_key, reason=f"{type(exc).__name__}: {exc}"[:300]
                 )
                 raise
+            state["delivery_succeeded"] = True
+            if callable(value):
+                state["delivery_result"] = getattr(value, "delivery_result", None)
             _journal_interrupt_phase("delivered", surface=surface_key)
         finally:
             # Delivery boundary: free the connection lease and this surface's
@@ -5573,23 +5621,7 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
                 reason="interrupt_reconciliation_deadline_exceeded",
                 reconciliation_deadline_s=_INTERRUPT_RECONCILIATION_DEADLINE_S,
             )
-            delivery_result = getattr(value, "delivery_result", None)
-            return {
-                **(
-                    dict(delivery_result)
-                    if isinstance(delivery_result, Mapping)
-                    else {"ok": True, "axis_delivery_lease_released": True}
-                ),
-                "delivered": True,
-                "delivery_completed": True,
-                "reconciliation_pending": True,
-                "reconciliation_required": True,
-                "reconciliation_deadline_s": _INTERRUPT_RECONCILIATION_DEADLINE_S,
-                "completion_ambiguous": False,
-                "physical_effect_verified": False,
-                "error": "interrupt_reconciliation_pending",
-                "recorded": True,
-            }
+            return _reconciliation_pending_payload(_INTERRUPT_RECONCILIATION_DEADLINE_S)
 
     worker = asyncio.create_task(
         leased_delivery_then_reconciliation(), name=f"bioxp-interrupt:{surface_key}"
@@ -5634,11 +5666,26 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
         worker.add_done_callback(
             lambda task: task.exception() if not task.cancelled() else None
         )
+        if state["delivery_succeeded"] and state["lease_released"]:
+            _journal_interrupt_phase(
+                "reconciliation_pending", surface=surface_key,
+                reason="interrupt_outer_deadline_exceeded_during_reconciliation",
+                reconciliation_deadline_s=float(timeout_s),
+            )
+            return _reconciliation_pending_payload(float(timeout_s))
+        tx_progress = progress.snapshot()
+        lease_currently_held = bool(state["lease_acquired"] and not state["lease_released"])
+        wire_write_started = bool(tx_progress["wire_write_started"])
+        wire_write_observed = bool(tx_progress["wire_write_observed"])
+        controller_ack_observed = bool(tx_progress["controller_ack_observed"])
         _journal_interrupt_phase(
             "failed", surface=surface_key,
             reason="interrupt_delivery_deadline_exceeded",
             delivery_deadline_s=float(timeout_s),
             delivery_outcome_unknown=not state["delivery_finished"],
+            wire_write_observed=wire_write_observed,
+            controller_ack_observed=controller_ack_observed,
+            connection_lease_held=lease_currently_held,
         )
         raise HTTPException(
             status_code=504,
@@ -5651,8 +5698,12 @@ async def _run_safety_interrupt_blocking(label: str, func, timeout_s: float = 30
                 "reconciliation_required": True,
                 "retry_forbidden": True,
                 "delivery_worker_still_running": not worker.done(),
-                "physical_delivery_started": bool(state["delivery_attempted"]),
-                "connection_transition_blocked_until_worker_exit": False,
+                "delivery_worker_submitted": bool(state["delivery_attempted"]),
+                "physical_delivery_started": wire_write_started,
+                "wire_write_observed": wire_write_observed,
+                "controller_ack_observed": controller_ack_observed,
+                "connection_lease_held": lease_currently_held,
+                "connection_transition_blocked_until_worker_exit": lease_currently_held,
                 "recorded": True,
             },
         ) from exc
@@ -6410,7 +6461,7 @@ async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
                 automatic=automatic,
             ),
             timeout_s=max(30.0, 15.0 * float(len(requested))),
-            **({"on_finished": _automatic_snapshot_pending.release} if automatic else {}),
+            on_finished=_automatic_snapshot_pending.release if automatic else None,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -6419,6 +6470,18 @@ async def hardware_snapshot_collect(payload: dict[str, Any] | None = None):
 def _pipette_forceabort_latched(tester: Any) -> bool:
     retained_oem_latch = getattr(tester, "oem_no24v_state", None)
     return bool(retained_oem_latch()) if callable(retained_oem_latch) else False
+
+
+async def _ensure_tester_fan_services(tester_now) -> None:
+    """Ensure OEM thermal and chiller 5 s fan/pedestal services are running on the active USB owner."""
+    if tester_now is None or not hasattr(tester_now, "_oem_ensure_fan_service"):
+        return
+    for board in (tester_now.BOARD_THERMAL, tester_now.BOARD_CHILLER):
+        try:
+            started = await asyncio.to_thread(tester_now._oem_ensure_fan_service, board)
+            print(f"[INFO] fan service board {board}: {started}")
+        except Exception as exc:
+            print(f"[WARN] fan service board {board} failed to start: {exc}")
 
 
 async def _claim_service_usb_runtime(*, source: str, block_motion: bool = True) -> dict[str, Any]:
@@ -6449,6 +6512,7 @@ async def _claim_service_usb_runtime(*, source: str, block_motion: bool = True) 
         _pipette_transport = transport
         _startup_error = None
         _ownership_changed(reason=source, transport="owned", usb="service", router="running")
+        await _ensure_tester_fan_services(candidate)
     except Exception as exc:
         cleanup_error = None
         partial_owner = getattr(exc, "partial_owner", None)
@@ -6539,6 +6603,7 @@ async def reconnect_runtime():
             )
             raise HTTPException(status_code=503, detail=_startup_error) from exc
         _ownership_changed(reason="runtime_reconnect", transport="owned", usb="service", router="running")
+        await _ensure_tester_fan_services(tester)
         return _mark_post_maintenance_motion_block(
             source="runtime_reconnect",
             reason="USB runtime reconnect completed; non-homing motion recovery is required before live motion.",
@@ -9054,7 +9119,8 @@ async def home_axis(req: HomeAxisRequest):
 async def motion_reference_status(
     axes: str = Query("x,y,z,g,door", description="Comma-separated axes to inspect reference state for."),
 ):
-    return _reference_state_store.snapshot(_parse_axes_csv(axes))
+    parsed_axes = _parse_axes_csv(axes)
+    return await asyncio.to_thread(_reference_state_store.snapshot, parsed_axes)
 
 
 @app.post("/motion/reference/mark_referenced")
@@ -9067,27 +9133,25 @@ async def motion_reference_mark_referenced(req: ReferenceMarkRequest):
             "message": "Z reference can only be established by a source-shaped OEM home with GAP9/stop/setHome proof.",
             "physical_motion_commanded": False,
         })
-    return _reference_state_store.mark_referenced(
-        MarkAxisReferencedCommand(
-            axis=req.axis,
-            position_steps=req.position_steps,
-            source=req.source,
-            note=req.note,
-            motion_kind="manual_reference",
-        )
+    cmd = MarkAxisReferencedCommand(
+        axis=req.axis,
+        position_steps=req.position_steps,
+        source=req.source,
+        note=req.note,
+        motion_kind="manual_reference",
     )
+    return await asyncio.to_thread(_reference_state_store.mark_referenced, cmd)
 
 
 @app.post("/motion/reference/mark_desynced")
 async def motion_reference_mark_desynced(req: ReferenceDesyncRequest):
-    return _reference_state_store.mark_desynced(
-        MarkAxisDesyncedCommand(
-            axis=req.axis,
-            reason=req.reason,
-            source=req.source,
-            motion_kind="manual_desync",
-        )
+    cmd = MarkAxisDesyncedCommand(
+        axis=req.axis,
+        reason=req.reason,
+        source=req.source,
+        motion_kind="manual_desync",
     )
+    return await asyncio.to_thread(_reference_state_store.mark_desynced, cmd)
 
 
 
@@ -9500,59 +9564,97 @@ async def liquid_application_status():
     return await run_in_threadpool(_pipette_application.status)
 
 
+_inflight_liquid_application_plans: dict[str, tuple[dict[str, Any], asyncio.Task]] = {}
+
+
 @app.post("/liquid/application/plan")
 async def liquid_application_plan(req: PipetteApplicationPlanRequest):
     if req.operation == "load_tip":
         if req.tip_tray is None or req.tip_well is None or req.tip_type is None or req.tip_location is None:
             raise HTTPException(status_code=422, detail="load_tip requires tip_tray, tip_well, tip_type, and tip_location")
-        plan = _pipette_application.plan_load_tip(
-            tip_tray=req.tip_tray,
-            tip_well=req.tip_well,
-            tip_type=req.tip_type,
-            tip_location=req.tip_location,
-            home_z_after=req.home_z_after,
-        )
-    elif req.operation == "move_to_waste":
-        plan = _pipette_application.plan_move_to_waste()
     elif req.operation == "detect_fluid":
         if req.fluid_class is None:
             raise HTTPException(status_code=422, detail="detect_fluid requires fluid_class")
-        plan = _pipette_application.plan_detect_fluid(fluid_class=req.fluid_class)
-    else:
-        plan = _pipette_application.plan_plunger(direction="up" if req.operation == "plunger_up" else "down")
     requested = req.model_dump(exclude_none=True)
-    receipt = _pipette_receipts.record(
-        operation=f"application_plan:{req.operation}",
-        requested_inputs=requested,
-        result=plan,
-        runtime_binding={
-            "owner": "PipetteApplicationPlanner",
-            "mode": "plan_only",
-            "idempotency_key": _DIRECT_PIPETTE_IDEMPOTENCY.get(),
-            # Provider observations belong to the stored result, not request identity.
-        },
-    )
-    return {
-        # Planning is no-motion receipt creation, not a hardware readback.
-        # Same-key recovery returns the persisted plan, even if providers changed.
-        **receipt["result"],
-        "receipt_id": receipt["receipt_id"],
-        "receipt_truth": receipt["truth"],
-    }
+    idempotency_key = _DIRECT_PIPETTE_IDEMPOTENCY.get()
+
+    def _plan_and_record():
+        if req.operation == "load_tip":
+            assert req.tip_tray is not None and req.tip_well is not None and req.tip_type is not None and req.tip_location is not None
+            plan = _pipette_application.plan_load_tip(
+                tip_tray=req.tip_tray,
+                tip_well=req.tip_well,
+                tip_type=req.tip_type,
+                tip_location=req.tip_location,
+                home_z_after=req.home_z_after,
+            )
+        elif req.operation == "move_to_waste":
+            plan = _pipette_application.plan_move_to_waste()
+        elif req.operation == "detect_fluid":
+            assert req.fluid_class is not None
+            plan = _pipette_application.plan_detect_fluid(fluid_class=req.fluid_class)
+        else:
+            plan = _pipette_application.plan_plunger(direction="up" if req.operation == "plunger_up" else "down")
+        receipt = _pipette_receipts.record(
+            operation=f"application_plan:{req.operation}",
+            requested_inputs=requested,
+            result=plan,
+            runtime_binding={
+                "owner": "PipetteApplicationPlanner",
+                "mode": "plan_only",
+                "idempotency_key": idempotency_key,
+                # Provider observations belong to the stored result, not request identity.
+            },
+        )
+        return {
+            # Planning is no-motion receipt creation, not a hardware readback.
+            # Same-key recovery returns the persisted plan, even if providers changed.
+            **receipt["result"],
+            "receipt_id": receipt["receipt_id"],
+            "receipt_truth": receipt["truth"],
+        }
+
+    if idempotency_key:
+        existing = _inflight_liquid_application_plans.get(idempotency_key)
+        if existing is not None:
+            existing_req, existing_task = existing
+            if existing_req != requested:
+                raise HTTPException(status_code=409, detail="idempotency_key already bound to different liquid application plan")
+            return await asyncio.shield(existing_task)
+
+        async def _run_owned():
+            try:
+                return await asyncio.to_thread(_plan_and_record)
+            finally:
+                current = _inflight_liquid_application_plans.get(idempotency_key)
+                if current is not None and current[1] is task:
+                    _inflight_liquid_application_plans.pop(idempotency_key, None)
+
+        task = asyncio.create_task(_run_owned(), name=f"bioxp-liquid-plan:{idempotency_key}")
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        _inflight_liquid_application_plans[idempotency_key] = (requested, task)
+        return await asyncio.shield(task)
+    return await asyncio.to_thread(_plan_and_record)
 
 
 @app.get("/liquid/status")
 async def liquid_status():
     projection = hardware_state.project("pipette")
     observed = _domain_observation(projection, "pipette")
+    latest_receipt, application_status = await asyncio.to_thread(
+        lambda: (
+            _pipette_receipts.latest() if _pipette_receipts is not None else None,
+            _pipette_application.status(),
+        )
+    )
     return {
         **projection,
         "pipette": observed,
         "channels": None if not isinstance(observed, dict) else observed.get("channels"),
         "live_query_performed": False,
         "truth_source": "hardware_state_projection_only",
-        "latest_receipt": _pipette_receipts.latest(),
-        "application": _pipette_application.status(),
+        "latest_receipt": latest_receipt,
+        "application": application_status,
     }
 
 
@@ -9578,7 +9680,11 @@ async def liquid_request_lookup(request: Request):
     if _pipette_receipts is None:
         result = lookup_envelope(kind, key, "unavailable", "store_unavailable")
     else:
-        result = _pipette_receipts.lookup_direct_request(request_kind=kind, idempotency_key=key)
+        result = await asyncio.to_thread(
+            _pipette_receipts.lookup_direct_request,
+            request_kind=kind,
+            idempotency_key=key,
+        )
     code = {"conflict": 409, "unavailable": 503}.get(result["lookup_state"], 200)
     return JSONResponse(status_code=code, content=result, headers={"Cache-Control": "no-store"})
 
