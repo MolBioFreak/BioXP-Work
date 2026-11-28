@@ -2942,7 +2942,11 @@ class FourPipetteTransport:
             reconciled_empty = [ch for ch in selected if ch not in loaded]
             still_loaded = [ch for ch in selected if ch in loaded]
             if reconciled_empty:
+                # Empty-head cleanup resets the full expectation set. Preserve
+                # unexplained absences outside this operator confirmation.
+                untouched = set(self._expected_tip_channels or ()) - set(reconciled_empty)
                 self._note_tips_released(reconciled_empty)
+                self._expected_tip_channels = sorted(untouched) or None
             return {
                 "ok": True,
                 "channels_requested": selected,

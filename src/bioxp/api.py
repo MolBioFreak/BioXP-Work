@@ -10118,7 +10118,8 @@ def _run_pipette_tip_query_with_deck_owner(audited_query, transport):
 _READINESS_TIP_PROBE_TIMEOUT_S = 3.0
 
 
-def _query_and_publish_pipette_tip_status(*, runtime_binding=None, readiness_bounded: bool = False):
+def _query_and_publish_pipette_tip_status(*, runtime_binding=None, readiness_bounded: bool = False,
+                                          intentionally_removed_channels: list[int] | None = None):
     """Shared query owner; called only inside the existing tester worker.
 
     ``readiness_bounded`` shortens the per-channel response timeout and stops
@@ -10130,15 +10131,24 @@ def _query_and_publish_pipette_tip_status(*, runtime_binding=None, readiness_bou
     async def inline_run(_label, callback, *, timeout_s):
         return callback()
 
+    def query(owned):
+        if intentionally_removed_channels is not None:
+            reconciled = owned.reconcile_intentional_tip_removal(intentionally_removed_channels)
+            # The deck publisher and receipt owner consume the actual query rows.
+            observation = reconciled.pop("after")
+            return {**observation, **reconciled}
+        return owned.query_tip_status_all(
+            response_timeout_s=_READINESS_TIP_PROBE_TIMEOUT_S if readiness_bounded else None,
+            abort_after_first_ack_timeout=readiness_bounded,
+        )
+
     def audited_query():
         return asyncio.run(run_pipette_operation(
-            "tip_status",
-            lambda owned: owned.query_tip_status_all(
-                response_timeout_s=_READINESS_TIP_PROBE_TIMEOUT_S if readiness_bounded else None,
-                abort_after_first_ack_timeout=readiness_bounded,
-            ),
+            "tip_status", query,
             get_transport=lambda: transport, run_blocking=inline_run,
-            timeout_s=120.0, receipt_store=_pipette_receipts, requested_inputs={},
+            timeout_s=120.0, receipt_store=_pipette_receipts,
+            requested_inputs=({"intentionally_removed_channels": intentionally_removed_channels}
+                              if intentionally_removed_channels is not None else {}),
             runtime_binding=runtime_binding,
         ))
 
@@ -10265,6 +10275,26 @@ async def liquid_tip_status():
     return await _run_blocking("Pipette tip status", _query_and_publish_pipette_tip_status, timeout_s=120.0)
 
 
+
+
+class ConfirmTipRemovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    channels: list[Annotated[StrictInt, Field(ge=0, le=3)]] = Field(min_length=1, max_length=4)
+
+
+@app.post("/liquid/confirm-tip-removal")
+async def liquid_confirm_tip_removal(req: ConfirmTipRemovalRequest):
+    """Record intentional manual removal, using a fresh tip query. No motion."""
+    if len(set(req.channels)) != len(req.channels):
+        raise HTTPException(status_code=422, detail="channels must not contain duplicates")
+    result = await _run_blocking(
+        "Confirm manual pipette tip removal",
+        lambda: _query_and_publish_pipette_tip_status(intentionally_removed_channels=sorted(req.channels)),
+        timeout_s=120.0,
+    )
+    if result.get("ok") is not True:
+        raise HTTPException(status_code=502, detail=result)
+    return result
 
 
 @app.post("/liquid/data")
